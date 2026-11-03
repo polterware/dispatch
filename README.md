@@ -6,10 +6,6 @@
 
 Dispatch delegates a task to a coding-agent CLI (Codex, Claude Code, Cursor, Grok, OpenCode, Pi, Gemini, Qwen, Copilot, Kimi, Antigravity, or any ACP agent you add), routed by difficulty and quota, and keeps each run's transcript, routing decision, usage, and worktree. Agents start runs with `dispatch run` or the Dispatch skill; the desktop app follows, merges, and tunes them. It is part of the [Polterware](https://github.com/polterware/polterware) ecosystem and works on plain folders without it.
 
-<p align="center">
-  <img src="docs/assets/cover.png" alt="Dispatch: delegate coding tasks to the right agent" width="720">
-</p>
-
 ## How it works
 
 - **One binary.** `Dispatch.app` holds a single Rust executable. Opened from the Finder it is the desktop app; given a command, or run as `dispatch` (`Contents/Resources/dispatch` links to it, and `dispatch setup link` puts it at `~/.local/bin/dispatch`), it is the CLI and the core.
@@ -48,7 +44,7 @@ dispatch merge <id>
 - `schemas`: the `dispatch.v1` contracts and `polterware/local/v1/dispatch_host.proto`, the `DispatchHostService` Polterware serves to Dispatch. Polterware vendors these files; change them here.
 - `plugins/opencode-gui`: the OpenCode Desktop plugin (Solid), built into the file `crates/dispatch-core` embeds.
 - `tooling`: the checks, the model catalog (`models.mjs`), the classifier evaluation (`classify-eval.mjs`), the icon renderer (`render-icon.swift`), the release bundle (`release/bundle.sh`), and the Sparkle updater (`updater`).
-- `docs/assets`: the icon, cover, and banner.
+- `docs/assets`: the icon, the README banner, and the cover (the repository's social preview).
 - `updates/dispatch.xml`: the Sparkle appcast the app checks daily.
 
 ## Develop

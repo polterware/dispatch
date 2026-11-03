@@ -15,7 +15,7 @@
 - `schemas`: the contracts. Polterware vendors `dispatch/v1` and `polterware/local/v1/dispatch_host.proto` with its `tooling/sync-dispatch-proto.sh`, so a change here reaches it through that script.
 - `plugins/opencode-gui`: the OpenCode Desktop plugin (Solid), with the bot avatars vendored under `vendor/bot-avatars` (MIT).
 - `tooling`: `verify.sh`, `check-boundaries.sh`, `models.mjs`, `classify-eval.mjs`, `render-icon.swift` (renders `app/resources/dispatch.icon` to a PNG: the Dock icon of an unbundled build, `app/resources/dispatch-icon.png`, and `docs/assets/icon.png`), `release/bundle.sh`, and `updater` (Sparkle; `configure-secret.sh` exports the signing key and needs Erick's explicit go-ahead).
-- `docs/assets`: the README's icon, cover, and banner.
+- `docs/assets`: the icon, the README banner, and the cover (the repository's social preview).
 - `updates/dispatch.xml`: the Sparkle appcast.
 
 ## What Dispatch does
