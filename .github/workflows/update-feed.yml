@@ -1,0 +1,39 @@
+name: Publish the update feed
+
+# Drafts are never advertised. Publishing an alpha also triggers this event.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-feed
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == 'polterware/dispatch' && startsWith(github.event.release.tag_name, 'dispatch-v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Validate and advance the feed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release download "$RELEASE_TAG" --pattern appcast.xml --dir "$RUNNER_TEMP/update-feed"
+          python3 tooling/updater/refresh-feed.py dispatch "$RELEASE_TAG" "$RUNNER_TEMP/update-feed/appcast.xml" updates/dispatch.xml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add updates/dispatch.xml
+          if ! git diff --cached --quiet; then
+            git commit -m "Publish the $RELEASE_TAG update feed"
+            git push origin HEAD:main
+          fi

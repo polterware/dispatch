@@ -1,0 +1,23 @@
+{
+  "name": "@polterware/dispatch-opencode-gui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "license": "Apache-2.0",
+  "description": "The OpenCode Desktop part of the Dispatch plugin, built into crates/dispatch-core/src/setup/opencode/gui-experimental.cjs.",
+  "packageManager": "pnpm@12.6.0",
+  "scripts": {
+    "build": "vite build",
+    "check": "node scripts/check.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@polterware/bot-avatars": "workspace:*"
+  },
+  "devDependencies": {
+    "solid-js": "^1.9.15",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.6",
+    "vite-plugin-solid": "^2.11.14"
+  }
+}

@@ -1,0 +1,22 @@
+syntax = "proto3";
+package dispatch.v1;
+
+message CheckRequest {}
+message CheckResponse {
+  string status = 1;
+  string version = 2;
+  double uptime_sec = 3;
+  // build identifies the core binary; a client with a newer build asks the
+  // core to shut down and starts its own.
+  string build = 4;
+  int32 pid = 5;
+}
+
+// Shutdown stops the core after the response is sent.
+message ShutdownRequest { string reason = 1; }
+message ShutdownResponse {}
+
+service HealthService {
+  rpc Check(CheckRequest) returns (CheckResponse);
+  rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
+}

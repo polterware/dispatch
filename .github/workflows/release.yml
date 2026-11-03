@@ -1,0 +1,101 @@
+name: Dispatch release
+
+on:
+  push:
+    tags:
+      - dispatch-v*
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing dispatch-v<version> tag to build as a draft
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dispatch-release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-26
+    if: github.repository == 'polterware/dispatch'
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: Validate tag
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^dispatch-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "Invalid tag: $RELEASE_TAG" >&2; exit 1; }
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+          persist-credentials: false
+      - id: meta
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: echo "version=${RELEASE_TAG#dispatch-v}" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go-core/go.mod
+          cache-dependency-path: go-core/go.sum
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc
+        run: brew install protobuf
+      - name: Build the ad-hoc signed bundle (never publish from the builder)
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          POLTERWARE_SPARKLE_PRIVATE_KEY: ${{ secrets.POLTERWARE_SPARKLE_PRIVATE_KEY }}
+        run: |
+          bash tooling/release/bundle.sh "$VERSION"
+          cat "target/release-bundle/$VERSION/gatekeeper.txt" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dispatch-mac-arm64
+          if-no-files-found: error
+          path: |
+            target/release-bundle/*/*.dmg
+            target/release-bundle/*/*.zip
+            target/release-bundle/*/SHA256SUMS
+            target/release-bundle/*/appcast.xml
+            target/release-bundle/*/gatekeeper.txt
+
+  draft:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dispatch-mac-arm64
+          path: artifacts
+      - name: Attach artifacts to a draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          VERSION: ${{ needs.build.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --json isDraft > release.json; then
+            [[ "$(jq -r .isDraft release.json)" == true ]] || { echo 'Refusing to modify a published release.' >&2; exit 1; }
+          else
+            prerelease=()
+            [[ "$VERSION" == *-* ]] && prerelease=(--prerelease)
+            cat > release-notes.txt <<NOTES
+          Dispatch $VERSION for macOS on Apple Silicon (arm64). Ad-hoc signed; not notarized.
+          Gatekeeper rejection is expected. First run: right-click the extracted Dispatch.app and choose Open, or remove quarantine from that trusted app with xattr -dr com.apple.quarantine /path/to/Dispatch.app.
+          NOTES
+            gh release create "$RELEASE_TAG" --verify-tag --draft "${prerelease[@]}" --title "Dispatch $VERSION" --notes-file release-notes.txt
+          fi
+          mapfile -t assets < <(find artifacts -type f \( -name '*.dmg' -o -name '*.zip' -o -name SHA256SUMS -o -name appcast.xml \))
+          [[ "${#assets[@]}" == 4 ]] || { echo 'Expected DMG, ZIP, SHA256SUMS and signed appcast.' >&2; exit 1; }
+          gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber

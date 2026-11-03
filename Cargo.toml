@@ -1,0 +1,23 @@
+[workspace]
+resolver = "3"
+members = ["app", "crates/dispatch-core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/polterware/dispatch"
+
+[workspace.dependencies]
+gpui = { version = "0.2.2", default-features = false, features = ["runtime_shaders", "font-kit"] }
+# A sibling checkout replaces it through the workspace's .cargo/config.toml [patch].
+polterware-ui = { git = "https://github.com/polterware/ui" }
+
+[workspace.lints.rust]
+# objc 0.2 msg_send! checks a `cargo-clippy` feature in the calling crate.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"

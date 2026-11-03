@@ -1,0 +1,81 @@
+syntax = "proto3";
+package polterware.local.v1;
+
+// DispatchHostService is what Polterware Dispatch reads from Polterware: the
+// projects, where a run works and what it is about, and the audited AgentRun
+// its agent writes under. Dispatch owns this contract (the package keeps its
+// first name so cores of either age still talk); Polterware vendors it and
+// serves it.
+
+message HostProject {
+  string id = 1;
+  string name = 2;
+}
+
+message ListHostProjectsRequest {}
+message ListHostProjectsResponse { repeated HostProject projects = 1; }
+
+// ResolveHostProject returns the project with id, else the one whose
+// repository clone holds dir.
+message ResolveHostProjectRequest {
+  string id = 1;
+  string dir = 2;
+}
+message ResolveHostProjectResponse { HostProject project = 1; }
+
+// ResolveRun settles a run before it starts: its directory (the request's,
+// else the repository's clone, else the card's component repository, else the
+// only repository), its area, and the card text the classifier reads.
+message ResolveRunRequest {
+  string project_id = 1;
+  string card_slug = 2;
+  string repo = 3;
+  string dir = 4;
+}
+message ResolveRunResponse {
+  string dir = 1;
+  repeated string kinds = 2;
+  repeated string tech = 3;
+  string card_text = 4;
+}
+
+message HostCard {
+  string slug = 1;
+  string title = 2;
+  string milestone = 3;
+  string stage = 4;
+}
+
+message HostRepository {
+  string name = 1;
+  string remote = 2;
+  string local_path = 3;
+}
+
+// ListHostCards lists a project's open cards and its repositories.
+message ListHostCardsRequest { string project_id = 1; }
+message ListHostCardsResponse {
+  repeated HostCard cards = 1;
+  repeated HostRepository repositories = 2;
+}
+
+// StartHostAgentRun opens the AgentRun a delegation's agent writes under.
+message StartHostAgentRunRequest {
+  string project_id = 1;
+  string task = 2;
+  string card_slug = 3;
+}
+message StartHostAgentRunResponse { string agent_run_id = 1; }
+
+// CompleteHostAgentRun closes it when the delegation ends.
+message CompleteHostAgentRunRequest { string agent_run_id = 1; }
+message CompleteHostAgentRunResponse {}
+
+service DispatchHostService {
+  rpc ListHostProjects(ListHostProjectsRequest) returns (ListHostProjectsResponse);
+  rpc ResolveHostProject(ResolveHostProjectRequest) returns (ResolveHostProjectResponse);
+  rpc ResolveRun(ResolveRunRequest) returns (ResolveRunResponse);
+  rpc ListHostCards(ListHostCardsRequest) returns (ListHostCardsResponse);
+  rpc StartHostAgentRun(StartHostAgentRunRequest) returns (StartHostAgentRunResponse);
+  rpc CompleteHostAgentRun(CompleteHostAgentRunRequest) returns (CompleteHostAgentRunResponse);
+}

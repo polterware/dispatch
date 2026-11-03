@@ -1,0 +1,2775 @@
+//! Roles: the list, each role's tier board, and the composer.
+//!
+//! General is the tier table. Every other role has the same board; an empty tier runs on General's.
+//! The core is called only from `cx.background_spawn`. Subagents and Config get an empty `dir`
+//! because this window has no project directory.
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+
+use gpui::{
+    AnyElement, AppContext as _, Bounds, Context, CursorStyle, DispatchPhase, Entity, FontWeight,
+    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render,
+    SharedString, Window, canvas, div, point, prelude::*, px,
+};
+
+use crate::avatar::agent_avatar;
+use crate::client::{
+    BuildTiersRequest, CheckTiersRequest, ConfigRequest, CoreClient, CoreError, DispatchAgent,
+    DispatchTier, ListAgentsRequest, ListModelsRequest, ListTiersRequest, ReplaceTiersRequest,
+    SubagentsRequest,
+};
+use crate::models::roles::{
+    GENERAL_ROLE, PaletteModel, RoleDraft, RoleListRow, RoleProfile, RoleRow, RoleSource,
+    RolesList, TIER_COLUMNS, TierBuild, TierCardInput, TierColumns, TierSlot, board_row_count,
+    classifier_from_config, compose_profile, is_build_empty, models_label, palette_card,
+    palette_groups, parse_roles_list, parse_tier_build, pick_note, place_tier_card,
+    profile_with_board, remove_tier_card, rename_drops_previous, role_board_tiers, role_list_rows,
+    role_name_error, tier_columns, tier_matches, toggle_name, when_display,
+};
+use crate::motion::{Animator, SpringTier, SpringValue};
+use crate::state::{AppState, Route, ToastTone, observe};
+use crate::theme::{StatusTone, Theme, mix, tw};
+use crate::ui::ellipsis;
+use crate::ui::parts::roles::{
+    build_sections, field_label, muted_note, order_mark, role_board_note, role_summary, tier_meter,
+};
+use crate::ui::patterns::{composer_actions, composer_card, modal_layer};
+use crate::ui::{
+    Button, ButtonKind, ButtonSize, Column, DataTable, Icon, IconTile, MascotMood, PointerTiming,
+    RadioOption, Switch, TextInput, TileTone, button, card, chip, drop, fade_text, icon,
+    icon_button, icon_colored, mono, page_content, page_empty, page_inner_height, primary_cell,
+    radio_group, sans, switch_row, tabular, text_width, toolbar, track, use_pointer_timed,
+};
+
+/// The list's `PageContent` scroll, and a board's.
+const ROLES_PAGE: &str = "roles-page";
+const ROLES_BOARD: &str = "roles-board";
+/// `DispatchAgentAvatar`'s default size.
+const AVATAR: f32 = 28.0;
+/// The board grid's order column and its gap (`72px repeat(3, minmax(0, 1fr))`, `gap: 10px`).
+const ORDER_W: f32 = 72.0;
+const GAP: f32 = 10.0;
+/// `DRAG_THRESHOLD`: a press becomes a drag after 4px.
+const DRAG_DISTANCE_SQ: f32 = 16.0;
+/// `.pw-tier-board__empty`.
+const EMPTY_MIN_H: f32 = 96.0;
+/// `.pw-tier-ghost__card`, 12px below and right of the pointer.
+const GHOST_W: f32 = 220.0;
+const GHOST_OFFSET: f32 = 12.0;
+/// `.pw-tier-card--lifted` (`brightness(0.6)`) and `--dimmed` (`grayscale(1) brightness(0.55)`),
+/// as opacity over the page: GPUI has no filters.
+const LIFTED_OPACITY: f32 = 0.6;
+const DIMMED_OPACITY: f32 = 0.55;
+
+/// A press on a card, a drag once it moves 4px. The board keeps the stored table while it
+/// moves: the card it left steps back, the cell under the pointer is outlined, and a ghost
+/// follows the pointer.
+struct PointerDrag {
+    card: TierCardInput,
+    from: TierSlot,
+    origin_x: f32,
+    origin_y: f32,
+    active: bool,
+    over: Option<TierSlot>,
+    /// The pointer, in page coordinates.
+    pointer: (f32, f32),
+}
+
+struct LoadBundle {
+    tiers: Result<Vec<DispatchTier>, String>,
+    problems: Result<Vec<String>, String>,
+    roles: Result<RolesList, String>,
+    classifier: Result<String, String>,
+    agents: Result<Vec<String>, String>,
+}
+
+pub struct RolesView {
+    state: Entity<AppState>,
+    roles: Vec<RoleRow>,
+    builtin: Vec<String>,
+    pick: bool,
+    pick_inflight: Option<bool>,
+    classifier: String,
+    tiers: Vec<DispatchTier>,
+    tier_problems: Vec<String>,
+    agents: Vec<String>,
+    palette_models: Vec<PaletteModel>,
+    palette_problems: Vec<String>,
+    palette_loaded: bool,
+    palette_loading: bool,
+    tier_query: String,
+    palette_query: String,
+    tier_search: Entity<TextInput>,
+    palette_search: Entity<TextInput>,
+    custom_agent: Entity<TextInput>,
+    custom_model: Entity<TextInput>,
+    name_input: Entity<TextInput>,
+    instructions_input: Entity<TextInput>,
+    when_input: Entity<TextInput>,
+    timeout_input: Entity<TextInput>,
+    pick_switch: Entity<Switch>,
+    /// `None` is closed, `Some("")` is a new role, otherwise the name being edited.
+    composer: Option<String>,
+    draft_tier: usize,
+    draft_readonly: bool,
+    draft_manual: bool,
+    draft_prefer: Vec<String>,
+    draft_avoid: Vec<String>,
+    build_open: bool,
+    build: Option<TierBuild>,
+    build_loading: bool,
+    build_applying: bool,
+    build_gen: u64,
+    drag: Option<PointerDrag>,
+    motion_for: Option<String>,
+    row_hover: HashMap<String, SpringValue>,
+    cell_bounds: Rc<RefCell<HashMap<(String, usize), Bounds<gpui::Pixels>>>>,
+    page_origin: Rc<RefCell<(f32, f32)>>,
+    animator: Animator,
+    composer_opacity: SpringValue,
+    composer_y: SpringValue,
+    build_opacity: SpringValue,
+    build_y: SpringValue,
+    palette_opacity: SpringValue,
+    palette_y: SpringValue,
+    palette_slot: Option<TierSlot>,
+    palette_anchor: Option<TierSlot>,
+    fetch_gen: u64,
+    tier_write: u64,
+    role_write: u64,
+    loading: bool,
+    visit: bool,
+    loaded: bool,
+    announced_error: bool,
+}
+
+impl RolesView {
+    pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        observe(&state, cx);
+        let view = cx.entity().clone();
+        cx.observe(&state, |this, _, cx| this.ensure_loaded(cx))
+            .detach();
+
+        let tier_search = cx.new(|cx| TextInput::new(cx).placeholder("Search tiers…"));
+        let palette_search = cx.new(|cx| TextInput::new(cx).placeholder("Search models…"));
+        let custom_agent = cx.new(|cx| TextInput::new(cx).placeholder("Agent"));
+        let custom_model = {
+            let view = view.clone();
+            cx.new(move |cx| {
+                TextInput::new(cx)
+                    .placeholder("Model")
+                    .on_submit(move |_, _, cx| {
+                        view.update(cx, |this, cx| this.add_custom(cx));
+                    })
+            })
+        };
+        let name_input = {
+            let submit = view.clone();
+            let cancel = view.clone();
+            cx.new(move |cx| {
+                TextInput::new(cx)
+                    .placeholder("Name, such as reviewer")
+                    .on_submit(move |_, _, cx| {
+                        submit.update(cx, |this, cx| this.submit_composer(cx));
+                    })
+                    .on_cancel(move |_, cx| {
+                        cancel.update(cx, |this, cx| this.close_composer(cx));
+                    })
+            })
+        };
+        let instructions_input = {
+            let submit = view.clone();
+            let cancel = view.clone();
+            cx.new(move |cx| {
+                TextInput::new(cx)
+                    .placeholder("Instructions put before every task it takes")
+                    .on_submit(move |_, _, cx| {
+                        submit.update(cx, |this, cx| this.submit_composer(cx));
+                    })
+                    .on_cancel(move |_, cx| {
+                        cancel.update(cx, |this, cx| this.close_composer(cx));
+                    })
+            })
+        };
+        let when_input = {
+            let cancel = view.clone();
+            cx.new(move |cx| {
+                TextInput::new(cx)
+                    .placeholder("The tasks it fits, for the classifier that picks it")
+                    .on_cancel(move |_, cx| {
+                        cancel.update(cx, |this, cx| this.close_composer(cx));
+                    })
+            })
+        };
+        let timeout_input = {
+            let cancel = view.clone();
+            cx.new(move |cx| {
+                TextInput::new(cx)
+                    .placeholder("Such as 15m; empty uses the default")
+                    .on_cancel(move |_, cx| {
+                        cancel.update(cx, |this, cx| this.close_composer(cx));
+                    })
+            })
+        };
+        let pick_switch = {
+            let view = view.clone();
+            cx.new(move |cx| {
+                Switch::new(true, cx).on_change(move |on, _, cx| {
+                    view.update(cx, |this, cx| this.write_pick(on, cx));
+                })
+            })
+        };
+
+        let tier_watch = tier_search.clone();
+        cx.observe(&tier_watch, |this, input, cx| {
+            let next = input.read(cx).text().to_string();
+            if this.tier_query != next {
+                this.tier_query = next;
+                cx.notify();
+            }
+        })
+        .detach();
+        let palette_watch = palette_search.clone();
+        cx.observe(&palette_watch, |this, input, cx| {
+            let next = input.read(cx).text().to_string();
+            if this.palette_query != next {
+                this.palette_query = next;
+                cx.notify();
+            }
+        })
+        .detach();
+        let deferred = view.clone();
+        cx.defer(move |app| {
+            deferred.update(app, |this, cx| this.ensure_loaded(cx));
+        });
+
+        Self {
+            state,
+            roles: Vec::new(),
+            builtin: Vec::new(),
+            pick: true,
+            pick_inflight: None,
+            classifier: String::new(),
+            tiers: Vec::new(),
+            tier_problems: Vec::new(),
+            agents: Vec::new(),
+            palette_models: Vec::new(),
+            palette_problems: Vec::new(),
+            palette_loaded: false,
+            palette_loading: false,
+            tier_query: String::new(),
+            palette_query: String::new(),
+            tier_search,
+            palette_search,
+            custom_agent,
+            custom_model,
+            name_input,
+            instructions_input,
+            when_input,
+            timeout_input,
+            pick_switch,
+            composer: None,
+            draft_tier: 0,
+            draft_readonly: false,
+            draft_manual: false,
+            draft_prefer: Vec::new(),
+            draft_avoid: Vec::new(),
+            build_open: false,
+            build: None,
+            build_loading: false,
+            build_applying: false,
+            build_gen: 0,
+            drag: None,
+            motion_for: None,
+            row_hover: HashMap::new(),
+            cell_bounds: Rc::new(RefCell::new(HashMap::new())),
+            page_origin: Rc::new(RefCell::new((0.0, 0.0))),
+            animator: Animator::new(),
+            composer_opacity: SpringValue::new(0.0, SpringTier::Fast),
+            composer_y: SpringValue::new(8.0, SpringTier::Fast),
+            build_opacity: SpringValue::new(0.0, SpringTier::Fast),
+            build_y: SpringValue::new(8.0, SpringTier::Fast),
+            palette_opacity: SpringValue::new(0.0, SpringTier::Fast),
+            palette_y: SpringValue::new(6.0, SpringTier::Fast),
+            palette_slot: None,
+            palette_anchor: None,
+            fetch_gen: 0,
+            tier_write: 0,
+            role_write: 0,
+            loading: false,
+            visit: false,
+            loaded: false,
+            announced_error: false,
+        }
+    }
+
+    fn on_roles(route: &Route) -> bool {
+        matches!(route, Route::Roles | Route::RoleBoard(_))
+    }
+
+    fn ensure_loaded(&mut self, cx: &mut Context<Self>) {
+        let on_page = Self::on_roles(self.state.read(cx).route());
+        if !on_page {
+            self.visit = false;
+            self.announced_error = false;
+            return;
+        }
+        if self.visit || self.loading {
+            return;
+        }
+        let Some(client) = self.state.read(cx).client() else {
+            return;
+        };
+        self.loading = true;
+        let generation = self.bump_fetch();
+        cx.spawn(async move |this, cx| {
+            let bundle = cx.background_spawn(async move { load_all(&client) }).await;
+            let _ = this.update(cx, |view, cx| {
+                if view.fetch_gen != generation {
+                    view.loading = false;
+                    return;
+                }
+                view.apply_load(bundle, cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn bump_fetch(&mut self) -> u64 {
+        self.fetch_gen = self.fetch_gen.wrapping_add(1);
+        self.fetch_gen
+    }
+
+    fn apply_load(&mut self, bundle: LoadBundle, cx: &mut Context<Self>) {
+        self.loading = false;
+        let mut roles_ok = false;
+        let mut tiers_ok = false;
+        if let Ok(tiers) = bundle.tiers {
+            self.tiers = tiers;
+            tiers_ok = true;
+        } else if let Err(message) = bundle.tiers {
+            self.note_error(message, cx);
+        }
+        if let Ok(problems) = bundle.problems {
+            self.tier_problems = problems;
+        }
+        if let Ok(list) = bundle.roles {
+            self.roles = list.rows;
+            self.builtin = list.builtin;
+            if self.pick_inflight.is_none() {
+                self.pick = list.pick;
+            }
+            roles_ok = true;
+            self.loaded = true;
+            self.bounce_missing(cx);
+        } else if let Err(message) = bundle.roles {
+            self.note_error(message, cx);
+        }
+        if let Ok(classifier) = bundle.classifier {
+            self.classifier = classifier;
+        }
+        if let Ok(agents) = bundle.agents {
+            self.agents = agents;
+        }
+        if roles_ok && tiers_ok {
+            self.visit = true;
+            self.announced_error = false;
+        } else {
+            self.visit = false;
+        }
+    }
+
+    fn note_error(&mut self, message: String, cx: &mut Context<Self>) {
+        if self.announced_error {
+            return;
+        }
+        self.announced_error = true;
+        self.toast(message, ToastTone::Danger, cx);
+    }
+
+    fn bounce_missing(&mut self, cx: &mut Context<Self>) {
+        let Route::RoleBoard(name) = self.state.read(cx).route().clone() else {
+            return;
+        };
+        if name == GENERAL_ROLE || self.roles.iter().any(|row| row.name == name) {
+            return;
+        }
+        self.go(Route::Roles, cx);
+    }
+
+    fn toast(&self, message: impl Into<SharedString>, tone: ToastTone, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            state.push_toast(message, tone);
+            cx.notify();
+        });
+    }
+
+    fn go(&self, route: Route, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            state.navigate(route);
+            cx.notify();
+        });
+    }
+
+    fn board_name(&self, cx: &Context<Self>) -> Option<String> {
+        match self.state.read(cx).route() {
+            Route::RoleBoard(name) => Some(name.clone()),
+            _ => None,
+        }
+    }
+
+    fn role_row(&self, name: &str) -> Option<&RoleRow> {
+        self.roles.iter().find(|row| row.name == name)
+    }
+
+    fn editable(&self, cx: &Context<Self>) -> bool {
+        match self.board_name(cx).as_deref() {
+            Some(name) if name == GENERAL_ROLE => true,
+            Some(name) => self
+                .role_row(name)
+                .is_some_and(|row| row.source != RoleSource::Repository),
+            None => false,
+        }
+    }
+
+    fn committed(&self, cx: &Context<Self>) -> Vec<DispatchTier> {
+        match self.board_name(cx).as_deref() {
+            Some(name) if name == GENERAL_ROLE => self.tiers.clone(),
+            Some(name) => self
+                .role_row(name)
+                .map(|row| role_board_tiers(&row.profile))
+                .unwrap_or_default(),
+            None => Vec::new(),
+        }
+    }
+
+    fn write_pick(&mut self, on: bool, cx: &mut Context<Self>) {
+        let Some(client) = self.state.read(cx).client() else {
+            self.toast("The local core is not running.", ToastTone::Danger, cx);
+            let switch = self.pick_switch.clone();
+            let view = cx.entity().clone();
+            self.pick_inflight = Some(on);
+            cx.defer(move |app| {
+                view.update(app, |this, cx| {
+                    switch.update(cx, |toggle, _| toggle.set_on(!on));
+                    this.pick_inflight = None;
+                    cx.notify();
+                });
+            });
+            return;
+        };
+        self.pick_inflight = Some(on);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    client.config(&ConfigRequest {
+                        action: "set".into(),
+                        key: "roles".into(),
+                        values: vec![if on { "true".into() } else { "false".into() }],
+                        ..Default::default()
+                    })
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                match result {
+                    Ok(response) if response.ok => view.pick = on,
+                    Ok(response) => {
+                        view.force_switch(!on, cx);
+                        let message = if response.json.is_empty() {
+                            "Could not save the setting.".to_string()
+                        } else {
+                            response.json
+                        };
+                        view.toast(message, ToastTone::Danger, cx);
+                    }
+                    Err(err) => {
+                        view.force_switch(!on, cx);
+                        view.toast(
+                            core_message(err, "Could not save the setting."),
+                            ToastTone::Danger,
+                            cx,
+                        );
+                    }
+                }
+                view.pick_inflight = None;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn force_switch(&self, on: bool, cx: &mut Context<Self>) {
+        self.pick_switch.update(cx, |toggle, _| toggle.set_on(on));
+    }
+
+    fn commit_board(&mut self, next: Vec<DispatchTier>, cx: &mut Context<Self>) {
+        if self.state.read(cx).client().is_none() {
+            self.toast("The local core is not running.", ToastTone::Danger, cx);
+            cx.notify();
+            return;
+        }
+        match self.board_name(cx).as_deref() {
+            Some(name) if name == GENERAL_ROLE => self.save_tiers(next, cx),
+            Some(name) => {
+                let name = name.to_string();
+                self.save_role_board(name, next, cx);
+            }
+            None => {}
+        }
+    }
+
+    fn save_tiers(&mut self, next: Vec<DispatchTier>, cx: &mut Context<Self>) {
+        let Some(client) = self.state.read(cx).client() else {
+            self.toast("The local core is not running.", ToastTone::Danger, cx);
+            return;
+        };
+        let previous = self.tiers.clone();
+        self.tiers = next.clone();
+        self.tier_write = self.tier_write.wrapping_add(1);
+        let token = self.tier_write;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let saved = client.replace_tiers(&ReplaceTiersRequest { tiers: next })?;
+                    let problems = client.check_tiers(&CheckTiersRequest {})?;
+                    Ok::<_, CoreError>((saved.tiers, problems.problems))
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if view.tier_write != token {
+                    return;
+                }
+                match result {
+                    Ok((tiers, problems)) => {
+                        view.tiers = tiers;
+                        view.tier_problems = problems;
+                    }
+                    Err(err) => {
+                        view.tiers = previous;
+                        view.toast(
+                            core_message(err, "Could not save the tiers."),
+                            ToastTone::Danger,
+                            cx,
+                        );
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn save_role_board(&mut self, name: String, next: Vec<DispatchTier>, cx: &mut Context<Self>) {
+        let Some(client) = self.state.read(cx).client() else {
+            self.toast("The local core is not running.", ToastTone::Danger, cx);
+            return;
+        };
+        let Some(previous) = self.role_row(&name).map(|row| row.profile.clone()) else {
+            return;
+        };
+        let updated = profile_with_board(&previous, &next);
+        let profile = serde_json::to_string(&updated).unwrap_or_else(|_| "{}".to_string());
+        let saved_name = name.clone();
+        if let Some(row) = self.roles.iter_mut().find(|row| row.name == name) {
+            row.profile = updated;
+        }
+        self.role_write = self.role_write.wrapping_add(1);
+        let token = self.role_write;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let response = client
+                        .subagents(&SubagentsRequest {
+                            action: "save".into(),
+                            dir: String::new(),
+                            name,
+                            profile,
+                        })
+                        .map_err(|err| core_message(err, "Could not save the role."))?;
+                    if response.ok {
+                        Ok(())
+                    } else {
+                        Err(if response.json.is_empty() {
+                            "Could not save the role.".to_string()
+                        } else {
+                            response.json
+                        })
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if view.role_write != token {
+                    return;
+                }
+                if let Err(message) = result {
+                    if let Some(row) = view.roles.iter_mut().find(|row| row.name == saved_name) {
+                        row.profile = previous;
+                    }
+                    view.toast(message, ToastTone::Danger, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn reload_tiers(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.state.read(cx).client() else {
+            return;
+        };
+        self.tier_write = self.tier_write.wrapping_add(1);
+        let token = self.tier_write;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let tiers = client.list_tiers(&ListTiersRequest {})?;
+                    let problems = client.check_tiers(&CheckTiersRequest {})?;
+                    Ok::<_, CoreError>((tiers.tiers, problems.problems))
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if view.tier_write != token {
+                    return;
+                }
+                if let Ok((tiers, problems)) = result {
+                    view.tiers = tiers;
+                    view.tier_problems = problems;
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn open_composer(&mut self, name: Option<&str>, cx: &mut Context<Self>) {
+        let row = name
+            .and_then(|name| self.roles.iter().find(|row| row.name == name))
+            .cloned();
+        let profile = row
+            .as_ref()
+            .map(|row| row.profile.clone())
+            .unwrap_or_default();
+        self.draft_tier = match profile.tier.as_str() {
+            "easy" => 1,
+            "normal" => 2,
+            "hard" => 3,
+            _ => 0,
+        };
+        self.draft_readonly = profile.readonly;
+        self.draft_manual = profile.manual;
+        self.draft_prefer = profile.prefer.clone();
+        self.draft_avoid = profile.avoid.clone();
+        self.composer = Some(name.unwrap_or("").to_string());
+        let title = name.unwrap_or("").to_string();
+        let instructions = profile.instructions.clone();
+        let when = profile.when.clone();
+        let timeout = profile.timeout.clone();
+        self.name_input
+            .update(cx, |input, cx| input.set_text(title, cx));
+        self.instructions_input
+            .update(cx, |input, cx| input.set_text(instructions, cx));
+        self.when_input
+            .update(cx, |input, cx| input.set_text(when, cx));
+        self.timeout_input
+            .update(cx, |input, cx| input.set_text(timeout, cx));
+        cx.notify();
+    }
+
+    fn close_composer(&mut self, cx: &mut Context<Self>) {
+        self.composer = None;
+        cx.notify();
+    }
+
+    fn submit_composer(&mut self, cx: &mut Context<Self>) {
+        let Some(previous) = self.composer.clone() else {
+            return;
+        };
+        let name = self.name_input.read(cx).text().trim().to_string();
+        if let Some(error) = role_name_error(&name) {
+            self.toast(error, ToastTone::Danger, cx);
+            return;
+        }
+        let draft = RoleDraft {
+            tier: match self.draft_tier {
+                1 => "easy".to_string(),
+                2 => "normal".to_string(),
+                3 => "hard".to_string(),
+                _ => String::new(),
+            },
+            readonly: self.draft_readonly,
+            manual: self.draft_manual,
+            prefer: self.draft_prefer.clone(),
+            avoid: self.draft_avoid.clone(),
+            instructions: self.instructions_input.read(cx).text().to_string(),
+            when: self.when_input.read(cx).text().to_string(),
+            timeout: self.timeout_input.read(cx).text().to_string(),
+        };
+        let existing = if previous.is_empty() {
+            None
+        } else {
+            self.roles.iter().find(|row| row.name == previous).cloned()
+        };
+        let source = existing
+            .as_ref()
+            .map(|row| row.source)
+            .unwrap_or(RoleSource::User);
+        let profile = compose_profile(existing.as_ref().map(|row| &row.profile), &draft);
+        let profile_json = serde_json::to_string(&profile).unwrap_or_else(|_| "{}".to_string());
+        let drops = rename_drops_previous(&previous, &name, source);
+        let Some(client) = self.state.read(cx).client() else {
+            self.toast("The local core is not running.", ToastTone::Danger, cx);
+            return;
+        };
+        let snapshot = self.roles.clone();
+        self.upsert_role(name.clone(), profile, RoleSource::User);
+        if drops {
+            let old = previous.clone();
+            self.roles.retain(|row| row.name != old);
+        }
+        let generation = self.bump_fetch();
+        let saved_name = name.clone();
+        let drop_name = previous.clone();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    save_role_ops(
+                        &client,
+                        &saved_name,
+                        &profile_json,
+                        drops.then_some(drop_name.as_str()),
+                    )
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                match result {
+                    Ok(list) => {
+                        if view.fetch_gen == generation {
+                            if let Some(list) = list {
+                                view.roles = list.rows;
+                                view.builtin = list.builtin;
+                            }
+                        }
+                        view.composer = None;
+                        view.toast(
+                            format!("Saved {name}. Runs take it with --role {name}."),
+                            ToastTone::Success,
+                            cx,
+                        );
+                        view.go(Route::RoleBoard(name), cx);
+                    }
+                    Err(message) => {
+                        view.roles = snapshot;
+                        view.toast(message, ToastTone::Danger, cx);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn upsert_role(&mut self, name: String, profile: RoleProfile, source: RoleSource) {
+        if let Some(row) = self.roles.iter_mut().find(|row| row.name == name) {
+            row.profile = profile;
+            row.source = source;
+        } else {
+            self.roles.push(RoleRow {
+                name,
+                profile,
+                source,
+            });
+        }
+        self.roles.sort_by(|left, right| left.name.cmp(&right.name));
+    }
+
+    fn remove_editing(&mut self, cx: &mut Context<Self>) {
+        let Some(name) = self.composer.clone().filter(|name| !name.is_empty()) else {
+            return;
+        };
+        let restores = self.builtin.iter().any(|item| item == &name);
+        let Some(client) = self.state.read(cx).client() else {
+            self.toast("The local core is not running.", ToastTone::Danger, cx);
+            return;
+        };
+        let generation = self.bump_fetch();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let response = client
+                        .subagents(&SubagentsRequest {
+                            action: "remove".into(),
+                            dir: String::new(),
+                            name: name.clone(),
+                            profile: String::new(),
+                        })
+                        .map_err(|err| core_message(err, "Could not remove the role."))?;
+                    if !response.ok {
+                        return Err(if response.json.is_empty() {
+                            "Could not remove the role.".to_string()
+                        } else {
+                            response.json
+                        });
+                    }
+                    let listed = client
+                        .subagents(&SubagentsRequest {
+                            action: "list".into(),
+                            dir: String::new(),
+                            name: String::new(),
+                            profile: String::new(),
+                        })
+                        .ok()
+                        .filter(|response| response.ok)
+                        .and_then(|response| parse_roles_list(&response.json).ok());
+                    Ok((name, restores, listed))
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                match result {
+                    Ok((name, restores, listed)) => {
+                        if view.fetch_gen == generation {
+                            if let Some(list) = listed {
+                                view.roles = list.rows;
+                                view.builtin = list.builtin;
+                            } else if !restores {
+                                view.roles.retain(|row| row.name != name);
+                            }
+                        }
+                        let message = if restores {
+                            format!("Restored the built-in {name}.")
+                        } else {
+                            format!("Removed {name}.")
+                        };
+                        view.toast(message, ToastTone::Success, cx);
+                        view.composer = None;
+                        if !restores {
+                            view.go(Route::Roles, cx);
+                        }
+                    }
+                    Err(message) => view.toast(message, ToastTone::Danger, cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn open_build(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.state.read(cx).client() else {
+            self.toast("The local core is not running.", ToastTone::Danger, cx);
+            return;
+        };
+        self.build_open = true;
+        self.build = None;
+        self.build_loading = true;
+        self.build_applying = false;
+        self.build_gen = self.build_gen.wrapping_add(1);
+        let token = self.build_gen;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { run_build(&client, false) })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if view.build_gen != token {
+                    return;
+                }
+                view.build_loading = false;
+                match result {
+                    Ok(build) => view.build = Some(build),
+                    Err(message) => view.toast(message, ToastTone::Danger, cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn apply_build(&mut self, cx: &mut Context<Self>) {
+        if self.build_loading || self.build_applying {
+            return;
+        }
+        if self.build.as_ref().is_none_or(is_build_empty) {
+            return;
+        }
+        let Some(client) = self.state.read(cx).client() else {
+            self.toast("The local core is not running.", ToastTone::Danger, cx);
+            return;
+        };
+        self.build_applying = true;
+        self.build_gen = self.build_gen.wrapping_add(1);
+        let token = self.build_gen;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { run_build(&client, true) })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if view.build_gen != token {
+                    return;
+                }
+                view.build_applying = false;
+                match result {
+                    Ok(build) if build.applied => {
+                        view.build_open = false;
+                        view.toast(
+                            "The tiers now follow the router model.",
+                            ToastTone::Success,
+                            cx,
+                        );
+                        view.reload_tiers(cx);
+                    }
+                    Ok(build) => view.build = Some(build),
+                    Err(message) => view.toast(message, ToastTone::Danger, cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn load_palette(&mut self, cx: &mut Context<Self>) {
+        if self.palette_loaded || self.palette_loading {
+            return;
+        }
+        let Some(client) = self.state.read(cx).client() else {
+            self.palette_problems = vec!["The local core is not running.".to_string()];
+            return;
+        };
+        self.palette_loading = true;
+        self.palette_loaded = true;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { client.list_models(&ListModelsRequest {}) })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                match result {
+                    Ok(response) => {
+                        view.palette_models = response
+                            .models
+                            .into_iter()
+                            .map(|model| PaletteModel {
+                                agent: model.agent,
+                                model: model.model,
+                                provider: model.provider,
+                                tier: model.tier,
+                            })
+                            .collect();
+                        view.palette_problems = response.problems;
+                        view.palette_loading = false;
+                    }
+                    Err(err) => {
+                        view.palette_loaded = false;
+                        view.palette_loading = false;
+                        view.toast(
+                            core_message(err, "Could not list models."),
+                            ToastTone::Danger,
+                            cx,
+                        );
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn toggle_palette(&mut self, slot: TierSlot, cx: &mut Context<Self>) {
+        if self.palette_slot.as_ref() == Some(&slot) {
+            self.palette_slot = None;
+        } else {
+            self.palette_slot = Some(slot);
+            self.load_palette(cx);
+        }
+        cx.notify();
+    }
+
+    fn place_new(&mut self, card: TierCardInput, cx: &mut Context<Self>) {
+        let Some(slot) = self.palette_slot.clone() else {
+            return;
+        };
+        let committed = self.committed(cx);
+        let next = place_tier_card(&committed, &card, &slot, None);
+        self.palette_slot = None;
+        if next != committed {
+            self.commit_board(next, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn add_custom(&mut self, cx: &mut Context<Self>) {
+        let agent = self.custom_agent.read(cx).text().trim().to_string();
+        let model = self.custom_model.read(cx).text().trim().to_string();
+        if agent.is_empty() || model.is_empty() {
+            return;
+        }
+        self.custom_model
+            .update(cx, |input, cx| input.set_text("", cx));
+        self.place_new(
+            TierCardInput {
+                agent,
+                model,
+                provider: String::new(),
+                speed: 0,
+                strength: 0,
+            },
+            cx,
+        );
+    }
+
+    fn remove_at(&mut self, slot: TierSlot, cx: &mut Context<Self>) {
+        if !self.editable(cx) {
+            return;
+        }
+        let next = remove_tier_card(&self.committed(cx), &slot);
+        self.commit_board(next, cx);
+    }
+
+    fn begin_drag(&mut self, slot: TierSlot, x: f32, y: f32, cx: &mut Context<Self>) {
+        if !self.editable(cx)
+            || self.palette_slot.is_some()
+            || self.composer.is_some()
+            || self.build_open
+        {
+            return;
+        }
+        let committed = self.committed(cx);
+        let Some(tier) = tier_columns(&committed)
+            .get(&slot.tier)
+            .get(slot.index)
+            .cloned()
+        else {
+            return;
+        };
+        self.drag = Some(PointerDrag {
+            card: TierCardInput::from_tier(&tier),
+            from: slot,
+            origin_x: x,
+            origin_y: y,
+            active: false,
+            over: None,
+            pointer: (0.0, 0.0),
+        });
+        cx.notify();
+    }
+
+    fn pointer_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if self.drag.is_none() {
+            return;
+        }
+        let x = f32::from(event.position.x);
+        let y = f32::from(event.position.y);
+        let (origin_x, origin_y) = *self.page_origin.borrow();
+        let over = self.hit_slot(x, y);
+        let Some(drag) = self.drag.as_mut() else {
+            return;
+        };
+        if !drag.active {
+            let dx = x - drag.origin_x;
+            let dy = y - drag.origin_y;
+            if dx * dx + dy * dy < DRAG_DISTANCE_SQ {
+                return;
+            }
+            drag.active = true;
+        }
+        drag.pointer = (x - origin_x, y - origin_y);
+        drag.over = over;
+        cx.notify();
+    }
+
+    fn hit_slot(&self, x: f32, y: f32) -> Option<TierSlot> {
+        let cursor = point(px(x), px(y));
+        self.cell_bounds
+            .borrow()
+            .iter()
+            .find_map(|((tier, index), bounds)| {
+                bounds.contains(&cursor).then(|| TierSlot {
+                    tier: tier.clone(),
+                    index: *index,
+                })
+            })
+    }
+
+    fn pointer_up(&mut self, cx: &mut Context<Self>) {
+        let Some(drag) = self.drag.take() else {
+            return;
+        };
+        if drag.active {
+            if let Some(over) = drag.over.clone() {
+                if over != drag.from {
+                    let committed = self.committed(cx);
+                    let next = place_tier_card(&committed, &drag.card, &over, Some(&drag.from));
+                    if next != committed {
+                        self.commit_board(next, cx);
+                        return;
+                    }
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn cancel_drag(&mut self, cx: &mut Context<Self>) {
+        if self.drag.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn on_escape(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.drag.is_some() {
+            self.cancel_drag(cx);
+            return true;
+        }
+        if self.palette_slot.is_some() {
+            self.palette_slot = None;
+            cx.notify();
+            return true;
+        }
+        if self.composer.is_some() {
+            self.composer = None;
+            cx.notify();
+            return true;
+        }
+        if self.build_open {
+            self.build_open = false;
+            cx.notify();
+            return true;
+        }
+        false
+    }
+
+    fn on_window_down(&mut self, _event: &MouseDownEvent, cx: &mut Context<Self>) {
+        if self.palette_slot.is_some() {
+            self.palette_slot = None;
+            cx.notify();
+        }
+    }
+
+    fn prepare(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let board = self.board_name(cx);
+        if self.motion_for != board {
+            self.motion_for = board;
+            self.drag = None;
+            self.palette_slot = None;
+        }
+        if self.pick_inflight.is_none() {
+            let pick = self.pick;
+            self.pick_switch.update(cx, |toggle, _| {
+                if toggle.is_on() != pick {
+                    toggle.set_on(pick);
+                }
+            });
+        }
+        let composer_on = self.composer.is_some();
+        self.composer_opacity
+            .set_target(if composer_on { 1.0 } else { 0.0 });
+        self.composer_y
+            .set_target(if composer_on { 0.0 } else { 8.0 });
+        let build_on = self.build_open;
+        self.build_opacity
+            .set_target(if build_on { 1.0 } else { 0.0 });
+        self.build_y.set_target(if build_on { 0.0 } else { 8.0 });
+        let palette_on = self.palette_slot.is_some();
+        self.palette_opacity
+            .set_target(if palette_on { 1.0 } else { 0.0 });
+        self.palette_y
+            .set_target(if palette_on { 0.0 } else { 6.0 });
+        if let Some(slot) = &self.palette_slot {
+            self.palette_anchor = Some(slot.clone());
+        } else if self.palette_opacity.settled() && self.palette_opacity.value() < 0.05 {
+            self.palette_anchor = None;
+        }
+        let active = self.any_moving();
+        let dt = self.animator.dt(window, active);
+        if dt > 0.0 {
+            self.step_all(dt);
+        }
+    }
+
+    fn any_moving(&self) -> bool {
+        self.row_hover.values().any(|spring| !spring.settled())
+            || !self.composer_opacity.settled()
+            || !self.composer_y.settled()
+            || !self.build_opacity.settled()
+            || !self.build_y.settled()
+            || !self.palette_opacity.settled()
+            || !self.palette_y.settled()
+    }
+
+    fn step_all(&mut self, dt: f32) {
+        for spring in self.row_hover.values_mut() {
+            spring.step(dt);
+        }
+        self.composer_opacity.step(dt);
+        self.composer_y.step(dt);
+        self.build_opacity.step(dt);
+        self.build_y.step(dt);
+        self.palette_opacity.step(dt);
+        self.palette_y.step(dt);
+    }
+
+    fn set_hover(&mut self, key: String, on: bool, cx: &mut Context<Self>) {
+        let spring = self
+            .row_hover
+            .entry(key)
+            .or_insert_with(|| SpringValue::new(0.0, SpringTier::Fast));
+        spring.set_target(if on { 1.0 } else { 0.0 });
+        cx.notify();
+    }
+
+    /// The card a drag left, which stays in its slot as a quiet placeholder.
+    fn lifted(&self, tier: &str, row: usize) -> bool {
+        self.drag
+            .as_ref()
+            .is_some_and(|drag| drag.active && drag.from.tier == tier && drag.from.index == row)
+    }
+
+    /// The cell a drag is over, outlined in the accent.
+    fn drop_over(&self, tier: &str, row: usize) -> bool {
+        self.drag
+            .as_ref()
+            .filter(|drag| drag.active)
+            .and_then(|drag| drag.over.as_ref())
+            .is_some_and(|slot| slot.tier == tier && slot.index == row)
+    }
+
+    fn origin_canvas(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let origin = self.page_origin.clone();
+        let view_move = cx.entity().clone();
+        let view_up = cx.entity().clone();
+        let view_key = cx.entity().clone();
+        let view_down = cx.entity().clone();
+        canvas(
+            move |bounds, _, _| {
+                *origin.borrow_mut() = (f32::from(bounds.left()), f32::from(bounds.top()));
+            },
+            move |_, _, window, _cx| {
+                // Listeners live one frame. The canvas is painted whenever this page is, so a
+                // mouse-up from a press that started last frame still reaches the drag.
+                window.on_mouse_event({
+                    let view = view_move.clone();
+                    move |event: &MouseMoveEvent, phase, _, cx| {
+                        if phase == DispatchPhase::Bubble {
+                            view.update(cx, |this, cx| this.pointer_move(event, cx));
+                        }
+                    }
+                });
+                window.on_mouse_event({
+                    let view = view_up.clone();
+                    move |event: &MouseUpEvent, phase, _, cx| {
+                        if phase == DispatchPhase::Bubble && event.button == MouseButton::Left {
+                            view.update(cx, |this, cx| this.pointer_up(cx));
+                        }
+                    }
+                });
+                window.on_mouse_event({
+                    let view = view_down.clone();
+                    move |event: &MouseDownEvent, phase, _, cx| {
+                        if phase == DispatchPhase::Bubble && event.button == MouseButton::Left {
+                            view.update(cx, |this, cx| this.on_window_down(event, cx));
+                        }
+                    }
+                });
+                window.on_key_event({
+                    let view = view_key.clone();
+                    move |event: &KeyDownEvent, phase, _, cx| {
+                        if phase == DispatchPhase::Bubble && event.keystroke.key == "escape" {
+                            view.update(cx, |this, cx| {
+                                this.on_escape(cx);
+                            });
+                        }
+                    }
+                });
+            },
+        )
+        .absolute()
+        .w(px(0.0))
+        .h(px(0.0))
+    }
+
+    fn toolbar_view(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = *Theme::global(cx);
+        let route = self.state.read(cx).route().clone();
+        let view = cx.entity().clone();
+        let start = match &route {
+            Route::RoleBoard(name) => {
+                let title = if name == GENERAL_ROLE {
+                    "General".to_string()
+                } else {
+                    name.clone()
+                };
+                let general = name == GENERAL_ROLE;
+                let editable = self.editable(cx);
+                let back_state = self.state.clone();
+                let build_view = view.clone();
+                let edit_view = view.clone();
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(theme.space_2))
+                    .child(
+                        Button::new("roles-back", ButtonKind::Secondary)
+                            .size(ButtonSize::Icon)
+                            .icon(Icon::Back)
+                            .tooltip("Back")
+                            .on_click(move |_, cx| {
+                                back_state.update(cx, |state, cx| {
+                                    state.navigate(Route::Roles);
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(theme.font_size_md))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.color_text_primary)
+                            .child(title),
+                    )
+                    .when(general, |row| {
+                        row.child(
+                            Button::new("roles-build", ButtonKind::Secondary)
+                                .size(ButtonSize::Sm)
+                                .pill()
+                                .icon(Icon::AiBrain01Icon)
+                                .label("Build from model")
+                                .on_click(move |_, cx| {
+                                    build_view.update(cx, |this, cx| this.open_build(cx));
+                                }),
+                        )
+                    })
+                    .when(!general && editable, |row| {
+                        row.child(
+                            Button::new("roles-edit", ButtonKind::Secondary)
+                                .size(ButtonSize::Sm)
+                                .pill()
+                                .label("Edit role")
+                                .on_click(move |_, cx| {
+                                    edit_view.update(cx, |this, cx| {
+                                        let name = this.board_name(cx);
+                                        if let Some(name) = name {
+                                            this.open_composer(Some(&name), cx);
+                                        }
+                                    });
+                                }),
+                        )
+                    })
+                    .into_any_element()
+            }
+            _ => {
+                let new_view = view.clone();
+                Button::new("roles-new", ButtonKind::Secondary)
+                    .size(ButtonSize::Sm)
+                    .pill()
+                    .icon(Icon::Bot)
+                    .label("New role")
+                    .on_click(move |_, cx| {
+                        new_view.update(cx, |this, cx| this.open_composer(None, cx));
+                    })
+                    .into_any_element()
+            }
+        };
+        let end = if matches!(&route, Route::RoleBoard(name) if name == GENERAL_ROLE) {
+            div()
+                .w(px(220.0))
+                .child(self.tier_search.clone())
+                .into_any_element()
+        } else {
+            div().into_any_element()
+        };
+        toolbar(start, end, cx).into_any_element()
+    }
+
+    fn loading_body(theme: &Theme) -> AnyElement {
+        div()
+            .flex_1()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(muted_note("Loading roles…", theme))
+            .into_any_element()
+    }
+
+    /// The open board's page, `PageContent`'s `flex-col gap-4` column: General's check and
+    /// board, or a role's summary, note, and board. `None` while the role is not loaded.
+    fn board_content(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        if !self.loaded {
+            return None;
+        }
+        let theme = *Theme::global(cx);
+        let column = div().w_full().flex().flex_col().gap(px(tw(4.0)));
+        match self.state.read(cx).route().clone() {
+            Route::RoleBoard(name) if name == GENERAL_ROLE => {
+                let column = column.when(!self.tier_problems.is_empty(), |column| {
+                    column.child(self.problems_card(&theme, cx))
+                });
+                let query = self.tier_query.clone();
+                Some(column.child(self.board(true, &query, window, cx)))
+            }
+            Route::RoleBoard(name) => {
+                let row = self.roles.iter().find(|row| row.name == name).cloned()?;
+                let repository = row.source == RoleSource::Repository;
+                Some(
+                    column
+                        .child(role_summary(&row.profile, row.source, &theme, cx))
+                        .child(role_board_note(repository, &theme))
+                        .child(self.board(!repository, "", window, cx)),
+                )
+            }
+            _ => None,
+        }
+    }
+
+    fn list_body(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
+        let theme = *Theme::global(cx);
+        let rows = Rc::new(role_list_rows(&self.roles, self.tiers.len()));
+        let measured = rows.clone();
+        let activated = rows.clone();
+        let state = self.state.clone();
+        let table = DataTable::new(
+            "roles-table",
+            vec![
+                Column::new("Role").fixed(),
+                Column::new("When to use").fixed(),
+                Column::new("Tier"),
+                Column::new("Access"),
+                Column::new("Models").end(),
+                Column::new("Source"),
+            ],
+            rows.len(),
+            move |row, _window, cx| {
+                let theme = *Theme::global(cx);
+                let item = &rows[row.index];
+                let general = item.name == GENERAL_ROLE;
+                let body = sans(&theme, FontWeight::NORMAL);
+                let tile = IconTile::new(Icon::Bot).tone(if general {
+                    TileTone::Neutral
+                } else {
+                    TileTone::Execution
+                });
+                vec![
+                    primary_cell(
+                        tile,
+                        item.label.clone(),
+                        role_title_font(general, &theme),
+                        None,
+                        cx,
+                    ),
+                    fade_text(
+                        when_display(&item.when).to_string(),
+                        body.clone(),
+                        12.0,
+                        theme.color_text_secondary,
+                        row.widths[1],
+                    ),
+                    fade_text(
+                        item.tier.clone(),
+                        body.clone(),
+                        12.0,
+                        row.ink,
+                        row.widths[2],
+                    ),
+                    fade_text(item.access.clone(), body, 12.0, row.ink, row.widths[3]),
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(theme.color_text_secondary)
+                        .child(models_label(&item.name, item.models))
+                        .into_any_element(),
+                    source_chips(item.source, item.manual, cx).into_any_element(),
+                ]
+            },
+        )
+        .measure(move |range, window, cx| {
+            let theme = *Theme::global(cx);
+            let body = sans(&theme, FontWeight::NORMAL);
+            let measured =
+                &measured[range.start.min(measured.len())..range.end.min(measured.len())];
+            let widest = |text: &dyn Fn(&RoleListRow) -> String, font: &gpui::Font| {
+                measured
+                    .iter()
+                    .map(|row| text_width(&text(row), font.clone(), 12.0, window))
+                    .fold(0.0, f32::max)
+            };
+            let role = measured
+                .iter()
+                .map(|row| {
+                    let font = role_title_font(row.name == GENERAL_ROLE, &theme);
+                    24.0 + 10.0 + text_width(&row.label, font, 12.5, window)
+                })
+                .fold(0.0, f32::max);
+            let source = measured
+                .iter()
+                .map(|row| source_chips_width(row.source, row.manual, &theme, window))
+                .fold(0.0, f32::max);
+            vec![
+                role,
+                widest(&|row| when_display(&row.when).to_string(), &body),
+                widest(&|row| row.tier.clone(), &body),
+                widest(&|row| row.access.clone(), &body),
+                widest(&|row| models_label(&row.name, row.models), &body),
+                source,
+            ]
+        })
+        .on_activate(move |index, _, cx| {
+            let Some(name) = activated.get(index).map(|row| row.name.clone()) else {
+                return;
+            };
+            state.update(cx, |state, cx| {
+                state.navigate(Route::RoleBoard(name));
+                cx.notify();
+            });
+        })
+        .empty("No roles");
+        // `.pw-data-table-root` is at least `calc(100% - 44px)` of `PageContent`, so the page
+        // scrolls by the card's height.
+        let table_height = page_inner_height(ROLES_PAGE, tw(4.0), window, cx);
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(tw(4.0)))
+            .child(self.pick_card(window, cx))
+            .child(div().h(px(table_height)).child(table))
+            .text_color(theme.color_text_primary)
+    }
+
+    /// The `Card` with the `SwitchRow` and its note (`flex-col gap-1 px-4 py-3`).
+    fn pick_card(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
+        let theme = *Theme::global(cx);
+        card(cx)
+            .flex_none()
+            .px(px(tw(4.0)))
+            .py(px(tw(3.0)))
+            .flex()
+            .flex_col()
+            .gap(px(tw(1.0)))
+            .child(switch_row(
+                "roles-pick",
+                "Pick a role for Auto runs",
+                &self.pick_switch,
+                window,
+                cx,
+            ))
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .line_height(px(18.0))
+                    .text_color(theme.color_text_muted)
+                    .child(pick_note(&self.classifier)),
+            )
+    }
+
+    fn problems_card(&self, theme: &Theme, cx: &Context<Self>) -> gpui::Div {
+        let count = self.tier_problems.len();
+        let mut list = div().w_full().flex().flex_col().gap(px(theme.space_1));
+        for problem in &self.tier_problems {
+            list = list.child(
+                div()
+                    .text_size(px(theme.font_size_sm))
+                    .text_color(theme.color_text_secondary)
+                    .child(format!("• {problem}")),
+            );
+        }
+        div()
+            .p(px(theme.space_4))
+            .rounded(px(theme.radius_card))
+            .bg(theme.color_surface_raised)
+            .border_1()
+            .border_color(theme.color_border_subtle)
+            .flex()
+            .flex_col()
+            .gap(px(theme.space_2))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(theme.font_size_md))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .child("Tier configuration check"),
+                    )
+                    .child(chip(format!("{count} problem(s)"), StatusTone::Warn, cx)),
+            )
+            .child(list)
+    }
+
+    /// `TierBoard`: the tier heads, then one row per order position, each the order mark
+    /// and a cell per tier. Rows take the height of their tallest card.
+    fn board(
+        &self,
+        editable: bool,
+        query: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let theme = *Theme::global(cx);
+        let committed = self.committed(cx);
+        let columns = tier_columns(&committed);
+        let rows = board_row_count(&columns, editable);
+        let clear_bounds = self.cell_bounds.clone();
+        let mut board = div()
+            .relative()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(GAP))
+            .child(
+                canvas(
+                    move |_, _, _| clear_bounds.borrow_mut().clear(),
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
+            .child(self.board_header(&columns, &theme));
+        for row in 0..rows {
+            board = board.child(self.board_row(row, &columns, editable, query, &theme, window, cx));
+        }
+        board
+    }
+
+    /// `.pw-tier-board__head`: the tier's name in 13px semibold and its count in 11px figures,
+    /// on one baseline.
+    fn board_header(&self, columns: &TierColumns, theme: &Theme) -> gpui::Div {
+        let mut header = div()
+            .w_full()
+            .flex()
+            .gap(px(GAP))
+            .child(div().w(px(ORDER_W)).flex_none());
+        for (id, label) in TIER_COLUMNS {
+            let count = columns.get(id).len();
+            header = header.child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .flex()
+                    .items_baseline()
+                    .justify_between()
+                    .gap(px(8.0))
+                    .px(px(4.0))
+                    .pb(px(2.0))
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .line_height(px(13.0 * 1.5))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.color_text_primary)
+                            .child(*label),
+                    )
+                    .child(
+                        div()
+                            .font(tabular(sans(theme, FontWeight::NORMAL)))
+                            .text_size(px(11.0))
+                            .line_height(px(11.0 * 1.5))
+                            .text_color(theme.color_text_muted)
+                            .child(count.to_string()),
+                    ),
+            );
+        }
+        header
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn board_row(
+        &self,
+        row: usize,
+        columns: &TierColumns,
+        editable: bool,
+        query: &str,
+        theme: &Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let mut line = div()
+            .w_full()
+            .flex()
+            .gap(px(GAP))
+            .child(order_mark(row, theme, cx));
+        for (id, _label) in TIER_COLUMNS {
+            let cards = columns.get(id);
+            let tier = cards.get(row).cloned();
+            let is_next = row == cards.len();
+            line =
+                line.child(self.cell(id, row, tier, is_next, editable, query, theme, window, cx));
+        }
+        line
+    }
+
+    /// `.pw-tier-board__cell`: the card in this slot, else Add model in a tier's next cell,
+    /// else an empty slot to drop on. Only an editable board registers its slots for drops.
+    #[allow(clippy::too_many_arguments)]
+    fn cell(
+        &self,
+        tier: &str,
+        row: usize,
+        card: Option<DispatchTier>,
+        is_next: bool,
+        editable: bool,
+        query: &str,
+        theme: &Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let mut cell = div()
+            .relative()
+            .flex_1()
+            .min_w(px(0.0))
+            .flex()
+            .rounded(px(theme.radius_card));
+        if editable {
+            let bounds = self.cell_bounds.clone();
+            let key = (tier.to_string(), row);
+            cell = cell.child(
+                canvas(
+                    move |rect, _, _| {
+                        bounds.borrow_mut().insert(key, rect);
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            );
+        }
+        cell = match card {
+            Some(card) => {
+                let dimmed = !query.is_empty() && !tier_matches(query, &card);
+                cell.child(self.tier_card(&card, row, editable, dimmed, theme, cx))
+            }
+            None if editable && is_next => {
+                cell.child(self.add_button(tier, row, theme, window, cx))
+            }
+            None if editable => cell.child(div().flex_1().min_h(px(EMPTY_MIN_H))),
+            None => cell,
+        };
+        if self.drop_over(tier, row) {
+            // `outline: 2px solid var(--color-accent); outline-offset: 2px`.
+            cell = cell.child(
+                div()
+                    .absolute()
+                    .top(px(-4.0))
+                    .left(px(-4.0))
+                    .right(px(-4.0))
+                    .bottom(px(-4.0))
+                    .rounded(px(theme.radius_card + 4.0))
+                    .border_2()
+                    .border_color(theme.color_accent),
+            );
+        }
+        cell
+    }
+
+    /// `.pw-tier-board__add`: a dashed slot that opens the model palette. Hovered or open, its
+    /// border, fill, and text brighten over `--duration-fast`.
+    fn add_button(
+        &self,
+        tier: &str,
+        row: usize,
+        theme: &Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let id = SharedString::from(format!("add-model-{tier}-{row}"));
+        let pointer = use_pointer_timed(id.clone(), PointerTiming::item(theme), window, cx);
+        let open = self
+            .palette_slot
+            .as_ref()
+            .is_some_and(|slot| slot.tier == tier);
+        let (fill, ink) = if open {
+            (1.0, 1.0)
+        } else {
+            let state = pointer.read(cx);
+            (state.hover(), state.hover_color())
+        };
+        let wash = theme.color_surface_hover;
+        let ink = mix(theme.color_text_muted, theme.color_text_primary, ink);
+        let view = cx.entity().clone();
+        let slot = TierSlot {
+            tier: tier.to_string(),
+            index: row,
+        };
+        let button = div()
+            .id(id)
+            .flex_1()
+            .min_w(px(0.0))
+            .min_h(px(EMPTY_MIN_H))
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap(px(6.0))
+            .rounded(px(theme.radius_card))
+            .border_1()
+            .border_dashed()
+            .border_color(mix(
+                theme.color_border_strong,
+                theme.color_border_default,
+                fill,
+            ))
+            .bg(gpui::Rgba {
+                a: wash.a * fill,
+                ..wash
+            })
+            .cursor_pointer()
+            .text_size(px(12.0))
+            .text_color(ink)
+            .child(icon_colored(Icon::Plus, 14.0, ink))
+            .child("Add model");
+        track(button, &pointer, true).on_mouse_down(MouseButton::Left, move |_, _, cx| {
+            cx.stop_propagation();
+            view.update(cx, |this, cx| this.toggle_palette(slot.clone(), cx));
+        })
+    }
+
+    /// `TierCard`: the shared `Card` with the model leading (two lines at most), the agent and
+    /// provider under it, Remove when editable, and the speed and strength meters at its foot.
+    fn tier_card(
+        &self,
+        tier: &DispatchTier,
+        row: usize,
+        editable: bool,
+        dimmed: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let opacity = if self.lifted(&tier.name, row) {
+            LIFTED_OPACITY
+        } else if dimmed {
+            DIMMED_OPACITY
+        } else {
+            1.0
+        };
+        let subtitle = [tier.agent.as_str(), tier.provider.as_str()]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" / ");
+        let slot = TierSlot {
+            tier: tier.name.clone(),
+            index: row,
+        };
+        let remove = editable.then(|| {
+            let view = cx.entity().clone();
+            let slot = slot.clone();
+            Button::new(
+                SharedString::from(format!("tier-remove-{}-{row}", tier.name)),
+                ButtonKind::Ghost,
+            )
+            .size(ButtonSize::Icon)
+            .icon(Icon::Close)
+            .tooltip(format!(
+                "Remove {} {} from {}",
+                tier.agent, tier.model, tier.name
+            ))
+            .on_click(move |_, cx| {
+                view.update(cx, |this, cx| this.remove_at(slot.clone(), cx));
+            })
+        });
+        let head = div()
+            .flex()
+            .min_w(px(0.0))
+            .items_start()
+            .gap(px(8.0))
+            .child(agent_avatar(&tier.agent, "", AVATAR))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(tw(0.5)))
+                    .child(
+                        div()
+                            .font(mono(theme, FontWeight::MEDIUM))
+                            .text_size(px(13.0))
+                            .line_height(px(13.0 * 1.35))
+                            .text_color(theme.color_text_primary)
+                            .line_clamp(2)
+                            .child(tier.model.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .line_height(px(11.0 * 1.5))
+                            .text_color(theme.color_text_muted)
+                            .child(ellipsis(subtitle)),
+                    ),
+            )
+            .children(remove);
+        let meters = div()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .pt(px(10.0))
+            .border_t_1()
+            .border_color(theme.color_border_subtle)
+            .child(tier_meter("Speed", tier.speed, theme.chart_blue, cx))
+            .child(tier_meter(
+                "Strength",
+                tier.strength,
+                theme.chart_violet,
+                cx,
+            ));
+        let mut body = div()
+            .flex_1()
+            .min_w(px(0.0))
+            .flex()
+            .flex_col()
+            .justify_between()
+            .gap(px(10.0))
+            .child(head)
+            .child(meters);
+        if editable {
+            let view = cx.entity().clone();
+            body = body.cursor(CursorStyle::OpenHand).on_mouse_down(
+                MouseButton::Left,
+                move |event: &MouseDownEvent, _, cx| {
+                    view.update(cx, |this, cx| {
+                        this.begin_drag(
+                            slot.clone(),
+                            f32::from(event.position.x),
+                            f32::from(event.position.y),
+                            cx,
+                        );
+                    });
+                },
+            );
+        }
+        card(cx)
+            .flex()
+            .flex_1()
+            .min_w(px(0.0))
+            .p(px(tw(3.0)))
+            .opacity(opacity)
+            .child(body)
+    }
+
+    fn palette_layer(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
+        let t = self.palette_opacity.value();
+        let anchor = self.palette_anchor.clone();
+        let bounds = anchor.as_ref().and_then(|slot| {
+            self.cell_bounds
+                .borrow()
+                .get(&(slot.tier.clone(), slot.index))
+                .copied()
+        });
+        let (origin_x, origin_y) = *self.page_origin.borrow();
+        let (left, top) = if let Some(bounds) = bounds {
+            (
+                f32::from(bounds.left()) - origin_x,
+                f32::from(bounds.bottom()) - origin_y + 4.0 + self.palette_y.value(),
+            )
+        } else {
+            (0.0, 0.0)
+        };
+        let groups = palette_groups(&self.palette_models, &self.palette_query);
+        let view = cx.entity().clone();
+        let mut list = div()
+            .id("palette-scroll")
+            .flex_1()
+            .min_h(px(0.0))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap(px(theme.space_2))
+            .p(px(theme.space_2));
+        if self.palette_loading {
+            list = list.child(muted_note(
+                "Asking the installed agents for their models…",
+                theme,
+            ));
+        } else if groups.is_empty() {
+            let (empty, mood) = if self.palette_query.trim().is_empty() {
+                ("No models listed", MascotMood::Sleeping)
+            } else {
+                ("No matches", MascotMood::Lost)
+            };
+            list = list.child(page_empty(empty, mood, cx));
+        } else {
+            for (agent, models) in groups {
+                list = list.child(
+                    div()
+                        .px(px(theme.space_1))
+                        .text_size(px(theme.font_size_xs))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.color_text_muted)
+                        .child(agent),
+                );
+                for model in models {
+                    let card = palette_card(&model);
+                    let view = view.clone();
+                    let subtitle = [model.provider.as_str(), model.tier.as_str()]
+                        .into_iter()
+                        .filter(|part| !part.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(" / ");
+                    list = list.child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "palette-{}-{}",
+                                model.agent, model.model
+                            )))
+                            .h(px(theme.row_height))
+                            .px(px(theme.space_2))
+                            .flex()
+                            .items_center()
+                            .gap(px(theme.space_2))
+                            .rounded(px(theme.radius_sm))
+                            .cursor_pointer()
+                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                cx.stop_propagation();
+                                view.update(cx, |this, cx| this.place_new(card.clone(), cx));
+                            })
+                            .child(agent_avatar(&model.agent, "", 18.0))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .flex()
+                                    .flex_col()
+                                    .child(
+                                        div()
+                                            .font_family(theme.font_mono)
+                                            .text_size(px(theme.font_size_sm))
+                                            .text_color(theme.color_text_primary)
+                                            .child(ellipsis(model.model.clone())),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(theme.font_size_xs))
+                                            .text_color(theme.color_text_muted)
+                                            .child(ellipsis(subtitle)),
+                                    ),
+                            ),
+                    );
+                }
+            }
+        }
+        let mut problems = div()
+            .flex()
+            .flex_col()
+            .gap(px(theme.space_1))
+            .px(px(theme.space_3));
+        for problem in &self.palette_problems {
+            problems = problems.child(
+                div()
+                    .text_size(px(theme.font_size_xs))
+                    .text_color(theme.color_text_muted)
+                    .child(format!("• {problem}")),
+            );
+        }
+        let agent_text = self.custom_agent.read(cx).text().trim().to_string();
+        let model_text = self.custom_model.read(cx).text().trim().to_string();
+        let can_custom = !agent_text.is_empty() && !model_text.is_empty();
+        let custom_view = view.clone();
+        div()
+            .absolute()
+            .left(px(left))
+            .top(px(top))
+            .w(px(360.0))
+            .h(px(420.0))
+            .flex()
+            .flex_col()
+            .gap(px(theme.space_2))
+            .p(px(theme.space_3))
+            .rounded(px(theme.radius_lg))
+            .bg(theme.color_surface_raised)
+            .border_1()
+            .border_color(theme.color_border)
+            .opacity(t)
+            .when(self.palette_slot.is_some(), |panel| panel.occlude())
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(self.palette_search.clone())
+            .child(list)
+            .when(!self.palette_problems.is_empty(), |panel| {
+                panel.child(problems)
+            })
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(theme.space_2))
+                    .child(div().flex_1().child(self.custom_agent.clone()))
+                    .child(div().flex_1().child(self.custom_model.clone()))
+                    .child(
+                        div()
+                            .opacity(if can_custom { 1.0 } else { 0.45 })
+                            .child(icon_button(
+                                "palette-custom",
+                                Icon::Plus,
+                                "Add custom model",
+                                Rc::new(move |_, cx| {
+                                    custom_view.update(cx, |this, cx| this.add_custom(cx));
+                                }),
+                                cx,
+                            )),
+                    ),
+            )
+    }
+
+    fn composer_layer(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
+        let t = self.composer_opacity.value();
+        let title = match self.composer.as_deref() {
+            Some(name) if !name.is_empty() => format!("Edit {name}"),
+            _ => "New role".to_string(),
+        };
+        let editing = self.composer.as_ref().is_some_and(|name| !name.is_empty());
+        let source = self
+            .composer
+            .as_ref()
+            .filter(|name| !name.is_empty())
+            .and_then(|name| self.role_row(name).map(|row| row.source));
+        let show_footer = source == Some(RoleSource::User);
+        let restores = self
+            .composer
+            .as_ref()
+            .is_some_and(|name| self.builtin.iter().any(|item| item == name));
+        let view = cx.entity().clone();
+        let mut card = composer_card(title, t, self.composer_y.value(), theme)
+            .child(self.name_input.clone())
+            .child(self.instructions_input.clone())
+            .child(field_label("Lowest tier", theme))
+            .child(radio_group(
+                "role-tier",
+                &[
+                    RadioOption {
+                        label: "Any tier".into(),
+                    },
+                    RadioOption {
+                        label: "Easy".into(),
+                    },
+                    RadioOption {
+                        label: "Normal".into(),
+                    },
+                    RadioOption {
+                        label: "Hard".into(),
+                    },
+                ],
+                self.draft_tier,
+                {
+                    let view = view.clone();
+                    Rc::new(move |index, _, cx| {
+                        view.update(cx, |this, cx| {
+                            this.draft_tier = index;
+                            cx.notify();
+                        });
+                    })
+                },
+                cx,
+            ))
+            .child(field_label("Access", theme))
+            .child(radio_group(
+                "role-access",
+                &[
+                    RadioOption {
+                        label: "Can change files".into(),
+                    },
+                    RadioOption {
+                        label: "Read only".into(),
+                    },
+                ],
+                usize::from(self.draft_readonly),
+                {
+                    let view = view.clone();
+                    Rc::new(move |index, _, cx| {
+                        view.update(cx, |this, cx| {
+                            this.draft_readonly = index == 1;
+                            cx.notify();
+                        });
+                    })
+                },
+                cx,
+            ))
+            .child(field_label("Picked", theme))
+            .child(radio_group(
+                "role-picked",
+                &[
+                    RadioOption {
+                        label: "Picked automatically".into(),
+                    },
+                    RadioOption {
+                        label: "Only with --role".into(),
+                    },
+                ],
+                usize::from(self.draft_manual),
+                {
+                    let view = view.clone();
+                    Rc::new(move |index, _, cx| {
+                        view.update(cx, |this, cx| {
+                            this.draft_manual = index == 1;
+                            cx.notify();
+                        });
+                    })
+                },
+                cx,
+            ))
+            .child(field_label("Prefer", theme))
+            .when(self.draft_prefer.is_empty(), |card| {
+                card.child(muted_note("No preference", theme))
+            })
+            .child(self.agent_toggles("prefer", &self.draft_prefer, theme, cx))
+            .child(field_label("Avoid", theme))
+            .when(self.draft_avoid.is_empty(), |card| {
+                card.child(muted_note("None", theme))
+            })
+            .child(self.agent_toggles("avoid", &self.draft_avoid, theme, cx))
+            .child(field_label("When to use", theme))
+            .child(self.when_input.clone())
+            .child(field_label("Time limit", theme))
+            .child(self.timeout_input.clone());
+        if show_footer {
+            let footer_view = view.clone();
+            let label: SharedString = if restores {
+                "Restore built-in".into()
+            } else {
+                "Remove role".into()
+            };
+            card = card.child(button(
+                "role-remove",
+                label,
+                ButtonKind::Ghost,
+                Rc::new(move |_, cx| {
+                    footer_view.update(cx, |this, cx| this.remove_editing(cx));
+                }),
+                cx,
+            ));
+        }
+        let cancel = view.clone();
+        let submit = view.clone();
+        let submit_label: SharedString = if editing {
+            "Save".into()
+        } else {
+            "Create role".into()
+        };
+        card = card.child(composer_actions(
+            [
+                button(
+                    "role-cancel",
+                    "Cancel",
+                    ButtonKind::Ghost,
+                    Rc::new(move |_, cx| {
+                        cancel.update(cx, |this, cx| this.close_composer(cx));
+                    }),
+                    cx,
+                )
+                .into_any_element(),
+                button(
+                    "role-save",
+                    submit_label,
+                    ButtonKind::Primary,
+                    Rc::new(move |_, cx| {
+                        submit.update(cx, |this, cx| this.submit_composer(cx));
+                    }),
+                    cx,
+                )
+                .into_any_element(),
+            ],
+            theme,
+        ));
+        let close = cx.entity().clone();
+        modal_layer(
+            t,
+            self.composer.is_some(),
+            Rc::new(move |_, cx| {
+                close.update(cx, |this, cx| this.close_composer(cx));
+            }),
+            card,
+            theme,
+        )
+    }
+
+    fn agent_toggles(
+        &self,
+        kind: &str,
+        selected: &[String],
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let mut column = div().flex().flex_col().gap(px(theme.space_1));
+        for (index, agent) in self.agents.iter().enumerate() {
+            let on = selected.iter().any(|name| name == agent);
+            let key = format!("{kind}:{agent}");
+            let hover = self
+                .row_hover
+                .get(&key)
+                .map(SpringValue::value)
+                .unwrap_or(0.0);
+            let view = cx.entity().clone();
+            let agent_name = agent.clone();
+            let kind_name = kind.to_string();
+            column = column.child(
+                div()
+                    .id(SharedString::from(format!("role-{kind}-{index}")))
+                    .relative()
+                    .h(px(theme.control_height_md))
+                    .px(px(theme.space_2))
+                    .flex()
+                    .items_center()
+                    .gap(px(theme.space_2))
+                    .rounded(px(theme.radius_sm))
+                    .cursor_pointer()
+                    .on_hover({
+                        let view = view.clone();
+                        let key = key.clone();
+                        move |over, _, cx| {
+                            let over = *over;
+                            view.update(cx, |this, cx| this.set_hover(key.clone(), over, cx));
+                        }
+                    })
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        cx.stop_propagation();
+                        view.update(cx, |this, cx| {
+                            let list = if kind_name == "prefer" {
+                                &mut this.draft_prefer
+                            } else {
+                                &mut this.draft_avoid
+                            };
+                            toggle_name(list, &agent_name);
+                            cx.notify();
+                        });
+                    })
+                    .child(
+                        div()
+                            .absolute()
+                            .size_full()
+                            .left(px(0.0))
+                            .top(px(0.0))
+                            .rounded(px(theme.radius_sm))
+                            .bg(theme.color_surface_hover)
+                            .opacity(hover),
+                    )
+                    .child(agent_avatar(agent, "", 14.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(theme.font_size_sm))
+                            .text_color(theme.color_text_primary)
+                            .child(agent.clone()),
+                    )
+                    .when(on, |row| row.child(icon(Icon::Check, 14.0, cx))),
+            );
+        }
+        column
+    }
+
+    fn build_layer(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
+        let t = self.build_opacity.value();
+        let view = cx.entity().clone();
+        let empty = self.build.as_ref().is_none_or(is_build_empty);
+        let can_apply = !self.build_loading && !self.build_applying && !empty;
+        let mut body = div()
+            .id("build-scroll")
+            .flex_1()
+            .min_h(px(0.0))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap(px(theme.space_3));
+        if self.build_loading {
+            body = body.child(muted_note("Pricing every model…", theme));
+        } else if empty {
+            body = body.child(muted_note("No models to propose.", theme));
+        } else if let Some(build) = &self.build {
+            body = body.child(build_sections(build, theme, cx));
+            for problem in &build.problems {
+                body = body.child(muted_note(problem.clone(), theme));
+            }
+        }
+        let apply_label: SharedString = if self.build_applying {
+            "Applying…".into()
+        } else {
+            "Apply".into()
+        };
+        let cancel = view.clone();
+        let apply = view.clone();
+        let priority = self
+            .build
+            .as_ref()
+            .map(|build| {
+                if build.priority.is_empty() {
+                    "balanced".to_string()
+                } else {
+                    build.priority.clone()
+                }
+            })
+            .unwrap_or_else(|| "balanced".to_string());
+        let card = div()
+            .w(px(560.0))
+            .max_h(px(640.0))
+            .flex()
+            .flex_col()
+            .gap(px(theme.space_3))
+            .p(px(theme.space_5))
+            .rounded(px(theme.radius_dialog))
+            .bg(theme.color_surface_raised)
+            .border_1()
+            .border_color(theme.color_border)
+            .mt(px(self.build_y.value()))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(theme.font_size_lg))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child("Build tiers from the model"),
+                    )
+                    .child(chip("Proposal", StatusTone::Muted, cx)),
+            )
+            .when(self.build.is_some(), |card| {
+                card.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(theme.space_2))
+                        .child(chip(format!("Priority {priority}"), StatusTone::Muted, cx))
+                        .child(muted_note(
+                            "The pass bar comes from the routing priority",
+                            theme,
+                        )),
+                )
+            })
+            .child(body)
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap(px(theme.space_2))
+                    .child(button(
+                        "build-cancel",
+                        "Cancel",
+                        ButtonKind::Ghost,
+                        Rc::new(move |_, cx| {
+                            cancel.update(cx, |this, cx| {
+                                this.build_open = false;
+                                cx.notify();
+                            });
+                        }),
+                        cx,
+                    ))
+                    .child(
+                        div()
+                            .opacity(if can_apply { 1.0 } else { 0.45 })
+                            .child(button(
+                                "build-apply",
+                                apply_label,
+                                if can_apply {
+                                    ButtonKind::Primary
+                                } else {
+                                    ButtonKind::Ghost
+                                },
+                                Rc::new(move |_, cx| {
+                                    apply.update(cx, |this, cx| this.apply_build(cx));
+                                }),
+                                cx,
+                            )),
+                    ),
+            );
+        let close = cx.entity().clone();
+        div()
+            .absolute()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .absolute()
+                    .size_full()
+                    .bg(theme.color_overlay)
+                    .opacity(t)
+                    .when(self.build_open, |backdrop| {
+                        backdrop
+                            .occlude()
+                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                cx.stop_propagation();
+                                close.update(cx, |this, cx| {
+                                    this.build_open = false;
+                                    cx.notify();
+                                });
+                            })
+                    }),
+            )
+            .child(div().opacity(t).child(card))
+    }
+
+    /// `TierDragGhost`: an opaque card under the pointer, never a hit target.
+    fn ghost_layer(&self, theme: &Theme, _cx: &Context<Self>) -> gpui::Div {
+        let Some(drag) = self.drag.as_ref().filter(|drag| drag.active) else {
+            return div();
+        };
+        let (x, y) = drag.pointer;
+        div()
+            .absolute()
+            .left(px(x + GHOST_OFFSET))
+            .top(px(y + GHOST_OFFSET))
+            .w(px(GHOST_W))
+            .p(px(tw(3.0)))
+            .rounded(px(theme.radius_card))
+            .bg(theme.color_surface_subtle)
+            .shadow(vec![drop(8.0, 24.0, theme.color_shadow)])
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .child(agent_avatar(&drag.card.agent, "", AVATAR))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .font(mono(theme, FontWeight::MEDIUM))
+                            .text_size(px(13.0))
+                            .line_height(px(13.0 * 1.5))
+                            .text_color(theme.color_text_primary)
+                            .child(ellipsis(drag.card.model.clone())),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .line_height(px(11.0 * 1.5))
+                            .text_color(theme.color_text_muted)
+                            .child(ellipsis(drag.card.agent.clone())),
+                    ),
+            )
+    }
+
+    fn layer_open(open: bool, opacity: &SpringValue) -> bool {
+        open || !opacity.settled() || opacity.value() > 0.02
+    }
+}
+
+impl Render for RolesView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.prepare(window, cx);
+        let theme = *Theme::global(cx);
+        let show_composer = Self::layer_open(self.composer.is_some(), &self.composer_opacity);
+        let show_build = Self::layer_open(self.build_open, &self.build_opacity);
+        let show_palette = self.palette_anchor.is_some();
+        let show_ghost = self.drag.as_ref().is_some_and(|drag| drag.active);
+        div()
+            .size_full()
+            .relative()
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .text_color(theme.color_text_primary)
+            .child(self.origin_canvas(cx))
+            .map(|page| {
+                let list =
+                    self.loaded && !matches!(self.state.read(cx).route(), Route::RoleBoard(_));
+                if list {
+                    let content = self.list_body(window, cx);
+                    let toolbar = self.toolbar_view(cx);
+                    page.child(page_content(
+                        ROLES_PAGE,
+                        toolbar,
+                        tw(4.0),
+                        content,
+                        window,
+                        cx,
+                    ))
+                } else if let Some(content) = self.board_content(window, cx) {
+                    let toolbar = self.toolbar_view(cx);
+                    page.child(page_content(
+                        ROLES_BOARD,
+                        toolbar,
+                        tw(4.0),
+                        content,
+                        window,
+                        cx,
+                    ))
+                } else {
+                    page.child(self.toolbar_view(cx))
+                        .child(Self::loading_body(&theme))
+                }
+            })
+            .when(show_composer, |page| {
+                page.child(self.composer_layer(&theme, cx))
+            })
+            .when(show_build, |page| page.child(self.build_layer(&theme, cx)))
+            .when(show_palette, |page| {
+                page.child(self.palette_layer(&theme, cx))
+            })
+            .when(show_ghost, |page| page.child(self.ghost_layer(&theme, cx)))
+    }
+}
+
+fn core_message(err: CoreError, fallback: &str) -> String {
+    match err {
+        CoreError::NotRunning => "The local core is not running.".to_string(),
+        CoreError::Rpc(message) if !message.is_empty() => message,
+        CoreError::Rpc(_) => fallback.to_string(),
+    }
+}
+
+fn load_all(client: &CoreClient) -> LoadBundle {
+    let tiers = client
+        .list_tiers(&ListTiersRequest {})
+        .map(|response| response.tiers)
+        .map_err(|err| core_message(err, "Could not list the tiers."));
+    let problems = client
+        .check_tiers(&CheckTiersRequest {})
+        .map(|response| response.problems)
+        .map_err(|err| core_message(err, "Could not check the tiers."));
+    let roles = load_roles(client);
+    let classifier = match client.config(&ConfigRequest {
+        action: "get".into(),
+        ..Default::default()
+    }) {
+        Ok(response) if response.ok => Ok(classifier_from_config(&response.json)),
+        _ => Ok(String::new()),
+    };
+    let agents = match client.list_agents(&ListAgentsRequest {}) {
+        Ok(response) => Ok(agent_names(response.agents)),
+        Err(_) => Ok(Vec::new()),
+    };
+    LoadBundle {
+        tiers,
+        problems,
+        roles,
+        classifier,
+        agents,
+    }
+}
+
+fn load_roles(client: &CoreClient) -> Result<RolesList, String> {
+    let response = client
+        .subagents(&SubagentsRequest {
+            action: "list".into(),
+            dir: String::new(),
+            name: String::new(),
+            profile: String::new(),
+        })
+        .map_err(|err| core_message(err, "Could not list the roles."))?;
+    if !response.ok {
+        return Err(if response.json.is_empty() {
+            "Could not list the roles.".to_string()
+        } else {
+            response.json
+        });
+    }
+    parse_roles_list(&response.json)
+}
+
+fn agent_names(agents: Vec<DispatchAgent>) -> Vec<String> {
+    let mut names: Vec<String> = agents
+        .into_iter()
+        .map(|agent| agent.name)
+        .filter(|name| !name.is_empty())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn save_role_ops(
+    client: &CoreClient,
+    name: &str,
+    profile: &str,
+    drop_previous: Option<&str>,
+) -> Result<Option<RolesList>, String> {
+    let saved = client
+        .subagents(&SubagentsRequest {
+            action: "save".into(),
+            dir: String::new(),
+            name: name.to_string(),
+            profile: profile.to_string(),
+        })
+        .map_err(|err| core_message(err, "Could not save the role."))?;
+    if !saved.ok {
+        return Err(if saved.json.is_empty() {
+            "Could not save the role.".to_string()
+        } else {
+            saved.json
+        });
+    }
+    if let Some(previous) = drop_previous {
+        let _ = client.subagents(&SubagentsRequest {
+            action: "remove".into(),
+            dir: String::new(),
+            name: previous.to_string(),
+            profile: String::new(),
+        });
+    }
+    Ok(client
+        .subagents(&SubagentsRequest {
+            action: "list".into(),
+            dir: String::new(),
+            name: String::new(),
+            profile: String::new(),
+        })
+        .ok()
+        .filter(|response| response.ok)
+        .and_then(|response| parse_roles_list(&response.json).ok()))
+}
+
+fn run_build(client: &CoreClient, apply: bool) -> Result<TierBuild, String> {
+    let response = client
+        .build_tiers(&BuildTiersRequest {
+            apply,
+            agent: String::new(),
+        })
+        .map_err(|err| core_message(err, "Could not build the tiers."))?;
+    if !response.ok {
+        return Err(if response.json.is_empty() {
+            "Could not build the tiers.".to_string()
+        } else {
+            response.json
+        });
+    }
+    parse_tier_build(&response.json)
+}
+
+/// A role's title: General in the sans face, the others as `<code>` in the mono face.
+fn role_title_font(general: bool, theme: &Theme) -> gpui::Font {
+    if general {
+        sans(theme, FontWeight::MEDIUM)
+    } else {
+        mono(theme, FontWeight::MEDIUM)
+    }
+}
+
+/// The Source cell: the source's `StatusChip` (Tier table for General), then "Only with
+/// --role" for a manual role, 6px apart.
+fn source_chips(source: Option<RoleSource>, manual: bool, cx: &gpui::App) -> gpui::Div {
+    let (label, tone) = match source {
+        None => ("Tier table", StatusTone::Muted),
+        Some(RoleSource::Builtin) => (RoleSource::Builtin.label(), StatusTone::Muted),
+        Some(other) => (other.label(), StatusTone::Ok),
+    };
+    div()
+        .flex()
+        .items_center()
+        .gap(px(tw(1.5)))
+        .child(chip(label, tone, cx))
+        .when(manual, |row| {
+            row.child(chip("Only with --role", StatusTone::Muted, cx))
+        })
+}
+
+fn source_chips_width(
+    source: Option<RoleSource>,
+    manual: bool,
+    theme: &Theme,
+    window: &Window,
+) -> f32 {
+    let font = sans(theme, FontWeight::MEDIUM);
+    let chip_width = |label: &str| text_width(label, font.clone(), 11.0, window) + 18.0 + 2.0;
+    let label = source.map(RoleSource::label).unwrap_or("Tier table");
+    let mut width = chip_width(label);
+    if manual {
+        width += tw(1.5) + chip_width("Only with --role");
+    }
+    width
+}

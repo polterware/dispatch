@@ -1,0 +1,615 @@
+use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, TimeZone, Utc};
+use dispatch_core::{
+    reports::{
+        MIN_SAMPLES, Row, STATS_SCHEMA, StatsOptions, capacity, capacity_from_store, compute,
+        evidence_by_tier_model, evidence_key, from_store, parse_since,
+    },
+    store::Store as SqliteStore,
+    types::{
+        Area, Attempt, Filters, QuotaSnapshot, RouteDecision, Run, STATUS_CANCELLED,
+        STATUS_COMPLETED, STATUS_FAILED, STATUS_ORPHANED, STATUS_RUNNING, STATUS_TIMED_OUT, Store,
+    },
+};
+
+fn rfc3339(dt: DateTime<Utc>) -> String {
+    dt.to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+fn find_row<'a>(rows: &'a [Row], key: &str) -> &'a Row {
+    rows.iter()
+        .find(|r| r.key == key)
+        .unwrap_or_else(|| panic!("missing {key} in {rows:?}"))
+}
+
+#[test]
+fn test_compute_rates_percentiles_and_ranks() {
+    let now = Utc.with_ymd_and_hms(2026, 10, 15, 12, 0, 0).unwrap();
+    let created = rfc3339(now - ChronoDuration::hours(1));
+    let mk = |id: &str,
+              model: &str,
+              provider: &str,
+              status: &str,
+              run_ms: Option<i64>,
+              attempts: Vec<Attempt>,
+              exit_class: &str|
+     -> Run {
+        Run {
+            id: id.into(),
+            model: model.into(),
+            provider: provider.into(),
+            agent: "codex".into(),
+            tier: "normal".into(),
+            status: status.into(),
+            created_at: created.clone(),
+            run_ms,
+            attempts,
+            exit_class: exit_class.into(),
+            ..Default::default()
+        }
+    };
+
+    let mut recs = Vec::new();
+    for (i, d) in [10, 20, 30, 40, 50, 60].into_iter().enumerate() {
+        recs.push(mk(
+            &format!("a{i}"),
+            "gpt-5.6-terra",
+            "openai",
+            STATUS_COMPLETED,
+            Some(d),
+            vec![],
+            "ok",
+        ));
+    }
+    let rl = vec![Attempt {
+        agent: "grok".into(),
+        model: "grok-4.7".into(),
+        error: "429 too many requests".into(),
+        exit_class: "rate_limit".into(),
+        duration_ms: None,
+    }];
+    recs.push(mk(
+        "a6",
+        "gpt-5.6-terra",
+        "openai",
+        STATUS_COMPLETED,
+        Some(70),
+        rl.clone(),
+        "ok",
+    ));
+    recs.push(mk(
+        "a7",
+        "gpt-5.6-terra",
+        "openai",
+        STATUS_COMPLETED,
+        Some(80),
+        rl.clone(),
+        "ok",
+    ));
+    recs.push(mk(
+        "a8",
+        "gpt-5.6-terra",
+        "openai",
+        STATUS_FAILED,
+        Some(90),
+        rl,
+        "rate_limit",
+    ));
+    recs.push(mk(
+        "a9",
+        "gpt-5.6-terra",
+        "openai",
+        STATUS_ORPHANED,
+        None,
+        vec![],
+        "",
+    ));
+    for i in 0..5 {
+        recs.push(mk(
+            &format!("b{i}"),
+            "gemini-3.8-flash-low",
+            "google",
+            STATUS_FAILED,
+            Some(200),
+            vec![],
+            "failed",
+        ));
+    }
+    recs.push(Run {
+        id: "fly".into(),
+        status: STATUS_RUNNING.into(),
+        model: "gpt-5.6-terra".into(),
+        created_at: rfc3339(now),
+        ..Default::default()
+    });
+
+    let rep = compute(
+        &recs,
+        StatsOptions {
+            by: "model".into(),
+            since: Some(now - ChronoDuration::days(7)),
+            now: Some(now),
+            ..Default::default()
+        },
+    )
+    .expect("compute");
+    assert_eq!(rep.schema, STATS_SCHEMA);
+    assert_eq!(rep.in_flight, 1);
+    assert_eq!(rep.min_samples, MIN_SAMPLES);
+
+    let gpt = find_row(&rep.rows, "gpt-5.6-terra");
+    assert_eq!(gpt.runs, 10);
+    assert_eq!(gpt.success_pct, 80.0);
+    assert_eq!(gpt.first_try_pct, 60.0);
+    assert_eq!(gpt.fallbacks, 3);
+    assert_eq!(gpt.rate_limits, 3);
+    assert_eq!(gpt.orphans, 1);
+    assert_eq!(gpt.p50_ms, Some(50));
+    assert_eq!(gpt.p90_ms, Some(90));
+    assert_eq!(gpt.duration_n, 9);
+
+    let gem = find_row(&rep.rows, "gemini-3.8-flash-low");
+    assert_eq!(gem.runs, 5);
+    assert_eq!(gem.success_pct, 0.0);
+    assert_eq!(gem.p50_ms, Some(200));
+
+    assert_eq!(rep.rankings.most_used_model.key, "gpt-5.6-terra");
+    assert_eq!(rep.rankings.most_used_model.runs, 10);
+    assert_eq!(rep.rankings.most_used_provider.key, "openai");
+    assert_eq!(rep.rankings.most_used_provider.runs, 10);
+    assert_eq!(rep.rankings.slowest_model.key, "gemini-3.8-flash-low");
+    assert_eq!(rep.rankings.slowest_model.p50_ms, Some(200));
+    assert_eq!(rep.rankings.most_failed_model.key, "gemini-3.8-flash-low");
+    assert_eq!(rep.rankings.most_failed_model.success_pct, Some(0.0));
+
+    let text = rep.text();
+    assert!(text.contains("gpt-5.6-terra"), "{text}");
+    assert!(
+        text.contains("slowest model: gemini-3.8-flash-low"),
+        "{text}"
+    );
+
+    // Too few samples to call a model slow or failure-prone.
+    let small = compute(
+        &[
+            mk(
+                "s1",
+                "fast",
+                "openai",
+                STATUS_COMPLETED,
+                Some(1),
+                vec![],
+                "ok",
+            ),
+            mk(
+                "s2",
+                "slow",
+                "openai",
+                STATUS_FAILED,
+                Some(999),
+                vec![],
+                "failed",
+            ),
+        ],
+        StatsOptions {
+            by: "model".into(),
+            now: Some(now),
+            ..Default::default()
+        },
+    )
+    .expect("small compute");
+    assert_eq!(small.rankings.slowest_model.key, "unknown");
+    assert!(small.rankings.slowest_model.reason.contains("minimum"));
+    assert!(!small.rankings.most_failed_model.reason.is_empty());
+    assert!(!small.rankings.most_used_model.key.is_empty());
+    assert!(small.text().contains("unknown"));
+}
+
+#[test]
+fn test_unknown_group_since_and_zero_duration() {
+    let now = Utc.with_ymd_and_hms(2026, 10, 15, 12, 0, 0).unwrap();
+    let old = now - ChronoDuration::days(30);
+    let recs = vec![
+        Run {
+            id: "e1".into(),
+            status: STATUS_COMPLETED.into(),
+            effort: "high".into(),
+            model: "gemini-3.8-flash-high".into(),
+            created_at: rfc3339(now),
+            run_ms: Some(0),
+            ..Default::default()
+        },
+        Run {
+            id: "e2".into(),
+            status: STATUS_FAILED.into(),
+            model: "grok-4.7".into(),
+            created_at: rfc3339(now),
+            ..Default::default()
+        },
+        Run {
+            id: "old".into(),
+            status: STATUS_COMPLETED.into(),
+            model: "gpt-5.6-terra".into(),
+            created_at: rfc3339(old),
+            run_ms: Some(5),
+            ..Default::default()
+        },
+        Run {
+            id: "d1".into(),
+            status: STATUS_COMPLETED.into(),
+            model: "m".into(),
+            created_at: rfc3339(Utc.with_ymd_and_hms(2026, 10, 14, 8, 0, 0).unwrap()),
+            ..Default::default()
+        },
+        Run {
+            id: "d2".into(),
+            status: STATUS_COMPLETED.into(),
+            model: "m".into(),
+            created_at: rfc3339(Utc.with_ymd_and_hms(2026, 10, 15, 8, 0, 0).unwrap()),
+            ..Default::default()
+        },
+    ];
+
+    let rep = compute(
+        &recs,
+        StatsOptions {
+            by: "effort".into(),
+            since: Some(now - ChronoDuration::days(7)),
+            now: Some(now),
+            ..Default::default()
+        },
+    )
+    .expect("effort compute");
+    let high = find_row(&rep.rows, "high");
+    assert_eq!(high.runs, 1);
+    assert_eq!(high.duration_n, 1);
+    assert_eq!(high.p50_ms, Some(0));
+    assert!(high.duration.is_empty());
+
+    let unk = find_row(&rep.rows, "unknown");
+    assert_eq!(unk.runs, 3);
+    assert_eq!(unk.duration, "unknown");
+    assert_eq!(unk.p50_ms, None);
+    assert_eq!(rep.rows.len(), 2);
+
+    let day = compute(
+        &recs[3..],
+        StatsOptions {
+            by: "day".into(),
+            now: Some(now),
+            ..Default::default()
+        },
+    )
+    .expect("day compute");
+    assert_eq!(day.rows.len(), 2);
+    assert_eq!(day.rows[0].key, "2026-10-14");
+    assert_eq!(day.rows[1].key, "2026-10-15");
+
+    let week = compute(
+        &recs[3..],
+        StatsOptions {
+            by: "week".into(),
+            now: Some(now),
+            ..Default::default()
+        },
+    )
+    .expect("week compute");
+    assert_eq!(week.rows.len(), 1);
+    assert!(week.rows[0].key.starts_with("2026-W"));
+
+    assert!(
+        compute(
+            &recs,
+            StatsOptions {
+                by: "nope".into(),
+                ..Default::default()
+            }
+        )
+        .is_err()
+    );
+
+    let start = parse_since("7d", now).expect("7d");
+    assert_eq!(start, Some(now - ChronoDuration::days(7)));
+    assert_eq!(parse_since("all", now).expect("all"), None);
+    assert!(parse_since("soon", now).is_err());
+}
+
+#[test]
+fn test_stats_from_store() {
+    let s = SqliteStore::new(":memory:").expect("in-memory store");
+    s.save_run(&Run {
+        id: "old".into(),
+        status: STATUS_COMPLETED.into(),
+        model: "gpt-5.6-terra".into(),
+        provider: "openai".into(),
+        created_at: rfc3339(Utc.with_ymd_and_hms(2026, 10, 10, 0, 0, 0).unwrap()),
+        run_ms: Some(10),
+        ..Default::default()
+    })
+    .expect("save old");
+    s.save_run(&Run {
+        id: "new".into(),
+        status: STATUS_FAILED.into(),
+        model: "gpt-5.6-terra".into(),
+        provider: "openai".into(),
+        created_at: rfc3339(Utc.with_ymd_and_hms(2026, 10, 14, 0, 0, 0).unwrap()),
+        run_ms: Some(20),
+        ..Default::default()
+    })
+    .expect("save new");
+
+    let rep = from_store(
+        Some(&s),
+        StatsOptions {
+            by: "model".into(),
+            now: Some(Utc.with_ymd_and_hms(2026, 10, 15, 0, 0, 0).unwrap()),
+            ..Default::default()
+        },
+    )
+    .expect("from_store");
+    let row = find_row(&rep.rows, "gpt-5.6-terra");
+    assert_eq!(row.runs, 2);
+    assert_eq!(row.success_pct, 50.0);
+    assert_eq!(row.duration_n, 2);
+}
+
+#[test]
+fn test_stats_by_area_reads_the_routing_decisions() {
+    let s = SqliteStore::new(":memory:").expect("in-memory store");
+    let now = Utc.with_ymd_and_hms(2026, 10, 15, 0, 0, 0).unwrap();
+    for id in ["a", "b", "c"] {
+        s.save_run(&Run {
+            id: id.into(),
+            status: STATUS_COMPLETED.into(),
+            created_at: rfc3339(now - ChronoDuration::hours(1)),
+            ..Default::default()
+        })
+        .expect("save run");
+    }
+    s.save_route_decision(&RouteDecision {
+        run_id: "a".into(),
+        area: Area::new("service", "go"),
+        created_at: rfc3339(now),
+        ..Default::default()
+    })
+    .expect("save decision a");
+    s.save_route_decision(&RouteDecision {
+        run_id: "b".into(),
+        area: Area::new("service", "go"),
+        created_at: rfc3339(now),
+        ..Default::default()
+    })
+    .expect("save decision b");
+
+    let rep = from_store(
+        Some(&s),
+        StatsOptions {
+            by: "area".into(),
+            now: Some(now),
+            ..Default::default()
+        },
+    )
+    .expect("from_store area");
+    assert_eq!(find_row(&rep.rows, "service, go").runs, 2);
+    assert_eq!(find_row(&rep.rows, "unknown").runs, 1);
+}
+
+#[test]
+fn test_capacity_windows() {
+    let now = Utc.with_ymd_and_hms(2026, 10, 15, 0, 0, 0).unwrap();
+    let week_mins = 7 * 24 * 60;
+    let snap = |key: &str, used: f64, reset: DateTime<Utc>, at: DateTime<Utc>| QuotaSnapshot {
+        agent: key.into(),
+        used_percent: Some(used),
+        resets_at: rfc3339(reset),
+        window_minutes: week_mins,
+        sampled_at: rfc3339(at),
+        ..Default::default()
+    };
+    let reset1 = now - ChronoDuration::hours(48);
+    let reset2 = now - ChronoDuration::days(14);
+    let reset3 = now + ChronoDuration::hours(72);
+
+    let snaps = vec![
+        snap("codex", 40.0, reset1, reset1 - ChronoDuration::hours(1)),
+        snap("codex", 100.0, reset2, reset2 - ChronoDuration::minutes(30)),
+        snap("codex", 80.0, reset3, now - ChronoDuration::hours(1)),
+    ];
+    let rep = capacity(&snaps, None, Some(now));
+    assert_eq!(rep.keys.len(), 1);
+    let k = &rep.keys[0];
+    assert_eq!(k.windows, 3);
+    assert_eq!(k.hit_full, 1);
+    assert_eq!(k.leftover_known, 2);
+    assert_eq!(k.leftover_unknown, 1);
+    assert_eq!(k.consumed_pct, Some(73.3));
+    assert_eq!(k.leftover_pct, Some(30.0));
+    assert_eq!(k.pace, "ahead");
+
+    let (mut closed, mut open, mut full) = (0, 0, 0);
+    for w in &k.detail {
+        if w.open {
+            open += 1;
+            assert_eq!(w.leftover, "unknown");
+            assert_eq!(w.leftover_pct, None);
+            assert_eq!(w.pace, "ahead");
+        } else {
+            closed += 1;
+        }
+        if w.hit_full {
+            full += 1;
+            assert_eq!(w.leftover_pct, Some(0.0));
+            assert_eq!(w.pace, "on pace");
+        }
+        if !w.open && !w.hit_full {
+            assert_eq!(w.leftover_pct, Some(60.0));
+            assert_eq!(w.pace, "behind");
+        }
+    }
+    assert_eq!(closed, 2);
+    assert_eq!(open, 1);
+    assert_eq!(full, 1);
+    assert!(rep.text().contains("unknown"));
+    assert!(rep.note.contains("unknown"));
+
+    // Also verify capacity_from_store reads stored quota snapshots identically.
+    let s = SqliteStore::new(":memory:").expect("in-memory store");
+    for qs in &snaps {
+        s.save_quota(qs).expect("save quota");
+    }
+    let stored_rep = capacity_from_store(Some(&s), None, Some(now)).expect("capacity_from_store");
+    assert_eq!(stored_rep, rep);
+
+    let empty = capacity(&[], None, Some(now));
+    assert!(empty.keys.is_empty());
+    assert!(empty.note.contains("unknown"));
+
+    // 99.5 counts as touching 100; a sample far from the reset leaves leftover unknown.
+    let barely = now - ChronoDuration::hours(1);
+    let early = barely - ChronoDuration::days(7) + ChronoDuration::hours(1);
+    let edge = capacity(
+        &[
+            snap("codex", 99.5, barely, barely - ChronoDuration::hours(1)),
+            snap("grok", 10.0, barely, early),
+        ],
+        None,
+        Some(now),
+    );
+    assert_eq!(edge.keys.len(), 2);
+    assert_eq!(edge.keys[0].key, "codex");
+    assert_eq!(edge.keys[0].hit_full, 1);
+    let grok = &edge.keys[1];
+    assert_eq!(grok.key, "grok");
+    assert_eq!(grok.leftover, "unknown");
+    assert_eq!(grok.hit_full, 0);
+}
+
+#[test]
+fn test_evidence_segments_by_tier() {
+    let recs = vec![
+        Run {
+            id: "1".into(),
+            status: STATUS_COMPLETED.into(),
+            tier: "easy".into(),
+            model: "m".into(),
+            run_ms: Some(1000),
+            ..Default::default()
+        },
+        Run {
+            id: "2".into(),
+            status: STATUS_COMPLETED.into(),
+            tier: "easy".into(),
+            model: "m".into(),
+            run_ms: Some(3000),
+            ..Default::default()
+        },
+        Run {
+            id: "2b".into(),
+            status: STATUS_COMPLETED.into(),
+            tier: "easy".into(),
+            model: "m".into(),
+            run_ms: Some(5000),
+            ..Default::default()
+        },
+        Run {
+            id: "3".into(),
+            status: STATUS_COMPLETED.into(),
+            tier: "hard".into(),
+            model: "m".into(),
+            run_ms: Some(9000),
+            ..Default::default()
+        },
+        Run {
+            id: "4".into(),
+            status: STATUS_RUNNING.into(),
+            tier: "easy".into(),
+            model: "m".into(),
+            run_ms: Some(1),
+            ..Default::default()
+        },
+        Run {
+            id: "5".into(),
+            status: STATUS_COMPLETED.into(),
+            tier: "easy".into(),
+            model: String::new(),
+            run_ms: Some(1),
+            ..Default::default()
+        },
+    ];
+    let ev = evidence_by_tier_model(&recs);
+    let easy = &ev[&evidence_key("easy", "m")];
+    let hard = &ev[&evidence_key("hard", "m")];
+    assert_eq!(easy.finished, 3);
+    assert_eq!(easy.duration_n, 3);
+    assert_eq!(hard.finished, 1);
+    assert_eq!(easy.p50_ms, Some(3000));
+    assert_eq!(hard.p50_ms, Some(9000));
+    assert!(!ev.contains_key(&evidence_key("easy", "")));
+}
+
+#[test]
+fn test_routing_filter_aggregations() {
+    let r = Run {
+        id: "filters".into(),
+        status: STATUS_COMPLETED.into(),
+        requested: Some(Filters {
+            provider: "google".into(),
+            ..Default::default()
+        }),
+        resolved: Some(Filters {
+            provider: "google".into(),
+            model: "gemini-fast".into(),
+            agent: "antigravity".into(),
+            effort: "high".into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    for by in ["requested", "resolved"] {
+        let report = compute(
+            std::slice::from_ref(&r),
+            StatsOptions {
+                by: by.into(),
+                ..Default::default()
+            },
+        )
+        .expect("compute filters");
+        assert_eq!(report.rows.len(), 1);
+        assert!(report.rows[0].key.contains("google"));
+        assert!(report.rows[0].key.starts_with("{\"Provider\":\"google\""));
+    }
+}
+
+#[test]
+fn test_evidence_durations_only_from_completed_runs() {
+    let recs = vec![
+        Run {
+            id: "1".into(),
+            status: STATUS_COMPLETED.into(),
+            tier: "easy".into(),
+            model: "m".into(),
+            run_ms: Some(1000),
+            ..Default::default()
+        },
+        Run {
+            id: "2".into(),
+            status: STATUS_TIMED_OUT.into(),
+            tier: "easy".into(),
+            model: "m".into(),
+            run_ms: Some(600_000),
+            ..Default::default()
+        },
+        Run {
+            id: "3".into(),
+            status: STATUS_CANCELLED.into(),
+            tier: "easy".into(),
+            model: "m".into(),
+            run_ms: Some(500_000),
+            ..Default::default()
+        },
+    ];
+    let ev = evidence_by_tier_model(&recs);
+    let e = &ev[&evidence_key("easy", "m")];
+    assert_eq!(e.finished, 3);
+    assert_eq!(e.duration_n, 1);
+    assert_eq!(e.p50_ms, Some(1000));
+}

@@ -1,0 +1,16 @@
+cursor-agent
+
+Usage: cursor-agent [flags] [prompt]
+
+Flags:
+  -p
+  --output-format stream-json
+  --stream-partial-output
+  --trust
+  --mode ask
+  --force
+  --sandbox enabled
+  --resume
+  --model
+  --workspace
+  create-chat

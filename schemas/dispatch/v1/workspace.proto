@@ -1,0 +1,69 @@
+syntax = "proto3";
+package dispatch.v1;
+
+// A workspace is where runs belong: a Polterware project when Polterware is
+// installed (its id is the project's), or a folder the person added.
+message Workspace {
+  string id = 1;
+  string name = 2;
+  // path is the folder of a standalone workspace; empty for a linked one.
+  string path = 3;
+  // polterware_project_id is set on a workspace that mirrors a Polterware project.
+  string polterware_project_id = 4;
+  string created_at = 5;
+}
+
+message ListWorkspacesRequest {}
+message ListWorkspacesResponse {
+  repeated Workspace workspaces = 1;
+  // linked reports whether Polterware's core answered, so its projects are listed.
+  bool linked = 2;
+}
+
+// AddWorkspace adds a folder as a standalone workspace, or returns the one
+// that already holds it (a Polterware project whose repository is cloned
+// there, or a folder added before).
+message AddWorkspaceRequest {
+  string path = 1;
+  string name = 2;
+}
+message AddWorkspaceResponse { Workspace workspace = 1; }
+
+message RemoveWorkspaceRequest { string id = 1; }
+message RemoveWorkspaceResponse {}
+
+// ResolveWorkspace returns the workspace with id, else the one that holds dir.
+message ResolveWorkspaceRequest {
+  string id = 1;
+  string dir = 2;
+}
+message ResolveWorkspaceResponse { Workspace workspace = 1; }
+
+message WorkspaceCard {
+  string slug = 1;
+  string title = 2;
+  string milestone = 3;
+  string stage = 4;
+}
+
+message WorkspaceRepository {
+  string name = 1;
+  string remote = 2;
+  string local_path = 3;
+}
+
+// ListWorkspaceCards lists a linked workspace's open cards and repositories
+// for Start run's pills; a standalone workspace has none.
+message ListWorkspaceCardsRequest { string workspace_id = 1; }
+message ListWorkspaceCardsResponse {
+  repeated WorkspaceCard cards = 1;
+  repeated WorkspaceRepository repositories = 2;
+}
+
+service WorkspaceService {
+  rpc ListWorkspaces(ListWorkspacesRequest) returns (ListWorkspacesResponse);
+  rpc AddWorkspace(AddWorkspaceRequest) returns (AddWorkspaceResponse);
+  rpc RemoveWorkspace(RemoveWorkspaceRequest) returns (RemoveWorkspaceResponse);
+  rpc ResolveWorkspace(ResolveWorkspaceRequest) returns (ResolveWorkspaceResponse);
+  rpc ListWorkspaceCards(ListWorkspaceCardsRequest) returns (ListWorkspaceCardsResponse);
+}

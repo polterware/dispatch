@@ -1,0 +1,639 @@
+syntax = "proto3";
+package dispatch.v1;
+
+message DispatchRun {
+  string id = 1;
+  string project_id = 2;
+  string status = 3;
+  string tier = 4;
+  string agent = 5;
+  string model = 6;
+  string provider = 7;
+  string effort = 8;
+  string prompt = 9;
+  string card_slug = 10;
+  string agent_run_id = 11;
+  string dir = 12;
+  string repo = 13;
+  string worktree = 14;
+  string branch = 15;
+  string base_sha = 16;
+  bool read_only = 17;
+  reserved 18;
+  reserved "verification";
+  int32 exit_code = 19;
+  string exit_class = 20;
+  string error = 21;
+  string note = 22;
+  optional int32 files_changed = 23;
+  optional int32 insertions = 24;
+  optional int32 deletions = 25;
+  string created_at = 26;
+  string started_at = 27;
+  string finished_at = 28;
+  string merged_at = 29;
+  string merge_sha = 30;
+  repeated DispatchAttempt attempts = 31;
+  string resumed_of = 32;
+  string parent_run_id = 33;
+  optional int64 queued_ms = 34;
+  optional int64 run_ms = 35;
+  string priority = 36;
+  // What the run's agents reported spending; unset when none did.
+  DispatchUsage usage = 37;
+  string worktree_status = 38;
+  string conversation_id = 39;
+  string caller_agent = 40;
+}
+
+// Tokens a run spent as its agent CLIs reported them, summed over attempts:
+// input excludes cache reads and writes, output includes reasoning. cost_usd
+// is the API-equivalent price (the CLI's own, else models.dev list prices),
+// unset when an attempt could not be priced. context_tokens is how full the
+// last attempt's context window was after its last model call, and
+// context_window that window's size; both zero when unknown.
+message DispatchUsage {
+  int64 input_tokens = 1;
+  int64 cache_read_tokens = 2;
+  int64 cache_write_tokens = 3;
+  int64 output_tokens = 4;
+  int64 reasoning_tokens = 5;
+  optional double cost_usd = 6;
+  string cost_source = 7;
+  int64 context_tokens = 8;
+  int64 context_window = 9;
+}
+
+message DispatchAttempt {
+  string agent = 1;
+  string model = 2;
+  string error = 3;
+  string exit_class = 4;
+  optional int64 duration_ms = 5;
+}
+
+message DispatchRunEvent {
+  string id = 1;
+  string run_id = 2;
+  string project_id = 3;
+  string kind = 4;
+  string agent = 5;
+  string tier = 6;
+  string text = 7;
+  int64 seq = 8;
+  string at = 9;
+}
+
+message DispatchWorktree {
+  string id = 1;
+  string project_id = 2;
+  string run_id = 3;
+  string card_slug = 4;
+  string path = 5;
+  string branch = 6;
+  string base_sha = 7;
+  string status = 8;
+  string owner = 9;
+}
+
+message DispatchQuotaSnapshot {
+  string agent = 1;
+  string provider = 2;
+  string window = 3;
+  string source = 4;
+  string confidence = 5;
+  optional double used_percent = 6;
+  int32 window_minutes = 7;
+  string resets_at = 8;
+  string sampled_at = 9;
+}
+
+message DispatchTier {
+  string name = 1;
+  string provider = 2;
+  string agent = 3;
+  string model = 4;
+  int32 speed = 5;
+  int32 strength = 6;
+  int32 position = 7;
+}
+
+message DispatchAgent {
+  string name = 1;
+  string bin = 2;
+  string provider = 3;
+  reserved 4, 5, 6;
+  reserved "quota_source", "confidence", "risk";
+  optional double used_percent = 7;
+  string cooldown_until = 8;
+  // Whether the agent's CLI is on this machine now.
+  bool installed = 9;
+}
+
+message ListRunsRequest {
+  string project_id = 1;
+  int32 limit = 2;
+  int32 offset = 3;
+  string conversation_id = 4;
+}
+
+message ListRunsResponse {
+  repeated DispatchRun runs = 1;
+}
+
+message GetRunRequest {
+  string id = 1;
+}
+
+message GetRunResponse {
+  DispatchRun run = 1;
+}
+
+message StartRunRequest {
+  string project_id = 1;
+  string tier = 2;
+  string prompt = 3;
+  string card_slug = 4;
+  string agent = 5;
+  string worktree = 6;
+  string dir = 7;
+  bool read_only = 8;
+  string provider = 9;
+  string model = 10;
+  string effort = 11;
+  string priority = 12;
+  bool relax = 13;
+  reserved 14;
+  reserved "no_verify";
+  int32 timeout_sec = 15;
+  string profile = 16;
+  // repo runs in that repository's clone. Without dir or repo, the run uses
+  // the card's component repository, else the project's only repository.
+  string repo = 17;
+  DispatchCaller caller = 18;
+}
+
+// The conversation that called dispatch, separate from the worker's resume session.
+message DispatchCaller {
+  string agent = 1;
+  string session_id = 2;
+  string conversation_id = 3;
+  string label = 4;
+}
+
+message DispatchSectionItem {
+  string kind = 1;
+  string ref = 2;
+  int32 position = 3;
+}
+
+message DispatchSection {
+  string id = 1;
+  string name = 2;
+  int32 position = 3;
+  string created_at = 4;
+  repeated DispatchSectionItem items = 5;
+}
+
+message ListSectionsRequest {}
+message ListSectionsResponse {
+  repeated DispatchSection sections = 1;
+}
+message SaveSectionRequest {
+  string id = 1;
+  string name = 2;
+  int32 position = 3;
+}
+message SaveSectionResponse {
+  DispatchSection section = 1;
+}
+message DeleteSectionRequest {
+  string id = 1;
+}
+message DeleteSectionResponse {}
+message MoveToSectionRequest {
+  string kind = 1;
+  string ref = 2;
+  string section_id = 3;
+}
+message MoveToSectionResponse {}
+
+message StartRunResponse {
+  DispatchRun run = 1;
+}
+
+message CancelRunRequest {
+  string id = 1;
+}
+
+message CancelRunResponse {
+  DispatchRun run = 1;
+}
+
+// Sections: summary, agent, files, attempts, meta, output.
+message ResultRequest {
+  string id = 1;
+  string section = 2;
+  int32 offset = 3;
+  int32 limit = 4;
+}
+
+message ResultResponse {
+  string content = 1;
+  int32 total = 2;
+}
+
+message WatchRunRequest {
+  string id = 1;
+  int64 after_seq = 2;
+}
+
+message WatchRunResponse {
+  int64 seq = 1;
+  string kind = 2;
+  string text = 3;
+  string at = 4;
+}
+
+message ListWorktreesRequest {
+  string project_id = 1;
+}
+
+message ListWorktreesResponse {
+  repeated DispatchWorktree worktrees = 1;
+}
+
+message ListQuotaRequest {
+  // Empty lists all agents.
+  string agent = 1;
+  string since = 2;
+}
+
+message ListQuotaResponse {
+  repeated DispatchQuotaSnapshot snapshots = 1;
+}
+
+message ListTiersRequest {}
+
+message ListTiersResponse {
+  repeated DispatchTier tiers = 1;
+}
+
+message ListAgentsRequest {}
+
+message ListAgentsResponse {
+  repeated DispatchAgent agents = 1;
+}
+
+// Only event kinds started, merged, failed.
+message ListHistoryRequest {
+  string project_id = 1;
+  string agent = 2;
+  string tier = 3;
+  int32 limit = 4;
+  int32 offset = 5;
+}
+
+message ListHistoryResponse {
+  repeated DispatchRunEvent events = 1;
+}
+
+// A model an installed agent CLI lists, for building the tier table.
+message DispatchModel {
+  string agent = 1;
+  string model = 2;
+  string provider = 3;
+  // The tier the agent suggests for the model, when it reports one.
+  string tier = 4;
+}
+
+message ListModelsRequest {}
+
+message ListModelsResponse {
+  repeated DispatchModel models = 1;
+  // Agents that are installed but could not list their models.
+  repeated string problems = 2;
+}
+
+// Replaces the whole tier table. Rows keep their order within each tier; position is recomputed.
+message ReplaceTiersRequest {
+  repeated DispatchTier tiers = 1;
+}
+
+message ReplaceTiersResponse {
+  repeated DispatchTier tiers = 1;
+}
+
+message CheckTiersRequest {}
+
+message CheckTiersResponse {
+  repeated string problems = 1;
+}
+
+message StatsRequest {
+  string project_id = 1;
+  string by = 2;
+  string since = 3;
+}
+
+message DispatchStatsRow {
+  string key = 1;
+  int32 runs = 2;
+  double success_pct = 3;
+  double first_try_pct = 4;
+  optional int64 p50_ms = 5;
+  optional int64 p90_ms = 6;
+  int32 fallbacks = 7;
+  int32 rate_limits = 8;
+  int32 orphans = 9;
+  // Spend of the group's runs: usage_runs reported usage, and cost_usd sums
+  // the cost_runs that were priced.
+  int32 usage_runs = 10;
+  int64 input_tokens = 11;
+  int64 cache_read_tokens = 12;
+  int64 cache_write_tokens = 13;
+  int64 output_tokens = 14;
+  int64 reasoning_tokens = 15;
+  double cost_usd = 16;
+  int32 cost_runs = 17;
+}
+
+message DispatchStatRank {
+  string key = 1;
+  int32 runs = 2;
+  int32 samples = 3;
+  optional int64 p50_ms = 4;
+  optional double success_pct = 5;
+  string reason = 6;
+}
+
+message DispatchStatsRankings {
+  DispatchStatRank most_used_model = 1;
+  DispatchStatRank most_used_provider = 2;
+  DispatchStatRank slowest_model = 3;
+  DispatchStatRank most_failed_model = 4;
+}
+
+message StatsResponse {
+  string by = 1;
+  string since = 2;
+  int32 in_flight = 3;
+  repeated DispatchStatsRow rows = 4;
+  DispatchStatsRankings rankings = 5;
+}
+
+// How a run's candidates were routed: the logged decision as JSON.
+message GetRouteDecisionRequest {
+  string run_id = 1;
+}
+
+// ok is false when the run has no routing decision (a resumed run).
+message GetRouteDecisionResponse {
+  bool ok = 1;
+  string json = 2;
+}
+
+// The tier table the model catalog proposes; apply replaces the stored one,
+// or with agent only that agent's entries.
+message BuildTiersRequest {
+  bool apply = 1;
+  // One agent's models only; with apply, only that agent's entries are
+  // replaced, after the others in each tier.
+  string agent = 2;
+}
+
+message BuildTiersResponse {
+  bool ok = 1;
+  string json = 2;
+}
+
+message CapacityRequest {
+  string since = 1;
+}
+
+message DispatchCapacityKey {
+  string key = 1;
+  int32 windows = 2;
+  int32 hit_full = 3;
+  optional double consumed_pct = 4;
+  optional double leftover_pct = 5;
+  string leftover = 6;
+  string pace = 7;
+}
+
+message CapacityResponse {
+  string since = 1;
+  string note = 2;
+  repeated DispatchCapacityKey keys = 3;
+}
+
+message RouteRequest {
+  // auto (or empty without model and provider) picks the cheapest model
+  // the catalog expects to do the task; easy, normal, or hard route that tier.
+  string tier = 1;
+  string provider = 2;
+  string model = 3;
+  string effort = 4;
+  string agent = 5;
+  string priority = 6;
+  bool relax = 7;
+  bool read_only = 8;
+  string dir = 9;
+  string profile = 10;
+  // prompt is what an auto route estimates the difficulty of.
+  string prompt = 11;
+  // project_id and card_slug name the card whose text the classifier reads.
+  string project_id = 12;
+  string card_slug = 13;
+}
+
+message ClassifyRequest {
+  reserved 1, 5, 6;
+  reserved "tier", "explain", "reset_model";
+  string prompt = 2;
+  string dir = 3;
+  bool read_only = 4;
+  // The card the task names: the classifier reads it before the prompt.
+  string project_id = 7;
+  string card_slug = 8;
+}
+
+message MergeRunRequest {
+  string id = 1;
+  bool keep_worktree = 4;
+  reserved 2, 3;
+  reserved "force", "no_verify";
+}
+
+message CleanRunRequest {
+  string id = 1;
+  bool force = 2;
+}
+
+message RecoverRunRequest {
+  string id = 1;
+}
+
+message ConfigRequest {
+  // get, set, allow-add, allow-rm, deny-add, or deny-rm.
+  string action = 1;
+  string dir = 2;
+  bool project = 3;
+  string key = 4;
+  repeated string values = 5;
+}
+
+message SubagentsRequest {
+  // list, init, check, save, or remove. save and remove change the user file.
+  string action = 1;
+  string dir = 2;
+  // save and remove: the subagent's name.
+  string name = 3;
+  // save: the profile as JSON (tier, readonly, instructions, prefer, avoid, timeout, ...).
+  string profile = 4;
+}
+
+message SkillRequest {
+  // install or refresh.
+  string action = 1;
+  // install only: one agent (claude, cursor, codex, grok, antigravity); empty installs for all.
+  string agent = 2;
+  // install only: overwrite an existing skill.
+  bool force = 3;
+}
+
+// ok is false when the operation ran but reports a failure; json is its body.
+message SkillResponse {
+  bool ok = 1;
+  string json = 2;
+}
+
+// How the agent CLIs reach dispatch: the command on the PATH, each agent's
+// skill, and the Claude Code SessionStart hook.
+message GetAgentSetupRequest {}
+
+message ApplyAgentSetupRequest {
+  // link_cli, install_skill, hook_on, or hook_off.
+  string action = 1;
+  // install_skill only: one agent; empty installs for every agent.
+  string agent = 2;
+}
+
+// json is the setup report: cli, skills, and hook.
+message GetAgentSetupResponse {
+  string json = 1;
+}
+
+// json is the setup report after the action.
+message ApplyAgentSetupResponse {
+  string json = 1;
+}
+
+// ok is false when the operation ran but reports a failure; json is its body.
+message RouteResponse {
+  bool ok = 1;
+  string json = 2;
+}
+
+// The model catalog the auto route prices candidates with.
+message ListModelCatalogRequest {}
+
+// json is the catalog report: its sources and, for each model the router can
+// route to, θ and its source, the cost per task, and P(pass) at each band.
+message ListModelCatalogResponse {
+  bool ok = 1;
+  string json = 2;
+}
+
+// The public benchmarks of every model the installed agent CLIs report.
+message ListModelBenchmarksRequest {}
+
+// json is the benchmark report: its sources and, for each installed model,
+// its CursorBench results per reasoning level and its ECI, as published.
+message ListModelBenchmarksResponse {
+  bool ok = 1;
+  string json = 2;
+}
+
+// Fetches models.dev prices over the embedded snapshot's.
+message RefreshModelCatalogRequest {}
+
+// ok is false when the fetch failed; json is its body.
+message RefreshModelCatalogResponse {
+  bool ok = 1;
+  string json = 2;
+}
+
+// ok is false when the operation ran but reports a failure; json is its body.
+message ClassifyResponse {
+  bool ok = 1;
+  string json = 2;
+}
+
+// ok is false when the operation ran but reports a failure; json is its body.
+message MergeRunResponse {
+  bool ok = 1;
+  string json = 2;
+}
+
+// ok is false when the operation ran but reports a failure; json is its body.
+message CleanRunResponse {
+  bool ok = 1;
+  string json = 2;
+}
+
+// ok is false when the operation ran but reports a failure; json is its body.
+message RecoverRunResponse {
+  bool ok = 1;
+  string json = 2;
+}
+
+// ok is false when the operation ran but reports a failure; json is its body.
+message ConfigResponse {
+  bool ok = 1;
+  string json = 2;
+}
+
+// ok is false when the operation ran but reports a failure; json is its body.
+message SubagentsResponse {
+  bool ok = 1;
+  string json = 2;
+}
+
+service DispatchService {
+  rpc ListSections(ListSectionsRequest) returns (ListSectionsResponse);
+  rpc SaveSection(SaveSectionRequest) returns (SaveSectionResponse);
+  rpc DeleteSection(DeleteSectionRequest) returns (DeleteSectionResponse);
+  rpc MoveToSection(MoveToSectionRequest) returns (MoveToSectionResponse);
+  rpc ListRuns(ListRunsRequest) returns (ListRunsResponse);
+  rpc GetRun(GetRunRequest) returns (GetRunResponse);
+  rpc StartRun(StartRunRequest) returns (StartRunResponse);
+  rpc CancelRun(CancelRunRequest) returns (CancelRunResponse);
+  rpc Result(ResultRequest) returns (ResultResponse);
+  rpc WatchRun(WatchRunRequest) returns (stream WatchRunResponse);
+  rpc ListWorktrees(ListWorktreesRequest) returns (ListWorktreesResponse);
+  rpc ListQuota(ListQuotaRequest) returns (ListQuotaResponse);
+  rpc ListTiers(ListTiersRequest) returns (ListTiersResponse);
+  rpc ListAgents(ListAgentsRequest) returns (ListAgentsResponse);
+  rpc ListHistory(ListHistoryRequest) returns (ListHistoryResponse);
+  rpc CheckTiers(CheckTiersRequest) returns (CheckTiersResponse);
+  rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
+  rpc ReplaceTiers(ReplaceTiersRequest) returns (ReplaceTiersResponse);
+  rpc Stats(StatsRequest) returns (StatsResponse);
+  rpc GetRouteDecision(GetRouteDecisionRequest) returns (GetRouteDecisionResponse);
+  rpc BuildTiers(BuildTiersRequest) returns (BuildTiersResponse);
+  rpc Capacity(CapacityRequest) returns (CapacityResponse);
+  rpc Route(RouteRequest) returns (RouteResponse);
+  rpc Classify(ClassifyRequest) returns (ClassifyResponse);
+  rpc ListModelCatalog(ListModelCatalogRequest) returns (ListModelCatalogResponse);
+  rpc RefreshModelCatalog(RefreshModelCatalogRequest) returns (RefreshModelCatalogResponse);
+  rpc ListModelBenchmarks(ListModelBenchmarksRequest) returns (ListModelBenchmarksResponse);
+  rpc MergeRun(MergeRunRequest) returns (MergeRunResponse);
+  rpc CleanRun(CleanRunRequest) returns (CleanRunResponse);
+  rpc RecoverRun(RecoverRunRequest) returns (RecoverRunResponse);
+  rpc Config(ConfigRequest) returns (ConfigResponse);
+  rpc Subagents(SubagentsRequest) returns (SubagentsResponse);
+  rpc Skill(SkillRequest) returns (SkillResponse);
+  rpc GetAgentSetup(GetAgentSetupRequest) returns (GetAgentSetupResponse);
+  rpc ApplyAgentSetup(ApplyAgentSetupRequest) returns (ApplyAgentSetupResponse);
+}
