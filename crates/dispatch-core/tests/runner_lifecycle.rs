@@ -1,5 +1,3 @@
-//! Ported from runner_lifecycle_test.go.
-
 #[path = "runner_support.rs"]
 mod support;
 

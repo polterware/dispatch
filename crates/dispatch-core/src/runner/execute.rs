@@ -665,6 +665,7 @@ impl Deps {
             resume_session: resume_session.into(),
             env: child_env.to_vec(),
             log_path: agent_log_path(&self.state_dir(), &rec.id),
+            started: None,
         };
         mark_attempt(&request.log_path, &rec.attempts, c);
         let call = AgentCall {

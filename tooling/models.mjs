@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Regenerates crates/dispatch-core/src/models_snapshot.json (and go-core's copy while it lives), the model catalog the Dispatch router
+// Regenerates crates/dispatch-core/src/models_snapshot.json, the model catalog the Dispatch router
 // embeds: prices and limits from models.dev (MIT), and agentic-coding scores from Epoch AI's
 // benchmarking hub (CC-BY 4.0): CursorBench per model and reasoning level, plus the Epoch
 // Capabilities Index as a fallback. Run by hand when models change; the core never fetches Epoch.
@@ -16,7 +16,6 @@ import { fileURLToPath } from "node:url";
 const MODELS_DEV = "https://models.dev/api.json";
 const EPOCH = "https://epoch.ai/data/benchmark_data.zip";
 const OUT = join(dirname(fileURLToPath(import.meta.url)), "../crates/dispatch-core/src/models_snapshot.json");
-const GO_COPY = join(dirname(fileURLToPath(import.meta.url)), "../go-core/domains/dispatch/models_snapshot.json");
 // Providers whose models the dispatch CLIs serve; aggregators repeat these and are skipped.
 const PROVIDERS = ["openai", "google", "xai", "anthropic", "deepseek", "zai", "moonshotai", "mistral", "alibaba", "meta"];
 const LEVELS = { minimal: "minimal", low: "low", medium: "medium", high: "high", "extra high": "xhigh", max: "max" };
@@ -127,5 +126,4 @@ const snapshot = {
 };
 const json = JSON.stringify(snapshot, null, 1) + "\n";
 writeFileSync(OUT, json);
-writeFileSync(GO_COPY, json);
 console.log(`wrote ${OUT}: ${models.length} models, ${scores.length} CursorBench scores, ${eci.length} ECI scores`);

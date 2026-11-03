@@ -4,6 +4,7 @@
 pub mod app;
 pub use polterware_ui::bots as avatar;
 pub mod client;
+mod dock_icon;
 pub mod format;
 pub mod models;
 pub use polterware_ui::motion;
@@ -26,6 +27,7 @@ pub fn run() {
     Application::new()
         .with_assets(IconAssets)
         .run(|cx: &mut App| {
+            dock_icon::install();
             cx.activate(true);
             theme::set_root_rem(theme::REM);
             theme::set_status_tones(theme::dispatch_status_tone);

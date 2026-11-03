@@ -8,6 +8,8 @@ publish = false
 
 [dependencies]
 gpui.workspace = true
+# The `dispatch` CLI and core, which this binary also is.
+dispatch-core = { path = "../crates/dispatch-core" }
 image = { version = "0.25.1", default-features = false, features = ["png"] }
 libc = "0.2"
 serde = { version = "1.0", features = ["derive"] }

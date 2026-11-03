@@ -25,8 +25,7 @@ const provided = new Set([
   "@opencode/client/solid",
 ]);
 
-// One CommonJS file next to the plugin's server part, which dispatch-core embeds
-// (tooling/sync-opencode-plugin.sh copies the plugin into go-core while it lives);
+// One CommonJS file next to the plugin's server part, which dispatch-core embeds;
 // DISPATCH_GUI_OUT writes it elsewhere (the check script).
 const outFile = process.env.DISPATCH_GUI_OUT ?? path.join(here, "../../crates/dispatch-core/src/setup/opencode/gui-experimental.cjs");
 

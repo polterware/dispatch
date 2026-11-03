@@ -1,5 +1,4 @@
-//! Ported from route_decision_test.go, router_auto_test.go and
-//! role_pick_test.go: the runner side of Auto, roles and the decision log.
+//! The runner side of Auto, roles, and the decision log.
 
 #[path = "runner_support.rs"]
 mod support;

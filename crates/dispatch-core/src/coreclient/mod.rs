@@ -1,6 +1,4 @@
 //! Discovering and dialing a running core.
-//!
-//! Ported from `dispatch/backend/platform/coreclient`.
 
 mod lifecycle;
 pub(crate) mod rpc;

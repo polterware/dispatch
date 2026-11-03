@@ -56,6 +56,7 @@ async fn fail_fast_stops_hanging_agent() {
         CancellationToken::new(),
         LiveLog::default(),
         None,
+        None,
     )
     .await
     .unwrap();

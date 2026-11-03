@@ -827,7 +827,6 @@ dependencies = [
 [[package]]
 name = "bot-avatar"
 version = "0.1.0"
-source = "git+https://github.com/polterware/bot-avatar#4628014df52ff1b637d822ee6f6c1cdd06acf311"
 dependencies = [
  "tiny-skia",
 ]
@@ -1631,6 +1630,7 @@ checksum = "bd0c93bb4b0c6d9b77f4435b0ae98c24d17f1c45b2ff844c6151a07256ca923b"
 name = "dispatch-app"
 version = "0.1.0"
 dependencies = [
+ "dispatch-core",
  "gpui",
  "image",
  "libc",
@@ -1654,6 +1654,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "core-foundation 0.10.0",
  "dirs 7.0.0",
  "futures",
  "hyper",
@@ -1671,6 +1672,7 @@ dependencies = [
  "security-framework",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -4390,7 +4392,6 @@ checksum = "5da3b0203fd7ee5720aa0b5e790b591aa5d3f41c3ed2c34a3a393382198af2f7"
 [[package]]
 name = "polterware-assets"
 version = "0.1.0"
-source = "git+https://github.com/polterware/ui#64df4c8e7d9aee610de5bd5d31cccfbce5d66dca"
 dependencies = [
  "gpui",
 ]
@@ -4398,7 +4399,6 @@ dependencies = [
 [[package]]
 name = "polterware-motion"
 version = "0.1.0"
-source = "git+https://github.com/polterware/ui#64df4c8e7d9aee610de5bd5d31cccfbce5d66dca"
 dependencies = [
  "gpui",
  "polterware-theme",
@@ -4407,7 +4407,6 @@ dependencies = [
 [[package]]
 name = "polterware-theme"
 version = "0.1.0"
-source = "git+https://github.com/polterware/ui#64df4c8e7d9aee610de5bd5d31cccfbce5d66dca"
 dependencies = [
  "gpui",
 ]
@@ -4415,7 +4414,6 @@ dependencies = [
 [[package]]
 name = "polterware-ui"
 version = "0.1.0"
-source = "git+https://github.com/polterware/ui#64df4c8e7d9aee610de5bd5d31cccfbce5d66dca"
 dependencies = [
  "bot-avatar",
  "gpui",
@@ -4431,7 +4429,6 @@ dependencies = [
 [[package]]
 name = "polterware-window"
 version = "0.1.0"
-source = "git+https://github.com/polterware/ui#64df4c8e7d9aee610de5bd5d31cccfbce5d66dca"
 dependencies = [
  "gpui",
  "image",

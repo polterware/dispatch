@@ -1,7 +1,5 @@
 //! Domain types: runs, attempts, events, tiers, agents, quota, worktrees, and the Store trait.
 //!
-//! Ported from `dispatch/backend/domains/dispatch/types.go`.
-//!
 //! Times are RFC 3339 strings in UTC; the empty string is Go's zero time.
 
 use crate::Error;

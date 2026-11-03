@@ -6,6 +6,7 @@ use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
 use super::{
+    StartedHook,
     failfast::FatalWatch,
     livelog::{LiveLog, StreamFilter},
 };
@@ -61,6 +62,7 @@ pub async fn run_command(
     cancel: CancellationToken,
     log: LiveLog,
     filter_name: Option<&str>,
+    started: Option<&StartedHook>,
 ) -> Result<CommandOutput, Error> {
     command
         .process_group(0)
@@ -76,6 +78,11 @@ pub async fn run_command(
     let pid = child
         .id()
         .ok_or_else(|| Error::Message("agent process has no pid".into()))? as i32;
+    if let Err(e) = report_started(started, pid) {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        return Err(e);
+    }
     if let Some(input) = input
         && let Some(mut stdin) = child.stdin.take()
     {
@@ -179,6 +186,7 @@ impl RpcProcess {
         mut command: Command,
         cancel: CancellationToken,
         log: LiveLog,
+        started: Option<&StartedHook>,
     ) -> Result<Self, Error> {
         use tokio::io::AsyncBufReadExt;
         command
@@ -192,6 +200,10 @@ impl RpcProcess {
             .id()
             .ok_or_else(|| Error::Message("agent process has no pid".into()))?
             as i32;
+        if let Err(e) = report_started(started, pid) {
+            let _ = child.start_kill();
+            return Err(e);
+        }
         let stdin = child.stdin.take();
         let stdout = child
             .stdout
@@ -261,4 +273,9 @@ impl RpcProcess {
         self.stderr.abort();
         result
     }
+}
+
+/// Hands the agent's pid to the run's hook, which persists it before the run waits.
+fn report_started(started: Option<&StartedHook>, pid: i32) -> Result<(), Error> {
+    started.map_or(Ok(()), |h| (h.0)(i64::from(pid)))
 }

@@ -2,8 +2,6 @@
 //! dispatch: the `dispatch` command on the PATH, the dispatch skill in each
 //! agent's skills folder, the Claude Code SessionStart hook, and the Dispatch
 //! plugin in OpenCode.
-//!
-//! Ported from `dispatch/backend/providers/setup`.
 
 mod jsonc;
 mod opencode;

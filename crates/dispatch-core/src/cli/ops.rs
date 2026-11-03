@@ -1,0 +1,1150 @@
+//! The operational commands: wait, route, classify, models, config, doctor,
+//! merge, clean, recover, roles, and the local ones (on, off, hook, skill,
+//! setup, update) that need no core.
+
+use super::{
+    CliResult, Fail, Flags, caller, dial_workspace, or_unknown, run_error, runs, sort_keys,
+    state_dir, usage_err, working_dir, write_json,
+};
+use crate::{
+    Error, adapters, hook,
+    pass_model::difficulty_tier,
+    proto as pb,
+    reports::{models_bench::BenchmarkReport, models_report::CatalogReport},
+    roles::{Profile, RoleEntry},
+    router::AutoInfo,
+    sandbox, setup, skill,
+    tiers::{known_adapters, table_from_rows},
+    types::{
+        RolePick, STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED, STATUS_ORPHANED,
+        STATUS_TIMED_OUT, Tier,
+    },
+};
+use serde_json::Value;
+use std::collections::BTreeMap;
+use std::io::BufRead;
+use std::path::Path;
+use std::time::Duration;
+
+pub(crate) const OPS_USAGE: &str = "       dispatch wait <id> [--timeout <dur>] [--json=false]
+       dispatch route [--tier <auto|easy|normal|hard>] [--provider <p>] [--model <m>] [--effort <e>] [--agent <a>] [--priority speed|balanced|quality] [--relax] [--readonly] [--role <name|none>] [--card <slug>] [--dir <repo>] [--json] [<prompt>]
+       dispatch models [--json] | refresh | bench [--json]
+       dispatch classify [--card <slug>] [--dir <repo>] [--json] <prompt>
+       dispatch config get [priority|discover|roles|classifier|classifier_model|classifier_keys|classifier_cli|allow|deny] [--project] [--dir <repo>]
+       dispatch config set priority <speed|balanced|quality> | discover <true|false> | roles <true|false> | classifier <off|jev|openai|cli> | classifier_model <model> [--project]
+       dispatch config allow|deny add|rm providers|models|agents <value>... [--project]
+       dispatch config key set|clear jev|openai   (set reads the key from stdin into a Keychain item only dispatch reads; TYPESAFE_API_KEY or OPENAI_API_KEY wins over it)
+       dispatch doctor [--json]
+       dispatch merge <id>
+       dispatch clean <id> [--force]
+       dispatch recover <id>
+       dispatch roles [--check] [--dir <repo>]
+       dispatch roles save <name> [--when <text>] [--tier easy|normal|hard] [--easy|--normal|--hard agent/model,...] [--readonly] [--instructions <text>] [--manual] [--prefer a,b] [--avoid a,b] [--timeout <dur>] | remove <name>
+       dispatch on|off|hook
+       dispatch setup [--json] | link | skill [<agent>] | hook on|off | opencode [--remove | on | off]
+       dispatch skill install [--agent <name>] [--force] | show | refresh
+       dispatch update [--check]";
+
+const PROJECT_USAGE: &str = "workspace id (default: the workspace holding the cwd)";
+
+/// Prints an operation body as Go printed the decoded value (keys in order)
+/// and turns a reported failure into exit status 1 after the body is shown.
+pub(super) fn print_op(ok: bool, body: &str) -> CliResult {
+    let v: Value = serde_json::from_str(body)?;
+    write_json(&sort_keys(v))?;
+    if ok { Ok(()) } else { Err(Fail::Exit(1)) }
+}
+
+fn single_run_id(f: &mut Flags, args: &[String], verb: &str) -> Result<String, Fail> {
+    match f.parse_interspersed(args)?.as_slice() {
+        [id] if !id.trim().is_empty() => Ok(id.trim().to_owned()),
+        _ => Err(usage_err(format!(
+            "dispatch {verb} needs one run id\n{OPS_USAGE}"
+        ))),
+    }
+}
+
+fn is_terminal_run(status: &str) -> bool {
+    [
+        STATUS_COMPLETED,
+        STATUS_FAILED,
+        STATUS_CANCELLED,
+        STATUS_TIMED_OUT,
+        STATUS_ORPHANED,
+    ]
+    .contains(&status)
+}
+
+/// The exit status of wait for a terminal status.
+fn exit_code(status: &str) -> i32 {
+    match status {
+        STATUS_COMPLETED => 0,
+        STATUS_TIMED_OUT => 124,
+        _ => 1,
+    }
+}
+
+pub(super) async fn wait(db_path: &Path, args: &[String]) -> CliResult {
+    let mut f = Flags::new("dispatch wait");
+    f.duration(
+        "timeout",
+        Duration::ZERO,
+        "stop waiting after this long (0 = no limit)",
+    )
+    .bool(
+        "json",
+        true,
+        "print compact summary JSON; --json=false prints text",
+    )
+    .string("project", "", PROJECT_USAGE);
+    let id = single_run_id(&mut f, args, "wait")?;
+    let (c, _) = dial_workspace(db_path, &f.str("project")).await?;
+    let as_json = f.flag("json");
+    let timeout = f.dur("timeout");
+    let deadline = (!timeout.is_zero()).then(|| tokio::time::Instant::now() + timeout);
+    let stopped = async {
+        let mut term =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            () = async { match term.as_mut() { Some(t) => { t.recv().await; } None => std::future::pending().await } } => {}
+            () = async { match deadline { Some(d) => tokio::time::sleep_until(d).await, None => std::future::pending().await } } => {}
+        }
+    };
+    tokio::pin!(stopped);
+    let mut tick = tokio::time::interval(Duration::from_millis(500));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        let got = tokio::select! {
+            r = runs::get_run(&c, &id) => Some(r),
+            () = &mut stopped => None,
+        };
+        match got {
+            Some(Err(e)) => return Err(e.into()),
+            Some(Ok(run)) if is_terminal_run(&run.status) => {
+                runs::write_proto_run(&run, as_json, true)?;
+                return match exit_code(&run.status) {
+                    0 => Ok(()),
+                    code => Err(Fail::Exit(code)),
+                };
+            }
+            Some(Ok(_)) => {}
+            None => return still_running(&c, &id, as_json).await,
+        }
+        tokio::select! {
+            _ = tick.tick() => {}
+            () = &mut stopped => return still_running(&c, &id, as_json).await,
+        }
+    }
+}
+
+/// Prints the run as it stands when wait stopped before it ended: exit 3.
+async fn still_running(c: &crate::coreclient::Clients, id: &str, as_json: bool) -> CliResult {
+    if let Ok(latest) = runs::get_run(c, id).await {
+        let _ = runs::write_proto_run(&latest, as_json, true);
+    }
+    Err(Fail::Exit(3))
+}
+
+pub(super) async fn route(db_path: &Path, args: &[String]) -> CliResult {
+    let mut f = Flags::new("dispatch route");
+    f.string(
+        "tier",
+        "",
+        "auto (the default with a classifier, else normal) or a tier: easy|normal|hard",
+    )
+    .string("provider", "", "restrict to a provider")
+    .string("model", "", "restrict to a model")
+    .string("effort", "", "restrict to an effort: low|medium|high|xhigh")
+    .string("agent", "", "restrict to an agent")
+    .string("priority", "", "speed|balanced|quality")
+    .bool(
+        "relax",
+        false,
+        "fall back to tier routing when filters match nothing",
+    )
+    .bool("readonly", false, "require read-only capability")
+    .string(
+        "role",
+        "",
+        "role to route as; none routes with no role and no pick",
+    )
+    .string("dir", "", "repository (default: current directory)")
+    .string(
+        "card",
+        "",
+        "Work card whose component prices the candidates",
+    )
+    .string("project", "", PROJECT_USAGE)
+    .bool("json", false, "print the full report as JSON");
+    let positional = f.parse_interspersed(args)?;
+    let dir = working_dir(&f.str("dir"))?;
+    let (c, project) = dial_workspace(db_path, &f.str("project")).await?;
+    let res = c
+        .dispatch
+        .route(&pb::RouteRequest {
+            tier: f.str("tier"),
+            provider: f.str("provider"),
+            model: f.str("model"),
+            effort: f.str("effort"),
+            agent: f.str("agent"),
+            priority: f.str("priority"),
+            relax: f.flag("relax"),
+            read_only: f.flag("readonly"),
+            dir,
+            profile: f.str("role"),
+            prompt: positional.join(" ").trim().to_owned(),
+            project_id: project,
+            card_slug: f.str("card"),
+        })
+        .await
+        .map_err(run_error)?;
+    if f.flag("json") {
+        return print_op(res.ok, &res.json);
+    }
+    let report: Value = serde_json::from_str(&res.json)?;
+    let text = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_owned();
+    let strings = |k: &str| -> Vec<String> {
+        report
+            .get(k)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect()
+    };
+    let Some(winner) = report.get("winner").filter(|w| !w.is_null()) else {
+        println!("{}", text(&report, "reason"));
+        for e in strings("eliminated") {
+            println!("  - {e}");
+        }
+        return Err(Fail::Exit(1));
+    };
+    println!(
+        "winner: {}/{} effort={} priority={}",
+        text(winner, "Agent"),
+        text(winner, "Model"),
+        or_unknown(&text(winner, "Effort")),
+        text(winner, "Priority")
+    );
+    println!("reason: {}", text(&report, "reason"));
+    if let Some(d) = report.get("difficulty").and_then(Value::as_f64) {
+        print!(
+            "difficulty: d={d:.2} ({}) classifier={}",
+            difficulty_tier(d),
+            text(&report, "classifier")
+        );
+        let probs: Vec<f64> = report
+            .get("probs")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_f64)
+            .collect();
+        if let [e, n, h] = probs.as_slice() {
+            print!(" P(easy)={e:.2} P(normal)={n:.2} P(hard)={h:.2}");
+        }
+        println!();
+    }
+    let pick: Option<RolePick> = report
+        .get("rolePick")
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
+    let line = role_line(&text(&report, "role"), pick.as_ref());
+    if !line.is_empty() {
+        println!("{line}");
+    }
+    for (i, c) in report
+        .get("candidates")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        if let Some(a) = c
+            .get("auto")
+            .and_then(|a| serde_json::from_value::<AutoInfo>(a.clone()).ok())
+        {
+            let mark = if a.qualified { "✓" } else { " " };
+            let eff = a.effective_cost.unwrap_or(0.0);
+            println!(
+                "  {}. {mark} {}/{} effort={} P={:.2} bound={:.2} cost=${:.2} q={:.2} → ${eff:.2}  θ={:.2} {}",
+                i + 1,
+                text(c, "Agent"),
+                text(c, "Model"),
+                or_unknown(&text(c, "Effort")),
+                a.p_pass,
+                a.p_pass_low,
+                eff / a.quota,
+                a.quota,
+                a.theta,
+                a.theta_source
+            );
+            continue;
+        }
+        println!(
+            "  {}. {}/{} score={:.2}  {}",
+            i + 1,
+            text(c, "Agent"),
+            text(c, "Model"),
+            c.get("score").and_then(Value::as_f64).unwrap_or(0.0),
+            text(c, "reason")
+        );
+    }
+    for e in strings("eliminated") {
+        println!("  eliminated: {e}");
+    }
+    let note = text(&report, "note");
+    if !note.is_empty() {
+        println!("note: {note}");
+    }
+    Ok(())
+}
+
+pub(super) async fn classify(db_path: &Path, args: &[String]) -> CliResult {
+    let mut f = Flags::new("dispatch classify");
+    f.string(
+        "dir",
+        "",
+        "repository whose policy picks the classifier (default: current directory)",
+    )
+    .string(
+        "card",
+        "",
+        "Work card the task names: the classifier reads it before the prompt",
+    )
+    .string(
+        "project",
+        "",
+        "workspace id for --card (default: the workspace holding the cwd)",
+    )
+    .bool("json", false, "print JSON");
+    let positional = f.parse_interspersed(args)?;
+    let prompt = positional.join(" ").trim().to_owned();
+    if prompt.is_empty() {
+        return Err(usage_err("dispatch classify needs a prompt"));
+    }
+    let dir = working_dir(&f.str("dir"))?;
+    let card = f.str("card");
+    let (c, project) = if card.is_empty() {
+        (dial_workspace(db_path, "").await?.0, String::new())
+    } else {
+        dial_workspace(db_path, &f.str("project")).await?
+    };
+    let res = c
+        .dispatch
+        .classify(&pb::ClassifyRequest {
+            prompt,
+            dir,
+            project_id: project,
+            card_slug: card,
+            ..Default::default()
+        })
+        .await
+        .map_err(run_error)?;
+    if f.flag("json") {
+        return print_op(res.ok, &res.json);
+    }
+    let body: Value = serde_json::from_str(&res.json)?;
+    if let Some(d) = body.get("difficulty").filter(|d| !d.is_null()) {
+        let text = |k: &str| d.get(k).and_then(Value::as_str).unwrap_or("").to_owned();
+        print!(
+            "tier={} d={:.2} classifier={}",
+            text("tier"),
+            d.get("d").and_then(Value::as_f64).unwrap_or(0.0),
+            text("provider")
+        );
+        let model = text("model");
+        if !model.is_empty() {
+            print!(" model={model}");
+        }
+        println!(
+            " latency={}ms",
+            d.get("latencyMs").and_then(Value::as_i64).unwrap_or(0)
+        );
+        let probs: Vec<f64> = d
+            .get("probs")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_f64)
+            .collect();
+        if let [e, n, h] = probs.as_slice() {
+            println!("  P(easy)={e:.2} P(normal)={n:.2} P(hard)={h:.2}");
+        }
+        if let Some(conf) = d.get("confidence").and_then(Value::as_f64) {
+            println!("  confidence={conf:.2}");
+        }
+    }
+    if let Some(s) = body.get("role").filter(|r| !r.is_null()) {
+        if s.get("unsupported").and_then(Value::as_bool) == Some(true) {
+            println!("role=general (this classifier does not pick one)");
+        } else {
+            let probs: BTreeMap<String, f64> = s
+                .get("probs")
+                .and_then(|p| serde_json::from_value(p.clone()).ok())
+                .unwrap_or_default();
+            let pick = RolePick {
+                auto: true,
+                role: s.get("role").and_then(Value::as_str).unwrap_or("").into(),
+                probs,
+                ..RolePick::default()
+            };
+            println!("{}", role_line("", Some(&pick)));
+        }
+    }
+    Ok(())
+}
+
+/// Names a route's role: the classifier's pick with its probabilities,
+/// highest first, or the one the request named.
+fn role_line(profile: &str, pick: Option<&RolePick>) -> String {
+    let Some(pick) = pick.filter(|p| p.auto) else {
+        return if profile.is_empty() {
+            String::new()
+        } else {
+            format!("role={profile}")
+        };
+    };
+    let mut line = format!("role={} (picked)", pick.role);
+    let mut names: Vec<(&String, f64)> = pick.probs.iter().map(|(k, v)| (k, *v)).collect();
+    names.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    for (name, p) in names {
+        line += &format!(" P({name})={p:.2}");
+    }
+    line
+}
+
+/// Prints the catalog the auto route prices models with, refreshes its prices
+/// from models.dev, or prints the installed models' benchmarks.
+pub(super) async fn models(db_path: &Path, args: &[String]) -> CliResult {
+    let mut f = Flags::new("models");
+    f.bool("json", false, "print JSON");
+    let positional = f.parse_interspersed(args)?;
+    let sub = match positional.as_slice() {
+        [] => "",
+        [s] if s == "refresh" || s == "bench" => s.as_str(),
+        _ => {
+            return Err(usage_err(
+                "usage: dispatch models [--json] | refresh | bench [--json]",
+            ));
+        }
+    };
+    let (c, _) = dial_workspace(db_path, "").await?;
+    let as_json = f.flag("json");
+    match sub {
+        "bench" => {
+            let res = c
+                .dispatch
+                .list_model_benchmarks(&pb::ListModelBenchmarksRequest {})
+                .await
+                .map_err(run_error)?;
+            if as_json || !res.ok {
+                return print_op(res.ok, &res.json);
+            }
+            print_benchmarks(&serde_json::from_str(&res.json)?);
+            Ok(())
+        }
+        "refresh" => {
+            let res = c
+                .dispatch
+                .refresh_model_catalog(&pb::RefreshModelCatalogRequest {})
+                .await
+                .map_err(run_error)?;
+            if as_json || !res.ok {
+                return print_op(res.ok, &res.json);
+            }
+            let body: Value = serde_json::from_str(&res.json)?;
+            println!(
+                "refreshed {} model prices from {}",
+                body.get("models").and_then(Value::as_i64).unwrap_or(0),
+                body.get("source").and_then(Value::as_str).unwrap_or("")
+            );
+            Ok(())
+        }
+        _ => {
+            let res = c
+                .dispatch
+                .list_model_catalog(&pb::ListModelCatalogRequest {})
+                .await
+                .map_err(run_error)?;
+            if as_json {
+                return print_op(res.ok, &res.json);
+            }
+            let report: CatalogReport = serde_json::from_str(&res.json)?;
+            print!(
+                "catalog {}: {} models, {} CursorBench scores, {} ECI scores",
+                report.generated, report.models, report.scores, report.eci
+            );
+            if !report.prices_fetched.is_empty() {
+                print!("; prices refreshed {}", report.prices_fetched);
+            }
+            println!();
+            for e in &report.entries {
+                let est = &e.estimate;
+                let cost = est.cost_per_task.map_or_else(
+                    || "price unknown".to_owned(),
+                    |c| format!("${c:.2}/task ({})", est.cost_source),
+                );
+                let mut theta = format!("θ={:.2} {}", est.theta, est.theta_source);
+                if let Some(score) = est.score {
+                    theta += &format!(" {}", catalog_score(&est.theta_source, score));
+                }
+                let pass: Vec<String> = e
+                    .bands
+                    .iter()
+                    .map(|b| format!("{} {:.2}≥{:.2}", b.tier, b.p_pass, b.low))
+                    .collect();
+                let tier = if e.tier.is_empty() { "found" } else { &e.tier };
+                println!(
+                    "  {tier:<6} {}/{} effort={}  {theta}  {cost}  P(pass): {}",
+                    e.agent,
+                    e.model,
+                    or_unknown(&e.effort),
+                    pass.join(" ")
+                );
+            }
+            for s in &report.sources {
+                println!("source: {} ({}): {}", s.name, s.license, s.fields);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The benchmark figure θ comes from, as the benchmark reports it.
+fn catalog_score(source: &str, score: f64) -> String {
+    if source.starts_with("eci") {
+        format!("(ECI {score:.0})")
+    } else {
+        format!("(CursorBench {:.0}%)", score * 100.0)
+    }
+}
+
+/// Prints each installed model's figures as the benchmarks publish them,
+/// then where they come from.
+fn print_benchmarks(report: &BenchmarkReport) {
+    if report.models.is_empty() {
+        println!("no installed agent CLI reported models");
+        return;
+    }
+    for m in &report.models {
+        let levels: Vec<String> = m
+            .cursor_bench
+            .iter()
+            .map(|l| {
+                let level = format!("{:.0}%", l.score * 100.0);
+                if l.effort.is_empty() {
+                    level
+                } else {
+                    format!("{} {level}", l.effort)
+                }
+            })
+            .collect();
+        let mut bench = "unmeasured".to_owned();
+        if !levels.is_empty() {
+            bench = levels.join(", ");
+            if !m.cursor_bench_as.is_empty() {
+                bench += &format!(" (as {})", m.cursor_bench_as);
+            }
+        }
+        let mut eci = "unmeasured".to_owned();
+        if let Some(v) = m.eci {
+            eci = format!("{v:.0}");
+            if !m.eci_as.is_empty() {
+                eci += &format!(" (as {})", m.eci_as);
+            }
+        }
+        println!(
+            "{:<8}  {:<28}  cursorbench={bench}  eci={eci}",
+            m.agent, m.model
+        );
+    }
+    print!("catalog {}", report.generated);
+    for src in &report.sources {
+        print!("; {} {}", src.name, src.url);
+    }
+    println!();
+}
+
+pub(super) async fn config(db_path: &Path, args: &[String]) -> CliResult {
+    let usage = || {
+        usage_err(
+            "usage: dispatch config get [key] | set priority|discover|classifier|classifier_model <value> | allow|deny add|rm providers|models|agents <value>... [--project] | key set|clear jev|openai",
+        )
+    };
+    let mut f = Flags::new("dispatch config");
+    f.bool("project", false, "read/write <repo>/.dispatch/config.json")
+        .string("dir", "", "repository (default: current directory)");
+    let positional = f.parse_interspersed(args)?;
+    if positional.is_empty() {
+        return Err(usage());
+    }
+    let mut req = pb::ConfigRequest {
+        project: f.flag("project"),
+        dir: working_dir(&f.str("dir"))?,
+        ..Default::default()
+    };
+    match positional[0].as_str() {
+        "get" => {
+            req.action = "get".into();
+            if let Some(key) = positional.get(1) {
+                req.key = key.clone();
+            }
+        }
+        "set" => {
+            if positional.len() != 3 {
+                return Err(usage());
+            }
+            req.action = "set".into();
+            req.key = positional[1].clone();
+            req.values = positional[2..].to_vec();
+        }
+        list @ ("allow" | "deny") => {
+            if positional.len() < 4 || (positional[1] != "add" && positional[1] != "rm") {
+                return Err(usage());
+            }
+            req.action = format!("{list}-{}", positional[1]);
+            req.key = positional[2].clone();
+            req.values = positional[3..].to_vec();
+        }
+        "key" => {
+            // The key never goes in the arguments, where the shell history and ps would keep it.
+            if positional.len() != 3 || (positional[1] != "set" && positional[1] != "clear") {
+                return Err(usage());
+            }
+            req.action = format!("key-{}", positional[1]);
+            req.key = positional[2].clone();
+            if positional[1] == "set" {
+                if super::stdin_is_terminal() {
+                    eprint!("Paste the key, then press Return: ");
+                }
+                let mut line = String::new();
+                let read = std::io::stdin().lock().read_line(&mut line);
+                if read.is_err() && line.is_empty() || line.is_empty() {
+                    return Err(usage_err("no key on stdin"));
+                }
+                req.values = vec![line.trim().to_owned()];
+            }
+        }
+        _ => return Err(usage()),
+    }
+    let (c, _) = dial_workspace(db_path, "").await?;
+    let res = c.dispatch.config(&req).await.map_err(run_error)?;
+    print_op(res.ok, &res.json)
+}
+
+pub(super) async fn doctor(db_path: &Path, args: &[String]) -> CliResult {
+    let mut f = Flags::new("dispatch doctor");
+    f.bool("json", false, "print JSON");
+    if !f.parse_interspersed(args)?.is_empty() {
+        return Err(usage_err(OPS_USAGE));
+    }
+    let reports = tokio::time::timeout(Duration::from_secs(30), adapters::probe::doctor()).await;
+    let mut reports = reports.unwrap_or_default();
+
+    let mut table_problems = Vec::new();
+    if let Ok((c, _)) = dial_workspace(db_path, "").await {
+        match c.dispatch.list_tiers(&pb::ListTiersRequest {}).await {
+            Err(e) => table_problems = vec![e.to_string()],
+            Ok(res) => {
+                let rows: Vec<Tier> = res
+                    .tiers
+                    .iter()
+                    .map(|t| Tier {
+                        name: t.name.clone(),
+                        provider: t.provider.clone(),
+                        agent: t.agent.clone(),
+                        model: t.model.clone(),
+                        speed: i64::from(t.speed),
+                        strength: i64::from(t.strength),
+                        position: i64::from(t.position),
+                    })
+                    .collect();
+                table_problems = table_from_rows(&rows).capability_problems(&known_adapters());
+            }
+        }
+    }
+    if !table_problems.is_empty() {
+        for r in &mut reports {
+            r.status = "DEGRADED".into();
+            r.notes.extend(table_problems.iter().cloned());
+        }
+    }
+    if f.flag("json") {
+        write_json(&reports)?;
+        return Ok(());
+    }
+    if reports.is_empty() {
+        println!("no installed agent CLIs");
+        return Ok(());
+    }
+    for r in &reports {
+        println!("{:<12} {:<14} {}", r.name, or_unknown(&r.version), r.status);
+        let have: Vec<&str> = r
+            .flags
+            .iter()
+            .filter(|f| f.present)
+            .map(|f| f.name.as_str())
+            .collect();
+        let miss: Vec<&str> = r
+            .flags
+            .iter()
+            .filter(|f| !f.present)
+            .map(|f| f.name.as_str())
+            .collect();
+        if !have.is_empty() {
+            println!("  flags: {}", have.join(" "));
+        }
+        if !miss.is_empty() {
+            println!("  missing: {}", miss.join(" "));
+        }
+        for n in &r.notes {
+            println!("  note: {}", sandbox::redact(n));
+        }
+    }
+    Ok(())
+}
+
+pub(super) async fn merge(db_path: &Path, args: &[String]) -> CliResult {
+    let mut f = Flags::new("dispatch merge");
+    let id = single_run_id(&mut f, args, "merge")?;
+    let (c, _) = dial_workspace(db_path, "").await?;
+    let res = c
+        .dispatch
+        .merge_run(&pb::MergeRunRequest {
+            id,
+            ..Default::default()
+        })
+        .await
+        .map_err(run_error)?;
+    print_op(res.ok, &res.json)
+}
+
+pub(super) async fn clean(db_path: &Path, args: &[String]) -> CliResult {
+    let mut f = Flags::new("dispatch clean");
+    f.bool("force", false, "discard even if the branch is not merged");
+    let id = single_run_id(&mut f, args, "clean")?;
+    let (c, _) = dial_workspace(db_path, "").await?;
+    let res = c
+        .dispatch
+        .clean_run(&pb::CleanRunRequest {
+            id,
+            force: f.flag("force"),
+        })
+        .await
+        .map_err(run_error)?;
+    print_op(res.ok, &res.json)
+}
+
+pub(super) async fn recover(db_path: &Path, args: &[String]) -> CliResult {
+    let mut f = Flags::new("dispatch recover");
+    let id = single_run_id(&mut f, args, "recover")?;
+    let (c, _) = dial_workspace(db_path, "").await?;
+    let res = c
+        .dispatch
+        .recover_run(&pb::RecoverRunRequest { id })
+        .await
+        .map_err(run_error)?;
+    print_op(res.ok, &res.json)
+}
+
+pub(super) async fn roles(db_path: &Path, args: &[String]) -> CliResult {
+    let mut f = Flags::new("dispatch roles");
+    f.bool(
+        "check",
+        false,
+        "validate roles against known and installed agents",
+    )
+    .string("dir", "", "repository (default: current directory)")
+    .string(
+        "tier",
+        "",
+        "save: the lowest tier it runs at, easy|normal|hard",
+    )
+    .bool("readonly", false, "save: the run may not change files")
+    .string("instructions", "", "save: the prompt put before the task")
+    .string("prefer", "", "save: agents to prefer, comma separated")
+    .string("avoid", "", "save: agents to avoid, comma separated")
+    .string("timeout", "", "save: how long a run may take, e.g. 15m")
+    .string(
+        "when",
+        "",
+        "save: the tasks it fits, read by the classifier that picks a role",
+    )
+    .bool(
+        "manual",
+        false,
+        "save: only --role gives it; the classifier never picks it",
+    )
+    .string(
+        "easy",
+        "",
+        "save: its easy models in order, agent/model, comma separated; empty uses the tier table",
+    )
+    .string(
+        "normal",
+        "",
+        "save: its normal models in order, agent/model, comma separated; empty uses the tier table",
+    )
+    .string(
+        "hard",
+        "",
+        "save: its hard models in order, agent/model, comma separated; empty uses the tier table",
+    );
+    let positional = f.parse_interspersed(args)?;
+    let check = f.flag("check");
+    let mut action = "list".to_owned();
+    let mut req = pb::SubagentsRequest::default();
+    match positional.as_slice() {
+        [verb, name] if (verb == "save" || verb == "remove") && !check => {
+            action.clone_from(verb);
+            req.name = name.clone();
+            if verb == "save" {
+                let mut entries = Vec::new();
+                for t in ["easy", "normal", "hard"] {
+                    entries.extend(parse_role_models(t, &f.str(t))?);
+                }
+                let profile = Profile {
+                    tier: f.str("tier"),
+                    read_only: f.flag("readonly"),
+                    instructions: f.str("instructions"),
+                    when: f.str("when"),
+                    tiers: entries,
+                    manual: f.flag("manual"),
+                    prefer: split_list(&f.str("prefer")),
+                    avoid: split_list(&f.str("avoid")),
+                    timeout: f.str("timeout"),
+                    ..Profile::default()
+                };
+                req.profile = serde_json::to_string(&profile)?;
+            }
+        }
+        [] => {
+            if check {
+                action = "check".into();
+            }
+        }
+        _ => return Err(usage_err(OPS_USAGE)),
+    }
+    let wd = working_dir(&f.str("dir"))?;
+    let (c, _) = dial_workspace(db_path, "").await?;
+    req.action = action.clone();
+    req.dir = wd;
+    let res = c.dispatch.subagents(&req).await.map_err(run_error)?;
+    if action == "check" {
+        let body: Value = serde_json::from_str(&res.json)?;
+        let problems: Vec<String> = body
+            .get("problems")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect();
+        if problems.is_empty() {
+            println!(
+                "ok: {} role(s)",
+                body.get("roles").and_then(Value::as_i64).unwrap_or(0)
+            );
+            return Ok(());
+        }
+        for p in &problems {
+            println!("! {p}");
+        }
+        return Err(Fail::Exit(1));
+    }
+    print_op(res.ok, &res.json)
+}
+
+/// Reads one tier's agent/model entries, comma separated, in order.
+fn parse_role_models(tier: &str, list: &str) -> Result<Vec<RoleEntry>, Fail> {
+    let mut out = Vec::new();
+    for item in split_list(list) {
+        match item.split_once('/') {
+            Some((agent, model)) if !agent.is_empty() && !model.is_empty() => out.push(RoleEntry {
+                tier: tier.into(),
+                agent: agent.into(),
+                model: model.into(),
+                ..RoleEntry::default()
+            }),
+            _ => {
+                return Err(usage_err(format!("--{tier}: {item:?} is not agent/model")));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Reads a comma-separated flag; empty is none.
+fn split_list(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+// --- on / off / hook / skill / setup / update (local, no core) ---
+
+fn executable() -> Result<String, Error> {
+    Ok(crate::runstate::command_binary()?
+        .to_string_lossy()
+        .into_owned())
+}
+
+fn home() -> Result<std::path::PathBuf, Error> {
+    dirs::home_dir().ok_or_else(|| Error::Message("$HOME is not defined".into()))
+}
+
+pub(super) fn on(db_path: &Path) -> CliResult {
+    let exe = executable()?;
+    hook::set_enabled(&state_dir(db_path), true)?;
+    let settings = hook::settings_path(Path::new(""));
+    hook::install(&settings, &exe)?;
+    println!(
+        "dispatch on: SessionStart hook registered in {}",
+        settings.display()
+    );
+    Ok(())
+}
+
+pub(super) fn off(db_path: &Path) -> CliResult {
+    hook::set_enabled(&state_dir(db_path), false)?;
+    let settings = hook::settings_path(Path::new(""));
+    hook::uninstall(&settings)?;
+    println!(
+        "dispatch off: SessionStart hook removed from {}",
+        settings.display()
+    );
+    Ok(())
+}
+
+/// The SessionStart hook target. It prints one line of context while
+/// dispatch is on and nothing otherwise, so a stale hook is harmless.
+pub(super) fn hook(db_path: &Path) -> CliResult {
+    let recorded = caller::record_hook_stdin();
+    if hook::is_enabled(&state_dir(db_path)) {
+        print!("{}", hook::context_block());
+    }
+    recorded.map_err(Fail::from)
+}
+
+pub(super) fn skill(args: &[String]) -> CliResult {
+    let usage =
+        || usage_err("usage: dispatch skill install [--agent <name>] [--force] | show | refresh");
+    let Some(sub) = args.first() else {
+        return Err(usage());
+    };
+    let home = home()?;
+    let targets = skill::targets(&home);
+    match sub.as_str() {
+        "show" => {
+            print!("{}", String::from_utf8_lossy(skill::CONTENT));
+            Ok(())
+        }
+        "refresh" => {
+            let r = skill::refresh(&home);
+            let paths = match &r {
+                Ok(p) => p.clone(),
+                Err(_) => Vec::new(),
+            };
+            for p in &paths {
+                println!("refreshed {}", p.display());
+            }
+            if r.is_ok() && paths.is_empty() {
+                println!("no installed dispatch skill to refresh");
+            }
+            r.map(|_| ()).map_err(Fail::from)
+        }
+        "install" => {
+            let mut f = Flags::new("dispatch skill install");
+            f.string(
+                "agent",
+                "",
+                "install for one agent (claude|cursor|codex|grok|antigravity); default all",
+            )
+            .bool("force", false, "overwrite an existing skill");
+            f.parse(&args[1..])?;
+            let agent = f.str("agent");
+            let names: Vec<&String> = targets
+                .keys()
+                .filter(|name| agent.is_empty() || **name == agent)
+                .collect();
+            if names.is_empty() {
+                return Err(usage_err(format!("unknown agent {agent:?}")));
+            }
+            let mut seen = std::collections::HashSet::new();
+            for name in names {
+                let dir = &targets[name].dir;
+                if !seen.insert(dir.clone()) {
+                    continue;
+                }
+                match skill::install(dir, f.flag("force")) {
+                    Ok(path) => println!("installed {}", path.display()),
+                    Err(e) => eprintln!("skip {name}: {e}"),
+                }
+            }
+            Ok(())
+        }
+        _ => Err(usage()),
+    }
+}
+
+/// Reports how the agent CLIs reach dispatch, or changes one part of it: link
+/// points ~/.local/bin/dispatch at this binary, skill installs the current
+/// skill (for one agent or all), hook switches the Claude Code SessionStart
+/// hook, and opencode installs or removes the Dispatch plugin in OpenCode or
+/// switches its delegation. The app's Settings › Agents does the same.
+pub(super) fn setup(db_path: &Path, args: &[String]) -> CliResult {
+    let home = home()?;
+    let binary = crate::runstate::command_binary()?
+        .to_string_lossy()
+        .into_owned();
+    let state = state_dir(db_path);
+    let action = args.first().map_or("", String::as_str);
+    match action {
+        "" | "--json" => {}
+        "link" => {
+            let path = setup::link_cli(&home, &binary)?;
+            println!("linked {} -> {binary}", path.display());
+        }
+        "skill" => {
+            let agent = args.get(1).map_or("", String::as_str);
+            let r = setup::install_skill(&home, agent);
+            if let Ok(paths) = &r {
+                for p in paths {
+                    println!("installed {}", p.display());
+                }
+            }
+            r?;
+        }
+        "hook" => {
+            let on = match args.get(1).map(String::as_str) {
+                Some("on") => true,
+                Some("off") => false,
+                _ => return Err(usage_err("usage: dispatch setup hook on|off")),
+            };
+            setup::set_hook(&home, &binary, &state, on)?;
+            println!("hook {}", args[1]);
+        }
+        "opencode" => match args.get(1).map_or("", String::as_str) {
+            "" => {
+                let path = setup::install_opencode_plugin(
+                    &home,
+                    &setup::opencode_binary(&home, &binary),
+                    &state,
+                )?;
+                println!(
+                    "installed {} and loaded it from {}",
+                    path.display(),
+                    setup::opencode_config_path(&home).display()
+                );
+            }
+            "--remove" => {
+                setup::remove_opencode_plugin(&home, &state)?;
+                println!(
+                    "removed the Dispatch plugin from {}",
+                    setup::opencode_config_path(&home).display()
+                );
+            }
+            sub @ ("on" | "off") => {
+                setup::set_opencode_delegation(&state, sub == "on")?;
+                println!("OpenCode delegation through dispatch {sub}");
+            }
+            _ => {
+                return Err(usage_err(
+                    "usage: dispatch setup opencode [--remove | on | off]",
+                ));
+            }
+        },
+        _ => {
+            return Err(usage_err(
+                "usage: dispatch setup [--json] | link | skill [<agent>] | hook on|off | opencode [--remove | on | off]",
+            ));
+        }
+    }
+    let report = setup::read(&home, &binary, &state);
+    if action == "--json" {
+        super::write_json_compact(&report, true)?;
+    } else if action.is_empty() {
+        print_setup(&report);
+    }
+    Ok(())
+}
+
+fn print_setup(r: &setup::Report) {
+    let cli = match r.cli.state.as_str() {
+        setup::LINKED => "linked to this binary".to_owned(),
+        setup::OTHER => format!("another copy ({})", r.cli.target),
+        setup::MISSING => "not installed".to_owned(),
+        _ => String::new(),
+    };
+    println!("command  {}: {cli}", r.cli.path);
+    for s in &r.skills {
+        println!("skill    {:<12} {}  {}", s.agent, s.state, s.path);
+    }
+    let mut hook_state = "off".to_owned();
+    if r.hook.on {
+        hook_state = "on".into();
+        if !r.hook.current {
+            hook_state += &format!(" (runs {})", r.hook.command);
+        }
+    }
+    println!("hook     Claude Code SessionStart: {hook_state}");
+    let mut plugin = match r.opencode.state.as_str() {
+        setup::CURRENT => "current",
+        setup::OUTDATED => "outdated",
+        setup::MISSING => "not installed",
+        _ => "",
+    }
+    .to_owned();
+    if r.opencode.state != setup::MISSING {
+        plugin += if r.opencode.on {
+            ", delegation on"
+        } else {
+            ", delegation off"
+        };
+    }
+    println!("plugin   OpenCode {plugin}  {}", r.opencode.path);
+}
+
+/// Explains where updates come from: dispatch ships inside the Polterware
+/// Dispatch app, so it has no updater of its own.
+pub(super) fn update(args: &[String]) -> CliResult {
+    let mut f = Flags::new("dispatch update");
+    f.bool("check", false, "report only");
+    f.parse(args)?;
+    println!("dispatch ships inside Dispatch and has no updater of its own.");
+    println!(
+        "Update Dispatch (Dispatch › Check for Updates…, or its daily check), then run `dispatch skill refresh`."
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn role_line_orders_by_probability() {
+        let pick = RolePick {
+            auto: true,
+            role: "tester".into(),
+            probs: BTreeMap::from([("general".into(), 0.2), ("tester".into(), 0.7)]),
+            ..RolePick::default()
+        };
+        assert_eq!(
+            role_line("", Some(&pick)),
+            "role=tester (picked) P(tester)=0.70 P(general)=0.20"
+        );
+        assert_eq!(role_line("reviewer", None), "role=reviewer");
+        assert_eq!(role_line("", None), "");
+    }
+
+    #[test]
+    fn role_models_need_agent_and_model() {
+        let got = parse_role_models("easy", "codex/gpt-5, claude/haiku").unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[1].agent, "claude");
+        assert!(parse_role_models("hard", "codex").is_err());
+    }
+}

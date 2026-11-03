@@ -1,6 +1,4 @@
 //! Git worktrees for write runs: create, inspect, merge, clean.
-//!
-//! Ported from `dispatch/backend/providers/worktree`.
 
 mod git;
 mod merge;

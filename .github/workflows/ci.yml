@@ -13,18 +13,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  go:
-    runs-on: macos-26
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go-core/go.mod
-      - run: go vet ./go-core/...
-      - run: go test ./go-core/... -count=1
-      - run: bash tooling/check-boundaries.sh
-      - run: bash tooling/sync-opencode-plugin.sh --check
-
   rust:
     runs-on: macos-26
     steps:
@@ -38,3 +26,5 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets
       - run: cargo test --workspace
+      - run: node --test crates/dispatch-core/src/setup/opencode/
+      - run: bash tooling/check-boundaries.sh

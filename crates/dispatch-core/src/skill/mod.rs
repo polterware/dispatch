@@ -1,6 +1,4 @@
 //! Installs the dispatch skill into each agent's skills dir.
-//!
-//! Ported from `dispatch/backend/providers/skill`.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;

@@ -11,6 +11,24 @@ pub fn executable() -> Result<PathBuf, Error> {
     Ok(std::fs::canonicalize(&exe).unwrap_or(exe))
 }
 
+/// The `dispatch` command agents run: this binary, or, inside Dispatch.app,
+/// the `Contents/Resources/dispatch` link to it, the path the command, the
+/// skill, and the hook have always pointed at.
+pub fn command_binary() -> Result<PathBuf, Error> {
+    let exe = executable()?;
+    if let Some(contents) = exe
+        .parent()
+        .filter(|d| d.ends_with("Contents/MacOS"))
+        .and_then(Path::parent)
+    {
+        let link = contents.join("Resources").join("dispatch");
+        if std::fs::canonicalize(&link).is_ok_and(|t| t == exe) {
+            return Ok(link);
+        }
+    }
+    Ok(exe)
+}
+
 /// Identifies a binary by modification time and size (`"<unix seconds>-<bytes>"`).
 pub fn build_id(exe: impl AsRef<Path>) -> String {
     let Ok(info) = std::fs::metadata(exe.as_ref()) else {

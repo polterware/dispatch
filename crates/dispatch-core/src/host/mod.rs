@@ -1,6 +1,4 @@
 //! The Polterware DispatchHostService client.
-//!
-//! Ported from `dispatch/backend/providers/polterware`.
 
 mod client;
 mod types;

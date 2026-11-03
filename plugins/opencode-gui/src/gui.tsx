@@ -2,8 +2,8 @@
 // Settings › Dispatch, the palette, and /dispatch), and the conversation's runs
 // in a side panel with each agent's bot, opened from the composer pill; a run
 // opens in the Dispatch app.
-// `pnpm --filter @polterware/dispatch-opencode build` writes it to
-// dispatch/backend/providers/setup/opencode/gui-experimental.cjs, which the
+// `pnpm --dir plugins/opencode-gui build` writes it to
+// crates/dispatch-core/src/setup/opencode/gui-experimental.cjs, which the
 // dispatch binary embeds and `dispatch setup opencode` installs.
 import { Command, ComposerPill, MenuItem, Panel, Plugin, SettingsPage, Style } from "@opencode/plugin/gui";
 import { For, Show, createSignal } from "solid-js";

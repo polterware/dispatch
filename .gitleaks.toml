@@ -5,7 +5,6 @@ useDefault = true
 [[allowlists]]
 description = "The sandbox redactor's fake secrets and the message ids of recorded Claude streams."
 paths = [
-  '''go-core/providers/sandbox/sandbox_test\.go''',
   '''crates/dispatch-core/tests/adapters_sandbox\.rs''',
-  '''(go-core/providers/adapters/testdata|crates/dispatch-core/tests/fixtures/adapters)/.*\.ndjson''',
+  '''crates/dispatch-core/tests/fixtures/adapters/.*\.ndjson''',
 ]

@@ -253,12 +253,20 @@ pub async fn run(
         token,
         LiveLog::open(&req.log_path),
         matches!(name, "claude" | "pi").then_some(name),
+        req.started.as_ref(),
     )
     .await;
     if let Some(timer) = timer {
         timer.abort();
     }
-    let output = output?;
+    let output = output.map_err(|err| match err {
+        Error::Message(m)
+            if m == "context canceled" && !cancel.is_cancelled() && !req.timeout.is_zero() =>
+        {
+            Error::Message("context deadline exceeded".into())
+        }
+        other => other,
+    })?;
     if !output.fatal.is_empty() {
         return Err(Error::Message(format!(
             "{name}: stopped early: {}",

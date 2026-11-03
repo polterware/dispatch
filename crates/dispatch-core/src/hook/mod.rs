@@ -1,7 +1,5 @@
 //! The Claude Code SessionStart hook that points agents at the dispatch skill,
 //! and the enabled flag.
-//!
-//! Ported from `dispatch/backend/providers/hook`.
 
 pub(crate) mod gojson;
 

@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/dispatch.v1.rs"));
@@ -32,6 +32,7 @@ pub mod tiers_build;
 
 pub mod adapters;
 pub mod classifier;
+pub mod cli;
 pub mod coreclient;
 pub mod hook;
 pub mod host;
@@ -40,6 +41,7 @@ pub mod reports;
 pub mod runner;
 pub mod runstate;
 pub mod sandbox;
+pub mod server;
 pub mod setup;
 pub mod skill;
 pub mod store;

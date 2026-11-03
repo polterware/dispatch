@@ -56,3 +56,18 @@ pub fn new_difficulty(probs: Option<[f64; 3]>, tier: &str) -> Result<Difficulty,
         })
     }
 }
+
+/// The one rubric every classifier asks, written in general terms and
+/// measured on the router's golden prompts.
+pub const DIFFICULTY_QUESTION: &str =
+    "How hard is this coding task for an AI coding agent working in the project's repository?";
+
+pub const DIFFICULTY_LEVELS: [&str; 3] = [
+    "Easy: trivial and local. A change of a few lines in one place, or a question about existing code. Nothing to design.",
+    "Normal: a contained feature or bug fix. Several files in one part of the system, some tests or investigation, and a clear approach.",
+    "Hard: broad or deep. Spans many parts of the system or needs design decisions, touches security, money, data migration, or concurrency, or the cause of a bug is unknown and hard to reproduce.",
+];
+
+/// What every classifier asks to pick a role.
+pub const ROLE_QUESTION: &str =
+    "Which role fits this coding task best, judged by the kind of work it asks for?";

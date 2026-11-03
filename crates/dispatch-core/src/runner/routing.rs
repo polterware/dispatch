@@ -399,7 +399,8 @@ impl Deps {
             avoid: o.avoid.clone(),
             role_board: Table::default(),
         };
-        let (cs, mut rejected) = router::select_candidates(&self.table, &self.policy, &agents, &ro);
+        let table = self.open_code_table(o, &mut agents).await;
+        let (cs, mut rejected) = router::select_candidates(&table, &self.policy, &agents, &ro);
         let mut out = Vec::with_capacity(cs.len());
         for c in cs {
             let scope = credit_scope(&c.agent, &c.provider, &c.model);
@@ -419,6 +420,72 @@ impl Deps {
             rejected.push("no candidate matches tier/model intersection".into());
         }
         (out, rejected)
+    }
+
+    /// Widens a route restricted to OpenCode with the models it lists. Auto
+    /// weighs all of them. A tier route keeps the tier's OpenCode entries when
+    /// the table has some; otherwise it takes the models `build_tiers` would
+    /// put in the tier, best first.
+    async fn open_code_table(&self, o: &Options, agents: &mut [router::Agent]) -> Table {
+        const OPEN_CODE: &str = crate::reports::OPEN_CODE_AGENT;
+        let mut table = self.table.clone();
+        if o.filters.agent != OPEN_CODE || !o.filters.model.is_empty() {
+            return table;
+        }
+        let Some(a) = self
+            .adapter(OPEN_CODE)
+            .filter(|a| self.is_installed(&a.binary()))
+        else {
+            return table;
+        };
+        let tier = o.tier.as_str();
+        if valid_tier(tier)
+            && table
+                .tiers
+                .get(tier)
+                .is_some_and(|es| es.iter().any(|e| e.agent == OPEN_CODE))
+        {
+            return table;
+        }
+        let Ok(models) = a.models().await else {
+            return table;
+        };
+        if !valid_tier(tier) {
+            // Auto, or no tier: every listed model is weighed, as if discovered.
+            if let Some(agent) = agents.iter_mut().find(|a| a.name == OPEN_CODE) {
+                agent.discovered = models.into_iter().map(|m| m.id).collect();
+            }
+            return table;
+        }
+        let listed: Vec<crate::tiers::Entry> = models
+            .into_iter()
+            .map(|m| crate::tiers::Entry {
+                agent: OPEN_CODE.into(),
+                provider: provider_of(OPEN_CODE, &m.id),
+                model: m.id,
+                ..crate::tiers::Entry::default()
+            })
+            .collect();
+        let pool: Vec<_> = crate::reports::agent_pool(OPEN_CODE, &table, &listed)
+            .into_iter()
+            .filter(|e| {
+                self.policy
+                    .reason(&e.provider, &e.model, &e.agent)
+                    .is_empty()
+            })
+            .collect();
+        let priority = if o.filters.priority.is_empty() {
+            PRIORITY_BALANCED
+        } else {
+            o.filters.priority.as_str()
+        };
+        let built = crate::tiers_build::build_tiers(&pool, &self.catalog(), priority);
+        if let Some(picks) = built.tiers.get(tier) {
+            let rows = table.tiers.entry(tier.into()).or_default();
+            rows.retain(|e| e.agent != OPEN_CODE);
+            rows.extend(picks.iter().map(|b| b.entry.clone()));
+        }
+        table
     }
 
     /// The tier a candidate came from, so measured evidence is not pooled

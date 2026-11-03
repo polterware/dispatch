@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Scores the configured Dispatch classifier on the router's golden prompts: accuracy, the
 // confusion matrix, and log-loss when the classifier gives probabilities. Manual and outside
-// `go test`, because it calls the classifier (a network API or an agent CLI) once per prompt.
+// `cargo test`, because it calls the classifier (a network API or an agent CLI) once per prompt.
 //
 //   node tooling/dispatch-classify-eval.mjs [--bin dispatch] [--limit N] [--concurrency 4]
 //
@@ -13,7 +13,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 const run = promisify(execFile);
-const GOLDEN = join(dirname(fileURLToPath(import.meta.url)), "../go-core/domains/dispatch/testdata/router_golden.json");
+const GOLDEN = join(dirname(fileURLToPath(import.meta.url)), "../crates/dispatch-core/tests/fixtures/router_golden.json");
 const TIERS = ["easy", "normal", "hard"];
 
 function arg(name, fallback) {

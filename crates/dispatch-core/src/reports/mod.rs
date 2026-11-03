@@ -1,6 +1,4 @@
 //! Spend, stats, pace, model benchmarks and reports, the state file, and the OpenCode route.
-//!
-//! Ported from `dispatch/backend/domains/dispatch/{spend,stats,stats_capacity,stats_evidence,pace,pace_history,models_bench,models_report,state_file,opencode_route}.go`.
 
 pub mod models_bench;
 pub mod models_report;

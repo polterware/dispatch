@@ -6,6 +6,7 @@ pub mod claude_limits;
 pub mod cli;
 pub mod codex;
 pub mod failfast;
+pub mod known;
 pub mod livelog;
 pub mod model;
 pub mod probe;
@@ -30,6 +31,17 @@ pub struct Capabilities {
     pub usage: bool,
 }
 
+/// Persists the agent's process group leader before the run waits for it;
+/// an error stops the agent.
+#[derive(Clone)]
+pub struct StartedHook(pub std::sync::Arc<dyn Fn(i64) -> Result<(), crate::Error> + Send + Sync>);
+
+impl std::fmt::Debug for StartedHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StartedHook")
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Request {
     pub effort: String,
@@ -41,6 +53,7 @@ pub struct Request {
     pub resume_session: String,
     pub env: Vec<String>,
     pub log_path: String,
+    pub started: Option<StartedHook>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]

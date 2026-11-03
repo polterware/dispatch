@@ -1,5 +1,3 @@
-//! Ported from runner_routing_test.go.
-
 #[path = "runner_support.rs"]
 mod support;
 

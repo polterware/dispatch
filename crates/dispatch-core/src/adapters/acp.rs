@@ -329,7 +329,7 @@ async fn session_inner(
     log: &mut LiveLog,
     result: &mut RunResult,
 ) -> Result<Vec<String>, Error> {
-    let mut process = RpcProcess::start(command, token, log.clone())?;
+    let mut process = RpcProcess::start(command, token, log.clone(), req.started.as_ref())?;
     result.exit_code = -1;
     let mut offered = Vec::new();
     let mut setup: Vec<(String, Value, bool)> = Vec::new();

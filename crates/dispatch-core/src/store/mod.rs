@@ -1,6 +1,4 @@
 //! The SQLite store: migrations, runs, events, sections, usage, route decisions.
-//!
-//! Ported from `dispatch/backend/providers/sqlite`.
 
 use crate::Error;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};

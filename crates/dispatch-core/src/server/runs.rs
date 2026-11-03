@@ -1,0 +1,1067 @@
+//! DispatchService: runs, their events and output, worktrees, quota, tiers,
+//! agents, and stats.
+
+use super::{
+    Core, RpcError, RpcResult, convert, is_terminal, lock, now_rfc3339,
+    workspace::{HOST_TIMEOUT, expand_path, run_area},
+};
+use crate::{
+    Error,
+    adapters::{
+        Model, known,
+        model::{base_model, provider_of},
+    },
+    proto as pb,
+    reports::{self, stats::StatsOptions},
+    runner::{self, AgentAdapter, Options, dispatch_run_task, empirical_quota, page, summary},
+    tiers::{Entry, Table},
+    types::{
+        self, Agent, Caller, EVENT_FAILED, EVENT_MERGED, EVENT_OUTPUT, EVENT_STARTED, Filters,
+        QuotaSnapshot, Run, RunEvent, STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED,
+        STATUS_ORPHANED, STATUS_PENDING, STATUS_RUNNING, STATUS_TIMED_OUT, Store as _,
+        WORKTREE_ABANDONED, WORKTREE_ACTIVE, WORKTREE_READY, WorktreeInfo,
+    },
+    worktree,
+};
+use chrono::{DateTime, Utc};
+use futures::Stream;
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
+
+const WATCH_TICK: Duration = Duration::from_millis(150);
+
+/// How long a probe of the agent CLIs' usage stays fresh. Each probe runs
+/// every installed CLI's usage command, seconds in all, so Runs, Usage, and
+/// Models share one.
+const AGENT_PROBE_GAP: Duration = Duration::from_secs(60);
+
+pub(crate) fn store_error(e: Error) -> RpcError {
+    if types::is_unknown_run(&e) {
+        RpcError::not_found(e.to_string())
+    } else {
+        RpcError::internal(e)
+    }
+}
+
+fn required(id: &str, what: &str) -> RpcResult<String> {
+    let id = id.trim();
+    if id.is_empty() {
+        return Err(RpcError::invalid(format!("{what} is required")));
+    }
+    Ok(id.into())
+}
+
+pub(crate) fn installed(a: &dyn AgentAdapter) -> bool {
+    which(&a.binary())
+}
+
+/// Whether `bin` resolves to an executable, like exec.LookPath.
+pub(crate) fn which(bin: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let executable = |p: &Path| {
+        std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    };
+    if bin.contains('/') {
+        return executable(Path::new(bin));
+    }
+    std::env::var("PATH")
+        .unwrap_or_default()
+        .split(':')
+        .any(|d| executable(&Path::new(if d.is_empty() { "." } else { d }).join(bin)))
+}
+
+pub(crate) fn same_dir(a: &str, b: &str) -> bool {
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    absolute(a) == absolute(b)
+}
+
+pub(crate) fn absolute(p: &str) -> String {
+    let joined = if p.starts_with('/') {
+        p.to_owned()
+    } else {
+        std::env::current_dir()
+            .map(|d| format!("{}/{p}", d.to_string_lossy()))
+            .unwrap_or_else(|_| p.to_owned())
+    };
+    runner_clean(&joined)
+}
+
+fn runner_clean(p: &str) -> String {
+    let rooted = p.starts_with('/');
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in p.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                if parts.last().is_some_and(|l| *l != "..") {
+                    parts.pop();
+                } else if !rooted {
+                    parts.push("..");
+                }
+            }
+            s => parts.push(s),
+        }
+    }
+    let j = parts.join("/");
+    match (rooted, j.is_empty()) {
+        (true, _) => format!("/{j}"),
+        (false, true) => ".".into(),
+        (false, false) => j,
+    }
+}
+
+pub(crate) fn parse_quota_since(raw: &str, now: DateTime<Utc>) -> RpcResult<Option<DateTime<Utc>>> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return Ok(None);
+    }
+    if let Ok(t) = DateTime::parse_from_rfc3339(s) {
+        return Ok(Some(t.with_timezone(&Utc)));
+    }
+    reports::stats::parse_since(s, now).map_err(|e| RpcError::invalid(e.to_string()))
+}
+
+fn since_text(t: Option<DateTime<Utc>>) -> String {
+    t.map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true))
+        .unwrap_or_default()
+}
+
+/// Saves the run's worktree with the status its run's end gives it.
+pub(crate) fn save_run_worktree(store: &dyn types::Store, run: &Run) -> Result<(), Error> {
+    if run.worktree.is_empty() {
+        return Ok(());
+    }
+    let status = match run.status.as_str() {
+        STATUS_COMPLETED => WORKTREE_READY,
+        STATUS_FAILED | STATUS_CANCELLED | STATUS_TIMED_OUT | STATUS_ORPHANED => WORKTREE_ABANDONED,
+        _ => WORKTREE_ACTIVE,
+    };
+    store.save_worktree(&WorktreeInfo {
+        id: run.id.clone(),
+        project_id: run.project_id.clone(),
+        run_id: run.id.clone(),
+        card_slug: run.card_slug.clone(),
+        path: run.worktree.clone(),
+        branch: run.branch.clone(),
+        base_sha: run.base_sha.clone(),
+        status: status.into(),
+        owner: run.agent.clone(),
+    })
+}
+
+fn event(run: &Run, kind: &str, text: &str) -> RunEvent {
+    RunEvent {
+        run_id: run.id.clone(),
+        project_id: run.project_id.clone(),
+        kind: kind.into(),
+        agent: run.agent.clone(),
+        tier: run.tier.clone(),
+        text: text.into(),
+        at: now_rfc3339(),
+        ..RunEvent::default()
+    }
+}
+
+/// Drops a trailing incomplete UTF-8 sequence so a chunk never splits a
+/// character. Invalid but complete bytes are kept.
+fn complete_char_prefix(b: &[u8]) -> &[u8] {
+    match std::str::from_utf8(b) {
+        Ok(_) => b,
+        Err(e) if e.error_len().is_none() => &b[..e.valid_up_to()],
+        Err(_) => {
+            // An invalid sequence earlier on: only trim an incomplete tail.
+            for n in 1..=3.min(b.len()) {
+                let tail = &b[b.len() - n..];
+                let lead = tail[0];
+                let need = match lead {
+                    0xC0..=0xDF => 2,
+                    0xE0..=0xEF => 3,
+                    0xF0..=0xF7 => 4,
+                    _ => continue,
+                };
+                if need > n {
+                    return &b[..b.len() - n];
+                }
+                break;
+            }
+            b
+        }
+    }
+}
+
+impl Core {
+    pub(crate) async fn list_runs(
+        &self,
+        m: pb::ListRunsRequest,
+    ) -> RpcResult<pb::ListRunsResponse> {
+        let project = m.project_id.trim();
+        let conversation = m.conversation_id.trim();
+        // A conversation may start runs in several workspaces, so it lists across them.
+        if project.is_empty() && conversation.is_empty() {
+            return Err(RpcError::invalid("project id is required"));
+        }
+        let runs = self
+            .store
+            .list_runs(
+                project,
+                i64::from(m.limit),
+                i64::from(m.offset),
+                conversation,
+            )
+            .map_err(RpcError::internal)?;
+        Ok(pb::ListRunsResponse {
+            runs: runs.iter().map(convert::run).collect(),
+        })
+    }
+
+    pub(crate) async fn get_run(&self, m: pb::GetRunRequest) -> RpcResult<pb::GetRunResponse> {
+        let id = required(&m.id, "run id")?;
+        let run = self.store.get_run(&id).map_err(store_error)?;
+        Ok(pb::GetRunResponse {
+            run: Some(convert::run(&run)),
+        })
+    }
+
+    pub(crate) async fn start_run(
+        self: &Arc<Self>,
+        m: pb::StartRunRequest,
+    ) -> RpcResult<pb::StartRunResponse> {
+        let project_id = required(&m.project_id, "project id")?;
+        let tier = m.tier.trim().to_owned();
+        if !tier.is_empty() && tier != runner::TIER_AUTO && !crate::adapters::valid_tier(&tier) {
+            return Err(RpcError::invalid(
+                "tier must be auto, easy, normal, or hard",
+            ));
+        }
+        let prompt = m.prompt.trim().to_owned();
+        if prompt.is_empty() {
+            return Err(RpcError::invalid("prompt is required"));
+        }
+        let ws = self
+            .workspace(&project_id)
+            .await
+            .map_err(|e| RpcError::invalid(e.to_string()))?;
+
+        // The run directory: the request's dir, else (in a Polterware project)
+        // its repository, else the card's component repository, else the
+        // project's only repository; a standalone workspace runs in its folder.
+        let mut dir = expand_path(&m.dir);
+        let req_worktree = m.worktree.trim().to_owned();
+        let no_worktree = !req_worktree.is_empty();
+        if no_worktree {
+            dir = expand_path(&req_worktree);
+        }
+        let card_slug = m.card_slug.trim().to_owned();
+        let hosted = self
+            .host_run(&ws, &card_slug, &m.repo, &dir)
+            .await
+            .map_err(|e| RpcError::invalid(e.to_string()))?;
+        let dir = absolute(&hosted.dir);
+        let deps = self.deps_in(&dir).map_err(RpcError::internal)?;
+
+        let start = self.start_mu.lock().await;
+        let existing = self
+            .store
+            .list_runs(&project_id, 0, 0, "")
+            .map_err(RpcError::internal)?;
+        for r in &existing {
+            if r.status != STATUS_PENDING && r.status != STATUS_RUNNING {
+                continue;
+            }
+            if same_dir(&r.dir, &dir) || (!r.worktree.is_empty() && same_dir(&r.worktree, &dir)) {
+                return Err(RpcError::invalid(format!(
+                    "another dispatch run is already active in {dir}"
+                )));
+            }
+        }
+        let caller = m.caller.unwrap_or_default();
+        let mut opts = Options {
+            caller: Caller {
+                agent: caller.agent,
+                session_id: caller.session_id,
+                conversation_id: caller.conversation_id,
+                label: caller.label,
+            },
+            project_id: project_id.clone(),
+            area: run_area(&hosted),
+            card_slug: card_slug.clone(),
+            card_text: hosted.card_text.clone(),
+            tier,
+            prompt: prompt.clone(),
+            dir: dir.clone(),
+            read_only: m.read_only,
+            no_worktree,
+            timeout: Duration::from_secs(u64::try_from(m.timeout_sec).unwrap_or(0)),
+            filters: Filters {
+                agent: m.agent.trim().into(),
+                provider: m.provider.trim().into(),
+                model: m.model.trim().into(),
+                effort: m.effort.trim().into(),
+                priority: m.priority.trim().into(),
+                relax: m.relax,
+            },
+            ..Options::default()
+        };
+        let profile = m.profile.trim();
+        if !profile.is_empty() {
+            self.apply_profile(&mut opts, profile)
+                .map_err(|e| RpcError::invalid(e.to_string()))?;
+        }
+        let begun = deps.begin(opts).await;
+        drop(start);
+        let mut run = begun.map_err(|e| RpcError::invalid(e.to_string()))?;
+
+        // A delegation is also an audited Run: the agent it launches writes
+        // under this AgentRun, so Activity shows one history for both.
+        if !ws.polterware_project_id.is_empty() {
+            let task = dispatch_run_task(&prompt);
+            let started = tokio::time::timeout(
+                HOST_TIMEOUT,
+                self.host
+                    .start_agent_run(&ws.polterware_project_id, &task, &run.card_slug),
+            )
+            .await;
+            if let Ok(Ok(id)) = started
+                && !id.is_empty()
+            {
+                run.agent_run_id = id;
+                let _ = self.store.save_run(&run);
+            }
+        }
+
+        if !req_worktree.is_empty() {
+            run.worktree.clone_from(&dir);
+            let root = worktree::root(&dir);
+            if !root.is_empty() {
+                run.repo = root;
+                if let Ok(br) = worktree::current_branch(&dir)
+                    && br != "HEAD"
+                {
+                    run.branch = br;
+                }
+                if let Ok(head) = worktree::head(&dir) {
+                    run.base_sha = head;
+                }
+            }
+            self.store.save_run(&run).map_err(RpcError::internal)?;
+            let _ = save_run_worktree(self.store.as_ref(), &run);
+        }
+
+        let started = event(&run, EVENT_STARTED, &run.prompt);
+        self.store
+            .append_event(&started)
+            .map_err(RpcError::internal)?;
+
+        let exec_cancel = CancellationToken::new();
+        self.put_cancel(&run.id, exec_cancel.clone());
+        let core = self.clone();
+        let initial = run.clone();
+        tokio::spawn(async move {
+            let mu = core.run_mu(&initial.id);
+            let guard = mu.lock().await;
+            let current = core.store.get_run(&initial.id).unwrap_or(initial.clone());
+            let final_run = if is_terminal(&current.status) {
+                current
+            } else {
+                deps.execute(&exec_cancel, current.clone())
+                    .await
+                    .unwrap_or_else(|_| core.store.get_run(&initial.id).unwrap_or(current))
+            };
+            core.finalize(&final_run).await;
+            drop(guard);
+            core.pop_cancel(&initial.id);
+            exec_cancel.cancel();
+        });
+
+        Ok(pb::StartRunResponse {
+            run: Some(convert::run(&run)),
+        })
+    }
+
+    /// Stops the agent tree and a runner that is not this process. The core's
+    /// own pid is never signalled; in-process runs end through their token.
+    async fn stop_foreign_procs(&self, run: &Run) -> Result<(), Error> {
+        let mut owner = run.pid;
+        if owner == i64::from(std::process::id()) {
+            owner = 0;
+        }
+        if run.agent_pid <= 0 && owner <= 0 {
+            return Ok(());
+        }
+        let mut tree =
+            crate::process::Tree::capture(i32::try_from(run.agent_pid).unwrap_or(0)).await?;
+        tree.include(i32::try_from(owner).unwrap_or(0), &run.proc_start)?;
+        tree.stop(&CancellationToken::new(), Duration::from_secs(5))
+            .await
+    }
+
+    fn cancelled(run: &mut Run) {
+        run.status = STATUS_CANCELLED.into();
+        if run.error.is_empty() {
+            run.error = "cancelled".into();
+        }
+        run.finished_at = now_rfc3339();
+    }
+
+    pub(crate) async fn cancel_run(
+        &self,
+        m: pb::CancelRunRequest,
+    ) -> RpcResult<pb::CancelRunResponse> {
+        let id = required(&m.id, "run id")?;
+        let had_cancel = match self.pop_cancel(&id) {
+            Some(t) => {
+                t.cancel();
+                true
+            }
+            None => false,
+        };
+        let mut run = self.store.get_run(&id).map_err(store_error)?;
+        let self_owned = had_cancel || run.pid == i64::from(std::process::id());
+        if !self_owned {
+            let deps = self.deps().map_err(RpcError::internal)?;
+            run = deps
+                .cancel(&CancellationToken::new(), &id)
+                .await
+                .map_err(|e| {
+                    if types::is_unknown_run(&e) {
+                        RpcError::not_found(e.to_string())
+                    } else {
+                        RpcError::invalid(e.to_string())
+                    }
+                })?;
+            if !is_terminal(&run.status) {
+                Self::cancelled(&mut run);
+                self.store.save_run(&run).map_err(RpcError::internal)?;
+            }
+            self.finalize(&run).await;
+            return Ok(pb::CancelRunResponse {
+                run: Some(convert::run(&run)),
+            });
+        }
+        let already = is_terminal(&run.status);
+        if already && !had_cancel {
+            return Err(RpcError::invalid(format!(
+                "run {} already {}",
+                run.id, run.status
+            )));
+        }
+        if !already {
+            self.stop_foreign_procs(&run)
+                .await
+                .map_err(|e| RpcError::invalid(e.to_string()))?;
+        }
+        let mu = self.run_mu(&id);
+        let _guard = mu.lock().await;
+        if let Ok(latest) = self.store.get_run(&id) {
+            run = latest;
+        }
+        if !is_terminal(&run.status) {
+            Self::cancelled(&mut run);
+            self.store.save_run(&run).map_err(RpcError::internal)?;
+        } else if run.status != STATUS_CANCELLED {
+            return Err(RpcError::invalid(format!(
+                "run {} already {}",
+                run.id, run.status
+            )));
+        }
+        self.finalize(&run).await;
+        Ok(pb::CancelRunResponse {
+            run: Some(convert::run(&run)),
+        })
+    }
+
+    pub(crate) async fn result(&self, m: pb::ResultRequest) -> RpcResult<pb::ResultResponse> {
+        let id = required(&m.id, "run id")?;
+        let run = self.store.get_run(&id).map_err(store_error)?;
+        let section = match m.section.trim() {
+            "" => "summary",
+            s => s,
+        };
+        let raw = match section {
+            "summary" => {
+                let max = if m.limit <= 0 { 40 } else { m.limit as usize };
+                summary(&run.output, max, 4096).0
+            }
+            "files" => serde_json::json!({
+                "files_changed": run.files_changed,
+                "insertions": run.insertions,
+                "deletions": run.deletions,
+            })
+            .to_string(),
+            "attempts" => serde_json::to_string(&run.attempts).map_err(RpcError::internal)?,
+            "meta" => convert::run_meta(&run).to_string(),
+            "output" | "agent" => run.output.clone(),
+            other => return Err(RpcError::invalid(format!("unknown section {other}"))),
+        };
+        let (content, total, _) = page(&raw, i64::from(m.offset), i64::from(m.limit));
+        Ok(pb::ResultResponse {
+            content,
+            total: i32::try_from(total).unwrap_or(i32::MAX),
+        })
+    }
+
+    /// Streams the run's events from `after_seq`, turning the agent's live log
+    /// into output events, until the run ends.
+    pub(crate) fn watch_run(
+        self: &Arc<Self>,
+        m: pb::WatchRunRequest,
+    ) -> RpcResult<impl Stream<Item = RpcResult<pb::WatchRunResponse>> + Send + 'static> {
+        let id = required(&m.id, "run id")?;
+        let run = self.store.get_run(&id).map_err(store_error)?;
+        let core = self.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel::<RpcResult<pb::WatchRunResponse>>(64);
+        tokio::spawn(async move {
+            let _guard = core.stream_guard();
+            let _ = core.watch_loop(run, m.after_seq, &tx).await.map_err(|e| {
+                let _ = tx.try_send(Err(e));
+            });
+        });
+        Ok(tokio_stream_from(rx))
+    }
+
+    async fn watch_loop(
+        &self,
+        mut run: Run,
+        after: i64,
+        tx: &tokio::sync::mpsc::Sender<RpcResult<pb::WatchRunResponse>>,
+    ) -> RpcResult<()> {
+        let id = run.id.clone();
+        let mut last = after;
+        let log = self
+            .state_dir()
+            .join("logs")
+            .join(format!("{id}.agent.log"));
+        let send_new = |last: &mut i64| -> RpcResult<Vec<RunEvent>> {
+            let events = self
+                .store
+                .list_events(&id, *last, 0)
+                .map_err(RpcError::internal)?;
+            for e in &events {
+                *last = (*last).max(e.seq);
+            }
+            Ok(events)
+        };
+        for e in send_new(&mut last)? {
+            if tx.send(Ok(convert::watch_event(&e))).await.is_err() {
+                return Ok(());
+            }
+        }
+        let done = self.done();
+        loop {
+            self.sync_agent_log(&run, &log)
+                .map_err(RpcError::internal)?;
+            for e in send_new(&mut last)? {
+                if tx.send(Ok(convert::watch_event(&e))).await.is_err() {
+                    return Ok(());
+                }
+            }
+            run = self.store.get_run(&id).map_err(RpcError::internal)?;
+            if is_terminal(&run.status) {
+                self.sync_agent_log(&run, &log)
+                    .map_err(RpcError::internal)?;
+                for e in send_new(&mut last)? {
+                    if tx.send(Ok(convert::watch_event(&e))).await.is_err() {
+                        return Ok(());
+                    }
+                }
+                return Ok(());
+            }
+            tokio::select! {
+                () = tx.closed() => return Ok(()),
+                () = done.cancelled() => return Ok(()),
+                () = tokio::time::sleep(WATCH_TICK) => {}
+            }
+        }
+    }
+
+    /// Appends what the agent's live log gained since the last read as an
+    /// output event.
+    fn sync_agent_log(&self, run: &Run, log: &Path) -> Result<(), Error> {
+        use std::io::{Read, Seek, SeekFrom};
+        let Ok(mut f) = std::fs::File::open(log) else {
+            return Ok(());
+        };
+        let size = match f.metadata() {
+            Ok(m) if m.len() > 0 => m.len(),
+            _ => return Ok(()),
+        };
+        let mut w = lock(&self.watch);
+        if !w.log_ready.contains(&run.id) {
+            let seeded: u64 = self
+                .store
+                .list_events(&run.id, 0, 0)?
+                .iter()
+                .filter(|e| e.kind == EVENT_OUTPUT)
+                .map(|e| e.text.len() as u64)
+                .sum();
+            w.log_off.insert(run.id.clone(), seeded);
+            w.log_ready.insert(run.id.clone());
+        }
+        let off = w.log_off.get(&run.id).copied().unwrap_or(0).min(size);
+        if off == size {
+            w.log_off.insert(run.id.clone(), off);
+            return Ok(());
+        }
+        f.seek(SeekFrom::Start(off))?;
+        let mut buf = Vec::with_capacity(usize::try_from(size - off).unwrap_or(0));
+        f.take(size - off).read_to_end(&mut buf)?;
+        let emit = complete_char_prefix(&buf);
+        if emit.is_empty() {
+            return Ok(());
+        }
+        self.store
+            .append_event(&event(run, EVENT_OUTPUT, &String::from_utf8_lossy(emit)))?;
+        w.log_off.insert(run.id.clone(), off + emit.len() as u64);
+        Ok(())
+    }
+
+    /// Records a run's end once: its worktree's status, its failure or merge
+    /// event, and the AgentRun it linked.
+    pub(crate) async fn finalize(&self, run: &Run) {
+        if run.id.is_empty() {
+            return;
+        }
+        if lock(&self.watch).finalized.contains(&run.id) {
+            return;
+        }
+        let mut run = run.clone();
+        if let Ok(latest) = self.store.get_run(&run.id)
+            && is_terminal(&latest.status)
+        {
+            run = latest;
+        }
+        if !run.agent_run_id.is_empty() {
+            let _ = tokio::time::timeout(
+                HOST_TIMEOUT,
+                self.host.complete_agent_run(&run.agent_run_id),
+            )
+            .await;
+        }
+        let mut w = lock(&self.watch);
+        if !w.finalized.insert(run.id.clone()) {
+            return;
+        }
+        w.log_off.remove(&run.id);
+        w.log_ready.remove(&run.id);
+        drop(w);
+        let events = self.store.list_events(&run.id, 0, 0).unwrap_or_default();
+        let _ = save_run_worktree(self.store.as_ref(), &run);
+        let has = |kind: &str| events.iter().any(|e| e.kind == kind);
+        if has(EVENT_FAILED) {
+            return;
+        }
+        if matches!(
+            run.status.as_str(),
+            STATUS_FAILED | STATUS_TIMED_OUT | STATUS_CANCELLED
+        ) {
+            let text = if run.error.is_empty() {
+                run.status.to_lowercase()
+            } else {
+                run.error.clone()
+            };
+            let _ = self.store.append_event(&event(&run, EVENT_FAILED, &text));
+        }
+        if run.merged_at.as_deref().is_some_and(|m| !m.is_empty()) && !has(EVENT_MERGED) {
+            let _ = self
+                .store
+                .append_event(&event(&run, EVENT_MERGED, &run.merge_sha));
+        }
+    }
+
+    pub(crate) async fn list_worktrees(
+        &self,
+        m: pb::ListWorktreesRequest,
+    ) -> RpcResult<pb::ListWorktreesResponse> {
+        let project = required(&m.project_id, "project id")?;
+        let items = self
+            .store
+            .list_worktrees(&project)
+            .map_err(RpcError::internal)?;
+        Ok(pb::ListWorktreesResponse {
+            worktrees: items.iter().map(convert::worktree).collect(),
+        })
+    }
+
+    pub(crate) async fn list_quota(
+        &self,
+        m: pb::ListQuotaRequest,
+    ) -> RpcResult<pb::ListQuotaResponse> {
+        let now = Utc::now();
+        let since = parse_quota_since(&m.since, now)?;
+        let agent = m.agent.trim();
+        self.probe_once(agent, now).await;
+        let snaps = self
+            .store
+            .list_quota(agent, &since_text(since))
+            .map_err(RpcError::internal)?;
+        Ok(pb::ListQuotaResponse {
+            snapshots: snaps.iter().map(convert::quota).collect(),
+        })
+    }
+
+    pub(crate) fn tier_rows(&self) -> RpcResult<Vec<pb::DispatchTier>> {
+        let rows = self.store.list_tiers().map_err(RpcError::internal)?;
+        Ok(rows.iter().map(convert::tier).collect())
+    }
+
+    pub(crate) async fn list_tiers(
+        &self,
+        _: pb::ListTiersRequest,
+    ) -> RpcResult<pb::ListTiersResponse> {
+        if self
+            .store
+            .list_tiers()
+            .map_err(RpcError::internal)?
+            .is_empty()
+        {
+            let table = Table::embedded().map_err(RpcError::internal)?;
+            self.store
+                .replace_tiers(&table.rows())
+                .map_err(RpcError::internal)?;
+        }
+        Ok(pb::ListTiersResponse {
+            tiers: self.tier_rows()?,
+        })
+    }
+
+    /// Stores a new tier table. Rows keep their request order within each tier.
+    pub(crate) async fn replace_tiers(
+        &self,
+        m: pb::ReplaceTiersRequest,
+    ) -> RpcResult<pb::ReplaceTiersResponse> {
+        let mut table = Table::default();
+        for row in m.tiers {
+            let tier = row.name.trim().to_owned();
+            if !crate::adapters::valid_tier(&tier) {
+                return Err(RpcError::invalid(format!("unknown tier {:?}", row.name)));
+            }
+            table.tiers.entry(tier).or_default().push(Entry {
+                provider: row.provider.trim().into(),
+                agent: row.agent.trim().into(),
+                model: row.model.trim().into(),
+                speed: row.speed,
+                strength: row.strength,
+                ..Entry::default()
+            });
+        }
+        let validated = table
+            .validated()
+            .map_err(|e| RpcError::invalid(e.to_string()))?;
+        self.store
+            .replace_tiers(&validated.rows())
+            .map_err(RpcError::internal)?;
+        Ok(pb::ReplaceTiersResponse {
+            tiers: self.tier_rows()?,
+        })
+    }
+
+    /// Asks every installed agent CLI for its models, in parallel and bounded
+    /// by a timeout.
+    pub(crate) async fn list_models(
+        &self,
+        _: pb::ListModelsRequest,
+    ) -> RpcResult<pb::ListModelsResponse> {
+        Ok(self.models_report().await)
+    }
+
+    pub(crate) async fn models_report(&self) -> pb::ListModelsResponse {
+        let listed = futures::future::join_all(
+            known::known()
+                .into_iter()
+                .filter(|a| installed(a.as_ref()))
+                .map(|a| async move {
+                    let r = tokio::time::timeout(Duration::from_secs(20), self.agent_models(&a))
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(Error::Message("context deadline exceeded".into()))
+                        });
+                    (a, r)
+                }),
+        )
+        .await;
+        let mut out = pb::ListModelsResponse::default();
+        for (a, r) in listed {
+            match r {
+                Ok(models) => out
+                    .models
+                    .extend(models.into_iter().map(|m| pb::DispatchModel {
+                        agent: a.name(),
+                        provider: provider_of(&a.name(), &m.id),
+                        model: m.id,
+                        tier: m.tier,
+                    })),
+                Err(e) => out.problems.push(format!("{}: {e}", a.name())),
+            }
+        }
+        out
+    }
+
+    /// The installed agent CLIs' models as tier entries.
+    pub(crate) async fn installed_entries(&self) -> (Vec<Entry>, Vec<String>) {
+        let listed = self.models_report().await;
+        let entries = listed
+            .models
+            .iter()
+            .map(|m| Entry {
+                agent: m.agent.clone(),
+                model: m.model.clone(),
+                provider: m.provider.clone(),
+                ..Entry::default()
+            })
+            .collect();
+        (entries, listed.problems)
+    }
+
+    pub(crate) async fn list_agents(
+        &self,
+        _: pb::ListAgentsRequest,
+    ) -> RpcResult<pb::ListAgentsResponse> {
+        self.probe_once("", Utc::now()).await;
+        let agents = self.store.list_agents().map_err(RpcError::internal)?;
+        let installed: HashMap<String, bool> = known::known()
+            .iter()
+            .map(|a| (a.name(), installed(a.as_ref())))
+            .collect();
+        Ok(pb::ListAgentsResponse {
+            agents: agents
+                .iter()
+                .map(|a| {
+                    let mut row = convert::agent(a);
+                    row.installed = installed.get(&a.name).copied().unwrap_or(false);
+                    row
+                })
+                .collect(),
+        })
+    }
+
+    pub(crate) async fn list_history(
+        &self,
+        m: pb::ListHistoryRequest,
+    ) -> RpcResult<pb::ListHistoryResponse> {
+        let events = self
+            .store
+            .list_history(
+                m.project_id.trim(),
+                m.agent.trim(),
+                m.tier.trim(),
+                i64::from(m.limit),
+                i64::from(m.offset),
+            )
+            .map_err(RpcError::internal)?;
+        Ok(pb::ListHistoryResponse {
+            events: events.iter().map(convert::run_event).collect(),
+        })
+    }
+
+    pub(crate) async fn check_tiers(
+        &self,
+        _: pb::CheckTiersRequest,
+    ) -> RpcResult<pb::CheckTiersResponse> {
+        let table =
+            Table::load_from_store(Some(self.store.as_ref())).map_err(RpcError::internal)?;
+        let adapters = known::known();
+        let by_name: HashMap<String, Arc<dyn AgentAdapter>> =
+            adapters.iter().map(|a| (a.name(), a.clone())).collect();
+        let mut problems = table.field_problems();
+        problems.extend(table.capability_problems(&crate::tiers::known_adapters()));
+
+        // Ask the table's installed agents for their models at once, through the shared cache.
+        let mut asked: Vec<String> = Vec::new();
+        for tier in ["easy", "normal", "hard"] {
+            for e in table.tiers.get(tier).into_iter().flatten() {
+                if by_name.contains_key(&e.agent) && !asked.contains(&e.agent) {
+                    asked.push(e.agent.clone());
+                }
+            }
+        }
+        let queried: HashMap<String, Result<Vec<Model>, Error>> = futures::future::join_all(
+            asked
+                .into_iter()
+                .filter_map(|name| Some((by_name.get(&name)?.clone(), name)))
+                .filter(|(a, _)| installed(a.as_ref()))
+                .map(|(a, name)| async move {
+                    let r = self.agent_models(&a).await;
+                    (name, r)
+                }),
+        )
+        .await
+        .into_iter()
+        .collect();
+        for tier in ["easy", "normal", "hard"] {
+            for e in table.tiers.get(tier).into_iter().flatten() {
+                if !by_name.contains_key(&e.agent) {
+                    problems.push(format!("{tier}: unknown agent {}", e.agent));
+                    continue;
+                }
+                match queried.get(&e.agent) {
+                    None => {}
+                    Some(Err(err)) => {
+                        problems.push(format!("{tier}: {}/{}: {err}", e.agent, e.model));
+                    }
+                    Some(Ok(models)) => {
+                        let listed = models
+                            .iter()
+                            .any(|m| m.id == e.model || base_model(&m.id) == base_model(&e.model));
+                        if !listed {
+                            problems.push(format!(
+                                "{tier}: {}/{}: model not listed by installed agent",
+                                e.agent, e.model
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(pb::CheckTiersResponse { problems })
+    }
+
+    pub(crate) async fn stats(&self, m: pb::StatsRequest) -> RpcResult<pb::StatsResponse> {
+        let now = Utc::now();
+        let since = reports::stats::parse_since(&m.since, now)
+            .map_err(|e| RpcError::invalid(e.to_string()))?;
+        let report = reports::stats::from_store(
+            Some(self.store.as_ref()),
+            StatsOptions {
+                project_id: m.project_id.trim().into(),
+                by: m.by.trim().into(),
+                since,
+                now: Some(now),
+            },
+        )
+        .map_err(|e| RpcError::invalid(e.to_string()))?;
+        Ok(convert::stats(&report))
+    }
+
+    pub(crate) async fn capacity(&self, m: pb::CapacityRequest) -> RpcResult<pb::CapacityResponse> {
+        let now = Utc::now();
+        let since = parse_quota_since(&m.since, now)?;
+        let report = reports::stats_capacity::capacity_from_store(
+            Some(self.store.as_ref()),
+            since,
+            Some(now),
+        )
+        .map_err(RpcError::internal)?;
+        Ok(pb::CapacityResponse {
+            since: report.since.clone(),
+            note: report.note.clone(),
+            keys: report
+                .keys
+                .iter()
+                .map(|k| pb::DispatchCapacityKey {
+                    key: k.key.clone(),
+                    windows: i32::try_from(k.windows).unwrap_or(i32::MAX),
+                    hit_full: i32::try_from(k.hit_full).unwrap_or(i32::MAX),
+                    leftover: k.leftover.clone(),
+                    pace: k.pace.clone(),
+                    consumed_pct: k.consumed_pct,
+                    leftover_pct: k.leftover_pct,
+                })
+                .collect(),
+        })
+    }
+
+    /// Probes at most once per [`AGENT_PROBE_GAP`] for the same filter. Calls
+    /// that arrive while a probe runs wait for it and then read what it stored.
+    async fn probe_once(&self, agent: &str, now: DateTime<Utc>) {
+        let mut last = self.probes.lock().await;
+        let fresh = |k: &str| last.get(k).is_some_and(|at| at.elapsed() < AGENT_PROBE_GAP);
+        // A full probe covers every agent; one agent's probe covers only that agent.
+        if fresh("") || (!agent.is_empty() && fresh(agent)) {
+            return;
+        }
+        self.probe_agents(agent, now).await;
+        last.insert(agent.into(), std::time::Instant::now());
+    }
+
+    async fn probe_agents(&self, filter: &str, now: DateTime<Utc>) {
+        let at = now.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
+        let time = |t: Option<DateTime<Utc>>| {
+            t.map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true))
+                .unwrap_or_default()
+        };
+        for a in known::known() {
+            let name = a.name();
+            if !filter.is_empty() && name != filter {
+                continue;
+            }
+            let provider = provider_of(&name, "");
+            let emp = empirical_quota(Some(self.store.as_ref()), &name, Some(now));
+            let mut row = Agent {
+                name: name.clone(),
+                bin: a.binary(),
+                provider: provider.clone(),
+                cooldown_until: emp.reset_at.map(|t| time(Some(t))),
+                ..Agent::default()
+            };
+            // source and confidence describe the quota snapshots this probe saves.
+            let mut source = emp.source.clone();
+            let is_installed = installed(a.as_ref());
+            if let Some(src) = a.usage_source() {
+                source = src.into();
+                if is_installed
+                    && let Ok(samples) = a.usage().await
+                    && !samples.is_empty()
+                {
+                    for s in samples {
+                        if row.used_percent.is_none() {
+                            row.used_percent = s.used;
+                        }
+                        let _ = self.store.save_quota(&QuotaSnapshot {
+                            agent: name.clone(),
+                            provider: provider.clone(),
+                            window: s.window.clone(),
+                            source: s.source.clone(),
+                            confidence: s.confidence.clone(),
+                            used_percent: s.used,
+                            window_minutes: i64::try_from(s.duration.as_secs() / 60).unwrap_or(0),
+                            resets_at: time(s.reset_at),
+                            sampled_at: s.sampled_at.map_or_else(|| at.clone(), |t| time(Some(t))),
+                        });
+                    }
+                    let _ = self.store.upsert_agent(&row);
+                    continue;
+                }
+            }
+            if is_installed && let Ok(q) = a.quota().await {
+                row.used_percent = Some(q.used_percent);
+                let _ = self.store.save_quota(&QuotaSnapshot {
+                    agent: name.clone(),
+                    provider: provider.clone(),
+                    window: "default".into(),
+                    source: source.clone(),
+                    confidence: "official".into(),
+                    used_percent: Some(q.used_percent),
+                    window_minutes: q.window_minutes,
+                    resets_at: time(q.resets_at),
+                    sampled_at: at.clone(),
+                });
+                let _ = self.store.upsert_agent(&row);
+                continue;
+            }
+            let _ = self.store.save_quota(&QuotaSnapshot {
+                agent: name.clone(),
+                provider,
+                window: emp.window.clone(),
+                source,
+                confidence: emp.confidence.clone(),
+                used_percent: None,
+                window_minutes: 0,
+                resets_at: time(emp.reset_at),
+                sampled_at: at.clone(),
+            });
+            let _ = self.store.upsert_agent(&row);
+        }
+    }
+}
+
+/// A stream over a channel's messages.
+fn tokio_stream_from<T: Send + 'static>(
+    mut rx: tokio::sync::mpsc::Receiver<T>,
+) -> impl Stream<Item = T> + Send + 'static {
+    futures::stream::poll_fn(move |cx| rx.poll_recv(cx))
+}

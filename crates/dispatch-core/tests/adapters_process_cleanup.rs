@@ -69,7 +69,7 @@ async fn agent_cancellation_kills_grandchild() {
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
         let task = tokio::spawn(async move {
-            run_command(command, None, task_cancel, LiveLog::default(), None).await
+            run_command(command, None, task_cancel, LiveLog::default(), None, None).await
         });
         let pid = read_pid(&path).await;
         let _cleanup = Cleanup(pid);
@@ -107,7 +107,7 @@ async fn agent_cancellation_kills_detached_grandchild() {
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
         let task = tokio::spawn(async move {
-            run_command(command, None, task_cancel, LiveLog::default(), None).await
+            run_command(command, None, task_cancel, LiveLog::default(), None, None).await
         });
         let pid = read_pid(&path).await;
         let _cleanup = Cleanup(pid);

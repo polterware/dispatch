@@ -1,6 +1,4 @@
 //! The run lifecycle: routing a request, attempts and fallbacks, worktrees, recovery, merge, clean, summaries.
-//!
-//! Ported from `dispatch/backend/domains/dispatch/runner*.go`.
 
 mod classify;
 mod decision;
@@ -34,7 +32,11 @@ pub use usage::{add_usage, load_catalog, usage_cost};
 
 use crate::{
     Error,
-    adapters::{Capabilities, Model, Request, RunResult, probe::ProbeReport, quota::Quota},
+    adapters::{
+        Capabilities, Model, Request, RunResult,
+        probe::ProbeReport,
+        quota::{Quota, QuotaSample},
+    },
     catalog::Catalog,
     config::Policy,
     difficulty::Difficulty,
@@ -137,6 +139,15 @@ pub trait AgentAdapter: Send + Sync {
         _models: Vec<String>,
     ) -> Option<BoxFuture<'_, Result<HashMap<String, Quota>, Error>>> {
         None
+    }
+    /// The official quota source, None for an adapter without one, which
+    /// must not invent a used percentage.
+    fn usage_source(&self) -> Option<&'static str> {
+        None
+    }
+    /// Every official quota window; fails with [`ERR_NO_QUOTA`] when unavailable.
+    fn usage(&self) -> BoxFuture<'_, Result<Vec<QuotaSample>, Error>> {
+        Box::pin(async { Err(Error::Message(ERR_NO_QUOTA.into())) })
     }
     /// Some when the adapter can probe its CLI's flags.
     fn probe(&self) -> Option<BoxFuture<'_, ProbeReport>> {

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Builds Dispatch.app for macOS arm64 with its ZIP, DMG, checksums, and signed appcast:
 #   bash tooling/release/bundle.sh <version>
-# The bundle holds the GPUI app, the `dispatch` core and CLI from go-core (until
-# dispatch-core replaces it), the app icon, and Sparkle. Signing is ad-hoc, as the Electron
-# app's was: no certificate, entitlements, hardened runtime, or notarization.
+# The bundle holds one binary, the GPUI app that is also the `dispatch` core and CLI
+# (Contents/Resources/dispatch links to it), the app icon, and Sparkle. Signing is ad-hoc,
+# as the Electron app's was: no certificate, entitlements, hardened runtime, or notarization.
 # SOURCE_DATE_EPOCH (the last commit's time by default) is the Sparkle build number.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -25,10 +25,9 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Framewor
 bash "$ROOT/tooling/updater/fetch.sh"
 (cd "$ROOT" && cargo build --release --locked -p dispatch-app)
 cp "$ROOT/target/release/dispatch-app" "$APP/Contents/MacOS/$PRODUCT"
-# The core and CLI. Its mtime is pinned to the commit time, because the core's build
-# handshake reads the binary's mtime.
-(cd "$ROOT/go-core" && CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -mod=readonly -trimpath -buildvcs=false -ldflags='-s -w -buildid=' -o "$APP/Contents/Resources/dispatch" ./runtimes/cli)
-touch -t "$(date -r "$SOURCE_DATE_EPOCH" +%Y%m%d%H%M.%S)" "$APP/Contents/Resources/dispatch"
+# The `dispatch` command agents, Polterware, and ~/.local/bin/dispatch run: the same binary,
+# which runs as the CLI and the core when it is given a command or called dispatch.
+ln -s "../MacOS/$PRODUCT" "$APP/Contents/Resources/dispatch"
 
 PLIST="$APP/Contents/Info.plist"
 cat > "$PLIST" <<PLIST
@@ -74,14 +73,15 @@ xcrun actool "$ROOT/app/resources/dispatch.icon" --compile "$APP/Contents/Resour
 ditto "$ROOT/tooling/updater/vendor/Sparkle.framework" "$APP/Contents/Frameworks/Sparkle.framework"
 cp "$ROOT/tooling/updater/vendor/LICENSE" "$APP/Contents/Resources/Sparkle-LICENSE"
 
-# Ad-hoc signing, inside out: Sparkle's helpers, the framework, the core, then the app.
+# Ad-hoc signing, inside out: Sparkle's helpers, the framework, then the app.
 FRAMEWORK="$APP/Contents/Frameworks/Sparkle.framework"
 for path in Versions/B/XPCServices/Downloader.xpc Versions/B/XPCServices/Installer.xpc Versions/B/Autoupdate Versions/B/Updater.app ""; do
   codesign --force --deep --sign - --timestamp=none "$FRAMEWORK/$path"
 done
-codesign --force --sign - --timestamp=none "$APP/Contents/Resources/dispatch"
-touch -t "$(date -r "$SOURCE_DATE_EPOCH" +%Y%m%d%H%M.%S)" "$APP/Contents/Resources/dispatch"
 codesign --force --sign - --timestamp=none "$APP"
+# The binary's mtime is pinned to the commit time, because the core's build handshake
+# reads it; signing rewrote the file, and the signature does not cover the mtime.
+touch -t "$(date -r "$SOURCE_DATE_EPOCH" +%Y%m%d%H%M.%S)" "$APP/Contents/MacOS/$PRODUCT"
 codesign --verify --deep --strict "$APP"
 
 ARTIFACT="${PRODUCT// /-}-$VERSION-arm64"
