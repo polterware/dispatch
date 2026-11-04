@@ -22,6 +22,10 @@
 //! `14-commander-again` presses ⌘K to close the palette and, once it has played out, again
 //! to open it; `14-settings-shortcut` then presses ⌘, for Settings.
 //!
+//! `18-settings-panels` opens Settings' menus and pickers over the dialog: Routing policy's
+//! Priority menu (`-priority`) and Allow models picker (`-tokens`), then the Classifier set to an agent CLI with its model picker (`-cli`); the
+//! last writes the classifier, so it is for a scratch data folder.
+//!
 //! `15-display-menu` opens the sidebar's Display menu on its Group by submenu, and
 //! `16-role-composer` opens the Composer on the explorer role, and `16-role-composer-tokens`
 //! fills its Prefer and Avoid.
@@ -34,7 +38,7 @@ use gpui::{App, AsyncWindowContext, Entity, Window};
 use crate::state::{AppState, Route, SettingsPage};
 use crate::ui::FilterPopover;
 use crate::views::StatsPane as Pane;
-use crate::views::{RolesView, SidebarView};
+use crate::views::{RolesView, SettingsView, SidebarView};
 
 /// A page's filters, for the stops that open its menu and add a pill.
 pub type PageFilters = Vec<(&'static str, Entity<FilterPopover>)>;
@@ -46,6 +50,7 @@ pub struct TourViews {
     pub run_page: Entity<crate::views::RunPageView>,
     pub stats: Entity<crate::views::StatsView>,
     pub intelligence: Entity<crate::views::IntelligenceView>,
+    pub settings: Entity<SettingsView>,
 }
 
 /// The directory to write to, when the tour is on.
@@ -372,6 +377,47 @@ pub fn start_tour(
                 });
                 settle(cx, 800).await;
                 capture(cx, &dir.join("16-role-composer-picker.png"));
+            }
+            if wanted("18-settings-panels") {
+                let settings = views.settings.clone();
+                let go = |page: SettingsPage, cx: &mut AsyncWindowContext| {
+                    let _ = cx.update(|_, app| {
+                        state.update(app, |state, cx| {
+                            state.set_commander_open(false);
+                            state.navigate(Route::Settings(page));
+                            state.request_refresh(cx);
+                            cx.notify();
+                        })
+                    });
+                };
+                go(SettingsPage::RoutingPolicy, cx);
+                front(cx);
+                settle(cx, 2500).await;
+                for (name, open) in [
+                    ("18-settings-panels-priority", 0usize),
+                    ("18-settings-panels-tokens", 1),
+                ] {
+                    let _ = cx.update(|_, app| {
+                        settings.update(app, |settings, cx| settings.tour_open(open, cx))
+                    });
+                    settle(cx, 2500).await;
+                    capture(cx, &dir.join(format!("{name}.png")));
+                    let _ = cx.update(|_, app| {
+                        settings.update(app, |settings, cx| settings.tour_close(cx))
+                    });
+                    settle(cx, 500).await;
+                }
+                go(SettingsPage::Classifier, cx);
+                settle(cx, 1500).await;
+                let _ = cx.update(|_, app| {
+                    settings.update(app, |settings, cx| settings.tour_open(2, cx))
+                });
+                settle(cx, 2500).await;
+                let _ = cx.update(|_, app| {
+                    settings.update(app, |settings, cx| settings.tour_open(3, cx))
+                });
+                settle(cx, 2500).await;
+                capture(cx, &dir.join("18-settings-panels-cli.png"));
             }
             let _ = cx.update(|_, app| app.quit());
         })

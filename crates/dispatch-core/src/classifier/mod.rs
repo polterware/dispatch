@@ -23,7 +23,8 @@ use std::{sync::Arc, time::Duration};
 pub const CLI_CLASSIFY_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The policy's difficulty classifier, or None when it is off. The CLI
-/// classifier runs the easy tier's first installed agent.
+/// classifier runs the agent `classifier_agent` names, else the easy tier's
+/// first installed agent.
 pub fn for_policy(deps: &Deps) -> Option<Arc<dyn Classifier>> {
     let model = deps.policy.classifier_model.clone();
     match deps.policy.classifier.as_str() {
@@ -37,6 +38,31 @@ pub fn for_policy(deps: &Deps) -> Option<Arc<dyn Classifier>> {
 /// The agent and model the CLI classifier asks, whether or not it is the
 /// policy's; with no easy-tier agent installed it has no agent and fails.
 pub fn cli_for(deps: &Deps) -> Cli {
+    // `agent` or `agent/model`; a model can hold a slash of its own (OpenCode's
+    // `provider/model`), so only the first one splits.
+    let picked = deps.policy.classifier_agent.trim();
+    let (agent, picked_model) = picked.split_once('/').unwrap_or((picked, ""));
+    if !agent.is_empty()
+        && let Some(a) = deps
+            .adapters
+            .iter()
+            .find(|a| a.name() == agent && deps.is_installed(&a.binary()))
+    {
+        // With no model named, the agent's easy-tier model, else its CLI's default.
+        let model = if picked_model.is_empty() {
+            deps.table
+                .tiers
+                .get("easy")
+                .into_iter()
+                .flatten()
+                .find(|e| e.agent == agent)
+                .map(|e| e.model.clone())
+                .unwrap_or_default()
+        } else {
+            picked_model.to_owned()
+        };
+        return Cli::with_adapter(a.clone(), model, CLI_CLASSIFY_TIMEOUT);
+    }
     let mut model = deps.policy.classifier_model.clone();
     for e in deps.table.tiers.get("easy").into_iter().flatten() {
         for a in &deps.adapters {

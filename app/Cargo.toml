@@ -22,6 +22,7 @@ polterware-ui.workspace = true
 raw-window-handle = "0.6.2"
 
 [dev-dependencies]
+tempfile = "3.27.0"
 gpui = { workspace = true, features = ["test-support"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

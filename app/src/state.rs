@@ -7,7 +7,8 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    time::Duration,
+    sync::Mutex,
+    time::{Duration, Instant},
 };
 
 use gpui::{App, AppContext as _, Context, Entity, SharedString};
@@ -263,7 +264,88 @@ struct Snapshot {
     last_error: Option<String>,
 }
 
+/// How long a core the app started gets to write its `core.json`.
+const CORE_START_WAIT: Duration = Duration::from_secs(8);
+/// The least time between two cores the app starts, so one that fails is not started again
+/// on every poll.
+const CORE_START_GAP: Duration = Duration::from_secs(30);
+static LAST_CORE_START: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Starts a core for `data_dir` when none is alive, as any `dispatch` command does: after a
+/// restart nothing else has started one yet. The core is its own process, so its runs go on
+/// once the app quits. It reports whether a core came up.
+fn start_core(data_dir: &Path) -> bool {
+    use std::os::unix::{fs::OpenOptionsExt, process::CommandExt};
+    use std::process::{Command, Stdio};
+
+    let db = data_dir.join("dispatch.db");
+    // A core that is alive but not answering is not replaced from here.
+    if dispatch_core::runstate::read_core(&db).is_some() {
+        return false;
+    }
+    {
+        let mut last = LAST_CORE_START
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if last.is_some_and(|at| at.elapsed() < CORE_START_GAP) {
+            return false;
+        }
+        *last = Some(Instant::now());
+    }
+    let Ok(exe) = dispatch_core::runstate::executable() else {
+        return false;
+    };
+    if dispatch_core::runstate::ensure_dir(&db).is_err() {
+        return false;
+    }
+    let Ok(log) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(dispatch_core::runstate::log_path(&db))
+    else {
+        return false;
+    };
+    let Ok(log_err) = log.try_clone() else {
+        return false;
+    };
+    let mut command = Command::new(exe);
+    command
+        .arg("-db")
+        .arg(&db)
+        .args(["serve", "--listen", "127.0.0.1:0"])
+        .stdin(Stdio::null())
+        .stdout(log)
+        .stderr(log_err)
+        .process_group(0);
+    let spawned = command.spawn();
+    let Ok(mut child) = spawned else {
+        return false;
+    };
+    // Reaps the core whenever it ends.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    let deadline = Instant::now() + CORE_START_WAIT;
+    while Instant::now() < deadline {
+        if dispatch_core::runstate::read_core(&db).is_some() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+/// The core's state, starting a core first when none is running.
 fn load_snapshot(data_dir: &Path, selected_run: Option<String>) -> Snapshot {
+    let snapshot = read_snapshot(data_dir, selected_run.clone());
+    if matches!(snapshot.connection, ConnectionState::Offline { .. }) && start_core(data_dir) {
+        return read_snapshot(data_dir, selected_run);
+    }
+    snapshot
+}
+
+fn read_snapshot(data_dir: &Path, selected_run: Option<String>) -> Snapshot {
     let offline_path = core_json_path(data_dir).display().to_string();
     let client = match CoreClient::connect(data_dir) {
         Ok(client) => client,

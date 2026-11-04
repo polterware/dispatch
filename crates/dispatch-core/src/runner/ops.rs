@@ -142,7 +142,12 @@ impl Deps {
         if rec.worktree.is_empty() {
             return Err(msg(format!("run {} has no worktree", rec.id)));
         }
-        worktree::remove(&rec.repo, &rec.worktree, &rec.branch, force).map_err(redact_err)?;
+        if std::path::Path::new(&rec.worktree).exists() {
+            worktree::remove(&rec.repo, &rec.worktree, &rec.branch, force).map_err(redact_err)?;
+        } else {
+            // `dispatch merge` removes the worktree it merges, so its folder may be gone.
+            worktree::forget(&rec.repo, &rec.branch, force).map_err(redact_err)?;
+        }
         let status = if rec.merged_at.is_some() {
             WORKTREE_REMOVED
         } else {

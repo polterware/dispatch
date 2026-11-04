@@ -329,7 +329,7 @@ pub static CLASSIFIERS: [ClassifierChoice; 4] = [
         value: "cli",
         radio: "cli",
         label: "Agent CLI model",
-        detail: "Asks the easy tier's model through your installed CLI. No key, but each run spends a few seconds and some of your quota.",
+        detail: "Asks a model through an installed agent CLI: the easy tier's first, or the one picked here. No key, but each run spends a few seconds and some of your quota.",
     },
 ];
 

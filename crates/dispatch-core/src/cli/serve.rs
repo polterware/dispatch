@@ -49,6 +49,7 @@ pub(super) fn run_serve(db_path: &Path, args: &[String]) -> CliResult {
         }
         Err(e) => return Err(super::usage_err(format!("core lock: {e}"))),
     };
+    reset_inherited_state();
     adopt_login_path();
 
     let runtime = tokio::runtime::Runtime::new()?;
@@ -149,6 +150,25 @@ fn idle_from_env() -> Duration {
         .ok()
         .and_then(|v| parse_duration(&v))
         .unwrap_or(Duration::ZERO)
+}
+
+/// Drops what the core inherits from the process that started it and a terminal would not
+/// give it: blocked signals, an ignored SIGCHLD, and macOS background mode. The app starts
+/// the core from a background thread, and a core started so never heard its children
+/// exit, so each run waited forever on the first command it ran. Called while the core has
+/// one thread, before the runtime starts.
+#[allow(unsafe_code)]
+fn reset_inherited_state() {
+    // SAFETY: these calls change only this thread's signal mask, one signal's disposition,
+    // and this process's priority.
+    unsafe {
+        let mut none: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut none);
+        libc::pthread_sigmask(libc::SIG_SETMASK, &none, std::ptr::null_mut());
+        libc::signal(libc::SIGCHLD, libc::SIG_DFL);
+        #[cfg(target_os = "macos")]
+        libc::setpriority(libc::PRIO_DARWIN_PROCESS, 0, 0);
+    }
 }
 
 /// Gives the core the PATH a terminal has. An app opened from the Finder

@@ -371,6 +371,33 @@ pub fn section_ref(group_id: &str) -> Option<&str> {
     group_id.strip_prefix("section:")
 }
 
+/// What the runs list shows besides its groups: one thing at a time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunsNotice {
+    /// Runs are listed and the last refresh worked: nothing more.
+    None,
+    /// The core is starting and nothing is listed yet: the rows in bones.
+    Loading,
+    /// Nothing to list: the mascot asleep, saying so.
+    Empty,
+    /// Nothing listed because the core did not answer: the mascot sad, saying only that.
+    Unreachable,
+    /// Runs are listed, but the last refresh failed: a line over them, which may be old.
+    Stale,
+}
+
+/// The notice for a list that holds runs or not (`listed`), while the core starts
+/// (`connecting`) or after a refresh that failed (`failed`).
+pub fn runs_notice(listed: bool, connecting: bool, failed: bool) -> RunsNotice {
+    match (listed, connecting, failed) {
+        (false, true, _) => RunsNotice::Loading,
+        (false, false, true) => RunsNotice::Unreachable,
+        (false, false, false) => RunsNotice::Empty,
+        (true, _, true) => RunsNotice::Stale,
+        (true, _, false) => RunsNotice::None,
+    }
+}
+
 fn kind_of(group_by: GroupBy) -> GroupKind {
     match group_by {
         GroupBy::Conversation => GroupKind::Conversation,
@@ -698,9 +725,21 @@ fn civil_from_days(days: i64) -> (i32, i32, i32) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Direction, GroupBy, Show, SidebarDisplay, SidebarRun, SortBy, format_utc_iso,
-        group_sidebar_runs, local_unix_ms, parse_sidebar_display, timestamp_ms,
+        Direction, GroupBy, RunsNotice, Show, SidebarDisplay, SidebarRun, SortBy, format_utc_iso,
+        group_sidebar_runs, local_unix_ms, parse_sidebar_display, runs_notice, timestamp_ms,
     };
+
+    #[test]
+    fn an_empty_list_says_one_thing() {
+        // The core is down and nothing is listed: that it could not load, not also that it is
+        // empty.
+        assert_eq!(runs_notice(false, false, true), RunsNotice::Unreachable);
+        assert_eq!(runs_notice(false, false, false), RunsNotice::Empty);
+        assert_eq!(runs_notice(false, true, true), RunsNotice::Loading);
+        assert_eq!(runs_notice(false, true, false), RunsNotice::Loading);
+        assert_eq!(runs_notice(true, false, true), RunsNotice::Stale);
+        assert_eq!(runs_notice(true, true, false), RunsNotice::None);
+    }
     use crate::client::{DispatchSection, DispatchSectionItem};
 
     fn run(id: &str, edit: impl FnOnce(&mut SidebarRun)) -> SidebarRun {

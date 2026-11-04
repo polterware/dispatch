@@ -317,6 +317,16 @@ pub fn skill_digits(theta: f64) -> String {
     format!("{:>2}", skill_score(theta))
 }
 
+/// The row's Score as the readout shows it: two dashes for a model no benchmark rates,
+/// whose θ is only the field's middle that Auto assumes.
+pub fn row_digits(row: &ModelRow) -> String {
+    if is_guess(row) {
+        "--".to_string()
+    } else {
+        skill_digits(row.entry.theta)
+    }
+}
+
 pub fn percent_text(value: f64) -> String {
     let rounded = if value.is_finite() {
         (value * 100.0).round() as i64
@@ -445,7 +455,8 @@ fn skill_sources(sources: &[CatalogSource]) -> String {
 }
 
 /// Whether the Score is a guess: no benchmark knows the model, so θ is the field's middle.
-/// The table draws such a Score dimmed.
+/// The table shows no Score for it (`--`), dims the pass chances Auto assumes for it, and
+/// sorts it after every rated model.
 pub fn is_guess(row: &ModelRow) -> bool {
     theta_family(&row.entry.theta_source) == "Unknown"
 }
@@ -842,6 +853,7 @@ pub fn visible_rows(
 /// Each column's `sortBy`.
 fn sort_value(row: &ModelRow, column: SkillColumn) -> SortValue {
     match column {
+        SkillColumn::Score if is_guess(row) => SortValue::Missing,
         SkillColumn::Score => SortValue::Number(row.entry.theta),
         SkillColumn::Model => SortValue::Text(row.name.clone()),
         SkillColumn::Easy | SkillColumn::Normal | SkillColumn::Hard => {
@@ -917,7 +929,8 @@ mod tests {
         BandPass, CatalogEntry, CatalogSource, ModelRow, SkillColumn, SortDirection,
         agent_task_price, best_effort_line, empty_catalog, group_models, map_dispatch_catalog,
         map_refresh, matches_model_filters, offer_name, offered_line, refresh_failure,
-        routing_note, row_tiers, score_detail, skill_score, theta_source_label, visible_rows,
+        routing_note, row_digits, row_tiers, score_detail, skill_score, theta_source_label,
+        visible_rows,
     };
 
     fn row(entry: CatalogEntry) -> ModelRow {
@@ -1329,6 +1342,29 @@ mod tests {
         );
         assert_eq!(rows[0].name, "high");
         assert_eq!(rows[1].name, "low");
+    }
+
+    #[test]
+    fn a_model_no_benchmark_rates_has_no_score_and_sorts_last() {
+        let mut guess = entry("pi", "guess", "", "unknown", None, None, "", vec![]);
+        guess.theta = 0.9;
+        let mut rated = entry("codex", "rated", "", "cursorbench", None, None, "", vec![]);
+        rated.theta = -1.5;
+        let rows = group_models(&[guess, rated]);
+        for direction in [SortDirection::Descending, SortDirection::Ascending] {
+            let sorted = visible_rows(
+                &rows,
+                "",
+                &Filters::default(),
+                0.8,
+                true,
+                Some((SkillColumn::Score, direction)),
+            );
+            assert_eq!(sorted[0].name, "rated");
+            assert_eq!(sorted[1].name, "guess");
+        }
+        let guess = rows.iter().find(|row| row.name == "guess").unwrap();
+        assert_eq!(row_digits(guess), "--");
     }
 
     #[test]

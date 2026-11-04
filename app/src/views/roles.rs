@@ -1533,7 +1533,7 @@ impl RolesView {
                 Rc::new(move |this, cx| this.open_build(&catalog, "", cx)),
             ),
             item(
-                "Ask Jev",
+                "Decision API recommendation",
                 Icon::AiBrain01Icon,
                 Rc::new(move |this, cx| this.open_build(&jev, "jev", cx)),
             ),
@@ -1580,9 +1580,12 @@ impl RolesView {
     fn build_title(&self) -> String {
         let general = self.build_role == GENERAL_ROLE;
         match (general, self.build_judge.as_str()) {
-            (true, "jev") => "Tiers Jev picks".to_string(),
+            (true, "jev") => "Tiers the Decision API recommends".to_string(),
             (true, _) => "Build tiers from the model".to_string(),
-            (false, "jev") => format!("{}'s board, as Jev picks it", self.build_role),
+            (false, "jev") => format!(
+                "{}'s board, as the Decision API recommends it",
+                self.build_role
+            ),
             (false, _) => format!("{}'s board from the catalog", self.build_role),
         }
     }

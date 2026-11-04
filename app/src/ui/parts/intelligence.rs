@@ -11,8 +11,8 @@ use gpui::{
 use crate::avatar::agent_avatar;
 use crate::models::intelligence::{
     BANDS, BandPass, ModelRow, ScoreDetail, band_label, band_of, band_title, effort_label,
-    is_guess, offer_name, offered_line, percent_text, routing_note, row_id, skill_digits,
-    theta_source_label, theta_text,
+    is_guess, offer_name, offered_line, percent_text, routing_note, row_digits, row_id,
+    skill_digits, theta_family, theta_source_label, theta_text,
 };
 use crate::models::settings::agent_label;
 use crate::theme::Theme;
@@ -21,8 +21,8 @@ use crate::ui::ellipsis::ellipsis;
 use crate::ui::segment_display::segment_display;
 use crate::ui::tooltip::tooltip;
 use crate::ui::{
-    rail_group, rail_properties, rail_property, rich_tooltip, tooltip_heading, tooltip_note,
-    tooltip_row, wrap_text,
+    Icon, rail_properties, rail_property, rail_section, rich_tooltip, tooltip_heading,
+    tooltip_note, tooltip_row, wrap_text,
 };
 
 /// The score cell's line box: the readout is `inline-flex` on the baseline of the cell's
@@ -35,8 +35,8 @@ const TIP_WIDTH: f32 = 300.0;
 /// How strong a Score no benchmark backs reads: dimmed, a guess and not a measure.
 const GUESS_OPACITY: f32 = 0.4;
 
-/// The skill score as an 18px segment readout, padded to two places, dimmed when it is a
-/// guess; its tooltip shows how it was read.
+/// The skill score as an 18px segment readout, padded to two places, two dimmed dashes for a
+/// model no benchmark rates; its tooltip shows how it was read.
 pub fn score_cell(row: &ModelRow, detail: ScoreDetail, cx: &App) -> AnyElement {
     div()
         .id(SharedString::from(format!("intel-score-{}", row_id(row))))
@@ -45,7 +45,7 @@ pub fn score_cell(row: &ModelRow, detail: ScoreDetail, cx: &App) -> AnyElement {
         .items_start()
         .when(is_guess(row), |cell| cell.opacity(GUESS_OPACITY))
         .tooltip(rich_tooltip(TIP_WIDTH, move |_, cx| score_tip(&detail, cx)))
-        .child(segment_display(skill_digits(row.entry.theta), 18.0, cx))
+        .child(segment_display(row_digits(row), 18.0, cx))
         .into_any_element()
 }
 
@@ -158,11 +158,13 @@ fn model_tip(row: &ModelRow, discover: bool, cx: &App) -> AnyElement {
 pub fn band_cell(row: &ModelRow, tier: &str, bar: f64, cx: &App) -> AnyElement {
     let theme = Theme::global(cx);
     match band_of(&row.entry, tier) {
+        // A model no benchmark rates shows what Auto assumes for it, dimmed like its Score.
         Some(pass) => div()
             .id(SharedString::from(format!(
                 "intel-band-{tier}-{}",
                 row_id(row)
             )))
+            .when(is_guess(row), |cell| cell.opacity(GUESS_OPACITY))
             .tooltip(tooltip(band_title(pass, bar)))
             .child(band_value(pass, bar, cx))
             .into_any_element(),
@@ -274,7 +276,7 @@ pub fn model_details(
             div()
                 .flex_none()
                 .when(is_guess(row), |score| score.opacity(GUESS_OPACITY))
-                .child(segment_display(skill_digits(row.entry.theta), 32.0, cx)),
+                .child(segment_display(row_digits(row), 32.0, cx)),
         )
         .child(meaning);
 
@@ -290,7 +292,11 @@ pub fn model_details(
                     .flex_none()
                     .font(mono(theme, FontWeight::MEDIUM))
                     .child(SharedString::from(
-                        skill_digits(entry.theta).trim().to_string(),
+                        if theta_family(&entry.theta_source) == "Unknown" {
+                            "\u{2014}".to_string()
+                        } else {
+                            skill_digits(entry.theta).trim().to_string()
+                        },
                     )),
             )
             .child(
@@ -323,7 +329,7 @@ pub fn model_details(
             cx,
         ));
     }
-    let efforts = rail_group("Efforts", cx).child(effort_rows);
+    let efforts = rail_section("Efforts", Icon::Sliders, cx).child(effort_rows);
 
     let mut skill_rows = rail_properties()
         .child(rail_property(
@@ -336,7 +342,7 @@ pub fn model_details(
     if let Some(bound) = &detail.bound {
         skill_rows = skill_rows.child(rail_property("Lower bound", code(bound), false, cx));
     }
-    let skill = rail_group("Skill", cx)
+    let skill = rail_section("Skill", Icon::AiBrain01Icon, cx)
         .min_w(px(0.0))
         .child(skill_rows)
         .child(prose(detail.how.clone(), cx));
@@ -364,7 +370,7 @@ pub fn model_details(
         };
         band_rows = band_rows.child(rail_property(&band_label(tier), value, false, cx));
     }
-    let bands = rail_group("Pass chance", cx)
+    let bands = rail_section("Pass chance", Icon::Gauge, cx)
         .min_w(px(0.0))
         .child(band_rows)
         .child(prose(bar_note.to_string(), cx));
@@ -373,7 +379,7 @@ pub fn model_details(
     for offer in &row.offers {
         offers = offers.child(offer_row(&offer.agent, &offer_name(offer), &offer.tier, cx));
     }
-    let machine = rail_group("On this machine", cx)
+    let machine = rail_section("On this machine", Icon::Laptop, cx)
         .child(prose(offered_line(row), cx))
         .child(offers)
         .child(prose(routing_note(row, discover), cx));

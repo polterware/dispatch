@@ -342,9 +342,20 @@ fn test_worktree_paths_dirty_remove_recover_and_branch_helpers() {
     assert!(stat.contains("sub/new.txt"), "stat={stat}");
     assert!(!dirty(&wt));
 
+    // An unmerged branch is refused before anything is removed.
+    let err = remove(repo, &wt, &branch, false).expect_err("unmerged remove without force");
+    assert!(err.to_string().contains("not merged"), "{err}");
+    assert!(wt.exists(), "the refused remove took the worktree");
+    let err = worktree::forget(repo, &branch, false).expect_err("unmerged forget");
+    assert!(err.to_string().contains("not merged"), "{err}");
+
     write_file(&wt, "sub/dirty_again.txt", b"discard me\n");
     remove(repo, &wt, &branch, true).expect("force remove dirty unmerged worktree");
     assert!(!wt.exists());
+    assert!(
+        must_git(repo, &["branch", "--list", "dispatch/*"]).is_empty(),
+        "the branch outlived a forced remove"
+    );
 
     // Detached HEAD reports "HEAD".
     run_git(repo, &["checkout", "-q", "--detach", &base_sha]);

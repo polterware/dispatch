@@ -96,10 +96,11 @@ pub fn agent_card(row: &SpendRow, cx: &App) -> AnyElement {
     }
     if let Some(counts) = row.counts.as_ref() {
         let cache = counts.cache_read.saturating_add(counts.cache_write);
+        // Three hues far apart, since the bar's face softens each into the material.
         for (count, color, name) in [
             (counts.input, theme.chart_blue, "Input"),
-            (cache, theme.chart_cyan, "Cache"),
-            (counts.output, theme.chart_violet, "Output"),
+            (cache, theme.chart_green, "Cache"),
+            (counts.output, theme.chart_amber, "Output"),
         ] {
             card = card.part(
                 count.max(0) as f32,

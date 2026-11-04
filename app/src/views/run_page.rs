@@ -630,7 +630,7 @@ impl RunPageView {
                 "Delete worktree"
             };
             row = row.child(
-                Button::new("run-delete-worktree", ButtonKind::Ghost)
+                Button::new("run-delete-worktree", ButtonKind::Danger)
                     .size(ButtonSize::Sm)
                     .icon(Icon::Delete)
                     .icon_size(12.0)

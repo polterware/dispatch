@@ -19,7 +19,7 @@ use std::path::Path;
 use std::time::Duration;
 
 const RUN_USAGE: &str = "usage: dispatch run [--tier <auto|easy|normal|hard>] [--role <name|none>] [--card <slug>] [--agent <name>] [--provider <p>] [--model <m>] [--effort <e>] [--priority <p>] [--relax] [--readonly] [--timeout <dur>] [--dir <repo>] [--worktree <dir>] [--json] [--compact] <prompt|->
-       dispatch ls [--conversation <id>] [--json] [--compact]
+       dispatch runs [--conversation <id>] [--project <id>] [--json] [--compact]
        dispatch status <id> [--json] [--compact]
        dispatch result <id> [--section summary|agent|files|attempts|meta|output] [--offset <n>] [--limit <n>] [--json] [--compact]
        dispatch cancel <id> [--json] [--compact]
@@ -134,8 +134,8 @@ impl From<&Run> for RunView {
     }
 }
 
-/// The run as the CLI has always read the core's message: its attempts are
-/// not carried, so the summary counts the one that ran.
+/// The run as the core's message carries it, its attempts included, so a summary counts a
+/// failed run's tries.
 pub(super) fn run_from_proto(p: &pb::DispatchRun) -> Run {
     Run {
         conversation_id: p.conversation_id.clone(),
@@ -184,6 +184,17 @@ pub(super) fn run_from_proto(p: &pb::DispatchRun) -> Run {
         merged_at: (!p.merged_at.trim().is_empty()
             && chrono::DateTime::parse_from_rfc3339(p.merged_at.trim()).is_ok())
         .then(|| p.merged_at.clone()),
+        attempts: p
+            .attempts
+            .iter()
+            .map(|a| Attempt {
+                agent: a.agent.clone(),
+                model: a.model.clone(),
+                error: a.error.clone(),
+                exit_class: a.exit_class.clone(),
+                duration_ms: a.duration_ms,
+            })
+            .collect(),
         ..Run::default()
     }
 }

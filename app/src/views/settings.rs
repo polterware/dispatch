@@ -15,7 +15,7 @@ use gpui::{
 use crate::avatar::agent_avatar;
 use crate::client::{
     ApplyAgentSetupRequest, ClassifyRequest, ConfigRequest, ConfigResponse, CoreClient, CoreError,
-    GetAgentSetupRequest, ListAgentsRequest, ListModelsRequest, Workspace,
+    GetAgentSetupRequest, ListAgentsRequest, ListModelsRequest,
 };
 use crate::models::settings::{
     CLASSIFIERS, CliState, Dimension, InstallState, ListedModel, Policy, RuleSide, SAMPLE_TASK,
@@ -31,7 +31,9 @@ use crate::motion::{Animator, Spring, SpringTier, SpringValue};
 use crate::state::{AppState, Route, SettingsPage, ToastTone};
 use crate::theme::{StatusTone, Theme};
 use crate::ui::parts::settings::{radio_mark, settings_row, settings_section, wash};
-use crate::ui::patterns::{SETTINGS_SECTION_GAP, SettingsNavItem, settings_dialog};
+use crate::ui::patterns::{
+    AnchorSlot, SETTINGS_SECTION_GAP, SettingsNavItem, settings_dialog, window_anchor,
+};
 use crate::ui::{
     ButtonKind, Icon, Menu, MenuItem, Popover, Switch, TextInput, TileTone, button, chip, icon,
     icon_button,
@@ -40,7 +42,10 @@ use crate::ui::{SkeletonLayout, page_skeleton};
 
 const RAIL_ROW: f32 = 32.0;
 const RAIL_GAP: f32 = 2.0;
-const EDITOR_HEIGHT: f32 = 120.0;
+/// The editor's height before a frame has measured it: one row of controls.
+const EDITOR_HEIGHT: f32 = 44.0;
+/// The token picker's trigger, the row's "+" icon button, which the picker lines up with.
+const TOKEN_TRIGGER: f32 = 28.0;
 
 const RAIL: [(SettingsPage, &str, Icon); 4] = [
     (SettingsPage::Agents, "Agents", Icon::Settings),
@@ -59,9 +64,6 @@ pub struct SettingsView {
     state: Entity<AppState>,
     started: bool,
     epoch: u64,
-    project_dir: String,
-    project_id: String,
-    project_scope: bool,
     policy: Option<Policy>,
     policy_ticket: u64,
     keys: BTreeMap<String, String>,
@@ -85,10 +87,17 @@ pub struct SettingsView {
     opencode: Entity<Switch>,
     roles: Entity<Switch>,
     discover: Entity<Switch>,
-    scope: Entity<Switch>,
     priority_menu: Entity<Menu>,
+    priority_anchor: AnchorSlot,
     token_popover: Entity<Popover>,
+    token_anchor: AnchorSlot,
     token_slot: Option<TokenSlot>,
+    /// The agent and model the CLI classifier asks, picked from what the CLIs list.
+    cli_popover: Entity<Popover>,
+    cli_anchor: AnchorSlot,
+    cli_filter: Entity<TextInput>,
+    /// The open classifier editor's content, as the last frame laid it out.
+    editor_measure: AnchorSlot,
     /// How far the dialog is in, 0 to 1.
     open: SpringValue,
     option_hover: [SpringValue; 4],
@@ -114,14 +123,19 @@ impl SettingsView {
         let discover = switch(true, view.clone(), cx, |this, on, cx| {
             this.on_discover(on, cx)
         });
-        let scope = switch(false, view.clone(), cx, |this, on, cx| {
-            this.on_scope(on, cx)
-        });
         let priority_menu = cx.new(Menu::new);
         let token_popover = cx.new(Popover::new);
         let panel_view = view.clone();
         token_popover.update(cx, |popover, _| {
             popover.set_panel(Rc::new(move |_window, app| token_panel(&panel_view, app)));
+            // The "+" ends its row, so the picker grows back over the row.
+            popover.set_align_end(Some(TOKEN_TRIGGER));
+        });
+        let cli_filter = cli_filter_input(view.clone(), cx);
+        let cli_popover = cx.new(Popover::new);
+        let cli_view = view.clone();
+        cli_popover.update(cx, |popover, _| {
+            popover.set_panel(Rc::new(move |_window, app| cli_panel(&cli_view, app)));
         });
         cx.observe(&state, |this, _, cx| {
             this.on_app_state(cx);
@@ -131,13 +145,11 @@ impl SettingsView {
         watch_input(&jev_key, cx);
         watch_input(&openai_key, cx);
         watch_input(&token_draft, cx);
+        watch_input(&cli_filter, cx);
         let mut this = Self {
             state,
             started: false,
             epoch: 0,
-            project_dir: String::new(),
-            project_id: String::new(),
-            project_scope: false,
             policy: None,
             policy_ticket: 0,
             keys: BTreeMap::new(),
@@ -160,10 +172,15 @@ impl SettingsView {
             opencode,
             roles,
             discover,
-            scope,
             priority_menu,
+            priority_anchor: AnchorSlot::default(),
             token_popover,
+            token_anchor: AnchorSlot::default(),
             token_slot: None,
+            cli_popover,
+            cli_anchor: AnchorSlot::default(),
+            cli_filter,
+            editor_measure: AnchorSlot::default(),
             open: SpringValue::new(0.0, SpringTier::Slow),
             option_hover: [SpringValue::new(0.0, SpringTier::Fast); 4],
             option_press: [SpringValue::new(0.0, SpringTier::Fast); 4],
@@ -179,18 +196,7 @@ impl SettingsView {
     }
 
     fn on_app_state(&mut self, cx: &mut Context<Self>) {
-        let workspaces = self.state.read(cx).workspaces().to_vec();
-        let (dir, id) = project_binding(&workspaces);
         let mut reload_policy = false;
-        if dir != self.project_dir || id != self.project_id {
-            self.project_dir = dir;
-            self.project_id = id;
-            if self.project_dir.is_empty() && self.project_scope {
-                self.project_scope = false;
-                self.scope.update(cx, |switch, _| switch.set_on(false));
-            }
-            reload_policy = self.started;
-        }
         let online = self.client(cx).is_some();
         if !online {
             if self.started {
@@ -428,15 +434,11 @@ impl SettingsView {
         self.policy_ticket = self.policy_ticket.wrapping_add(1);
         let ticket = self.policy_ticket;
         let epoch = self.epoch;
-        let dir = self.project_dir.clone();
-        let project = self.project_scope && !dir.is_empty();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
                     client.config(&ConfigRequest {
                         action: "get".to_string(),
-                        dir,
-                        project,
                         ..Default::default()
                     })
                 })
@@ -468,22 +470,16 @@ impl SettingsView {
         };
         self.keys_inflight = true;
         let epoch = self.epoch;
-        let dir = self.project_dir.clone();
-        let project = self.project_scope && !dir.is_empty();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
                     let keys = client.config(&ConfigRequest {
                         action: "get".to_string(),
-                        dir: dir.clone(),
-                        project,
                         key: "classifier_keys".to_string(),
                         ..Default::default()
                     });
                     let cli = client.config(&ConfigRequest {
                         action: "get".to_string(),
-                        dir,
-                        project,
                         key: "classifier_cli".to_string(),
                         ..Default::default()
                     });
@@ -612,23 +608,17 @@ impl SettingsView {
         self.policy_ticket = self.policy_ticket.wrapping_add(1);
         let ticket = self.policy_ticket;
         let epoch = self.epoch;
-        let dir = self.project_dir.clone();
-        let project = self.project_scope && !dir.is_empty();
         let key = key.to_string();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
                     client.config(&ConfigRequest {
                         action: "set".to_string(),
-                        dir: dir.clone(),
-                        project,
                         key,
                         values,
                     })?;
                     client.config(&ConfigRequest {
                         action: "get".to_string(),
-                        dir,
-                        project,
                         ..Default::default()
                     })
                 })
@@ -671,8 +661,6 @@ impl SettingsView {
         self.policy_ticket = self.policy_ticket.wrapping_add(1);
         let ticket = self.policy_ticket;
         let epoch = self.epoch;
-        let dir = self.project_dir.clone();
-        let project = self.project_scope && !dir.is_empty();
         let key = dimension.key().to_string();
         cx.spawn(async move |this, cx| {
             let result: Result<ConfigResponse, CoreError> = cx
@@ -680,8 +668,6 @@ impl SettingsView {
                     if !added.is_empty() {
                         client.config(&ConfigRequest {
                             action: side.action("add"),
-                            dir: dir.clone(),
-                            project,
                             key: key.clone(),
                             values: added,
                         })?;
@@ -689,16 +675,12 @@ impl SettingsView {
                     if !removed.is_empty() {
                         client.config(&ConfigRequest {
                             action: side.action("rm"),
-                            dir: dir.clone(),
-                            project,
                             key: key.clone(),
                             values: removed,
                         })?;
                     }
                     client.config(&ConfigRequest {
                         action: "get".to_string(),
-                        dir,
-                        project,
                         ..Default::default()
                     })
                 })
@@ -812,7 +794,6 @@ impl SettingsView {
                         action,
                         key: key_name,
                         values,
-                        ..Default::default()
                     })
                 })
                 .await;
@@ -876,8 +857,6 @@ impl SettingsView {
         };
         let request = ClassifyRequest {
             prompt,
-            dir: self.project_dir.clone(),
-            project_id: self.project_id.clone(),
             ..Default::default()
         };
         let epoch = self.epoch;
@@ -956,15 +935,120 @@ impl SettingsView {
         self.write_values("discover", vec![bool_wire(on)], cx);
     }
 
-    fn on_scope(&mut self, on: bool, cx: &mut Context<Self>) {
-        if self.project_dir.is_empty() {
-            self.project_scope = false;
-            self.scope.update(cx, |switch, _| switch.set_on(false));
+    /// For the screenshot tour: opens Priority (0), the Allow models picker (1), picks the
+    /// agent CLI classifier (2), or opens its model picker (3).
+    pub(crate) fn tour_open(&mut self, which: usize, cx: &mut Context<Self>) {
+        match which {
+            0 => self.open_priority(cx),
+            1 => self.open_tokens(RuleSide::Allow, Dimension::Models, cx),
+            2 => self.choose_classifier("cli", cx),
+            _ => self.open_cli_models(cx),
+        }
+        cx.notify();
+    }
+
+    /// For the screenshot tour: closes what [`Self::tour_open`] opened.
+    pub(crate) fn tour_close(&mut self, cx: &mut Context<Self>) {
+        self.priority_menu.update(cx, |menu, cx| {
+            menu.set_open(false);
             cx.notify();
+        });
+        for popover in [&self.token_popover, &self.cli_popover] {
+            popover.update(cx, |popover, cx| {
+                popover.set_open(false);
+                cx.notify();
+            });
+        }
+        self.token_slot = None;
+        cx.notify();
+    }
+
+    fn open_cli_models(&mut self, cx: &mut Context<Self>) {
+        self.cli_filter
+            .update(cx, |input, cx| input.set_text("", cx));
+        self.cli_popover.update(cx, |popover, cx| {
+            popover.set_open(true);
+            cx.notify();
+        });
+    }
+
+    /// The agent and model pairs the CLIs here list, as `agent/model`, that hold `filter`.
+    fn cli_options(&self, filter: &str) -> Vec<(String, String)> {
+        let filter = filter.trim().to_lowercase();
+        let mut options: Vec<(String, String)> = self
+            .models
+            .iter()
+            .filter(|listed| !listed.agent.is_empty() && !listed.model.is_empty())
+            .map(|listed| (listed.agent.clone(), listed.model.clone()))
+            .filter(|(agent, model)| {
+                filter.is_empty() || format!("{agent} {model}").to_lowercase().contains(&filter)
+            })
+            .collect();
+        options.sort();
+        options.dedup();
+        options
+    }
+
+    /// Picks the first model the filter holds, or the `agent/model` typed.
+    fn submit_cli_filter(&mut self, text: String, cx: &mut Context<Self>) {
+        let text = text.trim().to_string();
+        if text.is_empty() {
             return;
         }
-        self.project_scope = on;
-        self.load_policy(cx);
+        let pick = self
+            .cli_options(&text)
+            .into_iter()
+            .next()
+            .map(|(agent, model)| format!("{agent}/{model}"))
+            .or_else(|| text.contains('/').then_some(text));
+        if let Some(pick) = pick {
+            self.pick_cli_model(Some(pick), cx);
+        }
+    }
+
+    /// Has the CLI classifier ask `agent/model`, or the easy tier's agent with `None`.
+    fn pick_cli_model(&mut self, pick: Option<String>, cx: &mut Context<Self>) {
+        self.cli_popover.update(cx, |popover, cx| {
+            popover.set_open(false);
+            cx.notify();
+        });
+        let Some(client) = self.client(cx) else {
+            self.toast("This core does not support it yet.", ToastTone::Danger, cx);
+            return;
+        };
+        let value = pick.unwrap_or_else(|| "default".to_string());
+        let epoch = self.epoch;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    client.config(&ConfigRequest {
+                        action: "set".to_string(),
+                        key: "classifier_agent".to_string(),
+                        values: vec![value],
+                    })?;
+                    client.config(&ConfigRequest {
+                        action: "get".to_string(),
+                        key: "classifier_cli".to_string(),
+                        ..Default::default()
+                    })
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if view.epoch != epoch {
+                    return;
+                }
+                match result {
+                    Ok(response) => view.cli_model = Some(parse_cli_model(&response.json)),
+                    Err(err) => view.toast(
+                        core_message(&err, "Could not change the classifier's model."),
+                        ToastTone::Danger,
+                        cx,
+                    ),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn choose_classifier(&mut self, value: &str, cx: &mut Context<Self>) {
@@ -1023,7 +1107,11 @@ impl SettingsView {
     }
 
     fn open_tokens(&mut self, side: RuleSide, dimension: Dimension, cx: &mut Context<Self>) {
-        self.token_slot = Some(TokenSlot { side, dimension });
+        let slot = Some(TokenSlot { side, dimension });
+        if self.token_slot != slot {
+            self.token_anchor.clear();
+        }
+        self.token_slot = slot;
         self.token_draft
             .update(cx, |input, cx| input.set_text("", cx));
         self.token_popover.update(cx, |popover, cx| {
@@ -1058,8 +1146,12 @@ impl SettingsView {
         if editor_open && let Some(policy) = &self.policy {
             self.editor_slot = Some(picked_index(&policy.classifier));
         }
+        let measured = self
+            .editor_measure
+            .get()
+            .map_or(EDITOR_HEIGHT, |bounds| f32::from(bounds.size.height));
         self.editor
-            .set_target(if editor_open { EDITOR_HEIGHT } else { 0.0 });
+            .set_target(if editor_open { measured } else { 0.0 });
         let show_result = match page {
             SettingsPage::Classifier => self.classify_report.is_some(),
             _ => false,
@@ -1295,8 +1387,10 @@ impl SettingsView {
                 ));
             }
             if let Some(toggle) = self.hooks.get(&hook.agent) {
+                let selector = format!("settings-hook-{}", hook.agent);
                 trailing = trailing.child(
                     div()
+                        .debug_selector(move || selector)
                         .when(!enabled, |row| row.opacity(0.45))
                         .child(toggle.clone()),
                 );
@@ -1521,8 +1615,11 @@ impl SettingsView {
                             .overflow_hidden()
                             .child(
                                 div()
+                                    .relative()
                                     .pt(px(theme.space_2))
+                                    .pb(px(theme.space_1))
                                     .px(px(theme.space_2))
+                                    .child(self.editor_measure.probe())
                                     .child(self.classifier_editor(choice.value, cx)),
                             ),
                     );
@@ -1647,42 +1744,65 @@ impl SettingsView {
             .unwrap_or_default();
         let enabled = !agent.is_empty();
         let view = cx.entity().downgrade();
-        let mut row = div()
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .gap(px(theme.space_2));
-        if agent.is_empty() {
-            row = row.child(
-                div()
-                    .text_size(px(theme.font_size_xs))
-                    .text_color(theme.color_text_muted)
-                    .child("No agent of the easy tier is installed."),
-            );
+        let label = if agent.is_empty() {
+            div()
+                .text_size(px(theme.font_size_sm))
+                .text_color(theme.color_text_muted)
+                .child("Pick a model")
         } else {
-            row = row.child(
+            div()
+                .min_w(px(0.0))
+                .flex()
+                .items_center()
+                .gap(px(theme.space_2))
+                .child(agent_avatar(&agent, "", 14.0))
+                .child(
+                    div()
+                        .font_family(theme.font_mono)
+                        .text_size(px(theme.font_size_sm))
+                        .child(agent),
+                )
+                .when(!model.is_empty(), |row| {
+                    row.child(
+                        div()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .font_family(theme.font_mono)
+                            .text_size(px(theme.font_size_sm))
+                            .text_color(theme.color_text_muted)
+                            .child(model),
+                    )
+                })
+        };
+        let open = gated(true, view.clone(), |this, cx| this.open_cli_models(cx));
+        let trigger = div()
+            .relative()
+            .max_w(px(360.0))
+            .child(self.cli_anchor.probe())
+            .child(
                 div()
+                    .id("settings-cli-model")
+                    .debug_selector(|| "settings-cli-model".to_string())
+                    .h(px(theme.control_height_md))
+                    .px(px(theme.space_3))
                     .flex()
                     .items_center()
                     .gap(px(theme.space_2))
-                    .child(agent_avatar(&agent, "", 14.0))
-                    .child(
-                        div()
-                            .font_family(theme.font_mono)
-                            .text_size(px(theme.font_size_sm))
-                            .child(agent),
-                    )
-                    .when(!model.is_empty(), |row| {
-                        row.child(
-                            div()
-                                .font_family(theme.font_mono)
-                                .text_size(px(theme.font_size_sm))
-                                .text_color(theme.color_text_muted)
-                                .child(model),
-                        )
-                    }),
+                    .rounded_full()
+                    .bg(theme.color_surface_subtle)
+                    .border_1()
+                    .border_color(theme.color_border)
+                    .cursor_pointer()
+                    .on_click(move |_, window, cx| open(window, cx))
+                    .child(label)
+                    .child(icon(Icon::ChevronDown, 14.0, cx)),
             );
-        }
+        let row = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(theme.space_2))
+            .child(trigger);
         row.child(dim_button(
             "settings-cli-test",
             "Test",
@@ -1705,7 +1825,9 @@ impl SettingsView {
                 .child(settings_row(
                     "Pick a role for Auto runs",
                     Some("The classifier chooses a role for an Auto run that names none.".into()),
-                    self.roles.clone(),
+                    div()
+                        .debug_selector(|| "settings-pick-role".to_string())
+                        .child(self.roles.clone()),
                     cx,
                 ));
             for line in [
@@ -1796,20 +1918,8 @@ impl SettingsView {
     }
 
     fn policy_page(&self, theme: Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let description = if self.project_dir.is_empty() {
-            "Open a project to give it its own policy."
-        } else {
-            "Read and write this project's .dispatch/config.json, over the global policy."
-        };
         let view = cx.entity().downgrade();
-        let mut body = div().flex().flex_col().child(settings_row(
-            "This project only",
-            Some(description.into()),
-            div()
-                .when(self.project_dir.is_empty(), |row| row.opacity(0.45))
-                .child(self.scope.clone()),
-            cx,
-        ));
+        let mut body = div().flex().flex_col();
         if let Some(policy) = &self.policy {
             let priority = priority_label(priority_value(&policy.priority));
             body = body
@@ -1822,7 +1932,7 @@ impl SettingsView {
                     menu_trigger(
                         "settings-priority",
                         priority.into(),
-                        self.priority_menu.clone(),
+                        &self.priority_anchor,
                         gated(true, view.clone(), |this, cx| this.open_priority(cx)),
                         theme,
                         cx,
@@ -1835,7 +1945,9 @@ impl SettingsView {
                         "Let Auto route to models the agent CLIs report that are not in the tier table."
                             .into(),
                     ),
-                    self.discover.clone(),
+                    div()
+                        .debug_selector(|| "settings-discover".to_string())
+                        .child(self.discover.clone()),
                     cx,
                 ));
         } else {
@@ -1850,7 +1962,7 @@ impl SettingsView {
                 Icon::Route,
                 TileTone::Architecture,
                 "Model choice",
-                "How runs pick a model, for every repository or only this project.",
+                "How Auto picks a model. One policy, for every repository.",
                 None,
                 body,
                 cx,
@@ -1946,7 +2058,7 @@ impl SettingsView {
                     click(view, move |this, cx| this.open_tokens(side, dimension, cx)),
                     cx,
                 ))
-                .when(active, |row| row.child(self.token_popover.clone())),
+                .when(active, |row| row.child(self.token_anchor.probe())),
         )
         .into_any_element()
     }
@@ -1968,7 +2080,7 @@ impl Render for SettingsView {
             .collect();
         let select = self.state.clone();
         let close = self.state.clone();
-        settings_dialog(self.presence())
+        let mut dialog = settings_dialog(self.presence())
             .items(items)
             .active(active)
             .on_select(Rc::new(
@@ -1995,16 +2107,44 @@ impl Render for SettingsView {
                     .opacity(entered)
                     .font_family(theme.font_sans)
                     .child(self.page_body(&page, theme, cx)),
-            )
+            );
+        for overlay in self.overlays(&page) {
+            dialog = dialog.overlay(overlay);
+        }
+        dialog
     }
 }
 
-fn project_binding(workspaces: &[Workspace]) -> (String, String) {
-    workspaces
-        .iter()
-        .find(|workspace| !workspace.path.trim().is_empty())
-        .map(|workspace| (workspace.path.clone(), workspace.id.clone()))
-        .unwrap_or_else(|| (String::new(), String::new()))
+impl SettingsView {
+    /// The open page's menus and pickers, each hung from its trigger over the whole dialog,
+    /// outside the content's scroll and clip. A closed one draws nothing.
+    fn overlays(&self, page: &SettingsPage) -> Vec<gpui::AnyElement> {
+        let hung: Vec<(&AnchorSlot, gpui::AnyElement)> = match page {
+            SettingsPage::RoutingPolicy => {
+                let mut hung = vec![(
+                    &self.priority_anchor,
+                    self.priority_menu.clone().into_any_element(),
+                )];
+                if self.token_slot.is_some() {
+                    hung.push((
+                        &self.token_anchor,
+                        self.token_popover.clone().into_any_element(),
+                    ));
+                }
+                hung
+            }
+            SettingsPage::Classifier => {
+                vec![(
+                    &self.cli_anchor,
+                    self.cli_popover.clone().into_any_element(),
+                )]
+            }
+            _ => Vec::new(),
+        };
+        hung.into_iter()
+            .filter_map(|(anchor, panel)| Some(window_anchor(anchor.get()?, panel)))
+            .collect()
+    }
 }
 
 fn page_index(page: &SettingsPage) -> usize {
@@ -2195,10 +2335,12 @@ fn dim_button(
         .into_any_element()
 }
 
+/// A select-like trigger, 168px wide. Its menu hangs from `anchor` in the dialog's overlay,
+/// so the rows after it never paint over the menu.
 fn menu_trigger(
     id: &'static str,
     label: SharedString,
-    menu: Entity<Menu>,
+    anchor: &AnchorSlot,
     on_open: Rc<dyn Fn(&mut Window, &mut App)>,
     theme: Theme,
     cx: &App,
@@ -2206,9 +2348,11 @@ fn menu_trigger(
     div()
         .relative()
         .w(px(168.0))
+        .child(anchor.probe())
         .child(
             div()
                 .id(id)
+                .debug_selector(move || id.to_string())
                 .h(px(theme.control_height_md))
                 .w_full()
                 .px(px(theme.space_3))
@@ -2225,13 +2369,14 @@ fn menu_trigger(
                 .on_click(move |_, window, cx| on_open(window, cx))
                 .child(
                     div()
+                        .min_w(px(0.0))
+                        .truncate()
                         .text_size(px(theme.font_size_sm))
                         .text_color(theme.color_text_primary)
                         .child(label),
                 )
                 .child(icon(Icon::ChevronDown, 14.0, cx)),
         )
-        .child(menu)
         .into_any_element()
 }
 
@@ -2292,6 +2437,7 @@ fn token_panel(view: &WeakEntity<SettingsView>, cx: &mut App) -> gpui::AnyElemen
         );
     }
     div()
+        .debug_selector(|| "settings-token-panel".to_string())
         .w(px(220.0))
         .flex()
         .flex_col()
@@ -2299,6 +2445,140 @@ fn token_panel(view: &WeakEntity<SettingsView>, cx: &mut App) -> gpui::AnyElemen
         .child(list)
         .child(draft)
         .into_any_element()
+}
+
+/// The CLI classifier's picker: the easy tier's agent, then every agent and model the CLIs
+/// here list, under a filter that also takes a typed `agent/model`.
+fn cli_panel(view: &WeakEntity<SettingsView>, cx: &mut App) -> gpui::AnyElement {
+    let Some(view) = view.upgrade() else {
+        return div().into_any_element();
+    };
+    let theme = *Theme::global(cx);
+    let (options, filter, current) = {
+        let settings = view.read(cx);
+        let text = settings.cli_filter.read(cx).text().to_string();
+        let current = settings
+            .cli_model
+            .as_ref()
+            .map(|model| (model.agent.clone(), model.model.clone()));
+        (
+            settings.cli_options(&text),
+            settings.cli_filter.clone(),
+            current,
+        )
+    };
+    let row = |id: gpui::ElementId, on: bool, child: gpui::AnyElement, pick: Option<String>| {
+        let view = view.downgrade();
+        let selector = format!(
+            "settings-cli-option-{}",
+            pick.as_deref().unwrap_or("default")
+        );
+        div()
+            .id(id)
+            .debug_selector(move || selector)
+            .min_h(px(theme.control_height_md))
+            .px(px(theme.space_2))
+            .flex()
+            .items_center()
+            .gap(px(theme.space_2))
+            .rounded(px(theme.radius_sm))
+            .cursor_pointer()
+            .hover(|style| style.bg(theme.color_surface_hover))
+            .text_size(px(theme.font_size_sm))
+            .on_click(move |_, _, app| {
+                let view = view.clone();
+                let pick = pick.clone();
+                app.defer(move |app| {
+                    if let Some(view) = view.upgrade() {
+                        view.update(app, |this, cx| this.pick_cli_model(pick, cx));
+                    }
+                });
+            })
+            .child(div().flex_1().min_w(px(0.0)).child(child))
+            .when(on, |row| row.child(icon(Icon::Check, 14.0, cx)))
+    };
+    let mut list = div()
+        .id("settings-cli-options")
+        .flex()
+        .flex_col()
+        .max_h(px(260.0))
+        .overflow_y_scroll()
+        .child(row(
+            "settings-cli-default".into(),
+            false,
+            div()
+                .text_color(theme.color_text_secondary)
+                .child("The easy tier's first agent")
+                .into_any_element(),
+            None,
+        ));
+    for (index, (agent, model)) in options.iter().enumerate() {
+        let on = current
+            .as_ref()
+            .is_some_and(|(a, m)| a == agent && m == model);
+        let label = div()
+            .flex()
+            .items_center()
+            .gap(px(theme.space_2))
+            .child(agent_avatar(agent, "", 14.0))
+            .child(
+                div()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .font_family(theme.font_mono)
+                    .child(model.clone()),
+            )
+            .into_any_element();
+        list = list.child(row(
+            ("settings-cli-option", index).into(),
+            on,
+            label,
+            Some(format!("{agent}/{model}")),
+        ));
+    }
+    if options.is_empty() {
+        list = list.child(
+            div()
+                .px(px(theme.space_2))
+                .py(px(theme.space_2))
+                .text_size(px(theme.font_size_xs))
+                .text_color(theme.color_text_muted)
+                .child(
+                    "No model the agent CLIs list holds that. Type agent/model and press Return.",
+                ),
+        );
+    }
+    div()
+        .w(px(320.0))
+        .flex()
+        .flex_col()
+        .gap(px(theme.space_2))
+        .child(
+            div()
+                .debug_selector(|| "settings-cli-filter".to_string())
+                .child(filter),
+        )
+        .child(list)
+        .into_any_element()
+}
+
+fn cli_filter_input(
+    view: WeakEntity<SettingsView>,
+    cx: &mut Context<SettingsView>,
+) -> Entity<TextInput> {
+    cx.new(move |cx| {
+        TextInput::new(cx)
+            .placeholder("Search models, or type agent/model")
+            .on_submit(move |text, _, app| {
+                let text = text.to_string();
+                let view = view.clone();
+                app.defer(move |app| {
+                    if let Some(view) = view.upgrade() {
+                        view.update(app, |this, cx| this.submit_cli_filter(text, cx));
+                    }
+                });
+            })
+    })
 }
 
 /// A settings section in bones while the core answers: `rows` rows, no toolbar.

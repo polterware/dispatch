@@ -717,8 +717,6 @@ pub struct RecoverRunRequest {
 #[serde(rename_all = "camelCase", default)]
 pub struct ConfigRequest {
     pub action: String,
-    pub dir: String,
-    pub project: bool,
     pub key: String,
     pub values: Vec<String>,
 }

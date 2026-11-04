@@ -1,0 +1,882 @@
+//! End to end: the real `dispatch` binary and the core it starts, driven as an agent or a
+//! person drives them, with a fake ACP agent (`tests/fixtures/e2e/fake-acp.sh`) in a home,
+//! data folder, and repository of each test's own. Nothing here touches the user's data or
+//! runs a paid agent. `DISPATCH_E2E_BIN` points the suite at another build, such as the
+//! installed app's `Contents/Resources/dispatch`.
+
+use dispatch_core::{coreclient, proto as pb, runstate};
+use serde_json::Value;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+use std::time::{Duration, Instant};
+use tempfile::TempDir;
+
+const FAKE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/e2e/fake-acp.sh"
+);
+
+fn binary() -> PathBuf {
+    std::env::var_os("DISPATCH_E2E_BIN").map_or_else(
+        || PathBuf::from(env!("CARGO_BIN_EXE_dispatch")),
+        PathBuf::from,
+    )
+}
+
+/// Runs git in `dir` with no user or system config, so the machine's hooks stay out.
+fn git(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "-c",
+            "user.name=e2e",
+            "-c",
+            "user.email=e2e@example.invalid",
+        ])
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .expect("spawn git");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+fn read(path: impl AsRef<Path>) -> String {
+    std::fs::read_to_string(path.as_ref())
+        .unwrap_or_else(|e| panic!("read {}: {e}", path.as_ref().display()))
+}
+
+/// Waits up to 30 seconds for `done`.
+fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !done() {
+        assert!(Instant::now() < deadline, "timed out waiting until {what}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn items(v: &Value) -> &[Value] {
+    v.as_array().map_or(&[], Vec::as_slice)
+}
+
+/// One test's world: its home, data folder, repository, and copy of the fake agent.
+struct Env {
+    _dir: TempDir,
+    root: PathBuf,
+    home: PathBuf,
+    data: PathBuf,
+    repo: PathBuf,
+    agent: PathBuf,
+    session: String,
+}
+
+impl Env {
+    fn new() -> Self {
+        let dir = tempfile::Builder::new()
+            .prefix("dispatch-e2e-")
+            .tempdir()
+            .expect("tempdir");
+        let root = std::fs::canonicalize(dir.path()).expect("canonicalize");
+        let (home, data, repo) = (root.join("home"), root.join("data"), root.join("repo"));
+        for d in [&home, &data, &repo] {
+            std::fs::create_dir_all(d).expect("mkdir");
+        }
+        // Each test runs its own copy of the agent, so a process left behind is its own,
+        // and the copy logs what it reads next to it.
+        let agent = root.join("fake-acp.sh");
+        let script = read(FAKE).replacen(
+            "#!/bin/sh\n",
+            &format!(
+                "#!/bin/sh\nFAKE_ACP_LOG='{}'\n",
+                root.join("agent.log").display()
+            ),
+            1,
+        );
+        std::fs::write(&agent, script).expect("write agent");
+        std::fs::set_permissions(&agent, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("chmod agent");
+        git(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("README.md"), "end to end\n").expect("write readme");
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-qm", "init"]);
+        let session = format!("e2e-{}", root.file_name().unwrap().to_string_lossy());
+        let env = Env {
+            _dir: dir,
+            root,
+            home,
+            data,
+            repo,
+            agent,
+            session,
+        };
+        let agent = env.agent.to_string_lossy().into_owned();
+        env.ok(&["agents", "add", "fake", "--", &agent]);
+        // Routing never reaches an agent CLI this machine has installed.
+        env.ok(&["config", "allow", "add", "agents", "fake"]);
+        env
+    }
+
+    fn command(&self, args: &[&str]) -> Command {
+        self.command_of(&binary(), args)
+    }
+
+    /// A command of another program, with this test's environment.
+    fn command_of(&self, program: &Path, args: &[&str]) -> Command {
+        let mut c = Command::new(program);
+        c.args(args)
+            .current_dir(&self.repo)
+            .env_clear()
+            .env("HOME", &self.home)
+            .env("PWDISPATCH_DATA_DIR", &self.data)
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .env("SHELL", "/bin/sh")
+            .env("TMPDIR", std::env::temp_dir())
+            .env("DISPATCH_CALLER_AGENT", "claude")
+            .env("DISPATCH_CALLER_SESSION", &self.session);
+        c
+    }
+
+    fn output(&self, args: &[&str]) -> Output {
+        self.command(args).output().expect("spawn dispatch")
+    }
+
+    /// Runs a command that must succeed and returns its stdout.
+    fn ok(&self, args: &[&str]) -> String {
+        let out = self.output(args);
+        assert!(
+            out.status.success(),
+            "dispatch {args:?}: {}\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    fn json(&self, args: &[&str]) -> Value {
+        let out = self.ok(args);
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("dispatch {args:?}: {e}: {out}"))
+    }
+
+    /// Runs a command that must fail and returns its stderr.
+    fn fails(&self, args: &[&str]) -> String {
+        let out = self.output(args);
+        assert!(
+            !out.status.success(),
+            "dispatch {args:?} succeeded: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    }
+
+    /// Starts a run on the fake agent and returns its id.
+    fn run(&self, prompt: &str, flags: &[&str]) -> String {
+        let mut args = vec!["run", "--agent", "fake", "--json"];
+        args.extend_from_slice(flags);
+        args.push(prompt);
+        let started = self.json(&args);
+        assert_eq!(started["status"], "PENDING", "{started}");
+        started["id"].as_str().expect("run id").to_owned()
+    }
+
+    fn status(&self, id: &str) -> Value {
+        self.json(&["status", id, "--json"])
+    }
+
+    /// Waits for the run to reach `want`, failing at once when it ends otherwise.
+    fn wait_for(&self, id: &str, want: &str) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let s = self.status(id);
+            let status = s["status"].as_str().unwrap_or_default().to_owned();
+            if status == want {
+                return s;
+            }
+            let ended = ["COMPLETED", "FAILED", "CANCELLED", "ORPHANED"].contains(&status.as_str());
+            assert!(!ended, "run {id} ended {status}, not {want}: {s}");
+            assert!(
+                Instant::now() < deadline,
+                "run {id} is still {status}, not {want}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Whether this test's agent has a process.
+    fn agent_alive(&self) -> bool {
+        Command::new("pgrep")
+            .args(["-f", &self.agent.to_string_lossy()])
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
+    fn agent_log(&self) -> String {
+        std::fs::read_to_string(self.root.join("agent.log")).unwrap_or_default()
+    }
+
+    fn db(&self) -> PathBuf {
+        self.data.join("dispatch.db")
+    }
+
+    /// Kills the core with SIGKILL, as a crash or a force quit would.
+    fn kill_core(&self) {
+        let core = runstate::read_core(self.db()).expect("core.json");
+        let killed = Command::new("kill")
+            .args(["-9", &core.pid.to_string()])
+            .status()
+            .expect("spawn kill");
+        assert!(killed.success());
+        wait_until("the killed core is gone", || {
+            !Command::new("kill")
+                .args(["-0", &core.pid.to_string()])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        });
+    }
+
+    fn worktrees(&self) -> String {
+        git(&self.repo, &["branch", "--list", "dispatch/*"])
+    }
+}
+
+impl Drop for Env {
+    fn drop(&mut self) {
+        let _ = self.command(&["stop"]).output();
+        let _ = Command::new("pkill")
+            .args(["-9", "-f", &self.agent.to_string_lossy()])
+            .status();
+    }
+}
+
+#[test]
+fn a_read_only_run_answers_and_is_listed() {
+    let env = Env::new();
+    let id = env.run("say hi", &["--readonly"]);
+    let s = env.wait_for(&id, "COMPLETED");
+    assert_eq!(s["agent"], "fake");
+    assert_eq!(s["model"], "fake-fast");
+    assert_eq!(s["attempts"], 1);
+    assert_eq!(s["exit_class"], "ok");
+    assert_eq!(s["usage"]["input_tokens"], 100);
+    assert_eq!(s["usage"]["output_tokens"], 10);
+    let conversation = format!("claude:{}", env.session);
+    assert_eq!(s["conversation_id"], conversation.as_str());
+    assert!(
+        s.get("worktree").is_none(),
+        "a read-only run got a worktree: {s}"
+    );
+    assert!(
+        env.agent_log().contains("say hi"),
+        "the prompt never reached the agent"
+    );
+    assert_eq!(
+        env.ok(&["result", &id, "--section", "agent"]).trim(),
+        "Fake agent done."
+    );
+    assert!(
+        env.ok(&["result", &id])
+            .starts_with("COMPLETED fake/fake-fast")
+    );
+
+    // A short id names the run as the whole one does.
+    assert_eq!(env.status(&id[..8])["id"], id.as_str());
+    let err = env.fails(&["status", "0000000000", "--json"]);
+    assert!(err.contains("not found"), "{err}");
+
+    let all = env.json(&["runs", "--json"]);
+    assert!(
+        items(&all["runs"])
+            .iter()
+            .any(|r| r["ID"] == id.as_str() && r["Status"] == "COMPLETED"),
+        "{all}"
+    );
+    let mine = env.json(&["runs", "--conversation", &conversation, "--json"]);
+    assert_eq!(items(&mine["runs"]).len(), 1, "{mine}");
+    let theirs = env.json(&["runs", "--conversation", "claude:someone-else", "--json"]);
+    assert!(items(&theirs["runs"]).is_empty(), "{theirs}");
+
+    let waited: Value =
+        serde_json::from_str(&env.ok(&["wait", &id, "--timeout", "10s"])).expect("wait json");
+    assert_eq!(waited["status"], "COMPLETED");
+
+    let usage = env.json(&["usage", "--json"]);
+    let row = items(&usage["rows"])
+        .iter()
+        .find(|r| r["key"] == "fake-fast")
+        .unwrap_or_else(|| panic!("no fake-fast row: {usage}"));
+    assert_eq!(row["runs"], 1);
+    assert_eq!(row["input_tokens"], 100);
+}
+
+#[test]
+fn a_write_run_lands_on_its_branch_and_merges() {
+    let env = Env::new();
+    let id = env.run("WRITE a file", &[]);
+    let s = env.wait_for(&id, "COMPLETED");
+    let worktree = PathBuf::from(s["worktree"].as_str().expect("worktree"));
+    assert_eq!(s["branch"], format!("dispatch/{id}").as_str());
+    assert!(
+        worktree.join("e2e.txt").exists(),
+        "the agent's file is not in the worktree"
+    );
+    assert!(
+        !env.repo.join("e2e.txt").exists(),
+        "the run wrote into the checkout"
+    );
+    assert!(
+        env.ok(&["result", &id, "--section", "files"])
+            .contains("files=1"),
+        "files section"
+    );
+
+    env.ok(&["merge", &id[..8]]);
+    assert!(read(env.repo.join("e2e.txt")).starts_with("written by the fake agent"));
+    assert!(!worktree.exists(), "merge left the worktree");
+    assert_eq!(env.worktrees(), "", "merge left the branch");
+    assert!(git(&env.repo, &["log", "-1", "--format=%s"]).contains(&id));
+    assert_eq!(git(&env.repo, &["status", "--porcelain"]), "");
+    // A clean after the merge finds nothing left and is no error.
+    env.ok(&["clean", &id]);
+}
+
+#[test]
+fn clean_keeps_unmerged_work_unless_forced() {
+    let env = Env::new();
+    let id = env.run("WRITE a file", &[]);
+    let s = env.wait_for(&id, "COMPLETED");
+    let worktree = PathBuf::from(s["worktree"].as_str().expect("worktree"));
+
+    let err = env.fails(&["clean", &id]);
+    assert!(err.contains("not merged"), "{err}");
+    assert!(worktree.exists(), "a refused clean took the worktree");
+    assert_ne!(env.worktrees(), "", "a refused clean took the branch");
+
+    env.ok(&["clean", &id, "--force"]);
+    assert!(!worktree.exists());
+    assert_eq!(env.worktrees(), "");
+    assert!(!env.repo.join("e2e.txt").exists());
+    // Nothing is left to merge.
+    let merged = env.output(&["merge", &id]);
+    assert!(!merged.status.success(), "a cleaned run merged");
+}
+
+#[test]
+fn a_failing_agent_fails_after_each_model() {
+    let env = Env::new();
+    let id = env.run("FAIL please", &["--readonly"]);
+    let s = env.wait_for(&id, "FAILED");
+    assert_eq!(s["attempts"], 2, "both models were not tried: {s}");
+    assert!(
+        s["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("the fake agent failed"),
+        "{s}"
+    );
+    let waited = env.output(&["wait", &id, "--timeout", "10s"]);
+    assert!(!waited.status.success(), "wait exits 0 for a failed run");
+
+    // A denied model is never tried.
+    env.ok(&["config", "deny", "add", "models", "fake-deep"]);
+    let id = env.run("FAIL again", &["--readonly"]);
+    let s = env.wait_for(&id, "FAILED");
+    assert_eq!(s["attempts"], 1, "{s}");
+    assert_eq!(s["model"], "fake-fast");
+}
+
+#[test]
+fn a_cancelled_run_ends_with_its_agent() {
+    let env = Env::new();
+    let id = env.run("SLOW answer", &["--readonly"]);
+    env.wait_for(&id, "RUNNING");
+    wait_until("the agent runs", || env.agent_alive());
+
+    // One run at a time in a folder.
+    let err = env.fails(&["run", "--agent", "fake", "--readonly", "--json", "another"]);
+    assert!(err.contains("already active"), "{err}");
+
+    env.ok(&["cancel", &id[..8]]);
+    env.wait_for(&id, "CANCELLED");
+    wait_until("the cancelled agent is gone", || !env.agent_alive());
+
+    // The folder takes a run again.
+    let next = env.run("say hi", &["--readonly"]);
+    env.wait_for(&next, "COMPLETED");
+}
+
+#[test]
+fn a_run_cut_off_by_its_core_is_orphaned_and_recovered() {
+    let env = Env::new();
+    let id = env.run("WRITE then SLOW", &[]);
+    env.wait_for(&id, "RUNNING");
+    let worktree = env.repo.join(".dispatch").join("worktrees").join(&id);
+    wait_until("the agent wrote its file", || {
+        worktree.join("e2e.txt").exists()
+    });
+
+    env.kill_core();
+    assert!(env.agent_alive(), "the agent went down with the core");
+    // The next command starts a core, which finds the run's runner gone and stops its agent.
+    let s = env.wait_for(&id, "ORPHANED");
+    let said = format!("{} {}", s["error"], s["note"]);
+    assert!(said.contains("exited unexpectedly"), "{s}");
+    wait_until("the orphan's agent is gone", || !env.agent_alive());
+
+    let recovered = env.json(&["recover", &id[..8]]);
+    assert!(
+        recovered["diffStat"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("e2e.txt"),
+        "{recovered}"
+    );
+    let s = env.status(&id);
+    assert_eq!(s["status"], "COMPLETED");
+    assert_eq!(s["note"], "recovered from orphan; unverified");
+    assert_eq!(git(&worktree, &["status", "--porcelain"]), "");
+
+    env.ok(&["merge", &id]);
+    assert!(read(env.repo.join("e2e.txt")).starts_with("written by the fake agent"));
+}
+
+#[test]
+fn runs_and_settings_outlive_the_core() {
+    let env = Env::new();
+    let id = env.run("say hi", &["--readonly"]);
+    env.wait_for(&id, "COMPLETED");
+    env.ok(&["config", "set", "priority", "speed"]);
+    let before = runstate::read_core(env.db()).expect("core.json").pid;
+
+    assert!(env.ok(&["stop"]).contains("stopped"));
+    // Any command starts a core again, with everything kept.
+    assert_eq!(env.status(&id)["status"], "COMPLETED");
+    let after = runstate::read_core(env.db()).expect("core.json").pid;
+    assert_ne!(before, after, "stop left the core running");
+    assert_eq!(env.json(&["config", "get", "priority"]), "speed");
+    let agents = env.json(&["agents", "--json"]);
+    assert!(
+        items(&agents["agents"]).iter().any(|a| a["Name"] == "fake"),
+        "{agents}"
+    );
+}
+
+#[test]
+fn roles_are_saved_used_updated_and_removed() {
+    let env = Env::new();
+    env.ok(&[
+        "roles",
+        "save",
+        "e2e-checker",
+        "--when",
+        "end to end checks",
+        "--tier",
+        "easy",
+        "--readonly",
+        "--instructions",
+        "Answer in one word.",
+        "--easy",
+        "fake/fake-fast",
+        "--timeout",
+        "2m",
+    ]);
+    let roles = env.json(&["roles"]);
+    let role = &roles["roles"]["e2e-checker"];
+    assert_eq!(role["tier"], "easy", "{roles}");
+    assert_eq!(role["readonly"], true);
+    assert_eq!(role["timeout"], "2m");
+    assert_eq!(role["when"], "end to end checks");
+    assert_eq!(role["tiers"][0]["agent"], "fake");
+    assert_eq!(role["tiers"][0]["model"], "fake-fast");
+
+    // A run with the role gets its instructions and runs read-only.
+    let id = env.run("say hi", &["--role", "e2e-checker"]);
+    let s = env.wait_for(&id, "COMPLETED");
+    assert!(
+        s.get("worktree").is_none(),
+        "a read-only role got a worktree: {s}"
+    );
+    assert!(
+        env.agent_log().contains("Answer in one word."),
+        "the role's instructions never reached the agent"
+    );
+
+    env.ok(&[
+        "roles",
+        "save",
+        "e2e-checker",
+        "--tier",
+        "normal",
+        "--when",
+        "updated",
+    ]);
+    let role = env.json(&["roles"])["roles"]["e2e-checker"].clone();
+    assert_eq!(role["tier"], "normal", "{role}");
+    assert_eq!(role["when"], "updated");
+    assert!(
+        role.get("readonly").is_none(),
+        "save keeps what it was not given: {role}"
+    );
+
+    env.ok(&["roles", "remove", "e2e-checker"]);
+    assert!(env.json(&["roles"])["roles"].get("e2e-checker").is_none());
+    assert!(
+        env.fails(&["roles", "remove", "e2e-checker"])
+            .contains("no role")
+    );
+    // The built-in roles are not the user's to remove.
+    assert!(
+        env.fails(&["roles", "remove", "explorer"])
+            .contains("no role")
+    );
+    assert!(env.json(&["roles"])["roles"].get("explorer").is_some());
+}
+
+#[test]
+fn config_is_set_read_and_global() {
+    let env = Env::new();
+    env.ok(&["config", "set", "priority", "speed"]);
+    assert_eq!(env.json(&["config", "get", "priority"]), "speed");
+    assert!(
+        env.fails(&["config", "set", "priority", "fastest"])
+            .contains("invalid priority")
+    );
+
+    env.ok(&["config", "allow", "add", "agents", "codex"]);
+    assert_eq!(
+        env.json(&["config", "get", "allow"])["agents"],
+        serde_json::json!(["fake", "codex"])
+    );
+    env.ok(&["config", "allow", "rm", "agents", "codex"]);
+    assert_eq!(
+        env.json(&["config", "get", "allow"])["agents"],
+        serde_json::json!(["fake"])
+    );
+    env.ok(&["config", "deny", "add", "models", "fake-deep"]);
+    assert_eq!(
+        env.json(&["config", "get", "deny"])["models"],
+        serde_json::json!(["fake-deep"])
+    );
+    env.ok(&["config", "deny", "rm", "models", "fake-deep"]);
+    env.ok(&["config", "set", "discover", "false"]);
+    assert_eq!(env.json(&["config", "get", "discover"]), false);
+    env.ok(&["config", "set", "discover", "true"]);
+
+    // The CLI classifier asks the agent and model it is given, and the easy tier's
+    // again once that goes back to the default.
+    env.ok(&["config", "set", "classifier_agent", "fake/fake-mini"]);
+    assert_eq!(
+        env.json(&["config", "get", "classifier_cli"]),
+        serde_json::json!({"agent": "fake", "model": "fake-mini"})
+    );
+    env.ok(&["config", "set", "classifier_agent", "default"]);
+    assert_eq!(env.json(&["config", "get", "classifier_agent"]), "");
+    assert_ne!(
+        env.json(&["config", "get", "classifier_cli"])["agent"],
+        "fake"
+    );
+
+    // The policy is global: there is no repository's own to write, and a file a repository
+    // keeps where an older build put one changes neither the policy nor its runs.
+    assert!(
+        env.fails(&["config", "set", "priority", "quality", "--project"])
+            .contains("project")
+    );
+    let dir = env.repo.join(".dispatch");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("config.json"),
+        r#"{"priority":"quality","deny":{"agents":["fake"]}}"#,
+    )
+    .unwrap();
+    assert_eq!(env.json(&["config", "get", "priority"]), "speed");
+    let global: Value =
+        serde_json::from_str(&read(env.data.join("dispatch").join("config.json"))).unwrap();
+    assert_eq!(global["priority"], "speed");
+    let id = env.run("say hi", &["--readonly"]);
+    env.wait_for(&id, "COMPLETED");
+}
+
+#[test]
+fn workspaces_are_added_listed_and_removed() {
+    let env = Env::new();
+    let other = env.root.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    let other_path = other.to_string_lossy().into_owned();
+    let added = env.ok(&["workspace", "add", &other_path, "--name", "second"]);
+    assert!(added.contains("second"), "{added}");
+    // Adding it again is the same workspace.
+    assert_eq!(env.ok(&["workspace", "add", &other_path]), added);
+
+    let listed = env.json(&["workspace", "ls", "--json"]);
+    let ws = items(&listed["workspaces"])
+        .iter()
+        .find(|w| w["path"] == other_path.as_str())
+        .unwrap_or_else(|| panic!("{listed}"))
+        .clone();
+    assert_eq!(ws["name"], "second");
+    let id = ws["id"].as_str().unwrap();
+    // The repository a command ran in is a workspace too.
+    assert!(
+        items(&listed["workspaces"])
+            .iter()
+            .any(|w| w["path"] == env.repo.to_string_lossy().as_ref()),
+        "{listed}"
+    );
+
+    assert!(env.ok(&["workspace", "rm", id]).contains(id));
+    let listed = env.json(&["workspace", "ls", "--json"]);
+    assert!(!items(&listed["workspaces"]).iter().any(|w| w["id"] == id));
+    assert!(
+        env.fails(&["workspace", "rm", id])
+            .contains("no such workspace")
+    );
+    let missing = env.root.join("missing").to_string_lossy().into_owned();
+    assert!(
+        env.fails(&["workspace", "add", &missing])
+            .contains("not a folder")
+    );
+}
+
+#[test]
+fn added_agents_are_listed_at_once() {
+    let env = Env::new();
+    let names = || -> Vec<String> {
+        items(&env.json(&["agents", "--json"])["agents"])
+            .iter()
+            .filter_map(|a| a["Name"].as_str().map(str::to_owned))
+            .collect()
+    };
+    assert!(names().contains(&"fake".to_owned()));
+    env.ok(&["agents", "add", "second", "--", "/bin/cat"]);
+    assert!(
+        names().contains(&"second".to_owned()),
+        "an added agent is missing"
+    );
+    env.ok(&["agents", "remove", "second"]);
+    assert!(
+        !names().contains(&"second".to_owned()),
+        "a removed agent is listed"
+    );
+    assert!(
+        env.fails(&["agents", "remove", "second"])
+            .contains("no added agent")
+    );
+    assert!(
+        env.fails(&["agents", "add", "codex", "--", "/bin/cat"])
+            .contains("built-in")
+    );
+}
+
+#[test]
+fn sections_are_made_filled_renamed_and_removed() {
+    let env = Env::new();
+    let id = env.run("say hi", &["--readonly"]);
+    env.wait_for(&id, "COMPLETED");
+    let core = runstate::read_core(env.db()).expect("core.json");
+    let c = coreclient::new(&core, "e2e");
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let list = || async {
+            c.dispatch
+                .list_sections(&pb::ListSectionsRequest {})
+                .await
+                .expect("list sections")
+                .sections
+        };
+        let made = c
+            .dispatch
+            .save_section(&pb::SaveSectionRequest {
+                name: "Review".into(),
+                ..Default::default()
+            })
+            .await
+            .expect("save section")
+            .section
+            .expect("section");
+        assert!(!made.id.is_empty());
+        let moved = |section_id: String| pb::MoveToSectionRequest {
+            kind: "run".into(),
+            r#ref: id.clone(),
+            section_id,
+        };
+        c.dispatch
+            .move_to_section(&moved(made.id.clone()))
+            .await
+            .expect("move run");
+        let sections = list().await;
+        let s = sections
+            .iter()
+            .find(|s| s.id == made.id)
+            .expect("section listed");
+        assert_eq!(s.name, "Review");
+        assert_eq!(s.items.len(), 1);
+        assert_eq!(s.items[0].r#ref, id);
+
+        c.dispatch
+            .save_section(&pb::SaveSectionRequest {
+                id: made.id.clone(),
+                name: "Done".into(),
+                position: 0,
+            })
+            .await
+            .expect("rename section");
+        assert_eq!(list().await[0].name, "Done");
+
+        // Out of every section, then into one that does not exist.
+        c.dispatch
+            .move_to_section(&moved(String::new()))
+            .await
+            .expect("move out");
+        assert!(list().await[0].items.is_empty());
+        assert!(
+            c.dispatch
+                .move_to_section(&moved("no-such-section".into()))
+                .await
+                .is_err()
+        );
+
+        c.dispatch
+            .delete_section(&pb::DeleteSectionRequest {
+                id: made.id.clone(),
+            })
+            .await
+            .expect("delete section");
+        assert!(list().await.is_empty());
+    });
+    // The run itself stays.
+    assert_eq!(env.status(&id)["status"], "COMPLETED");
+}
+
+#[test]
+fn setup_installs_and_removes_skills_and_hooks() {
+    let env = Env::new();
+    std::fs::create_dir_all(env.home.join(".claude")).unwrap();
+    std::fs::create_dir_all(env.home.join(".codex")).unwrap();
+    let report = env.json(&["setup", "--json"]);
+    for key in ["cli", "skills", "hooks", "agents", "opencode"] {
+        assert!(
+            report.get(key).is_some(),
+            "setup --json has no {key}: {report}"
+        );
+    }
+    let hook_on = |agent: &str| {
+        items(&env.json(&["setup", "--json"])["hooks"])
+            .iter()
+            .find(|h| h["agent"] == agent)
+            .map(|h| h["on"] == true)
+    };
+    assert_eq!(hook_on("claude"), Some(false));
+    assert_eq!(hook_on("codex"), Some(false));
+
+    // Skills: Claude Code's own folder, and the shared one Codex reads.
+    let claude_skill = env.home.join(".claude/skills/dispatch/SKILL.md");
+    let shared_skill = env.home.join(".agents/skills/dispatch/SKILL.md");
+    env.ok(&["setup", "skill", "claude"]);
+    assert!(read(&claude_skill).contains("dispatch"));
+    env.ok(&["skill", "install", "--agent", "codex"]);
+    assert!(shared_skill.exists());
+    assert!(
+        env.fails(&["skill", "install", "--agent", "codex"])
+            .contains("--force"),
+        "a second install overwrote the skill"
+    );
+    env.ok(&["setup", "skill", "--remove", "claude"]);
+    assert!(!claude_skill.exists());
+    env.ok(&["skill", "remove", "--agent", "codex"]);
+    assert!(!shared_skill.exists());
+
+    // Hooks, one agent at a time, and what the hook says while one is on.
+    let speaks = |agent: &str| {
+        let mut child = env
+            .command(&["hook", "--agent", agent])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn hook");
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(br#"{"session_id":"hook-session"}"#)
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout).contains("Dispatch is active")
+    };
+    assert!(!speaks("claude"), "the hook spoke with every hook off");
+    env.ok(&["setup", "hook", "claude", "on"]);
+    assert_eq!(hook_on("claude"), Some(true));
+    assert_eq!(hook_on("codex"), Some(false));
+    assert!(read(env.home.join(".claude/settings.json")).contains("SessionStart"));
+    assert!(speaks("claude"));
+    env.ok(&["setup", "hook", "codex", "on"]);
+    assert!(read(env.home.join(".codex/hooks.json")).contains("hook --agent codex"));
+    env.ok(&["setup", "hook", "claude", "off"]);
+    assert!(!read(env.home.join(".claude/settings.json")).contains("SessionStart"));
+    assert!(speaks("codex"), "codex's hook went quiet with claude's off");
+    env.ok(&["setup", "hook", "codex", "off"]);
+    assert!(!speaks("codex"));
+    assert!(
+        env.fails(&["setup", "hook", "claude", "maybe"])
+            .contains("usage")
+    );
+}
+
+/// A core started the way the app starts one, from a background thread of another program:
+/// in macOS background mode and with every signal blocked. Such a core once never heard its
+/// children exit, so each run waited forever on the first command it ran.
+#[cfg(target_os = "macos")]
+#[test]
+#[allow(unsafe_code)]
+fn a_core_started_from_a_background_thread_runs() {
+    use std::os::unix::process::CommandExt;
+    let env = Env::new();
+    env.ok(&["stop"]);
+    let db = env.db().to_string_lossy().into_owned();
+    let bin = binary().to_string_lossy().into_owned();
+    let mut core = env.command_of(
+        Path::new("/usr/sbin/taskpolicy"),
+        &["-b", &bin, "-db", &db, "serve", "--listen", "127.0.0.1:0"],
+    );
+    core.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0);
+    // SAFETY: the hook runs in the child before exec and only changes its signal mask.
+    unsafe {
+        core.pre_exec(|| {
+            let mut all: libc::sigset_t = std::mem::zeroed();
+            libc::sigfillset(&mut all);
+            libc::pthread_sigmask(libc::SIG_SETMASK, &all, std::ptr::null_mut());
+            Ok(())
+        });
+    }
+    let mut child = core.spawn().expect("spawn core");
+    let pid = i32::try_from(child.id()).unwrap();
+    // This test is the core's parent: it reaps the core, as the app does, so `stop` sees it go.
+    let reaper = std::thread::spawn(move || child.wait());
+    wait_until("the core is up", || runstate::read_core(env.db()).is_some());
+
+    let started = Instant::now();
+    let id = env.run("say hi", &["--readonly"]);
+    env.wait_for(&id, "COMPLETED");
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "the run took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        runstate::read_core(env.db()).map(|c| c.pid),
+        Some(pid),
+        "the run went to another core"
+    );
+    env.ok(&["stop"]);
+    let _ = reaper.join();
+}

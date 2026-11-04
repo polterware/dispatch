@@ -197,6 +197,26 @@ fn complete_char_prefix(b: &[u8]) -> &[u8] {
 }
 
 impl Core {
+    /// The run `raw` names: its id, or the one run whose id starts with it (the CLI
+    /// prints a run's first 12 characters). An unknown id is left for the lookup to refuse.
+    pub(crate) fn full_run_id(&self, raw: &str) -> RpcResult<String> {
+        let id = required(raw, "run id")?;
+        if id.len() < 6 || id.len() >= 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Ok(id);
+        }
+        let ids = self
+            .store
+            .run_ids_with_prefix(&id, 2)
+            .map_err(RpcError::internal)?;
+        match ids.as_slice() {
+            [one] => Ok(one.clone()),
+            [] => Ok(id),
+            _ => Err(RpcError::invalid(format!(
+                "run id {id} matches more than one run: give more of it"
+            ))),
+        }
+    }
+
     pub(crate) async fn list_runs(
         &self,
         m: pb::ListRunsRequest,
@@ -222,7 +242,7 @@ impl Core {
     }
 
     pub(crate) async fn get_run(&self, m: pb::GetRunRequest) -> RpcResult<pb::GetRunResponse> {
-        let id = required(&m.id, "run id")?;
+        let id = self.full_run_id(&m.id)?;
         let run = self.store.get_run(&id).map_err(store_error)?;
         Ok(pb::GetRunResponse {
             run: Some(convert::run(&run)),
@@ -414,7 +434,7 @@ impl Core {
         &self,
         m: pb::CancelRunRequest,
     ) -> RpcResult<pb::CancelRunResponse> {
-        let id = required(&m.id, "run id")?;
+        let id = self.full_run_id(&m.id)?;
         let had_cancel = match self.pop_cancel(&id) {
             Some(t) => {
                 t.cancel();
@@ -478,7 +498,7 @@ impl Core {
     }
 
     pub(crate) async fn result(&self, m: pb::ResultRequest) -> RpcResult<pb::ResultResponse> {
-        let id = required(&m.id, "run id")?;
+        let id = self.full_run_id(&m.id)?;
         let run = self.store.get_run(&id).map_err(store_error)?;
         let section = match m.section.trim() {
             "" => "summary",
@@ -513,7 +533,7 @@ impl Core {
         &self,
         m: pb::ReadRunEventsRequest,
     ) -> RpcResult<pb::ReadRunEventsResponse> {
-        let id = required(&m.id, "run id")?;
+        let id = self.full_run_id(&m.id)?;
         self.store.get_run(&id).map_err(store_error)?;
         let before =
             (m.before_seq > 0).then(|| (m.before_seq, u64::try_from(m.before_offset).unwrap_or(0)));
@@ -551,7 +571,7 @@ impl Core {
         self: &Arc<Self>,
         m: pb::WatchRunRequest,
     ) -> RpcResult<impl Stream<Item = RpcResult<pb::WatchRunResponse>> + Send + 'static> {
-        let id = required(&m.id, "run id")?;
+        let id = self.full_run_id(&m.id)?;
         let run = self.store.get_run(&id).map_err(store_error)?;
         let core = self.clone();
         let (tx, rx) = tokio::sync::mpsc::channel::<RpcResult<pb::WatchRunResponse>>(64);

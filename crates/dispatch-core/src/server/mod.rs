@@ -171,15 +171,11 @@ impl Core {
         })
     }
 
-    /// The runner with the global and project routing policy, the
-    /// classifier, and the roles of `dir`. An empty dir loads the global
-    /// policy only.
+    /// The runner with the routing policy, which is global, the classifier, and the roles of
+    /// `dir`.
     pub(crate) fn deps_in(&self, dir: &str) -> Result<Deps, Error> {
         let mut deps = self.deps()?;
-        deps.policy = config::load_all(
-            &config::policy_config_path(&self.state_dir()),
-            &project_config(dir),
-        )?;
+        deps.policy = self.global_policy()?;
         deps.classifier = classifier::for_policy(&deps);
         deps.profiles = self.profiles(dir)?;
         Ok(deps)
@@ -194,12 +190,9 @@ impl Core {
         roles::load_all_profiles(&roles::global_profiles_path(&self.state_dir()), &project)
     }
 
-    /// The global routing policy.
+    /// The routing policy: one for every repository.
     pub(crate) fn global_policy(&self) -> Result<Policy, Error> {
-        config::load_all(
-            &config::policy_config_path(&self.state_dir()),
-            Path::new(""),
-        )
+        config::load(&config::policy_config_path(&self.state_dir()))
     }
 
     /// Marks RUNNING and PENDING runs whose runner died with the previous
@@ -209,15 +202,6 @@ impl Core {
             let cancel = CancellationToken::new();
             let _ = tokio::time::timeout(Duration::from_secs(15), deps.reconcile(&cancel)).await;
         }
-    }
-}
-
-/// `<dir>/.dispatch/config.json`, empty for no dir.
-pub(crate) fn project_config(dir: &str) -> PathBuf {
-    if dir.is_empty() {
-        PathBuf::new()
-    } else {
-        Path::new(dir).join(".dispatch").join("config.json")
     }
 }
 

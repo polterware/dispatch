@@ -17,9 +17,9 @@ use crate::client::{CoreError, DeleteSectionRequest, MoveToSectionRequest, SaveS
 use crate::format::agent_display_name;
 use crate::models::sidebar::{
     COLLAPSED_PREFERENCE, DISPLAY_PREFERENCE, Direction, GroupBy, GroupKind, HOVER_CLOSE_MS,
-    HOVER_OPEN_MS, Show, SidebarDisplay, SidebarGroup, SidebarRun, SortBy, conversation_ref,
-    group_sidebar_runs, now_unix_ms, parse_sidebar_display, section_ref, sidebar_run_title,
-    sidebar_runs,
+    HOVER_OPEN_MS, RunsNotice, Show, SidebarDisplay, SidebarGroup, SidebarRun, SortBy,
+    conversation_ref, group_sidebar_runs, now_unix_ms, parse_sidebar_display, runs_notice,
+    section_ref, sidebar_run_title, sidebar_runs,
 };
 use crate::motion::{Animator, SpringTier, SpringValue};
 use crate::state::{AppState, ConnectionState, Route, SettingsPage, observe};
@@ -28,12 +28,15 @@ use crate::ui::list_skeleton;
 use crate::ui::parts::sidebar::{preview_surface, run_dot, run_none};
 use crate::ui::patterns::{FadeEdges, fade_item, fade_scroll};
 use crate::ui::{
-    Button, ButtonKind, ButtonSize, Icon, Menu, MenuEntry, MenuItem, SidebarItem,
-    SidebarSectionLabel, TextInput, ToastTone, button, ellipsis, icon_button, kbd,
+    Button, ButtonKind, ButtonSize, Icon, MascotMood, Menu, MenuEntry, MenuItem, SidebarItem,
+    SidebarSectionLabel, TextInput, ToastTone, button, ellipsis, icon_button, kbd, list_empty,
 };
 
 /// The Display menu's width (`min-w-48`, 12rem).
 const DISPLAY_MENU_WIDTH: f32 = 12.0 * crate::theme::REM;
+
+/// What the runs list says when the core did not answer its last refresh.
+const REFRESH_FAILED: &str = "Could not refresh runs and sections.";
 
 #[derive(Clone)]
 struct SectionDraft {
@@ -902,19 +905,27 @@ impl SidebarView {
                     cx,
                 )
             });
-        if snapshot.show_error {
-            column = column.child(run_none("Could not refresh runs and sections.", &theme));
-        }
-        if snapshot.groups.is_empty() && snapshot.connecting {
+        let notice = runs_notice(
+            !snapshot.groups.is_empty(),
+            snapshot.connecting,
+            snapshot.show_error,
+        );
+        column = match notice {
+            RunsNotice::None => column,
             // The core is starting: the runs, in bones, until it answers.
-            column = column.child(
+            RunsNotice::Loading => column.child(
                 div()
                     .px(px(theme.space_2))
                     .child(list_skeleton(6, 32.0, window, cx)),
-            );
-        } else if snapshot.groups.is_empty() {
-            column = column.child(run_none("No runs to show.", &theme));
-        }
+            ),
+            RunsNotice::Empty => {
+                column.child(list_empty("No runs to show.", MascotMood::Sleeping, cx))
+            }
+            RunsNotice::Unreachable => {
+                column.child(list_empty(REFRESH_FAILED, MascotMood::Sad, cx))
+            }
+            RunsNotice::Stale => column.child(run_none(REFRESH_FAILED, &theme)),
+        };
         for group in &snapshot.groups {
             column = column.child(self.group_block(group, selected.as_deref(), theme, window, cx));
         }

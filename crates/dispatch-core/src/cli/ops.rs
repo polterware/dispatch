@@ -30,9 +30,9 @@ pub(crate) const OPS_USAGE: &str = "       dispatch wait <id> [--timeout <dur>] 
        dispatch route [--tier <auto|easy|normal|hard>] [--provider <p>] [--model <m>] [--effort <e>] [--agent <a>] [--priority speed|balanced|quality] [--relax] [--readonly] [--role <name|none>] [--card <slug>] [--dir <repo>] [--json] [<prompt>]
        dispatch models [--json] | refresh | bench [--json]
        dispatch classify [--card <slug>] [--dir <repo>] [--json] <prompt>
-       dispatch config get [priority|discover|roles|classifier|classifier_model|classifier_keys|classifier_cli|allow|deny] [--project] [--dir <repo>]
-       dispatch config set priority <speed|balanced|quality> | discover <true|false> | roles <true|false> | classifier <off|jev|openai|cli> | classifier_model <model> [--project]
-       dispatch config allow|deny add|rm providers|models|agents <value>... [--project]
+       dispatch config get [priority|discover|roles|classifier|classifier_model|classifier_agent|classifier_keys|classifier_cli|allow|deny]
+       dispatch config set priority <speed|balanced|quality> | discover <true|false> | roles <true|false> | classifier <off|jev|openai|cli> | classifier_model <model> | classifier_agent <agent[/model]|default>
+       dispatch config allow|deny add|rm providers|models|agents <value>...   (one routing policy, for every repository)
        dispatch config key set|clear jev|openai   (set reads the key from stdin into a Keychain item only dispatch reads; TYPESAFE_API_KEY or OPENAI_API_KEY wins over it)
        dispatch doctor [--json]
        dispatch merge <id>
@@ -569,21 +569,15 @@ fn print_benchmarks(report: &BenchmarkReport) {
 pub(super) async fn config(db_path: &Path, args: &[String]) -> CliResult {
     let usage = || {
         usage_err(
-            "usage: dispatch config get [key] | set priority|discover|classifier|classifier_model <value> | allow|deny add|rm providers|models|agents <value>... [--project] | key set|clear jev|openai",
+            "usage: dispatch config get [key] | set priority|discover|classifier|classifier_model|classifier_agent <value> | allow|deny add|rm providers|models|agents <value>... | key set|clear jev|openai",
         )
     };
-    let mut f = Flags::new("dispatch config");
-    f.bool("project", false, "read/write <repo>/.dispatch/config.json")
-        .string("dir", "", "repository (default: current directory)");
-    let positional = f.parse_interspersed(args)?;
+    // The routing policy is global, so the command takes no repository.
+    let positional = Flags::new("dispatch config").parse_interspersed(args)?;
     if positional.is_empty() {
         return Err(usage());
     }
-    let mut req = pb::ConfigRequest {
-        project: f.flag("project"),
-        dir: working_dir(&f.str("dir"))?,
-        ..Default::default()
-    };
+    let mut req = pb::ConfigRequest::default();
     match positional[0].as_str() {
         "get" => {
             req.action = "get".into();
@@ -1017,6 +1011,8 @@ pub(super) fn skill(args: &[String]) -> CliResult {
             for folder in folders {
                 match skill::install(&folder.dir, f.flag("force")) {
                     Ok(path) => println!("installed {}", path.display()),
+                    // The one folder asked for is an error; one of all of them is skipped.
+                    Err(e) if !key.is_empty() => return Err(e.into()),
                     Err(e) => eprintln!("skip {}: {e}", folder.dir.display()),
                 }
             }

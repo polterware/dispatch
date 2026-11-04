@@ -235,6 +235,11 @@ fn every_agents_command_is_ours() {
         "Claude Code keeps the bare command"
     );
     assert!(!is_hook_command("/bin/other hook --agent cursor"));
+    // A development build of the app runs the hook too.
+    assert!(is_hook_command(
+        "/repo/target/release/dispatch-app hook --agent codex"
+    ));
+    assert!(!is_hook_command("/bin/dispatch-other hook"));
     assert!(!is_hook_command("/bin/dispatch hook --agent"));
 }
 

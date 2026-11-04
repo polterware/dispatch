@@ -53,6 +53,10 @@ pub struct Policy {
     pub classifier: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub classifier_model: String,
+    /// The agent the CLI classifier asks, `agent` or `agent/model`; empty asks the easy
+    /// tier's first installed agent.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub classifier_agent: String,
 }
 
 pub type ConfigFile = Policy;
@@ -69,6 +73,7 @@ impl Default for Policy {
             acp_agents: BTreeMap::new(),
             classifier: String::new(),
             classifier_model: String::new(),
+            classifier_agent: String::new(),
         }
     }
 }
@@ -174,11 +179,13 @@ impl Policy {
                 ));
             }
         }
-        if let Some(v) = root.get("classifier_model") {
-            if v.is_null() {
-                root.remove("classifier_model");
-            } else if !v.is_string() {
-                return Err(Error::Message("classifier_model must be a string".into()));
+        for key in ["classifier_model", "classifier_agent"] {
+            if let Some(v) = root.get(key) {
+                if v.is_null() {
+                    root.remove(key);
+                } else if !v.is_string() {
+                    return Err(Error::Message(format!("{key} must be a string")));
+                }
             }
         }
         let mut p: Self = serde_json::from_value(value)?;
@@ -227,49 +234,6 @@ impl Policy {
     }
 }
 
-/// Merge project keys over global keys, retaining global denies and executable settings.
-pub fn merge(global: &str, project: &str) -> Result<Policy, Error> {
-    let g = Policy::parse(global)?;
-    let p = Policy::parse(project)?;
-    let raw: serde_json::Value = if project.trim().is_empty() {
-        serde_json::json!({})
-    } else {
-        serde_json::from_str(project)?
-    };
-    let mut out = g.clone();
-    if raw.get("priority").is_some() {
-        out.priority = p.priority;
-    }
-    if raw.get("discover").is_some() {
-        out.discover = p.discover;
-    }
-    if raw.get("roles").is_some() {
-        out.roles = p.roles;
-    }
-    if raw.get("allow").is_some() {
-        out.allow = p.allow;
-    }
-    if raw.get("classifier").is_some() {
-        out.classifier = p.classifier;
-        out.classifier_model = p.classifier_model;
-    }
-    if raw.get("deny").is_some() {
-        fn union(a: &mut Vec<String>, b: Vec<String>) {
-            for value in b {
-                if !a.contains(&value) {
-                    a.push(value);
-                }
-            }
-        }
-        union(&mut out.deny.providers, p.deny.providers);
-        union(&mut out.deny.models, p.deny.models);
-        union(&mut out.deny.agents, p.deny.agents);
-    }
-    out.binaries = g.binaries;
-    out.acp_agents = g.acp_agents;
-    Ok(out)
-}
-
 pub fn load(path: &Path) -> Result<Policy, Error> {
     match std::fs::read_to_string(path) {
         Ok(value) => {
@@ -278,21 +242,6 @@ pub fn load(path: &Path) -> Result<Policy, Error> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Policy::default()),
         Err(e) => Err(e.into()),
     }
-}
-
-pub fn load_all(global: &Path, project: &Path) -> Result<Policy, Error> {
-    fn read(path: &Path) -> Result<String, Error> {
-        match std::fs::read_to_string(path) {
-            Ok(value) => Ok(value),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-            Err(e) => Err(e.into()),
-        }
-    }
-    let g = read(global)?;
-    let p = read(project)?;
-    load(global)?;
-    load(project)?;
-    merge(&g, &p)
 }
 
 fn read_policy_raw(path: &Path) -> Result<serde_json::Map<String, serde_json::Value>, Error> {
@@ -373,6 +322,7 @@ pub fn write_config(path: &Path, f: &Policy) -> Result<(), Error> {
     for (k, v) in [
         ("classifier", &f.classifier),
         ("classifier_model", &f.classifier_model),
+        ("classifier_agent", &f.classifier_agent),
     ] {
         if v.is_empty() {
             raw.remove(k);

@@ -505,13 +505,14 @@ message RecoverRunRequest {
   string id = 1;
 }
 
+// The routing policy is global: one file in the state dir, the same for every repository.
 message ConfigRequest {
   // get, set, allow-add, allow-rm, deny-add, or deny-rm.
   string action = 1;
-  string dir = 2;
-  bool project = 3;
   string key = 4;
   repeated string values = 5;
+  reserved 2, 3;
+  reserved "dir", "project";
 }
 
 message SubagentsRequest {

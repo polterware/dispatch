@@ -295,6 +295,30 @@ pub(super) fn list_tiers_on(conn: &Connection) -> Result<Vec<Tier>, Error> {
     rows.collect::<Result<Vec<_>, _>>().map_err(db)
 }
 
+impl Store {
+    /// The ids of up to `limit` runs whose id starts with `prefix`.
+    pub fn run_ids_with_prefix(&self, prefix: &str, limit: i64) -> Result<Vec<String>, Error> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare("SELECT id FROM dispatch_runs WHERE substr(id, 1, length(?1)) = ?1 LIMIT ?2")
+            .map_err(db)?;
+        let rows = stmt
+            .query_map(rusqlite::params![prefix, limit], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(db)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db)
+    }
+
+    /// Drops an agent from the agents list, for an added agent the user removed.
+    pub fn delete_agent(&self, name: &str) -> Result<(), Error> {
+        self.conn()
+            .execute("DELETE FROM dispatch_agents WHERE name = ?1", [name])
+            .map_err(db)?;
+        Ok(())
+    }
+}
+
 impl types::Store for Store {
     fn save_run(&self, run: &Run) -> Result<(), Error> {
         let id = if run.id.is_empty() {

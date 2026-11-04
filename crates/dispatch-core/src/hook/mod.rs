@@ -149,7 +149,8 @@ fn shell_quote(p: &str) -> String {
 }
 
 /// Reports whether cmd is recognized as our session hook command: a dispatch
-/// binary followed by HOOK_SUFFIX, or the legacy Polterware one.
+/// binary followed by HOOK_SUFFIX, or the legacy Polterware one. A development build
+/// of the app, `dispatch-app`, is a dispatch binary too: the hook it registers runs it.
 pub fn is_hook_command(cmd: &str) -> bool {
     let mut cmd = cmd.trim();
     if let Some((head, agent)) = cmd.rsplit_once(AGENT_FLAG)
@@ -165,7 +166,10 @@ pub fn is_hook_command(cmd: &str) -> bool {
     let Some(bin) = cmd.strip_suffix(HOOK_SUFFIX) else {
         return false;
     };
-    go_base(bin.trim_end_matches('\'')) == "dispatch"
+    matches!(
+        go_base(bin.trim_end_matches('\'')),
+        "dispatch" | "dispatch-app"
+    )
 }
 
 // go_base is Go's filepath.Base.

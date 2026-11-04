@@ -1,32 +1,15 @@
 use dispatch_core::{
-    config::{self, Policy},
+    config::Policy,
     roles::{self, Profile, RoleEntry},
 };
 use std::collections::{BTreeMap, HashSet};
 
 #[test]
-fn test_load_all_merges_project_and_deny() {
-    let g = r#"{"priority":"speed","discover":true,"allow":{"providers":["openai"]},"deny":{"agents":["cursor"]}}"#;
-    let p = r#"{"priority":"quality","allow":{"models":["gpt"]},"deny":{"agents":["grok"],"providers":["google"]}}"#;
-    let f = config::merge(g, p).unwrap();
-    assert_eq!(f.priority, "quality");
-    assert!(f.discover);
-    assert_eq!(f.allow.models, ["gpt"]);
-    assert_eq!(f.deny.agents, ["cursor", "grok"]);
-    assert_eq!(f.deny.providers, ["google"]);
-}
-#[test]
 fn test_discover_defaults_on_and_explicit_false_wins() {
     for body in ["", "{}", r#"{"discover":true}"#, r#"{"discover":false}"#] {
         let want = body != r#"{"discover":false}"#;
         assert_eq!(Policy::parse(body).unwrap().discover, want);
-        assert_eq!(config::merge(body, "").unwrap().discover, want);
     }
-    assert!(
-        !config::merge(r#"{"discover":true}"#, r#"{"discover":false}"#)
-            .unwrap()
-            .discover
-    );
 }
 #[test]
 fn wrong_known_types_are_rejected() {

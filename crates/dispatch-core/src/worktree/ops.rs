@@ -131,6 +131,7 @@ pub fn remove(
                 "worktree is dirty; use --force to discard changes".into(),
             ));
         }
+        ensure_merged(root, branch)?;
     }
     let path_str = path.to_string_lossy();
     if force {
@@ -141,6 +142,40 @@ pub fn remove(
     let del = if force { "-D" } else { "-d" };
     git(root, &["branch", del, branch])?;
     Ok(())
+}
+
+/// Clears what is left of a worktree whose folder is gone (a merge removed it, or someone
+/// deleted it): its stale registration, and its branch while one remains. Without force it
+/// keeps a branch that is not merged.
+pub fn forget(root: impl AsRef<Path>, branch: &str, force: bool) -> Result<(), Error> {
+    let root = root.as_ref();
+    if !force {
+        ensure_merged(root, branch)?;
+    }
+    git(root, &["worktree", "prune"])?;
+    if has_branch(root, branch) {
+        let del = if force { "-D" } else { "-d" };
+        git(root, &["branch", del, branch])?;
+    }
+    Ok(())
+}
+
+fn has_branch(root: &Path, branch: &str) -> bool {
+    let head = format!("refs/heads/{branch}");
+    !branch.is_empty() && git(root, &["rev-parse", "--verify", "--quiet", &head]).is_ok()
+}
+
+/// Refuses a branch with commits the repository's HEAD does not have, before anything is
+/// removed: `git branch -d` would refuse it too, but only after the worktree was gone.
+fn ensure_merged(root: &Path, branch: &str) -> Result<(), Error> {
+    if !has_branch(root, branch)
+        || git(root, &["merge-base", "--is-ancestor", branch, "HEAD"]).is_ok()
+    {
+        return Ok(());
+    }
+    Err(Error::Message(format!(
+        "{branch} has commits that are not merged: merge the run, or use --force to drop them"
+    )))
 }
 
 fn clean_lexical(path: &Path) -> PathBuf {

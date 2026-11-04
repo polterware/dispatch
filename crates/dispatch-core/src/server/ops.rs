@@ -3,7 +3,7 @@
 //! agent setup.
 
 use super::{
-    Core, RpcError, RpcResult, project_config,
+    Core, RpcError, RpcResult,
     runs::{installed, save_run_worktree},
     workspace::run_area,
 };
@@ -38,14 +38,6 @@ fn op_error(e: Error) -> RpcError {
     } else {
         RpcError::invalid(sandbox::redact(&e.to_string()))
     }
-}
-
-fn run_id(id: &str) -> RpcResult<String> {
-    let id = id.trim();
-    if id.is_empty() {
-        return Err(RpcError::invalid("run id is required"));
-    }
-    Ok(id.into())
 }
 
 fn invalid(e: impl std::fmt::Display) -> RpcError {
@@ -253,7 +245,7 @@ impl Core {
         &self,
         m: pb::MergeRunRequest,
     ) -> RpcResult<pb::MergeRunResponse> {
-        let id = run_id(&m.id)?;
+        let id = self.full_run_id(&m.id)?;
         let deps = self.deps_in("").map_err(RpcError::internal)?;
         let mu = self.run_mu(&id);
         let _guard = mu.lock().await;
@@ -272,7 +264,7 @@ impl Core {
         &self,
         m: pb::CleanRunRequest,
     ) -> RpcResult<pb::CleanRunResponse> {
-        let id = run_id(&m.id)?;
+        let id = self.full_run_id(&m.id)?;
         let deps = self.deps_in("").map_err(RpcError::internal)?;
         let mu = self.run_mu(&id);
         let _guard = mu.lock().await;
@@ -291,7 +283,7 @@ impl Core {
         &self,
         m: pb::RecoverRunRequest,
     ) -> RpcResult<pb::RecoverRunResponse> {
-        let id = run_id(&m.id)?;
+        let id = self.full_run_id(&m.id)?;
         let deps = self.deps_in("").map_err(RpcError::internal)?;
         let mu = self.run_mu(&id);
         let _guard = mu.lock().await;
@@ -303,20 +295,10 @@ impl Core {
         })
     }
 
+    /// Reads and changes the routing policy, which is global: one file in the state dir that
+    /// every repository's runs follow.
     pub(crate) async fn config(&self, m: pb::ConfigRequest) -> RpcResult<pb::ConfigResponse> {
-        let dir = m.dir.trim();
-        if m.project && dir.is_empty() {
-            return Err(RpcError::invalid(
-                "a project directory is required for project config",
-            ));
-        }
         let global = config::policy_config_path(&self.state_dir());
-        let project_path = project_config(dir);
-        let path = if m.project {
-            project_path.clone()
-        } else {
-            global.clone()
-        };
         let key = m.key.trim().to_owned();
         let values = m.values;
         let respond = |v: Value| -> RpcResult<pb::ConfigResponse> {
@@ -345,16 +327,12 @@ impl Core {
                 }
                 respond(json!({"key": key, "status": k.status()}))
             }
-            // agent-add and agent-remove keep the ACP agents the user added,
-            // in the global config only: a repository must not add a program to run.
+            // agent-add and agent-remove keep the ACP agents the user added.
             "agent-add" | "agent-remove" => {
-                if m.project {
-                    return Err(RpcError::invalid(
-                        "agents are added to the global config only",
-                    ));
-                }
                 let mut f = config::load(&global).map_err(invalid)?;
-                if m.action == "agent-add" {
+                let added = m.action == "agent-add";
+                let bin = values.first().cloned().unwrap_or_default();
+                if added {
                     acp::valid_custom_agent(&key, &values).map_err(invalid)?;
                     f.acp_agents.insert(key.clone(), values);
                 } else if f.acp_agents.remove(&key).is_none() {
@@ -363,17 +341,24 @@ impl Core {
                 config::write_config_key(&global, "acp_agents", &f.acp_agents)
                     .map_err(RpcError::internal)?;
                 acp::set_custom_agents(f.acp_agents.clone().into_iter().collect());
+                // The agents list is the probe's table, and a probe only adds to it at most
+                // once a minute: put the change in it now, so the list shows it at once.
+                let listed = if added {
+                    self.store.upsert_agent(&types::Agent {
+                        name: key.clone(),
+                        bin,
+                        ..types::Agent::default()
+                    })
+                } else {
+                    self.store.delete_agent(&key)
+                };
+                listed.map_err(RpcError::internal)?;
                 respond(
                     json!({"path": path_text(&global), "key": "acp_agents", "value": f.acp_agents}),
                 )
             }
             "get" => {
-                let f = if m.project {
-                    config::load(&path)
-                } else {
-                    config::load_all(&global, &project_path)
-                }
-                .map_err(invalid)?;
+                let f = config::load(&global).map_err(invalid)?;
                 let v = match key.as_str() {
                     "" => json!(f),
                     "priority" => json!(f.priority),
@@ -383,13 +368,14 @@ impl Core {
                     "deny" => json!(f.deny),
                     "classifier" => json!(f.classifier),
                     "classifier_model" => json!(f.classifier_model),
+                    "classifier_agent" => json!(f.classifier_agent),
                     "acp_agents" => json!(f.acp_agents),
                     "classifier_keys" => json!({
                         CLASSIFIER_JEV: classifier::key_status(CLASSIFIER_JEV),
                         CLASSIFIER_OPENAI: classifier::key_status(CLASSIFIER_OPENAI),
                     }),
                     "classifier_cli" => {
-                        let deps = self.deps_in(dir).map_err(RpcError::internal)?;
+                        let deps = self.deps_in("").map_err(RpcError::internal)?;
                         let cli = classifier::cli_for(&deps);
                         json!({"agent": cli.agent, "model": cli.model})
                     }
@@ -398,11 +384,12 @@ impl Core {
                 respond(v)
             }
             action => {
-                let mut f = config::load(&path).map_err(invalid)?;
+                let mut f = config::load(&global).map_err(invalid)?;
                 let (write_key, value) = set_config(&mut f, action, &key, &values)?;
                 config::validate_config(&f).map_err(invalid)?;
-                config::write_config_key(&path, &write_key, &value).map_err(RpcError::internal)?;
-                respond(json!({"path": path_text(&path), "key": write_key, "value": value}))
+                config::write_config_key(&global, &write_key, &value)
+                    .map_err(RpcError::internal)?;
+                respond(json!({"path": path_text(&global), "key": write_key, "value": value}))
             }
         }
     }
@@ -468,7 +455,7 @@ impl Core {
                     (name, from)
                 })
                 .collect();
-            let pick = config::load_all(&config::policy_config_path(&state), &project_config(dir))
+            let pick = config::load(&config::policy_config_path(&state))
                 .map_or(config::default_policy().roles, |p| p.roles);
             return respond(
                 true,
@@ -601,10 +588,11 @@ impl Core {
         &self,
         m: pb::GetRouteDecisionRequest,
     ) -> RpcResult<pb::GetRouteDecisionResponse> {
-        let id = m.run_id.trim();
-        if id.is_empty() {
+        if m.run_id.trim().is_empty() {
             return Err(RpcError::invalid("run_id is required"));
         }
+        let id = self.full_run_id(&m.run_id)?;
+        let id = id.as_str();
         let Some(dec) = self
             .store
             .get_route_decision(id)
@@ -876,6 +864,17 @@ fn set_config(
         ("set", "classifier_model") if one.is_some() => {
             f.classifier_model = one.unwrap_or_default().trim().into();
             Ok(("classifier_model".into(), json!(f.classifier_model)))
+        }
+        // `agent` or `agent/model` for the CLI classifier; `default` or nothing goes back
+        // to the easy tier's first installed agent.
+        ("set", "classifier_agent") if one.is_some() => {
+            let value = one.unwrap_or_default().trim().to_owned();
+            f.classifier_agent = if value == "default" {
+                String::new()
+            } else {
+                value
+            };
+            Ok(("classifier_agent".into(), json!(f.classifier_agent)))
         }
         _ if action.starts_with("allow-") || action.starts_with("deny-") => {
             let (side, op) = action.split_once('-').unwrap_or_default();

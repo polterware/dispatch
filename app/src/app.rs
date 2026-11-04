@@ -62,6 +62,11 @@ pub struct AppView {
 const RESIZE_HANDLE_WIDTH: f32 = 12.0;
 
 impl AppView {
+    /// The window's state: its route, the core's data, and its toasts.
+    pub fn state(&self) -> gpui::Entity<AppState> {
+        self.state.clone()
+    }
+
     /// Starts the countdown of every toast that has none yet, and forgets the ones gone.
     fn time_toasts(&mut self, state: &gpui::Entity<AppState>, cx: &mut Context<Self>) {
         let shown: Vec<(u64, crate::ui::ToastTone)> = state
@@ -135,6 +140,7 @@ impl AppView {
                 run_page: view.run_page.clone(),
                 stats: view.stats.clone(),
                 intelligence: view.intelligence.clone(),
+                settings: view.settings.clone(),
             };
             crate::shots::start_tour(dir, view.state.clone(), filters, views, window, cx);
         }
@@ -265,10 +271,13 @@ impl Render for AppView {
                     cx.notify();
                 });
             }))
+            // ⌘, opens Settings and, pressed again, closes it, as ⌘K does Commander.
             .on_action(cx.listener(|this, _: &OpenSettings, _window, cx| {
                 this.state.update(cx, |state, cx| {
                     state.set_commander_open(false);
-                    if !matches!(state.route(), Route::Settings(_)) {
+                    if matches!(state.route(), Route::Settings(_)) {
+                        state.close_settings();
+                    } else {
                         state.navigate(Route::Settings(SettingsPage::Agents));
                         state.request_refresh(cx);
                     }

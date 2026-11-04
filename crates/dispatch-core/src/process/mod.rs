@@ -222,8 +222,36 @@ impl Tree {
 fn send(pid: i32, signal: Signal) -> Result<(), Error> {
     match kill(Pid::from_raw(pid), signal) {
         Ok(()) | Err(Errno::ESRCH) => Ok(()),
+        // Darwin refuses to signal a zombie, a process that has exited but is not reaped
+        // yet, and a group whose only members are zombies, with EPERM: it has stopped.
+        Err(Errno::EPERM) if only_zombies(pid) => Ok(()),
         Err(e) => Err(Error::Message(e.to_string())),
     }
+}
+
+/// Whether every process `pid` names (a process, or a group when negative) has exited,
+/// gone or a zombie, as `ps` says.
+fn only_zombies(pid: i32) -> bool {
+    let Ok(out) = std::process::Command::new("ps")
+        .args(["-axo", "pid=,pgid=,stat="])
+        .output()
+    else {
+        return false;
+    };
+    out.status.success() && only_zombies_in(&String::from_utf8_lossy(&out.stdout), pid)
+}
+
+fn only_zombies_in(table: &str, pid: i32) -> bool {
+    table
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let row: i32 = fields.next()?.parse().ok()?;
+            let group: i32 = fields.next()?.parse().ok()?;
+            let named = if pid < 0 { group == -pid } else { row == pid };
+            named.then(|| fields.next().unwrap_or(""))
+        })
+        .all(|state| state.starts_with('Z'))
 }
 
 #[cfg(test)]
@@ -235,6 +263,19 @@ struct TestOps {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_target_of_zombies_has_stopped() {
+        let table = "  10  10 Ss\n  11  10 Z\n  12  12 Z+\n  13  13 R\n";
+        assert!(
+            !only_zombies_in(table, -10),
+            "the group's leader still runs"
+        );
+        assert!(only_zombies_in(table, 11));
+        assert!(only_zombies_in(table, -12));
+        assert!(only_zombies_in(table, 99), "gone");
+        assert!(!only_zombies_in(table, 13));
+    }
     use std::sync::{Arc, Mutex};
 
     #[tokio::test]
