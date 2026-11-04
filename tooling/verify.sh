@@ -8,7 +8,8 @@ cd "$ROOT"
 
 (cd schemas && buf lint)
 
-node --test crates/dispatch-core/src/setup/opencode/
+# A glob, since Node 24 (CI's) runs a directory given to --test as a module.
+node --test 'crates/dispatch-core/src/setup/opencode/*.test.mjs'
 
 cargo fmt --all --check
 cargo clippy --workspace --all-targets

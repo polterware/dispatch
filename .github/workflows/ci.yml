@@ -26,5 +26,6 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets
       - run: cargo test --workspace
-      - run: node --test crates/dispatch-core/src/setup/opencode/
+      # Node 24 runs a directory given to --test as a module; a glob names the test files.
+      - run: node --test 'crates/dispatch-core/src/setup/opencode/*.test.mjs'
       - run: bash tooling/check-boundaries.sh
