@@ -310,6 +310,7 @@ async fn test_watch_run_connect_server_stream_and_error_frame() {
                                 kind: "output".into(),
                                 text: "line one".into(),
                                 at: "2026-04-20T00:00:01Z".into(),
+                                ..Default::default()
                             })
                             .expect("m1");
                             let m2 = serde_json::to_vec(&WatchRunResponse {
@@ -317,6 +318,7 @@ async fn test_watch_run_connect_server_stream_and_error_frame() {
                                 kind: "done".into(),
                                 text: "finished".into(),
                                 at: "2026-04-20T00:00:02Z".into(),
+                                ..Default::default()
                             })
                             .expect("m2");
                             wire.extend_from_slice(&encode_envelope(0x00, &m1));
@@ -360,6 +362,7 @@ async fn test_watch_run_connect_server_stream_and_error_frame() {
         .watch_run(&WatchRunRequest {
             id: "r1".into(),
             after_seq: 10,
+            ..Default::default()
         })
         .await
         .expect("open watch_run");
@@ -396,6 +399,7 @@ async fn test_watch_run_connect_server_stream_and_error_frame() {
         .watch_run(&WatchRunRequest {
             id: "fail".into(),
             after_seq: 0,
+            ..Default::default()
         })
         .await
         .expect("open failing watch_run");

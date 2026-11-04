@@ -597,6 +597,78 @@ impl types::Store for Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(db)
     }
 
+    fn event_sizes(&self, run_id: &str) -> Result<Vec<types::EventSize>, Error> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "
+		SELECT seq, kind, length(CAST(text AS BLOB))
+		FROM dispatch_run_events
+		WHERE run_id = ?
+		ORDER BY seq ASC",
+            )
+            .map_err(db)?;
+        let rows = stmt
+            .query_map([run_id], |r| {
+                Ok(types::EventSize {
+                    seq: r.get(0)?,
+                    kind: r.get(1)?,
+                    bytes: u64::try_from(r.get::<_, i64>(2)?).unwrap_or(0),
+                })
+            })
+            .map_err(db)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db)
+    }
+
+    /// Reads only the slice's bytes, and one past it, so a page of a huge event never loads
+    /// the event whole.
+    fn event_slice(
+        &self,
+        run_id: &str,
+        seq: i64,
+        start: u64,
+        end: u64,
+    ) -> Result<Option<(RunEvent, u64)>, Error> {
+        let from = i64::try_from(start).unwrap_or(i64::MAX);
+        let wanted = i64::try_from(end.saturating_sub(start)).unwrap_or(i64::MAX);
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "
+		SELECT id, run_id, project_id, kind, agent, tier,
+		       substr(CAST(text AS BLOB), ? + 1, ? + 1), seq, at
+		FROM dispatch_run_events
+		WHERE run_id = ? AND seq = ?",
+            )
+            .map_err(db)?;
+        let mut rows = stmt
+            .query_map(params![from, wanted, run_id, seq], |r| {
+                let window: Vec<u8> = r.get(6)?;
+                Ok((
+                    RunEvent {
+                        id: r.get(0)?,
+                        run_id: r.get(1)?,
+                        project_id: r.get(2)?,
+                        kind: r.get(3)?,
+                        agent: r.get(4)?,
+                        tier: r.get(5)?,
+                        text: String::new(),
+                        seq: r.get(7)?,
+                        at: parse_time(&r.get::<_, String>(8)?),
+                    },
+                    window,
+                ))
+            })
+            .map_err(db)?;
+        let Some(row) = rows.next() else {
+            return Ok(None);
+        };
+        let (mut event, window) = row.map_err(db)?;
+        let (text, moved) = types::cut_utf8(&window, usize::try_from(wanted).unwrap_or(usize::MAX));
+        event.text = text;
+        Ok(Some((event, start + moved as u64)))
+    }
+
     fn list_history(
         &self,
         project_id: &str,

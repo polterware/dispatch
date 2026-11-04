@@ -114,6 +114,18 @@ fn test_compute_rates_percentiles_and_ranks() {
             "failed",
         ));
     }
+    // A second model with enough completed runs, so the slowest has something to beat.
+    for i in 0..5 {
+        recs.push(mk(
+            &format!("c{i}"),
+            "claude-opus-5-5",
+            "anthropic",
+            STATUS_COMPLETED,
+            Some(300),
+            vec![],
+            "ok",
+        ));
+    }
     recs.push(Run {
         id: "fly".into(),
         status: STATUS_RUNNING.into(),
@@ -156,15 +168,19 @@ fn test_compute_rates_percentiles_and_ranks() {
     assert_eq!(rep.rankings.most_used_model.runs, 10);
     assert_eq!(rep.rankings.most_used_provider.key, "openai");
     assert_eq!(rep.rankings.most_used_provider.runs, 10);
-    assert_eq!(rep.rankings.slowest_model.key, "gemini-3.8-flash-low");
-    assert_eq!(rep.rankings.slowest_model.p50_ms, Some(200));
+    // Gemini never completed, so its 200ms says nothing of its speed.
+    assert_eq!(rep.rankings.slowest_model.key, "claude-opus-5-5");
+    assert_eq!(rep.rankings.slowest_model.p50_ms, Some(300));
+    assert_eq!(rep.rankings.slowest_model.samples, 5);
     assert_eq!(rep.rankings.most_failed_model.key, "gemini-3.8-flash-low");
     assert_eq!(rep.rankings.most_failed_model.success_pct, Some(0.0));
+    assert_eq!(rep.rankings.most_failed_model.failures, 5);
 
     let text = rep.text();
     assert!(text.contains("gpt-5.6-terra"), "{text}");
+    assert!(text.contains("slowest model: claude-opus-5-5"), "{text}");
     assert!(
-        text.contains("slowest model: gemini-3.8-flash-low"),
+        text.contains("most failed model: gemini-3.8-flash-low (5 of 5 runs failed)"),
         "{text}"
     );
 
@@ -202,6 +218,106 @@ fn test_compute_rates_percentiles_and_ranks() {
     assert!(!small.rankings.most_failed_model.reason.is_empty());
     assert!(!small.rankings.most_used_model.key.is_empty());
     assert!(small.text().contains("unknown"));
+}
+
+/// Runs of `model`, one per status in `statuses`, each 1s long.
+fn runs_of(model: &str, statuses: &[(&str, usize)]) -> Vec<Run> {
+    let now = Utc.with_ymd_and_hms(2026, 10, 15, 12, 0, 0).unwrap();
+    let mut out = Vec::new();
+    for (status, count) in statuses {
+        for i in 0..*count {
+            out.push(Run {
+                id: format!("{model}-{status}-{i}"),
+                model: model.into(),
+                provider: "p".into(),
+                agent: "codex".into(),
+                status: (*status).into(),
+                created_at: rfc3339(now - ChronoDuration::hours(1)),
+                run_ms: Some(1000),
+                ..Default::default()
+            });
+        }
+    }
+    out
+}
+
+fn rankings_of(runs: Vec<Vec<Run>>) -> dispatch_core::reports::Rankings {
+    let now = Utc.with_ymd_and_hms(2026, 10, 15, 12, 0, 0).unwrap();
+    let recs: Vec<Run> = runs.into_iter().flatten().collect();
+    compute(
+        &recs,
+        StatsOptions {
+            by: "model".into(),
+            now: Some(now),
+            ..Default::default()
+        },
+    )
+    .expect("compute")
+    .rankings
+}
+
+#[test]
+fn test_most_failed_counts_only_the_runs_a_model_ended_itself() {
+    // Orphans (the core went away), cancels (the user's call), and a rate-limited end are not
+    // the model failing: "flaky" failed once in the 16 runs it ended.
+    let mut limited = runs_of("flaky", &[(STATUS_FAILED, 1)]);
+    limited[0].exit_class = "rate_limit".into();
+    limited[0].id = "flaky-limited".into();
+    let ranks = rankings_of(vec![
+        runs_of(
+            "flaky",
+            &[
+                (STATUS_COMPLETED, 15),
+                (STATUS_ORPHANED, 2),
+                (STATUS_CANCELLED, 1),
+                (STATUS_FAILED, 1),
+            ],
+        ),
+        limited,
+        runs_of("steady", &[(STATUS_COMPLETED, 5), (STATUS_ORPHANED, 3)]),
+    ]);
+    let failed = &ranks.most_failed_model;
+    assert_eq!(failed.key, "flaky");
+    assert_eq!(failed.runs, 16);
+    assert_eq!(failed.failures, 1);
+    assert_eq!(failed.success_pct, Some(93.8));
+}
+
+#[test]
+fn test_most_failed_weighs_how_many_runs_back_the_rate() {
+    // 1 in 5 is a higher rate than 3 in 18, but five runs cannot tell 20% from 2%.
+    let ranks = rankings_of(vec![
+        runs_of("few", &[(STATUS_COMPLETED, 4), (STATUS_FAILED, 1)]),
+        runs_of("many", &[(STATUS_COMPLETED, 15), (STATUS_TIMED_OUT, 3)]),
+    ]);
+    assert_eq!(ranks.most_failed_model.key, "many");
+    assert_eq!(ranks.most_failed_model.failures, 3);
+}
+
+#[test]
+fn test_comparison_rankings_need_two_models_and_a_failure() {
+    // No failures: no model is named most failed.
+    let clean = rankings_of(vec![
+        runs_of("a", &[(STATUS_COMPLETED, 5)]),
+        runs_of("b", &[(STATUS_COMPLETED, 6)]),
+    ]);
+    assert_eq!(clean.most_failed_model.key, "unknown");
+    assert_eq!(clean.most_failed_model.reason, "no failures in range");
+    assert_eq!(clean.slowest_model.key, "a");
+
+    // One model with enough runs is slower and more failed than nothing.
+    let alone = rankings_of(vec![
+        runs_of("a", &[(STATUS_COMPLETED, 5), (STATUS_FAILED, 2)]),
+        runs_of("b", &[(STATUS_COMPLETED, 2)]),
+    ]);
+    for rank in [&alone.slowest_model, &alone.most_failed_model] {
+        assert_eq!(rank.key, "unknown");
+        assert_eq!(
+            rank.reason,
+            format!("needs two models with enough runs (minimum {MIN_SAMPLES})")
+        );
+    }
+    assert_eq!(alone.most_used_model.key, "a");
 }
 
 #[test]

@@ -20,8 +20,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     config.file_descriptor_set_path(&descriptor);
     config.compile_protos(&files, &[SCHEMAS])?;
+    // A client a release ahead of its core may send a field the core does not know yet:
+    // ignoring it keeps older cores answering instead of failing the whole request.
     pbjson_build::Builder::new()
         .register_descriptors(&std::fs::read(descriptor)?)?
+        .ignore_unknown_fields()
         .build(&[".dispatch.v1", ".polterware.local.v1"])?;
     Ok(())
 }

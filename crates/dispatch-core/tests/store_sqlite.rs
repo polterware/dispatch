@@ -470,3 +470,57 @@ fn events_agents_quota_and_tiers() {
     let other = Store::new(":memory:").unwrap();
     assert_eq!(other.list_tiers().unwrap().len(), 0);
 }
+
+#[test]
+fn event_pages_read_sizes_and_slices_on_whole_characters() {
+    let (_dir, s) = new_store();
+    s.save_run(&Run {
+        id: "r".into(),
+        project_id: "p".into(),
+        ..Default::default()
+    })
+    .unwrap();
+    // "é" and "ö" are two bytes each: "h é llo w ö rld" is 13 bytes.
+    s.append_event(&types::RunEvent {
+        run_id: "r".into(),
+        kind: types::EVENT_OUTPUT.into(),
+        text: "h\u{e9}llo w\u{f6}rld".into(),
+        ..Default::default()
+    })
+    .unwrap();
+    s.append_event(&types::RunEvent {
+        run_id: "r".into(),
+        kind: types::EVENT_MERGED.into(),
+        text: "into main".into(),
+        ..Default::default()
+    })
+    .unwrap();
+    let sizes = s.event_sizes("r").unwrap();
+    assert_eq!(
+        sizes,
+        vec![
+            types::EventSize {
+                seq: 1,
+                kind: types::EVENT_OUTPUT.into(),
+                bytes: 13,
+            },
+            types::EventSize {
+                seq: 2,
+                kind: types::EVENT_MERGED.into(),
+                bytes: 9,
+            },
+        ]
+    );
+    // Byte 2 is inside "é": the start moves on to the "l" after it.
+    let (event, start) = s.event_slice("r", 1, 2, 13).unwrap().unwrap();
+    assert_eq!((event.text.as_str(), start), ("llo w\u{f6}rld", 3));
+    // Byte 8 is inside "ö": the end moves back before it.
+    let (event, start) = s.event_slice("r", 1, 0, 8).unwrap().unwrap();
+    assert_eq!((event.text.as_str(), start), ("h\u{e9}llo w", 0));
+    assert_eq!(event.kind, types::EVENT_OUTPUT);
+    assert_eq!(
+        s.event_slice("r", 2, 0, 9).unwrap().unwrap().0.text,
+        "into main"
+    );
+    assert!(s.event_slice("r", 9, 0, 1).unwrap().is_none());
+}

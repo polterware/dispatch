@@ -4,53 +4,27 @@
 use gpui::{AnyElement, App, IntoElement, Rgba, SharedString, div, prelude::*, px};
 
 use crate::theme::Theme;
+use crate::ui::{Icon, TileTone};
 
+/// A settings section as a card: its tile, title and description, an optional action, and
+/// its rows (polterware-ui's [`SettingsSection`](crate::ui::patterns::SettingsSection)).
 pub fn settings_section(
+    icon: Icon,
+    tone: TileTone,
     title: impl Into<SharedString>,
     description: impl Into<SharedString>,
     action: Option<AnyElement>,
     body: impl IntoElement,
-    cx: &App,
+    _cx: &App,
 ) -> AnyElement {
-    let theme = Theme::global(cx);
-    let mut header = div()
-        .w_full()
-        .flex()
-        .items_start()
-        .justify_between()
-        .gap(px(theme.space_3))
-        .child(
-            div()
-                .flex_1()
-                .min_w(px(0.0))
-                .flex()
-                .flex_col()
-                .gap(px(theme.space_1))
-                .child(
-                    div()
-                        .text_size(px(theme.font_size_md))
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(theme.color_text_primary)
-                        .child(title.into()),
-                )
-                .child(
-                    div()
-                        .text_size(px(theme.font_size_sm))
-                        .text_color(theme.color_text_secondary)
-                        .child(description.into()),
-                ),
-        );
+    let mut section = crate::ui::patterns::settings_section(title)
+        .description(description)
+        .icon(icon, tone)
+        .child(body);
     if let Some(action) = action {
-        header = header.child(div().flex_none().child(action));
+        section = section.action(action);
     }
-    div()
-        .w_full()
-        .flex()
-        .flex_col()
-        .gap(px(theme.space_3))
-        .child(header)
-        .child(body)
-        .into_any_element()
+    section.into_any_element()
 }
 
 pub fn settings_row(
@@ -103,52 +77,13 @@ pub fn settings_row(
         .into_any_element()
 }
 
-pub fn settings_field(
-    label: impl Into<SharedString>,
-    control: impl IntoElement,
-    cx: &App,
-) -> AnyElement {
-    let theme = Theme::global(cx);
-    div()
-        .flex_1()
-        .min_w(px(0.0))
-        .flex()
-        .flex_col()
-        .gap(px(theme.space_1))
-        .child(
-            div()
-                .text_size(px(theme.font_size_xs))
-                .text_color(theme.color_text_muted)
-                .child(label.into()),
-        )
-        .child(control)
-        .into_any_element()
-}
-
-/// 14px ring and 8px mark, the same metrics as `radio_group`.
+/// The lib's 14px radio control, set 2px down to sit on the label's first line.
 pub fn radio_mark(on: bool, cx: &App) -> AnyElement {
     let theme = Theme::global(cx);
-    let mark = if on {
-        theme.color_primary
-    } else {
-        theme.color_surface
-    };
-    let border = if on {
-        theme.color_primary
-    } else {
-        theme.color_border_strong
-    };
     div()
         .mt(px(2.0))
-        .size(px(14.0))
         .flex_none()
-        .rounded_full()
-        .border_1()
-        .border_color(border)
-        .flex()
-        .items_center()
-        .justify_center()
-        .child(div().size(px(8.0)).rounded_full().bg(mark))
+        .child(crate::ui::radio_mark(on, 14.0, theme))
         .into_any_element()
 }
 

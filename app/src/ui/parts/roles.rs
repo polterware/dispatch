@@ -145,17 +145,12 @@ fn summary_label(label: &'static str, theme: &Theme) -> impl IntoElement {
         .child(label)
 }
 
-pub fn role_board_note(repository: bool, theme: &Theme) -> impl IntoElement {
-    let mut text =
-        "Its own models for each tier, primary first. A tier with none runs on General's."
-            .to_string();
-    if repository {
-        text.push_str(" This role is in the repository's .dispatch/roles.json; edit it there.");
-    }
+/// Under a repository's role: where it is edited.
+pub fn role_board_note(theme: &Theme) -> impl IntoElement {
     div()
         .text_size(px(theme.font_size_sm))
         .text_color(theme.color_text_muted)
-        .child(text)
+        .child("This role is in the repository's .dispatch/roles.json; edit it there.")
 }
 
 /// The proposed table: one section per tier, primary first.
@@ -235,14 +230,6 @@ fn build_row(index: usize, entry: &BuiltEntry, theme: &Theme, cx: &App) -> impl 
         .when(!entry.qualified, |row| {
             row.child(chip("Below bar", StatusTone::Muted, cx))
         })
-}
-
-pub fn field_label(text: &'static str, theme: &Theme) -> impl IntoElement {
-    div()
-        .text_size(px(theme.font_size_xs))
-        .font_weight(gpui::FontWeight::MEDIUM)
-        .text_color(theme.color_text_muted)
-        .child(text)
 }
 
 pub fn muted_note(text: impl Into<SharedString>, theme: &Theme) -> impl IntoElement {

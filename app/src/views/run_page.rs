@@ -13,7 +13,7 @@ use gpui::{
     MouseButton, SharedString, StyledText, TextRun, WeakEntity, Window, div, prelude::*, px,
 };
 
-use crate::avatar::agent_avatar;
+use crate::avatar::{agent_avatar, agent_avatar_live};
 use crate::client::{
     CancelRunRequest, CleanRunRequest, CoreClient, CoreError, DispatchRun, DispatchWorktree,
     GetRouteDecisionRequest, ListWorktreesRequest, MergeRunRequest, RecoverRunRequest,
@@ -32,11 +32,13 @@ use crate::state::{AppState, ConnectionState, Route, observe};
 use crate::theme::{Theme, status_tone, tw};
 use crate::ui::ellipsis;
 use crate::ui::parts::run_page::{context_meter, file_change_line, prompt_text};
+use crate::ui::patterns::trailing_toolbar;
 use crate::ui::{
     Button, ButtonKind, ButtonSize, Icon, MascotMood, Menu, MenuEntry, PageWidth, RailGroup,
-    RailPresence, ToastTone, chip, mono, page_empty_with, rail_page_body, rail_page_header,
-    rail_properties, rail_property, rail_toggle_label, sans, tabular, toolbar, tooltip,
+    RailPresence, ToastTone, chip, mono, page_empty_with, rail_page_body_under, rail_page_header,
+    rail_properties, rail_property, rail_toggle_label, sans, tabular, toolbar, tooltip, wrap_text,
 };
+use crate::ui::{SkeletonLayout, page_skeleton};
 
 /// Where the rail's open state is remembered, as `railStorageKey` names it.
 const RAIL_PREFERENCE: &str = "polterware.run.rail";
@@ -105,6 +107,26 @@ pub struct RunPageView {
 }
 
 impl RunPageView {
+    /// Presses the transcript's jump-to-end button (the screenshot tour).
+    pub(crate) fn jump_transcript_to_end(&mut self, cx: &mut Context<Self>) {
+        self.transcript
+            .update(cx, |transcript, cx| transcript.jump_to_end(cx));
+    }
+
+    /// Scrolls the transcript `y` down (the screenshot tour).
+    pub(crate) fn scroll_transcript(&mut self, y: f32, cx: &mut Context<Self>) {
+        self.transcript
+            .update(cx, |transcript, cx| transcript.scroll_by(y, cx));
+    }
+
+    /// Folds the Agent and Prompt groups, so the run's properties show (the screenshot tour).
+    pub(crate) fn fold_rail_heads(&mut self, cx: &mut Context<Self>) {
+        for group in [&self.agent, &self.prompt] {
+            group.update(cx, |group, cx| group.set_open(false, cx));
+        }
+        cx.notify();
+    }
+
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         observe(&state, cx);
         let run_id = match state.read(cx).route() {
@@ -178,17 +200,6 @@ impl RunPageView {
         bind_body(&self.routing, weak.clone(), paint_routing, cx);
         bind_body(&self.changes, weak.clone(), paint_changes, cx);
         bind_body(&self.linked, weak, paint_linked, cx);
-    }
-
-    fn leave(&mut self, cx: &mut Context<Self>) {
-        self.state.update(cx, |state, cx| {
-            if !state.go_back() {
-                state.navigate(Route::Runs);
-            }
-            state.request_refresh(cx);
-            cx.notify();
-        });
-        cx.notify();
     }
 
     /// The rail toggle: beside the text it flips the remembered choice; on a narrow page it
@@ -389,15 +400,7 @@ impl RunPageView {
                     let worktrees = client
                         .list_worktrees(&ListWorktreesRequest { project_id })
                         .ok();
-                    let log = client
-                        .result(&ResultRequest {
-                            id: run_id.clone(),
-                            section: "output".to_string(),
-                            offset: 0,
-                            limit: 0,
-                        })
-                        .ok()
-                        .map(|response| response.content);
+                    let log = log_tail(&client, &run_id);
                     (decision, worktrees, log, run_id)
                 })
                 .await;
@@ -564,22 +567,15 @@ impl RunPageView {
         }
     }
 
-    /// Back, a texture icon button.
-    fn toolbar_start(&self, weak: WeakEntity<Self>) -> AnyElement {
-        Button::new("run-back", ButtonKind::Secondary)
-            .size(ButtonSize::Icon)
-            .icon(Icon::Back)
-            .tooltip("Back")
-            .on_click(move |_, cx| {
-                let _ = weak.update(cx, |view, cx| view.leave(cx));
-            })
-            .into_any_element()
-    }
-
     /// The next step: Cancel while the run works, Merge for a finished run with a worktree
     /// that is not merged, Delete worktree once it is, each a small button with a 12px mark;
     /// then "…" with Recover run and Remove worktree, when the run offers either.
-    fn toolbar_end(&self, run: &DispatchRun, weak: WeakEntity<Self>) -> AnyElement {
+    fn toolbar_end(
+        &self,
+        run: &DispatchRun,
+        menu_open: bool,
+        weak: WeakEntity<Self>,
+    ) -> AnyElement {
         let review = run_review_action(
             &run.status,
             &run.merged_at,
@@ -652,15 +648,19 @@ impl RunPageView {
             has_worktree(&self.branch, &self.path),
         );
         if !more.is_empty() {
-            row = row.child(
-                Button::new("run-more", ButtonKind::Ghost)
-                    .size(ButtonSize::Icon)
-                    .icon(Icon::More)
-                    .tooltip("More run actions")
-                    .on_click(move |_, cx| {
-                        let _ = weak.update(cx, |view, cx| view.toggle_menu(cx));
-                    }),
-            );
+            // A face like the rail toggle's beside it; no tooltip over its own open menu.
+            let more = Button::new("run-more", ButtonKind::Secondary)
+                .size(ButtonSize::Icon)
+                .icon(Icon::More)
+                .selected(menu_open)
+                .on_click(move |_, cx| {
+                    let _ = weak.update(cx, |view, cx| view.toggle_menu(cx));
+                });
+            row = row.child(if menu_open {
+                more
+            } else {
+                more.tooltip("More run actions")
+            });
         }
         row.into_any_element()
     }
@@ -811,6 +811,7 @@ impl Render for RunPageView {
         }
 
         let weak = cx.weak_entity();
+        let menu_open = self.menu.read(cx).is_open();
         let visible = self.rail_visible();
         self.rail.set_open(visible);
         let bar = if let Some(run) = self.snapshot_run.clone() {
@@ -819,7 +820,7 @@ impl Render for RunPageView {
                 .flex()
                 .items_center()
                 .gap(px(8.0))
-                .child(self.toolbar_end(&run, weak.clone()))
+                .child(self.toolbar_end(&run, menu_open, weak.clone()))
                 .child(
                     Button::new("run-rail-toggle", ButtonKind::Secondary)
                         .size(ButtonSize::Icon)
@@ -830,11 +831,12 @@ impl Render for RunPageView {
                             let _ = toggle_view.update(cx, |view, cx| view.toggle_rail(cx));
                         }),
                 );
-            rail_page_header(self.toolbar_start(weak.clone()), end, cx).into_any_element()
+            rail_page_header(div(), end, cx).into_any_element()
         } else {
-            toolbar(self.toolbar_start(weak.clone()), div(), cx).into_any_element()
+            toolbar(div(), div(), cx).into_any_element()
         };
 
+        let header = theme.page_header_height;
         let mut drawer = None;
         let body = if self.snapshot_run.is_some() {
             let agent = self.agent.clone();
@@ -864,12 +866,29 @@ impl Render for RunPageView {
                 .flex()
                 .flex_col()
                 .child(self.transcript.clone());
-            let (row, over) =
-                rail_page_body(column, rail, &self.rail, &self.page_width, window, cx);
+            // The transcript runs up under the header, which fades it out on its trail.
+            self.transcript
+                .update(cx, |transcript, cx| transcript.set_top_inset(header, cx));
+            let (row, over) = rail_page_body_under(
+                column,
+                rail,
+                &self.rail,
+                &self.page_width,
+                header,
+                window,
+                cx,
+            );
             drawer = over;
             row.into_any_element()
         } else {
-            missing_body(&connection, theme, cx)
+            div()
+                .flex_1()
+                .min_h(px(0.0))
+                .flex()
+                .flex_col()
+                .pt(px(header))
+                .child(missing_body(&connection, theme, cx))
+                .into_any_element()
         };
 
         let confirm_id = self
@@ -886,8 +905,21 @@ impl Render for RunPageView {
             .flex_col()
             .text_color(theme.color_text_primary)
             .child(self.page_width.probe())
-            .child(bar)
             .child(body)
+            // The header floats over the page; its background is the toolbar's trail.
+            .child(
+                div()
+                    .absolute()
+                    .top(px(0.0))
+                    .left(px(0.0))
+                    .right(px(0.0))
+                    .child(trailing_toolbar(
+                        bar,
+                        theme.color_surface,
+                        header,
+                        theme.radius_surface,
+                    )),
+            )
             .children(drawer)
             .child(
                 div()
@@ -956,6 +988,28 @@ fn unix_now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// The lines of a run's log the rail reads its live token count from, the latest usage line
+/// being among the last ones.
+const LOG_TAIL_LINES: i32 = 200;
+
+/// The last [`LOG_TAIL_LINES`] lines of the run's log: the line count first, then that page,
+/// so a live run's rail never fetches its whole log again on each usage change.
+fn log_tail(client: &CoreClient, run_id: &str) -> Option<String> {
+    let page = |offset: i32, limit: i32| {
+        client
+            .result(&ResultRequest {
+                id: run_id.to_string(),
+                section: "output".to_string(),
+                offset,
+                limit,
+            })
+            .ok()
+    };
+    let total = page(0, 1)?.total;
+    let offset = (total - LOG_TAIL_LINES).max(0);
+    page(offset, LOG_TAIL_LINES).map(|response| response.content)
+}
+
 fn log_stamp(run: &DispatchRun) -> String {
     format!(
         "{}:{}:{}:{}:{}:{}:{}:{}",
@@ -1007,7 +1061,7 @@ fn paint_agent(view: &WeakEntity<RunPageView>, window: &mut Window, cx: &mut App
         .min_w(px(0.0))
         .items_center()
         .gap(px(tw(2.5)))
-        .child(agent_avatar(&current.agent, &pack.run.status, 28.0))
+        .child(agent_avatar_live(&current.agent, &pack.run.status, 28.0))
         .child(
             div()
                 .min_w(px(0.0))
@@ -1116,7 +1170,7 @@ fn paint_run(view: &WeakEntity<RunPageView>, window: &mut Window, cx: &mut App) 
                 .id("run-tokens-tip")
                 .font(figures.clone())
                 .tooltip(tooltip(token_breakdown(usage)))
-                .child(format_tokens(total_tokens(usage))),
+                .child(wrap_text(format_tokens(total_tokens(usage)))),
             false,
             cx,
         ));
@@ -1149,7 +1203,7 @@ fn paint_run(view: &WeakEntity<RunPageView>, window: &mut Window, cx: &mut App) 
                 .id("run-cost-tip")
                 .font(figures)
                 .tooltip(tooltip(priced.title))
-                .child(priced.label),
+                .child(wrap_text(priced.label)),
             false,
             cx,
         ));
@@ -1357,12 +1411,7 @@ fn paint_linked(view: &WeakEntity<RunPageView>, window: &mut Window, cx: &mut Ap
 
 /// A property's text, wrapping where it must (`overflow-wrap: anywhere`).
 fn wrapped(text: &str) -> AnyElement {
-    div()
-        .min_w(px(0.0))
-        .max_w_full()
-        .whitespace_normal()
-        .child(text.to_string())
-        .into_any_element()
+    wrap_text(text.to_string()).into_any_element()
 }
 
 fn context_color(percent: u32, theme: Theme) -> gpui::Rgba {
@@ -1377,7 +1426,12 @@ fn context_color(percent: u32, theme: Theme) -> gpui::Rgba {
 
 fn missing_body(connection: &ConnectionState, theme: Theme, cx: &App) -> AnyElement {
     match connection {
-        ConnectionState::Connecting => centered("Connecting to Dispatch core...", theme),
+        // The core is starting: the run's page, in bones, until it answers.
+        ConnectionState::Connecting => div()
+            .size_full()
+            .px(px(theme.space_4))
+            .child(page_skeleton(SkeletonLayout::Detail).without_toolbar())
+            .into_any_element(),
         ConnectionState::Offline { core_json_path } => offline_body(core_json_path, theme),
         ConnectionState::Online => no_run_open(theme, cx),
     }

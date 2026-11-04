@@ -1,15 +1,14 @@
 //! Spend figures and the Spend page's row rules.
 //!
-//! Ports `packages/features/dispatch/src/spend.ts` and the usage-tab calculations
-//! in `index.tsx` (`linearPace`, quota, pace, window, task price, `agentFilters`).
+//! Ports `packages/features/dispatch/src/spend.ts` and the usage-tab calculations in
+//! `index.tsx`. The page shows only what Dispatch's runs used: the agents that ran in the
+//! Spend window, dearest first, under the window's totals. Account limits live with the tiers.
 
 use std::cmp::Ordering;
 use std::collections::HashSet;
 
 use super::filter::{FilterOption, FilterSpec, Filters};
-pub use super::sort::SortDirection;
-use super::sort::{SortValue, sort_rows as sort_by_value};
-use crate::client::{DispatchAgent, DispatchCapacityKey, DispatchQuotaSnapshot, DispatchStatsRow};
+use crate::client::{DispatchAgent, DispatchStatsRow};
 
 pub const API_EQUIVALENT: &str =
     "API-equivalent cost: what these tokens cost at API prices, not what a subscription bills.";
@@ -22,34 +21,6 @@ pub const SINCE_OPTIONS: &[(&str, &str)] = &[
 ];
 
 pub const DEFAULT_SINCE: &str = "7d";
-
-pub const QUOTA_OPTIONS: &[&str] = &["Available", "Low", "Cooldown", "Unknown"];
-
-pub const PACE_OPTIONS: &[&str] = &["ahead", "on pace", "behind", "unknown"];
-
-pub const RUN_OPTIONS: &[(&str, &str)] = &[
-    ("Ran", "Ran in the window"),
-    ("No runs", "No runs in the window"),
-];
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SortKey {
-    Agent,
-    Task,
-    Tokens,
-    Cost,
-}
-
-/// The sort each column's header offers, in column order: Usage, Pace, and Window do not sort.
-pub const COLUMN_SORT: [Option<SortKey>; 7] = [
-    Some(SortKey::Agent),
-    None,
-    None,
-    None,
-    Some(SortKey::Task),
-    Some(SortKey::Tokens),
-    Some(SortKey::Cost),
-];
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct TokenCounts {
@@ -107,42 +78,20 @@ pub struct ContextUsage {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct CatalogModel {
-    pub agent: String,
-    pub model: String,
-    pub cost_per_task: Option<f64>,
-    pub cost_source: String,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct TaskPrice {
-    pub label: String,
-    pub title: String,
-    pub min: f64,
-}
-
-#[derive(Clone, Debug, PartialEq)]
 pub struct SpendRow {
     pub agent: String,
-    /// Filter key: the agent's provider, else the first snapshot's.
+    /// The agent's provider, empty when unknown.
     pub provider: String,
-    /// Trailing label: the latest snapshot's provider, else the agent's.
-    pub display_provider: String,
-    pub quota: String,
-    pub pace_label: String,
-    pub ran: String,
-    pub usage_label: String,
-    pub usage_aria: String,
-    pub source_tooltip: Option<String>,
-    pub cooldown_tooltip: Option<String>,
-    pub window_label: String,
-    pub window_tooltip: Option<String>,
-    pub task: Option<Cell>,
+    /// Dispatch runs in the Spend window.
+    pub runs: i64,
     pub tokens: Option<Cell>,
     pub cost: Option<Cell>,
-    pub sort_task: f64,
-    pub sort_tokens: f64,
-    pub sort_cost: f64,
+    /// The window's tokens, when a run reported usage.
+    pub counts: Option<TokenCounts>,
+    /// The window's API-equivalent cost, when a run could be priced.
+    pub cost_usd: Option<f64>,
+    /// The runs whose cost is in `cost_usd`.
+    pub cost_runs: i64,
 }
 
 /// Every token sent or received, cache included. Reasoning is part of output.
@@ -245,17 +194,6 @@ pub fn cost_source_label(source: &str) -> &'static str {
     }
 }
 
-/// Short price source used on Cost / task.
-pub fn task_source_label(source: &str) -> &str {
-    if source == "cursorbench" {
-        "CursorBench"
-    } else if source == "models.dev price" {
-        "models.dev"
-    } else {
-        source
-    }
-}
-
 /// A run's cost and its tooltip. Unknown when an attempt could not be priced.
 pub fn run_cost(usage: &Usage) -> Cell {
     match usage.cost_usd {
@@ -326,240 +264,9 @@ pub fn known_text(value: &str) -> Option<String> {
     }
 }
 
-pub fn format_used_percent(used: Option<f64>) -> String {
-    match used {
-        Some(value) if value.is_finite() => format!("{value:.1}%"),
-        _ => "unknown".to_string(),
-    }
-}
-
-/// RFC 3339 / ISO-8601 instant as unix milliseconds. A date with no zone is UTC.
-pub fn parse_time_ms(value: &str) -> Option<i64> {
-    let text = value.trim();
-    if text.is_empty() {
-        return None;
-    }
-    let (date, time_and_zone) = if let Some((date, rest)) = split_date_time(text) {
-        (date, Some(rest))
-    } else {
-        (text, None)
-    };
-    let mut date_parts = date.split('-');
-    let year: i32 = date_parts.next()?.parse().ok()?;
-    let month: u32 = date_parts.next()?.parse().ok()?;
-    let day: u32 = date_parts.next()?.parse().ok()?;
-    if date_parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return None;
-    }
-    let mut hour = 0_i64;
-    let mut minute = 0_i64;
-    let mut second = 0_i64;
-    let mut millis = 0_i64;
-    let mut offset_ms = 0_i64;
-    if let Some(rest) = time_and_zone {
-        let (time, offset) = split_zone(rest)?;
-        if time.is_empty() {
-            return None;
-        }
-        let mut bits = time.split(':');
-        hour = bits.next()?.parse().ok()?;
-        minute = bits.next().unwrap_or("0").parse().ok()?;
-        let seconds = bits.next().unwrap_or("0");
-        if bits.next().is_some() || !(0..=23).contains(&hour) || !(0..=59).contains(&minute) {
-            return None;
-        }
-        let (sec, frac) = seconds.split_once('.').unwrap_or((seconds, ""));
-        second = sec.parse().ok()?;
-        if second > 60 {
-            return None;
-        }
-        if !frac.is_empty() {
-            let mut digits: String = frac
-                .chars()
-                .filter(|ch| ch.is_ascii_digit())
-                .take(3)
-                .collect();
-            if digits.is_empty() {
-                return None;
-            }
-            while digits.len() < 3 {
-                digits.push('0');
-            }
-            millis = digits.parse().ok()?;
-        }
-        offset_ms = offset;
-    }
-    let days = days_from_civil(year, month, day);
-    let utc = days * 86_400_000 + hour * 3_600_000 + minute * 60_000 + second * 1000 + millis;
-    Some(utc - offset_ms)
-}
-
-pub fn format_duration_ms(ms: i64) -> String {
-    let sec = (ms as f64 / 1000.0).round().max(0.0) as i64;
-    if sec < 60 {
-        return format!("{sec}s");
-    }
-    let min = sec / 60;
-    if min < 60 {
-        return format!("{min}m");
-    }
-    let hours = min / 60;
-    let rem = min % 60;
-    if rem == 0 {
-        format!("{hours}h")
-    } else {
-        format!("{hours}h {rem}m")
-    }
-}
-
-/// Relative clock text. Empty stays unknown; an unparseable value stays as stored.
-pub fn relative_when(value: &str, now_ms: i64) -> String {
-    let text = value.trim();
-    if text.is_empty() {
-        return "unknown".to_string();
-    }
-    let Some(time) = parse_time_ms(text) else {
-        return text.to_string();
-    };
-    let delta = time - now_ms;
-    let abs = delta.abs();
-    if abs < 1000 {
-        return "now".to_string();
-    }
-    let label = format_duration_ms(abs);
-    if delta > 0 {
-        format!("in {label}")
-    } else {
-        format!("{label} ago")
-    }
-}
-
-/// Local calendar text for a cooldown tooltip. Empty is an em dash.
-pub fn format_when(value: &str) -> String {
-    let text = value.trim();
-    if text.is_empty() {
-        return "—".to_string();
-    }
-    let Some(ms) = parse_time_ms(text) else {
-        return text.to_string();
-    };
-    local_date_time(ms).unwrap_or_else(|| text.to_string())
-}
-
-/// Linear pace from a sampled point. Missing window or timestamps stay unknown.
-pub fn linear_pace(
-    used: f64,
-    window_minutes: i32,
-    resets_at: &str,
-    sampled_at: &str,
-) -> Option<f64> {
-    let reset = parse_time_ms(resets_at)?;
-    let at = parse_time_ms(sampled_at)?;
-    if !used.is_finite() || window_minutes <= 0 {
-        return None;
-    }
-    let window_ms = f64::from(window_minutes) * 60_000.0;
-    let remaining = (reset - at).max(0) as f64;
-    let elapsed = (window_ms - remaining).max(0.0);
-    Some(used - (elapsed / window_ms) * 100.0)
-}
-
-pub fn pool_matches_agent(key: &str, agent: &str) -> bool {
-    if key == agent {
-        return true;
-    }
-    key.split([':', '|']).next().unwrap_or("") == agent
-}
-
-pub fn pace_option_label(value: &str) -> String {
-    let mut chars = value.chars();
-    match chars.next() {
-        None => String::new(),
-        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-    }
-}
-
-pub fn parse_catalog_entries(json: &str) -> Vec<CatalogModel> {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
-        return Vec::new();
-    };
-    let Some(entries) = value.get("entries").and_then(|item| item.as_array()) else {
-        return Vec::new();
-    };
-    entries
-        .iter()
-        .filter_map(|entry| {
-            let model = entry
-                .get("model")
-                .and_then(|item| item.as_str())
-                .unwrap_or("");
-            if model.is_empty() {
-                return None;
-            }
-            Some(CatalogModel {
-                agent: entry
-                    .get("agent")
-                    .and_then(|item| item.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                model: model.to_string(),
-                cost_per_task: entry.get("costPerTask").and_then(|item| item.as_f64()),
-                cost_source: entry
-                    .get("costSource")
-                    .and_then(|item| item.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-            })
-        })
-        .collect()
-}
-
-/// Cheapest to dearest catalog price for one agent's models.
-pub fn agent_task_price(entries: &[CatalogModel], agent: &str) -> Option<TaskPrice> {
-    let mut priced: Vec<&CatalogModel> = entries
-        .iter()
-        .filter(|entry| entry.agent == agent && entry.cost_per_task.is_some())
-        .collect();
-    if priced.is_empty() {
-        return None;
-    }
-    priced.sort_by(|left, right| {
-        left.cost_per_task
-            .partial_cmp(&right.cost_per_task)
-            .unwrap_or(Ordering::Equal)
-    });
-    let min = priced[0].cost_per_task.unwrap_or(0.0);
-    let max = priced[priced.len() - 1].cost_per_task.unwrap_or(min);
-    let title = priced
-        .iter()
-        .map(|entry| {
-            let cost = entry.cost_per_task.unwrap_or(0.0);
-            let source = task_source_label(&entry.cost_source);
-            if source.is_empty() {
-                format!("{}: {}", entry.model, format_dollars(cost))
-            } else {
-                format!("{}: {} ({source})", entry.model, format_dollars(cost))
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let label = if min == max {
-        format_dollars(min)
-    } else {
-        format!("{}–{}", format_dollars(min), format_dollars(max))
-    };
-    Some(TaskPrice { label, title, min })
-}
-
-/// `agentFilters`: Provider over the rows' providers, then Quota, Pace, the Spend window (one
-/// at a time, Last 7 days without one), and Dispatch runs.
-pub fn filter_specs(rows: &[SpendRow]) -> [FilterSpec; 5] {
-    let options = |values: &[(&str, &str)]| {
-        values
-            .iter()
-            .map(|(id, label)| FilterOption::new(*id, *label))
-            .collect()
-    };
+/// `agentFilters`: Provider over the rows' providers, then the Spend window (one at a time,
+/// Last 7 days without one).
+pub fn filter_specs(rows: &[SpendRow]) -> [FilterSpec; 2] {
     [
         FilterSpec::values(
             "provider",
@@ -567,25 +274,15 @@ pub fn filter_specs(rows: &[SpendRow]) -> [FilterSpec; 5] {
             rows.iter().map(|row| row.provider.as_str()),
         ),
         FilterSpec::multi(
-            "quota",
-            "Quota",
-            QUOTA_OPTIONS
+            "since",
+            "Spend window",
+            SINCE_OPTIONS
                 .iter()
-                .map(|value| FilterOption::new(*value, *value))
+                .map(|(id, label)| FilterOption::new(*id, *label))
                 .collect(),
-        ),
-        FilterSpec::multi(
-            "pace",
-            "Pace",
-            PACE_OPTIONS
-                .iter()
-                .map(|value| FilterOption::new(*value, pace_option_label(value)))
-                .collect(),
-        ),
-        FilterSpec::multi("since", "Spend window", options(SINCE_OPTIONS))
-            .single()
-            .plural("windows"),
-        FilterSpec::multi("runs", "Dispatch runs", options(RUN_OPTIONS)).plural("run states"),
+        )
+        .single()
+        .plural("windows"),
     ]
 }
 
@@ -598,185 +295,124 @@ pub fn since_value(filters: &Filters) -> &str {
         .unwrap_or(DEFAULT_SINCE)
 }
 
-/// The search over agent and provider, and every filter but the Spend window, which picks
-/// the figures instead.
+/// The search over agent and provider, and the Provider filter; the Spend window picks the
+/// figures instead.
 pub fn row_matches(row: &SpendRow, query: &str, filters: &Filters) -> bool {
     matches_query(query, &[&row.agent, &row.provider])
         && filters.matches(|field| match field {
             "provider" => Some(vec![row.provider.as_str()]),
-            "quota" => Some(vec![row.quota.as_str()]),
-            "pace" => Some(vec![row.pace_label.as_str()]),
-            "runs" => Some(vec![row.ran.as_str()]),
             _ => None,
         })
 }
 
-/// The rows as the header sorts them: the agent's name, the cheapest task (the dearest number
-/// when unpriced), and the window's tokens and cost (-1 with no run that reported them).
-pub fn sort_rows(rows: &[SpendRow], key: SortKey, direction: SortDirection) -> Vec<SpendRow> {
-    sort_by_value(rows, direction, |row| match key {
-        SortKey::Agent => SortValue::Text(row.agent.clone()),
-        SortKey::Task => SortValue::Number(row.sort_task),
-        SortKey::Tokens => SortValue::Number(row.sort_tokens),
-        SortKey::Cost => SortValue::Number(row.sort_cost),
-    })
-}
-
-/// One row per installed agent, in name order, across every workspace's spend.
-pub fn agent_rows(
-    agents: &[DispatchAgent],
-    snapshots: &[DispatchQuotaSnapshot],
-    pools: &[DispatchCapacityKey],
-    stats: &[DispatchStatsRow],
-    catalog: &[CatalogModel],
-    now_ms: i64,
-) -> Vec<SpendRow> {
-    let installed: HashSet<&str> = agents
-        .iter()
-        .filter(|agent| agent.installed)
-        .map(|agent| agent.name.as_str())
-        .collect();
-    let mut names: Vec<String> = Vec::new();
-    let mut seen = HashSet::new();
-    for agent in agents {
-        if seen.insert(agent.name.clone()) {
-            names.push(agent.name.clone());
-        }
-    }
-    for snapshot in snapshots {
-        if seen.insert(snapshot.agent.clone()) {
-            names.push(snapshot.agent.clone());
-        }
-    }
-    names.retain(|name| installed.contains(name.as_str()));
-    names.sort();
-    names
-        .into_iter()
-        .map(|name| build_row(&name, agents, snapshots, pools, stats, catalog, now_ms))
-        .collect()
-}
-
-fn build_row(
-    name: &str,
-    agents: &[DispatchAgent],
-    snapshots: &[DispatchQuotaSnapshot],
-    pools: &[DispatchCapacityKey],
-    stats: &[DispatchStatsRow],
-    catalog: &[CatalogModel],
-    now_ms: i64,
-) -> SpendRow {
-    let agent = agents.iter().find(|agent| agent.name == name);
-    let latest = latest_snapshot(snapshots, name);
-    let provider = agent
-        .and_then(|agent| known_text(&agent.provider))
-        .or_else(|| {
-            snapshots
-                .iter()
-                .find(|snapshot| snapshot.agent == name)
-                .and_then(|snapshot| known_text(&snapshot.provider))
-        })
-        .unwrap_or_default();
-    let display_provider = latest
-        .and_then(|snapshot| known_text(&snapshot.provider))
-        .or_else(|| agent.and_then(|agent| known_text(&agent.provider)))
-        .unwrap_or_default();
-    let used = latest
-        .and_then(|snapshot| snapshot.used_percent)
-        .or_else(|| agent.and_then(|agent| agent.used_percent))
-        .filter(|value| value.is_finite());
-    let matched_pools: Vec<&DispatchCapacityKey> = pools
-        .iter()
-        .filter(|pool| pool_matches_agent(&pool.key, name))
-        .collect();
-    let pace = matched_pools
-        .iter()
-        .find_map(|pool| reported_pace(&pool.pace))
-        .or_else(|| pace_from_snapshot(latest));
-    let pace_label = pace.unwrap_or_else(|| "unknown".to_string());
-    let cooldown_until = agent
-        .map(|agent| agent.cooldown_until.as_str())
-        .unwrap_or("");
-    let cooling = parse_time_ms(cooldown_until).is_some_and(|time| time > now_ms);
-    let cooldown_tooltip = if cooling {
-        Some(format!("Cooldown until {}", format_when(cooldown_until)))
-    } else {
-        None
-    };
-    let quota = if cooling {
-        "Cooldown"
-    } else if used.is_none() {
-        "Unknown"
-    } else if used.unwrap_or(0.0) >= 90.0 {
-        "Low"
-    } else {
-        "Available"
-    };
-    let window_name = latest.and_then(|snapshot| quota_window(snapshot));
-    let reset = latest.and_then(|snapshot| {
-        parse_time_ms(&snapshot.resets_at)
-            .map(|_| format!("resets {}", relative_when(&snapshot.resets_at, now_ms)))
+/// The agents Dispatch ran in the window, dearest first: by cost (unpriced after priced), then
+/// tokens, then name.
+pub fn spent_rows(rows: &[SpendRow]) -> Vec<SpendRow> {
+    let mut spent: Vec<SpendRow> = rows.iter().filter(|row| row.runs > 0).cloned().collect();
+    let tokens = |row: &SpendRow| row.counts.as_ref().map(total_tokens).unwrap_or(-1);
+    spent.sort_by(|left, right| {
+        let cost = |row: &SpendRow| row.cost_usd.unwrap_or(-1.0);
+        cost(right)
+            .partial_cmp(&cost(left))
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| tokens(right).cmp(&tokens(left)))
+            .then_with(|| left.agent.cmp(&right.agent))
     });
-    let window_label = dotted(&[
-        window_name.as_deref().unwrap_or(""),
-        reset.as_deref().unwrap_or(""),
-    ]);
-    let window_tooltip = window_facts(&matched_pools);
-    let usage_label = match used {
-        Some(value) => format_used_percent(Some(value)),
-        None => "--".to_string(),
+    spent
+}
+
+/// The window's totals over the rows on show.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpendTotals {
+    pub runs: i64,
+    pub tokens: i64,
+    /// The API-equivalent cost of the priced runs, when any was priced.
+    pub cost_usd: Option<f64>,
+    pub cost_runs: i64,
+}
+
+impl SpendTotals {
+    /// The cost of a priced run on average.
+    pub fn per_run(&self) -> Option<f64> {
+        let cost = self.cost_usd?;
+        (self.cost_runs > 0).then(|| cost / self.cost_runs as f64)
+    }
+}
+
+pub fn spend_totals(rows: &[SpendRow]) -> SpendTotals {
+    let mut totals = SpendTotals {
+        runs: 0,
+        tokens: 0,
+        cost_usd: None,
+        cost_runs: 0,
     };
-    let source_tooltip = latest
-        .and_then(|snapshot| known_text(&snapshot.source))
-        .map(|source| format!("Source: {source}"));
-    let stat = stats.iter().find(|row| row.key == name);
+    for row in rows {
+        totals.runs += row.runs;
+        totals.tokens += row.counts.as_ref().map(total_tokens).unwrap_or(0);
+        if let Some(cost) = row.cost_usd {
+            totals.cost_usd = Some(totals.cost_usd.unwrap_or(0.0) + cost);
+            totals.cost_runs += row.cost_runs;
+        }
+    }
+    totals
+}
+
+/// One row per installed agent, in name order, with its spend across every workspace.
+pub fn agent_rows(agents: &[DispatchAgent], stats: &[DispatchStatsRow]) -> Vec<SpendRow> {
+    // Before the agents' list first answers, every agent that ran has a card, its provider
+    // still unknown.
+    if agents.is_empty() {
+        let mut rows: Vec<SpendRow> = stats
+            .iter()
+            .map(|row| {
+                let agent = DispatchAgent {
+                    name: row.key.clone(),
+                    ..DispatchAgent::default()
+                };
+                build_row(&agent, stats)
+            })
+            .collect();
+        rows.sort_by(|left, right| left.agent.cmp(&right.agent));
+        return rows;
+    }
+    let mut seen = HashSet::new();
+    let mut rows: Vec<SpendRow> = agents
+        .iter()
+        .filter(|agent| agent.installed && seen.insert(agent.name.clone()))
+        .map(|agent| build_row(agent, stats))
+        .collect();
+    rows.sort_by(|left, right| left.agent.cmp(&right.agent));
+    rows
+}
+
+fn build_row(agent: &DispatchAgent, stats: &[DispatchStatsRow]) -> SpendRow {
+    let stat = stats.iter().find(|row| row.key == agent.name);
     let runs = stat.map(|row| i64::from(row.runs)).unwrap_or(0);
-    let ran = if runs > 0 { "Ran" } else { "No runs" };
-    let (tokens, cost, sort_tokens, sort_cost) = match stat {
+    let (tokens, cost, counts, cost_usd, cost_runs) = match stat {
         Some(row) => {
             let group = group_from_row(row);
             let cells = spend_cells(&group, runs);
-            let sort_tokens = if row.usage_runs > 0 {
-                total_tokens(&group.tokens) as f64
-            } else {
-                -1.0
-            };
-            let sort_cost = if row.cost_runs > 0 {
-                row.cost_usd
-            } else {
-                -1.0
-            };
-            (cells.tokens, cells.cost, sort_tokens, sort_cost)
+            let counts = (row.usage_runs > 0).then(|| group.tokens.clone());
+            let cost_usd = (row.cost_runs > 0).then_some(row.cost_usd);
+            (
+                cells.tokens,
+                cells.cost,
+                counts,
+                cost_usd,
+                i64::from(row.cost_runs),
+            )
         }
-        None => (None, None, -1.0, -1.0),
+        None => (None, None, None, None, 0),
     };
-    let task_price = agent_task_price(catalog, name);
-    let sort_task = task_price
-        .as_ref()
-        .map(|price| price.min)
-        .unwrap_or(f64::MAX);
-    let task = task_price.map(|price| Cell {
-        label: price.label,
-        title: price.title,
-    });
     SpendRow {
-        agent: name.to_string(),
-        provider,
-        display_provider,
-        quota: quota.to_string(),
-        pace_label,
-        ran: ran.to_string(),
-        usage_label,
-        usage_aria: format!("{name} quota usage: {}", format_used_percent(used)),
-        source_tooltip,
-        cooldown_tooltip,
-        window_label,
-        window_tooltip,
-        task,
+        agent: agent.name.clone(),
+        provider: known_text(&agent.provider).unwrap_or_default(),
+        runs,
         tokens,
         cost,
-        sort_task,
-        sort_tokens,
-        sort_cost,
+        counts,
+        cost_usd,
+        cost_runs,
     }
 }
 
@@ -795,116 +431,12 @@ fn group_from_row(row: &DispatchStatsRow) -> SpendGroup {
     }
 }
 
-fn latest_snapshot<'a>(
-    snapshots: &'a [DispatchQuotaSnapshot],
-    name: &str,
-) -> Option<&'a DispatchQuotaSnapshot> {
-    let mut matched: Vec<&DispatchQuotaSnapshot> = snapshots
-        .iter()
-        .filter(|snapshot| snapshot.agent == name)
-        .collect();
-    matched.sort_by(|left, right| right.sampled_at.cmp(&left.sampled_at));
-    matched.into_iter().next()
-}
-
-fn reported_pace(pace: &str) -> Option<String> {
-    let trimmed = pace.trim();
-    let label = if trimmed.is_empty() {
-        "unknown"
-    } else {
-        trimmed
-    };
-    known_text(label)
-}
-
-fn pace_from_snapshot(snapshot: Option<&DispatchQuotaSnapshot>) -> Option<String> {
-    let snapshot = snapshot?;
-    let used = snapshot.used_percent?;
-    let delta = linear_pace(
-        used,
-        snapshot.window_minutes,
-        &snapshot.resets_at,
-        &snapshot.sampled_at,
-    )?;
-    Some(
-        if delta > 2.0 {
-            "ahead"
-        } else if delta < -2.0 {
-            "behind"
-        } else {
-            "on pace"
-        }
-        .to_string(),
-    )
-}
-
-fn quota_window(snapshot: &DispatchQuotaSnapshot) -> Option<String> {
-    if let Some(name) = known_text(&snapshot.window) {
-        return Some(name);
-    }
-    if snapshot.window_minutes > 0 {
-        Some(format!("{} min", snapshot.window_minutes))
-    } else {
-        None
-    }
-}
-
-fn window_facts(pools: &[&DispatchCapacityKey]) -> Option<String> {
-    if pools.is_empty() {
-        return None;
-    }
-    let many = pools.len() > 1;
-    let mut facts = Vec::new();
-    for pool in pools {
-        let prefix = if many {
-            format!("{} ", pool.key)
-        } else {
-            String::new()
-        };
-        facts.push(format!("{prefix}Windows: {}", pool.windows));
-        facts.push(format!("{prefix}Hit 100%: {}", pool.hit_full));
-        let leftover = if pool.leftover_pct.is_some_and(|value| value.is_finite()) {
-            Some(format_used_percent(pool.leftover_pct))
-        } else {
-            let trimmed = pool.leftover.trim();
-            let label = if trimmed.is_empty() {
-                "unknown"
-            } else {
-                trimmed
-            };
-            known_text(label)
-        };
-        if let Some(leftover) = leftover {
-            facts.push(format!("{prefix}Leftover: {leftover}"));
-        }
-    }
-    if facts.is_empty() {
-        None
-    } else {
-        Some(facts.join(" / "))
-    }
-}
-
 fn matches_query(query: &str, values: &[&str]) -> bool {
     let needle = query.trim().to_lowercase();
     needle.is_empty()
         || values
             .iter()
             .any(|value| value.to_lowercase().contains(&needle))
-}
-
-fn dotted(parts: &[&str]) -> String {
-    let visible: Vec<&str> = parts
-        .iter()
-        .copied()
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .collect();
-    if visible.is_empty() {
-        "—".to_string()
-    } else {
-        visible.join(" / ")
-    }
 }
 
 fn fixed(value: f64, digits: u32) -> String {
@@ -942,82 +474,6 @@ fn group_int(value: i64) -> String {
     } else {
         grouped
     }
-}
-
-fn split_date_time(value: &str) -> Option<(&str, &str)> {
-    value
-        .split_once('T')
-        .or_else(|| value.split_once('t'))
-        .or_else(|| value.split_once(' '))
-}
-
-fn split_zone(rest: &str) -> Option<(&str, i64)> {
-    if let Some(time) = rest.strip_suffix(['Z', 'z']) {
-        return Some((time, 0));
-    }
-    if let Some(index) = rest.rfind(['+', '-'])
-        && index > 0
-    {
-        let time = &rest[..index];
-        let zone = &rest[index..];
-        let sign = if zone.starts_with('+') { 1 } else { -1 };
-        let zone = &zone[1..];
-        let (hour, minute) = if let Some((hour, minute)) = zone.split_once(':') {
-            (hour.parse::<i64>().ok()?, minute.parse::<i64>().ok()?)
-        } else if zone.len() == 4 {
-            (zone[..2].parse().ok()?, zone[2..].parse().ok()?)
-        } else if zone.len() == 2 {
-            (zone.parse().ok()?, 0)
-        } else {
-            return None;
-        };
-        if !(0..=23).contains(&hour) || !(0..=59).contains(&minute) {
-            return None;
-        }
-        return Some((time, sign * (hour * 3_600_000 + minute * 60_000)));
-    }
-    Some((rest, 0))
-}
-
-fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
-    let mut year = i64::from(year);
-    let month = i64::from(month);
-    let day = i64::from(day);
-    if month <= 2 {
-        year -= 1;
-    }
-    let era = year.div_euclid(400);
-    let year_of_era = (year - era * 400) as u64;
-    let month_prime = if month > 2 { month - 3 } else { month + 9 };
-    let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year as u64;
-    era * 146_097 + day_of_era as i64 - 719_468
-}
-
-fn local_date_time(ms: i64) -> Option<String> {
-    let secs = ms.div_euclid(1000);
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    let instant = secs as libc::time_t;
-    let parsed = unsafe { libc::localtime_r(&instant, &mut tm) };
-    if parsed.is_null() {
-        return None;
-    }
-    let hour24 = tm.tm_hour;
-    let ampm = if hour24 < 12 { "AM" } else { "PM" };
-    let hour12 = match hour24 % 12 {
-        0 => 12,
-        hour => hour,
-    };
-    Some(format!(
-        "{}/{}/{}, {}:{:02}:{:02} {}",
-        tm.tm_mon + 1,
-        tm.tm_mday,
-        tm.tm_year + 1900,
-        hour12,
-        tm.tm_min,
-        tm.tm_sec,
-        ampm
-    ))
 }
 
 #[cfg(test)]
@@ -1135,88 +591,54 @@ mod tests {
     }
 
     #[test]
-    fn parses_rfc3339_and_speaks_relative_time() {
-        assert_eq!(parse_time_ms("1970-01-01T00:00:00Z"), Some(0));
-        assert_eq!(parse_time_ms("1970-01-01T01:00:00+01:00"), Some(0));
-        assert_eq!(parse_time_ms("2000-01-01T00:00:00Z"), Some(946_684_800_000));
-        assert_eq!(relative_when("", 0), "unknown");
-        assert_eq!(relative_when("not-a-date", 0), "not-a-date");
-        assert_eq!(relative_when("1970-01-01T00:00:00.400Z", 0), "now");
-        assert_eq!(relative_when("1970-01-01T00:01:30Z", 0), "in 1m");
-        assert_eq!(relative_when("1970-01-01T00:02:00Z", 0), "in 2m");
-        assert_eq!(relative_when("1970-01-01T00:00:00Z", 90_000), "1m ago");
-        assert_eq!(relative_when("1970-01-01T00:00:00Z", 120_000), "2m ago");
-        assert_eq!(format_when(""), "—");
+    fn keeps_the_agents_that_ran_dearest_first_and_totals_them() {
+        let agent = |name: &str| DispatchAgent {
+            name: name.into(),
+            installed: true,
+            ..DispatchAgent::default()
+        };
+        let stat = |key: &str, runs: i32, tokens: i64, cost: Option<f64>| DispatchStatsRow {
+            key: key.into(),
+            runs,
+            usage_runs: runs,
+            output_tokens: ProtoI64(tokens),
+            cost_usd: cost.unwrap_or(0.0),
+            cost_runs: if cost.is_some() { runs } else { 0 },
+            ..DispatchStatsRow::default()
+        };
+        let rows = agent_rows(
+            &[agent("a"), agent("b"), agent("c"), agent("idle")],
+            &[
+                stat("a", 2, 100, Some(1.0)),
+                stat("b", 1, 900, None),
+                stat("c", 3, 50, Some(4.0)),
+            ],
+        );
+        let spent = spent_rows(&rows);
+        assert_eq!(
+            spent
+                .iter()
+                .map(|row| row.agent.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c", "a", "b"]
+        );
+        let totals = spend_totals(&spent);
+        assert_eq!(totals.runs, 6);
+        assert_eq!(totals.tokens, 1050);
+        assert_eq!(totals.cost_usd, Some(5.0));
+        assert_eq!(totals.cost_runs, 5);
+        assert_eq!(totals.per_run(), Some(1.0));
+        assert_eq!(spend_totals(&[]).cost_usd, None);
+        assert_eq!(spend_totals(&[]).per_run(), None);
     }
 
     #[test]
-    fn classifies_pace_from_the_sample_or_the_pool() {
-        assert_eq!(
-            linear_pace(60.0, 60, "1970-01-01T00:30:00Z", "1970-01-01T00:00:00Z"),
-            Some(10.0)
-        );
-        assert_eq!(
-            linear_pace(40.0, 60, "1970-01-01T00:30:00Z", "1970-01-01T00:00:00Z"),
-            Some(-10.0)
-        );
-        assert!(linear_pace(10.0, 0, "1970-01-01T00:30:00Z", "1970-01-01T00:00:00Z").is_none());
-        assert!(pool_matches_agent("codex:work", "codex"));
-        assert!(pool_matches_agent("codex|weekly", "codex"));
-        assert!(!pool_matches_agent("codexextra", "codex"));
-    }
-
-    #[test]
-    fn prices_an_agents_task_from_its_catalog_models() {
-        let entries = vec![
-            CatalogModel {
-                agent: "codex".into(),
-                model: "big".into(),
-                cost_per_task: Some(0.4),
-                cost_source: "models.dev price".into(),
-            },
-            CatalogModel {
-                agent: "codex".into(),
-                model: "small".into(),
-                cost_per_task: Some(0.05),
-                cost_source: "cursorbench".into(),
-            },
-            CatalogModel {
-                agent: "codex".into(),
-                model: "free".into(),
-                cost_per_task: None,
-                cost_source: "models.dev price".into(),
-            },
-            CatalogModel {
-                agent: "grok".into(),
-                model: "m".into(),
-                cost_per_task: Some(1.0),
-                cost_source: "models.dev price".into(),
-            },
-        ];
-        let codex = agent_task_price(&entries, "codex").unwrap();
-        assert_eq!(codex.label, "$0.05–$0.40");
-        assert_eq!(
-            codex.title,
-            "small: $0.05 (CursorBench)\nbig: $0.40 (models.dev)"
-        );
-        assert_eq!(codex.min, 0.05);
-        assert_eq!(agent_task_price(&entries, "grok").unwrap().label, "$1.00");
-        assert!(agent_task_price(&entries, "cursor").is_none());
-        let parsed = parse_catalog_entries(
-            r#"{"entries":[{"agent":"codex","model":"small","costPerTask":0.05,"costSource":"cursorbench"},{"model":""}]}"#,
-        );
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].model, "small");
-    }
-
-    #[test]
-    fn lists_installed_agents_with_quota_pace_window_and_spend() {
+    fn lists_installed_agents_with_their_spend_and_filters_by_provider() {
         let agents = vec![
             DispatchAgent {
                 name: "codex".into(),
                 provider: "openai".into(),
                 installed: true,
-                cooldown_until: "1970-01-01T00:00:30Z".into(),
                 ..DispatchAgent::default()
             },
             DispatchAgent {
@@ -1227,31 +649,11 @@ mod tests {
             },
             DispatchAgent {
                 name: "grok".into(),
-                provider: "xai".into(),
-                used_percent: Some(92.0),
+                provider: "unknown".into(),
                 installed: true,
                 ..DispatchAgent::default()
             },
         ];
-        let snapshots = vec![DispatchQuotaSnapshot {
-            agent: "codex".into(),
-            provider: "openai".into(),
-            window: "5h".into(),
-            source: "cli".into(),
-            used_percent: Some(40.0),
-            window_minutes: 60,
-            resets_at: "1970-01-01T00:30:00Z".into(),
-            sampled_at: "1970-01-01T00:00:00Z".into(),
-            ..DispatchQuotaSnapshot::default()
-        }];
-        let pools = vec![DispatchCapacityKey {
-            key: "codex:main".into(),
-            windows: 4,
-            hit_full: 1,
-            leftover_pct: Some(12.5),
-            pace: "  ".into(),
-            ..DispatchCapacityKey::default()
-        }];
         let stats = vec![DispatchStatsRow {
             key: "codex".into(),
             runs: 4,
@@ -1262,7 +664,7 @@ mod tests {
             cost_runs: 2,
             ..DispatchStatsRow::default()
         }];
-        let rows = agent_rows(&agents, &snapshots, &pools, &stats, &[], 0);
+        let rows = agent_rows(&agents, &stats);
         assert_eq!(
             rows.iter()
                 .map(|row| row.agent.as_str())
@@ -1271,144 +673,27 @@ mod tests {
         );
         let codex = &rows[0];
         assert_eq!(codex.provider, "openai");
-        assert_eq!(codex.usage_label, "40.0%");
-        assert_eq!(codex.usage_aria, "codex quota usage: 40.0%");
-        assert_eq!(codex.source_tooltip.as_deref(), Some("Source: cli"));
-        assert_eq!(codex.pace_label, "behind");
-        assert_eq!(codex.quota, "Cooldown");
-        assert!(codex.cooldown_tooltip.is_some());
-        assert_eq!(codex.window_label, "5h / resets in 30m");
-        assert_eq!(
-            codex.window_tooltip.as_deref(),
-            Some("Windows: 4 / Hit 100%: 1 / Leftover: 12.5%")
-        );
+        assert_eq!(codex.runs, 4);
         assert_eq!(codex.tokens.as_ref().unwrap().label, "1.5k");
         assert_eq!(codex.cost.as_ref().unwrap().label, "$2.50");
-        assert_eq!(codex.ran, "Ran");
-        assert_eq!(rows[1].quota, "Low");
-        assert_eq!(rows[1].usage_label, "92.0%");
-        assert_eq!(rows[1].pace_label, "unknown");
-        assert_eq!(rows[1].ran, "No runs");
+        assert_eq!(codex.cost_usd, Some(2.5));
+        assert_eq!(codex.counts.as_ref().map(total_tokens), Some(1500));
+        assert_eq!(rows[1].provider, "");
+        assert_eq!(rows[1].runs, 0);
         assert!(rows[1].tokens.is_none());
-        assert_eq!(rows[1].window_label, "—");
-    }
 
-    #[test]
-    fn filters_by_provider_quota_pace_runs_and_search() {
-        let agents = vec![
-            DispatchAgent {
-                name: "codex".into(),
-                provider: "openai".into(),
-                used_percent: Some(10.0),
-                installed: true,
-                ..DispatchAgent::default()
-            },
-            DispatchAgent {
-                name: "grok".into(),
-                provider: "xai".into(),
-                used_percent: Some(95.0),
-                installed: true,
-                ..DispatchAgent::default()
-            },
-        ];
-        let rows = agent_rows(&agents, &[], &[], &[], &[], 0);
         let specs = filter_specs(&rows);
-        assert_eq!(
-            specs[0]
-                .options
-                .iter()
-                .map(|option| option.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["openai", "xai"]
-        );
-        assert_eq!(specs[2].options[1].label, "On pace");
         let mut filters = Filters::default();
-        assert_eq!(since_value(&filters), "7d");
         assert!(row_matches(&rows[0], "Open", &filters));
         assert!(!row_matches(&rows[0], "xai", &filters));
-        filters.add(&specs[1], &["Low".into()]);
-        assert!(!row_matches(&rows[0], "", &filters));
-        assert!(row_matches(&rows[1], "", &filters));
-        filters.clear();
         filters.add(&specs[0], &["openai".into()]);
-        filters.add(&specs[2], &["unknown".into()]);
-        filters.add(&specs[4], &["No runs".into()]);
         assert!(row_matches(&rows[0], "", &filters));
         assert!(!row_matches(&rows[1], "", &filters));
-        filters.add(&specs[3], &["24h".into()]);
-        filters.add(&specs[3], &["30d".into()]);
+
+        assert_eq!(since_value(&filters), "7d");
+        filters.add(&specs[1], &["24h".into()]);
+        filters.add(&specs[1], &["30d".into()]);
         assert_eq!(since_value(&filters), "30d");
-        assert_eq!(filters.clauses.len(), 4);
         assert!(row_matches(&rows[0], "", &filters));
-    }
-
-    #[test]
-    fn sorts_missing_spend_after_real_numbers_when_ascending() {
-        let rows = agent_rows(
-            &[
-                DispatchAgent {
-                    name: "b".into(),
-                    installed: true,
-                    ..DispatchAgent::default()
-                },
-                DispatchAgent {
-                    name: "a".into(),
-                    installed: true,
-                    ..DispatchAgent::default()
-                },
-            ],
-            &[],
-            &[],
-            &[DispatchStatsRow {
-                key: "a".into(),
-                runs: 1,
-                usage_runs: 1,
-                output_tokens: ProtoI64(10),
-                cost_usd: 1.0,
-                cost_runs: 1,
-                ..DispatchStatsRow::default()
-            }],
-            &[],
-            0,
-        );
-        let rows = sort_rows(&rows, SortKey::Agent, SortDirection::Ascending);
-        assert_eq!(rows[0].agent, "a");
-        let rows = sort_rows(&rows, SortKey::Tokens, SortDirection::Ascending);
-        assert_eq!(rows[0].agent, "b");
-        assert_eq!(rows[0].sort_tokens, -1.0);
-        let rows = sort_rows(&rows, SortKey::Cost, SortDirection::Descending);
-        assert_eq!(rows[0].agent, "a");
-    }
-
-    #[test]
-    fn splits_the_filter_provider_from_the_latest_snapshot_label() {
-        let rows = agent_rows(
-            &[DispatchAgent {
-                name: "codex".into(),
-                provider: "openai".into(),
-                installed: true,
-                ..DispatchAgent::default()
-            }],
-            &[
-                DispatchQuotaSnapshot {
-                    agent: "codex".into(),
-                    provider: "old".into(),
-                    sampled_at: "1970-01-01T00:00:00Z".into(),
-                    ..DispatchQuotaSnapshot::default()
-                },
-                DispatchQuotaSnapshot {
-                    agent: "codex".into(),
-                    provider: "azure".into(),
-                    sampled_at: "1970-01-02T00:00:00Z".into(),
-                    ..DispatchQuotaSnapshot::default()
-                },
-            ],
-            &[],
-            &[],
-            &[],
-            0,
-        );
-        assert_eq!(rows[0].provider, "openai");
-        assert_eq!(rows[0].display_provider, "azure");
     }
 }

@@ -289,7 +289,7 @@ async fn run_dispatch(db_path: &Path, args: &[String]) -> CliResult {
         "roles" => ops::roles(db_path, rest).await,
         "on" => ops::on(db_path),
         "off" => ops::off(db_path),
-        "hook" => ops::hook(db_path),
+        "hook" => ops::hook(db_path, rest),
         "skill" => ops::skill(rest),
         "setup" => ops::setup(db_path, rest),
         "update" => ops::update(rest),

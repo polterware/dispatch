@@ -238,15 +238,27 @@ pub(crate) fn caller_args(command: &str) -> Vec<String> {
     out
 }
 
-/// Exports the Claude Code session the SessionStart hook reads on stdin to
-/// `$CLAUDE_ENV_FILE`, so the runs that session starts join it.
+/// The caller name agent's runs carry: Claude Code's is `claude-code`, as the
+/// sessions it starts have always been named.
+pub(crate) fn hook_caller_agent(agent: &str) -> &str {
+    match agent {
+        "" | "claude" => "claude-code",
+        agent => agent,
+    }
+}
+
+/// Reads the session a SessionStart hook gets on stdin (`session_id`, or
+/// Cursor's `conversation_id`) and, when the agent gives the hook an env file
+/// (`$CLAUDE_ENV_FILE`), exports it there, so the runs that session starts
+/// join it. It returns the session, empty when there is none.
 pub(crate) fn record_hook_caller(
     input: &mut dyn Read,
     terminal: bool,
     env_file: &str,
-) -> Result<(), Error> {
+    agent: &str,
+) -> Result<String, Error> {
     if terminal {
-        return Ok(());
+        return Ok(String::new());
     }
     let mut data = Vec::new();
     if input
@@ -255,18 +267,19 @@ pub(crate) fn record_hook_caller(
         .is_err()
         || data.len() as u64 > MAX_HOOK_INPUT
     {
-        return Ok(());
+        return Ok(String::new());
     }
     let session = serde_json::from_slice::<serde_json::Value>(&data)
         .ok()
         .and_then(|v| {
-            v.get("session_id")
-                .and_then(|s| s.as_str())
-                .map(str::to_owned)
+            ["session_id", "conversation_id", "sessionId"]
+                .iter()
+                .find_map(|key| v.get(key)?.as_str().map(str::to_owned))
         })
         .unwrap_or_default();
-    if session.trim().is_empty() || env_file.is_empty() {
-        return Ok(());
+    let session = session.trim().to_owned();
+    if session.is_empty() || env_file.is_empty() {
+        return Ok(session);
     }
     use std::os::unix::fs::OpenOptionsExt;
     let mut file = std::fs::OpenOptions::new()
@@ -279,17 +292,35 @@ pub(crate) fn record_hook_caller(
         file,
         "export {ENV_CALLER_SESSION}={}\nexport {ENV_CALLER_AGENT}={}\n",
         quote(&session),
-        quote("claude-code")
+        quote(hook_caller_agent(agent))
     )?;
-    Ok(())
+    Ok(session)
 }
 
-pub(crate) fn record_hook_stdin() -> Result<(), Error> {
-    record_hook_caller(
+/// The caller variables for agent's session, for an agent that sets them
+/// from the hook's answer (Cursor's `env`).
+pub(crate) fn hook_caller_env(
+    session: &str,
+    agent: &str,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut env = serde_json::Map::new();
+    if !session.is_empty() {
+        env.insert(ENV_CALLER_SESSION.into(), session.into());
+        env.insert(ENV_CALLER_AGENT.into(), hook_caller_agent(agent).into());
+    }
+    env
+}
+
+pub(crate) fn record_hook_stdin(agent: &str) -> (String, Result<(), Error>) {
+    match record_hook_caller(
         &mut std::io::stdin().lock(),
         super::stdin_is_terminal(),
         &std::env::var("CLAUDE_ENV_FILE").unwrap_or_default(),
-    )
+        agent,
+    ) {
+        Ok(session) => (session, Ok(())),
+        Err(e) => (String::new(), Err(e)),
+    }
 }
 
 #[cfg(test)]
@@ -367,11 +398,30 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("env");
         let mut input: &[u8] = br#"{"session_id":"it's"}"#;
-        record_hook_caller(&mut input, false, &file.to_string_lossy()).unwrap();
+        let session = record_hook_caller(&mut input, false, &file.to_string_lossy(), "claude");
+        assert_eq!(session.unwrap(), "it's");
         let body = std::fs::read_to_string(&file).unwrap();
         assert_eq!(
             body,
             "export DISPATCH_CALLER_SESSION='it'\\''s'\nexport DISPATCH_CALLER_AGENT='claude-code'\n"
         );
+    }
+
+    #[test]
+    fn hook_reads_cursors_conversation_and_names_its_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("env");
+        let mut input: &[u8] = br#"{"conversation_id":"c1","workspace_roots":["/w"]}"#;
+        let session = record_hook_caller(&mut input, false, &file.to_string_lossy(), "grok");
+        assert_eq!(session.unwrap(), "c1");
+        let body = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            body.ends_with("export DISPATCH_CALLER_AGENT='grok'\n"),
+            "{body}"
+        );
+        let env = hook_caller_env("c1", "cursor");
+        assert_eq!(env["DISPATCH_CALLER_SESSION"], "c1");
+        assert_eq!(env["DISPATCH_CALLER_AGENT"], "cursor");
+        assert!(hook_caller_env("", "cursor").is_empty());
     }
 }

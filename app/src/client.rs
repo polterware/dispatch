@@ -43,6 +43,12 @@ struct CoreStateFile {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ProtoI64(pub i64);
 
+impl ProtoI64 {
+    pub fn is_zero(&self) -> bool {
+        self.0 == 0
+    }
+}
+
 impl Serialize for ProtoI64 {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&self.0.to_string())
@@ -399,6 +405,10 @@ pub struct ResultResponse {
 pub struct WatchRunRequest {
     pub id: String,
     pub after_seq: ProtoI64,
+    /// With `after_seq` 0, open with only this many of the last bytes; 0 sends everything.
+    /// Left off the wire at 0, so a core from before pages still takes the request.
+    #[serde(skip_serializing_if = "ProtoI64::is_zero")]
+    pub tail_bytes: ProtoI64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -408,6 +418,24 @@ pub struct WatchRunResponse {
     pub kind: String,
     pub text: String,
     pub at: String,
+    /// Where `text` starts in the event's whole text: above 0 when a page edge cut it.
+    pub text_offset: ProtoI64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ReadRunEventsRequest {
+    pub id: String,
+    pub before_seq: ProtoI64,
+    pub before_offset: ProtoI64,
+    pub max_bytes: ProtoI64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ReadRunEventsResponse {
+    pub events: Vec<WatchRunResponse>,
+    pub more: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -595,6 +623,11 @@ pub struct GetRouteDecisionResponse {
 pub struct BuildTiersRequest {
     pub apply: bool,
     pub agent: String,
+    /// Sent only when set, so a core from before roles had boards still reads the request.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub role: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub judge: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -1229,6 +1262,14 @@ impl CoreClient {
 
     pub fn result(&self, request: &ResultRequest) -> Result<ResultResponse, CoreError> {
         self.rpc("dispatch.v1.DispatchService/Result", request)
+    }
+
+    /// The page of a run's event text before a point, for a transcript opened at its end.
+    pub fn read_run_events(
+        &self,
+        request: &ReadRunEventsRequest,
+    ) -> Result<ReadRunEventsResponse, CoreError> {
+        self.rpc("dispatch.v1.DispatchService/ReadRunEvents", request)
     }
 
     pub fn watch_run(&self, request: &WatchRunRequest) -> Result<WatchRunIter, CoreError> {

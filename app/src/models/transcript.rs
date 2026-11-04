@@ -1113,43 +1113,138 @@ pub fn live_usage(log: &str) -> Option<LiveUsage> {
     None
 }
 
-/// Joins stored output with events streamed since, without repeating either.
-pub fn run_log(stored: &str, events: &[LogEvent]) -> String {
-    let mut streamed = String::new();
-    let mut has_output = false;
-    for event in events {
-        if event.kind == "output" || event.kind == "agent" {
-            streamed.push_str(&event.text);
-            has_output = true;
-        } else {
-            let text = event.text.trim();
-            if !text.is_empty() {
-                streamed.push('[');
-                streamed.push_str(&event.kind);
-                streamed.push_str("] ");
-                streamed.push_str(text);
-                streamed.push('\n');
-            }
+/// A streamed event with where it sits in the run: its seq, and where its text starts in the
+/// event's whole text (above 0 when a page edge cut it).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PagedEvent {
+    pub event: LogEvent,
+    pub seq: i64,
+    pub offset: u64,
+}
+
+/// The text of a run's streamed events, built as they arrive: an event is written once, when
+/// it comes in, instead of every event again on every batch. A stream opened at the run's end
+/// holds only its last page; pages read further back go in front of it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StreamedLog {
+    text: String,
+    has_output: bool,
+    /// Where the text starts in the run: the first event's seq and offset.
+    head: Option<(i64, u64)>,
+    /// The text starts inside an output event, so its first line is a line's end.
+    partial: bool,
+}
+
+fn write_event(text: &mut String, has_output: &mut bool, event: &LogEvent) {
+    if event.kind == "output" || event.kind == "agent" {
+        text.push_str(&event.text);
+        *has_output = true;
+    } else {
+        let line = event.text.trim();
+        if !line.is_empty() {
+            text.push('[');
+            text.push_str(&event.kind);
+            text.push_str("] ");
+            text.push_str(line);
+            text.push('\n');
         }
     }
-    if stored.is_empty() {
-        return streamed;
+}
+
+impl StreamedLog {
+    /// Writes `events` after the ones already in: output as it is, any other kind as one
+    /// `[kind] text` line.
+    pub fn extend<'a>(&mut self, events: impl IntoIterator<Item = &'a LogEvent>) {
+        for event in events {
+            write_event(&mut self.text, &mut self.has_output, event);
+        }
     }
-    if streamed.is_empty() {
-        return stored.to_string();
+
+    /// [`Self::extend`] with events that know their place, the first of which marks where the
+    /// text starts.
+    pub fn extend_paged(&mut self, events: &[PagedEvent]) {
+        if self.head.is_none()
+            && let Some(first) = events.first()
+        {
+            self.head = Some((first.seq, first.offset));
+            self.partial = first.offset > 0;
+        }
+        self.extend(events.iter().map(|paged| &paged.event));
     }
-    if streamed.contains(stored) || stored.contains(&streamed) {
-        return if streamed.len() >= stored.len() {
-            streamed
-        } else {
-            stored.to_string()
+
+    /// Puts a page read from before the text in front of it. Returns whether that brought
+    /// a whole line in: a page inside one long line only lengthens the line held back.
+    pub fn prepend(&mut self, events: &[PagedEvent]) -> bool {
+        let Some(first) = events.first() else {
+            return false;
         };
+        let held = self.partial;
+        let mut text = String::new();
+        let mut has_output = self.has_output;
+        for paged in events {
+            write_event(&mut text, &mut has_output, &paged.event);
+        }
+        // A line ends inside the page, or the page starts on a line and so does the text.
+        let gained = text.contains('\n') || (first.offset == 0 && !held);
+        text.push_str(&self.text);
+        self.text = text;
+        self.has_output = has_output;
+        self.head = Some((first.seq, first.offset));
+        self.partial = first.offset > 0;
+        gained || !self.partial
     }
-    if has_output {
-        streamed
-    } else {
-        format!("{stored}\n{streamed}")
+
+    /// Where the text starts in the run, once an event came in.
+    pub fn head(&self) -> Option<(i64, u64)> {
+        self.head
     }
+
+    /// Whether the run may have text before this one: the start is not the run's first
+    /// event from its first byte.
+    pub fn may_have_earlier(&self) -> bool {
+        self.head.is_some_and(|(seq, offset)| seq > 1 || offset > 0)
+    }
+
+    /// The text from its first whole line: a start inside a line drops that line's end.
+    fn whole_lines(&self) -> &str {
+        if !self.partial {
+            return &self.text;
+        }
+        match self.text.find('\n') {
+            Some(newline) => &self.text[newline + 1..],
+            None => "",
+        }
+    }
+
+    /// Joins `stored` output with this stream, without repeating either.
+    pub fn join(&self, stored: &str) -> String {
+        let streamed = self.whole_lines();
+        if stored.is_empty() {
+            return streamed.to_string();
+        }
+        if streamed.is_empty() {
+            return stored.to_string();
+        }
+        if streamed.contains(stored) || stored.contains(streamed) {
+            return if streamed.len() >= stored.len() {
+                streamed.to_string()
+            } else {
+                stored.to_string()
+            };
+        }
+        if self.has_output {
+            streamed.to_string()
+        } else {
+            format!("{stored}\n{streamed}")
+        }
+    }
+}
+
+/// Joins stored output with events streamed since, without repeating either.
+pub fn run_log(stored: &str, events: &[LogEvent]) -> String {
+    let mut streamed = StreamedLog::default();
+    streamed.extend(events);
+    streamed.join(stored)
 }
 
 /// `bash -lc 'go test ./...'` reads as `go test ./...`.
@@ -1572,8 +1667,8 @@ fn first_tool_call_key(line: &str, call: &Map<String, Value>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        LiveUsage, LogEvent, TranscriptBuilder, TranscriptEntry, build_transcript, live_usage,
-        looks_like_diff, run_log, strip_ansi, unwrap_shell,
+        LiveUsage, LogEvent, PagedEvent, StreamedLog, TranscriptBuilder, TranscriptEntry,
+        build_transcript, live_usage, looks_like_diff, run_log, strip_ansi, unwrap_shell,
     };
 
     fn message(text: &str) -> TranscriptEntry {
@@ -1945,6 +2040,66 @@ mod tests {
             run_log("stored", &merged_only),
             "stored\n[merged] into main\n"
         );
+    }
+
+    #[test]
+    fn a_stream_written_batch_by_batch_joins_as_one_written_at_once() {
+        let events = [
+            LogEvent {
+                kind: "started".into(),
+                text: "Lane: store".into(),
+            },
+            LogEvent {
+                kind: "output".into(),
+                text: "hello\n".into(),
+            },
+            LogEvent {
+                kind: "merged".into(),
+                text: "into main".into(),
+            },
+        ];
+        let mut streamed = StreamedLog::default();
+        for batch in events.chunks(1) {
+            streamed.extend(batch);
+        }
+        for stored in ["", "stored", "hello\n"] {
+            assert_eq!(streamed.join(stored), run_log(stored, &events));
+        }
+    }
+
+    #[test]
+    fn a_log_opened_at_its_end_reads_back_to_the_same_text() {
+        let output = |seq: i64, offset: u64, text: &str| PagedEvent {
+            event: LogEvent {
+                kind: "output".into(),
+                text: text.into(),
+            },
+            seq,
+            offset,
+        };
+        let started = PagedEvent {
+            event: LogEvent {
+                kind: "started".into(),
+                text: "Lane: store".into(),
+            },
+            seq: 1,
+            offset: 0,
+        };
+        let mut whole = StreamedLog::default();
+        whole.extend_paged(&[started.clone(), output(2, 0, "one\ntwo\nthree\n")]);
+        // The tail starts inside "two": that line's end is held back until its start comes.
+        let mut paged = StreamedLog::default();
+        paged.extend_paged(&[output(2, 6, "o\nthree\n")]);
+        assert!(paged.may_have_earlier());
+        assert_eq!(paged.join(""), "three\n");
+        // Still inside "two": nothing whole came in.
+        assert!(!paged.prepend(&[output(2, 4, "tw")]));
+        assert_eq!(paged.head(), Some((2, 4)));
+        assert_eq!(paged.join(""), "three\n");
+        assert!(paged.prepend(&[started, output(2, 0, "one\n")]));
+        assert!(!paged.may_have_earlier());
+        assert_eq!(paged.join(""), whole.join(""));
+        assert_eq!(paged.join("stored"), whole.join("stored"));
     }
 
     #[test]

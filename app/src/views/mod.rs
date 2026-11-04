@@ -19,7 +19,7 @@ pub use runs::RunsView;
 pub use settings::SettingsView;
 pub use sidebar::SidebarView;
 pub use spend::SpendView;
-pub use stats::StatsView;
+pub use stats::{Pane as StatsPane, StatsView};
 // Not mounted. Run pages construct it later without editing this module's other lines.
 #[allow(unused_imports)]
 pub use transcript::TranscriptView;

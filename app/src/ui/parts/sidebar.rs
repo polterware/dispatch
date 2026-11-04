@@ -1,12 +1,9 @@
 //! Pieces of the sidebar that the shared controls do not cover: the run dot, the empty line,
-//! display-menu headings, menu actions, and the transcript card frame.
+//! and the transcript card frame.
 
-use std::rc::Rc;
-
-use gpui::{AnyElement, App, ElementId, IntoElement, SharedString, Window, div, prelude::*, px};
+use gpui::{AnyElement, IntoElement, div, prelude::*, px};
 
 use crate::theme::Theme;
-use crate::ui::{Icon, icon};
 
 /// `.dispatch-run-dot`: 6px, info while running or pending, danger once it failed, timed out,
 /// or was orphaned, muted when cancelled, success otherwise (`runTone`).
@@ -28,61 +25,6 @@ pub fn run_none(text: &'static str, theme: &Theme) -> gpui::Div {
         .text_size(px(theme.font_size_sm))
         .text_color(theme.color_text_muted)
         .child(text)
-}
-
-pub fn menu_heading(label: impl Into<SharedString>, theme: &Theme) -> impl IntoElement {
-    div()
-        .px(px(theme.space_2))
-        .pt(px(theme.space_3))
-        .pb(px(theme.space_1))
-        .text_size(px(theme.font_size_xs))
-        .font_weight(gpui::FontWeight::MEDIUM)
-        .text_color(theme.color_text_muted)
-        .child(label.into())
-}
-
-pub fn menu_separator(theme: &Theme) -> impl IntoElement {
-    div()
-        .mt(px(theme.space_2))
-        .mx(px(theme.space_2))
-        .h(px(1.0))
-        .bg(theme.color_border_subtle)
-}
-
-/// Left-aligned display-menu action. Shared `Menu` rows cannot sit beside radio groups.
-pub fn action_row(
-    id: impl Into<ElementId>,
-    name: Icon,
-    label: impl Into<SharedString>,
-    danger: bool,
-    on_click: Rc<dyn Fn(&mut Window, &mut App)>,
-    theme: &Theme,
-    cx: &App,
-) -> impl IntoElement {
-    let fg = if danger {
-        theme.color_danger
-    } else {
-        theme.color_text_primary
-    };
-    let hover = theme.color_surface_hover;
-    div()
-        .id(id)
-        .h(px(theme.control_height_md))
-        .px(px(theme.space_2))
-        .flex()
-        .items_center()
-        .gap(px(theme.space_2))
-        .rounded(px(theme.radius_sm))
-        .cursor_pointer()
-        .hover(move |style| style.bg(hover))
-        .on_click(move |_, window, cx| on_click(window, cx))
-        .child(icon(name, 14.0, cx))
-        .child(
-            div()
-                .text_size(px(theme.font_size_sm))
-                .text_color(fg)
-                .child(label.into()),
-        )
 }
 
 /// Card frame for the run transcript. `slide` drops the face a few pixels as it enters.
@@ -112,7 +54,14 @@ pub fn preview_surface(
                 .border_color(theme.color_border)
                 .overflow_hidden()
                 .occlude()
-                .child(body),
+                // The transcript keeps clear of the card's rounded edges.
+                .child(
+                    div()
+                        .size_full()
+                        .px(px(theme.space_4))
+                        .py(px(theme.space_3))
+                        .child(body),
+                ),
         )
         .into_any_element()
 }

@@ -83,22 +83,22 @@ pub struct CliInstall {
     pub binary: String,
 }
 
+/// The dispatch skill in one skills folder, and the agents that read it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SkillRow {
-    pub agent: String,
-    pub path: String,
-    pub state: InstallState,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SkillFolder {
+    pub dir: String,
     pub path: String,
     pub agents: Vec<String>,
     pub state: InstallState,
+    /// An agent's own folder the shared one already reaches, listed only while it holds a
+    /// second copy, to remove it.
+    pub extra: bool,
 }
 
+/// One agent's SessionStart hook.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HookSetup {
+    pub agent: String,
     pub on: bool,
     pub settings: String,
     pub command: String,
@@ -117,7 +117,9 @@ pub struct OpenCodeSetup {
 pub struct AgentSetup {
     pub cli: CliInstall,
     pub skills: Vec<SkillRow>,
-    pub hook: HookSetup,
+    pub hooks: Vec<HookSetup>,
+    /// The agents whose config folder is on this machine.
+    pub agents: Vec<String>,
     pub opencode: OpenCodeSetup,
 }
 
@@ -169,6 +171,21 @@ pub struct Policy {
 impl Policy {
     pub fn classifier_on(&self) -> bool {
         !self.classifier.is_empty()
+    }
+
+    /// Why picking a role would do nothing with this classifier, or `None` when it works.
+    pub fn pick_blocked(&self) -> Option<&'static str> {
+        if !self.classifier_on() {
+            Some(
+                "No classifier is set, so nothing picks a role yet: a run gets one only from --role. Choose a classifier in Classifier.",
+            )
+        } else if self.classifier == "openai" {
+            Some(
+                "OpenAI Decisions judges a task's difficulty but cannot pick a role, so Auto runs stay on General. Jev and the agent CLI model can pick one.",
+            )
+        } else {
+            None
+        }
     }
 
     pub fn rules(&self, side: RuleSide) -> &RuleSet {
@@ -271,31 +288,6 @@ pub struct RoleAnswer {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct AutoCandidate {
-    pub p_pass: f64,
-    pub effective_cost: f64,
-    pub quota_multiplier: f64,
-    pub qualified: bool,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct RouteCandidateView {
-    pub agent: String,
-    pub model: String,
-    pub reason: String,
-    pub auto: Option<AutoCandidate>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct RouteView {
-    pub candidates: Vec<RouteCandidateView>,
-    pub eliminated: Vec<String>,
-    pub reason: String,
-    pub difficulty: Option<f64>,
-    pub role: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
 pub struct ClassifyView {
     pub provider: String,
     pub model: String,
@@ -361,6 +353,11 @@ pub fn agent_label(agent: &str) -> String {
         "grok" => "Grok".to_string(),
         "antigravity" => "Antigravity".to_string(),
         "opencode" => "OpenCode".to_string(),
+        "gemini" => "Gemini CLI".to_string(),
+        "qwen" => "Qwen Code".to_string(),
+        "pi" => "Pi".to_string(),
+        "kimi" => "Kimi Code".to_string(),
+        "copilot" => "Copilot".to_string(),
         other => other.to_string(),
     }
 }
@@ -373,27 +370,26 @@ pub fn folder_agents_label(agents: &[String]) -> String {
         .join(", ")
 }
 
-/// Lists a shared skills folder once, with every agent that reads it, in first-seen order.
-pub fn skill_folders(skills: &[SkillRow]) -> Vec<SkillFolder> {
-    let mut folders: Vec<SkillFolder> = Vec::new();
-    for skill in skills {
-        if let Some(folder) = folders.iter_mut().find(|item| item.path == skill.path) {
-            folder.agents.push(skill.agent.clone());
-        } else {
-            folders.push(SkillFolder {
-                path: skill.path.clone(),
-                agents: vec![skill.agent.clone()],
-                state: skill.state,
-            });
-        }
+/// The agents of a skills folder to name: those on this machine, or every reader when none
+/// of them is.
+pub fn skill_readers<'a>(skill: &'a SkillRow, present: &[String]) -> Vec<&'a String> {
+    let here: Vec<&String> = skill
+        .agents
+        .iter()
+        .filter(|agent| present.contains(agent))
+        .collect();
+    if here.is_empty() {
+        skill.agents.iter().collect()
+    } else {
+        here
     }
-    folders
 }
 
+/// Whether a folder Dispatch installs into lacks the current skill.
 pub fn skills_need_install(skills: &[SkillRow]) -> bool {
     skills
         .iter()
-        .any(|skill| skill.state != InstallState::Current)
+        .any(|skill| !skill.extra && skill.state != InstallState::Current)
 }
 
 pub fn cli_description(cli: &CliInstall) -> String {
@@ -408,6 +404,15 @@ pub fn hook_points_elsewhere(hook: &HookSetup) -> bool {
     hook.on && !hook.current
 }
 
+/// What an agent asks of its hook, said under the file it lives in.
+pub fn hook_note(agent: &str) -> Option<&'static str> {
+    match agent {
+        "codex" => Some("Codex asks you to trust it once in /hooks."),
+        "grok" => Some("Grok also runs Claude Code's and Cursor's hooks; it reads the line once."),
+        _ => None,
+    }
+}
+
 pub fn opencode_description(item: &OpenCodeSetup) -> &str {
     if item.state == InstallState::Missing {
         &item.config
@@ -419,25 +424,76 @@ pub fn opencode_description(item: &OpenCodeSetup) -> &str {
 pub fn parse_agent_setup(json: &str) -> AgentSetup {
     let root = json_object(json);
     let cli = record(root.get("cli"));
-    let hook = record(root.get("hook"));
     let opencode = record(root.get("opencode"));
-    let skills = root
-        .get("skills")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .map(|item| {
-                    let row = record_of(item);
-                    SkillRow {
-                        agent: text(&row, "agent"),
-                        path: text(&row, "path"),
-                        state: InstallState::from_wire(&text(&row, "state")),
-                    }
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let items = |key: &str| -> Vec<Map<String, Value>> {
+        root.get(key)
+            .and_then(Value::as_array)
+            .map(|items| items.iter().map(record_of).collect())
+            .unwrap_or_default()
+    };
+    let strings = |row: &Map<String, Value>, key: &str| -> Vec<String> {
+        row.get(key)
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut skills: Vec<SkillRow> = Vec::new();
+    for row in items("skills") {
+        let path = text(&row, "path");
+        let state = InstallState::from_wire(&text(&row, "state"));
+        if row.contains_key("agents") {
+            skills.push(SkillRow {
+                dir: text(&row, "dir"),
+                path,
+                agents: strings(&row, "agents"),
+                state,
+                extra: flag_true(&row, "extra"),
+            });
+            continue;
+        }
+        // A core from before skills folders lists one row per agent: a folder's agents
+        // come together, in first-seen order.
+        let agent = text(&row, "agent");
+        if let Some(folder) = skills.iter_mut().find(|folder| folder.path == path) {
+            folder.agents.push(agent);
+            continue;
+        }
+        let dir = std::path::Path::new(&path)
+            .parent()
+            .and_then(std::path::Path::parent)
+            .map(|dir| dir.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        skills.push(SkillRow {
+            dir,
+            path,
+            agents: vec![agent],
+            state,
+            extra: false,
+        });
+    }
+    let hook = |row: &Map<String, Value>, agent: String| HookSetup {
+        agent,
+        on: flag_true(row, "on"),
+        settings: text(row, "settings"),
+        command: text(row, "command"),
+        current: flag_true(row, "current"),
+    };
+    let mut hooks: Vec<HookSetup> = items("hooks")
+        .iter()
+        .map(|row| hook(row, text(row, "agent")))
+        .collect();
+    if hooks.is_empty()
+        && let Some(Value::Object(old)) = root.get("hook")
+    {
+        // A core from before per-agent hooks reports Claude Code's alone.
+        hooks.push(hook(old, "claude".to_string()));
+    }
     AgentSetup {
         cli: CliInstall {
             path: text(&cli, "path"),
@@ -446,12 +502,8 @@ pub fn parse_agent_setup(json: &str) -> AgentSetup {
             binary: text(&cli, "binary"),
         },
         skills,
-        hook: HookSetup {
-            on: flag_true(&hook, "on"),
-            settings: text(&hook, "settings"),
-            command: text(&hook, "command"),
-            current: flag_true(&hook, "current"),
-        },
+        hooks,
+        agents: strings(&root, "agents"),
         opencode: OpenCodeSetup {
             path: text(&opencode, "path"),
             config: text(&opencode, "config"),
@@ -662,62 +714,6 @@ pub fn parse_role_answer(value: &Value) -> RoleAnswer {
     }
 }
 
-pub fn route_role_line(body: &Value) -> Option<String> {
-    let root = record_of(body);
-    if let Some(pick) = root.get("rolePick").map(record_of) {
-        if let Some(role) = pick.get("role").and_then(Value::as_str) {
-            if role == "general" {
-                return Some("General: no role fits clearly".to_string());
-            }
-            let probability = pick
-                .get("probs")
-                .and_then(Value::as_object)
-                .and_then(|probs| probs.get(role))
-                .and_then(Value::as_f64);
-            let mut line = format!("Role {role}, picked");
-            if let Some(probability) = probability {
-                line.push_str(&format!(" (P {})", fixed2(probability)));
-            }
-            return Some(line);
-        }
-    }
-    root.get("role")
-        .and_then(Value::as_str)
-        .filter(|role| !role.is_empty())
-        .map(|role| format!("Role {role}"))
-}
-
-pub fn parse_route(json: &str) -> RouteView {
-    let body = json_value(json);
-    let root = record_of(&body);
-    let candidates = root
-        .get("candidates")
-        .and_then(Value::as_array)
-        .map(|items| items.iter().map(parse_candidate).collect())
-        .unwrap_or_default();
-    let eliminated = root
-        .get("eliminated")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
-    RouteView {
-        candidates,
-        eliminated,
-        reason: root
-            .get("reason")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        difficulty: root.get("difficulty").and_then(Value::as_f64),
-        role: route_role_line(&body),
-    }
-}
-
 pub fn parse_classify(json: &str) -> ClassifyView {
     let body = json_object(json);
     let difficulty = record(body.get("difficulty"));
@@ -813,24 +809,6 @@ pub fn priority_value(value: &str) -> &'static str {
     }
 }
 
-pub fn route_tier_options(classifier_on: bool) -> Vec<(&'static str, &'static str)> {
-    let mut tiers = Vec::new();
-    if classifier_on {
-        tiers.push(("auto", "Auto"));
-    }
-    tiers.extend([("easy", "Easy"), ("normal", "Normal"), ("hard", "Hard")]);
-    tiers
-}
-
-pub fn route_tier_label(value: &str) -> &'static str {
-    match value {
-        "auto" => "Auto",
-        "easy" => "Easy",
-        "hard" => "Hard",
-        _ => "Normal",
-    }
-}
-
 pub fn fixed2(value: f64) -> String {
     format!("{value:.2}")
 }
@@ -873,29 +851,6 @@ pub fn classify_meta(view: &ClassifyView) -> String {
 
 pub fn bool_wire(value: bool) -> String {
     if value { "true" } else { "false" }.to_string()
-}
-
-fn parse_candidate(value: &Value) -> RouteCandidateView {
-    let row = record_of(value);
-    let auto = row.get("auto").filter(|item| item.is_object()).map(|item| {
-        let auto = record_of(item);
-        AutoCandidate {
-            p_pass: number_or(auto.get("pPass"), 0.0),
-            effective_cost: number_or(auto.get("effectiveCost"), 0.0),
-            quota_multiplier: number_or(auto.get("quotaMultiplier"), 1.0),
-            qualified: matches!(auto.get("qualified"), Some(Value::Bool(true))),
-        }
-    });
-    RouteCandidateView {
-        agent: field_string(&row, "Agent", "agent"),
-        model: field_string(&row, "Model", "model"),
-        reason: row
-            .get("reason")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        auto,
-    }
 }
 
 fn parse_rules(value: Option<&Value>) -> RuleSet {
@@ -987,67 +942,89 @@ fn number_or(value: Option<&Value>, default: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentSetup, CliModel, CliState, HookSetup, InstallState, OpenCodeSetup, SkillRow,
-        classifier_trailing, fixed2, folder_agents_label, key_chip, parse_agent_setup,
-        parse_classify, parse_key_status_value, parse_policy, parse_role_answer, parse_route,
-        role_answer_line, skill_folders, token_delta,
+        AgentSetup, CliModel, CliState, HookSetup, InstallState, OpenCodeSetup,
+        classifier_trailing, fixed2, folder_agents_label, hook_note, hook_points_elsewhere,
+        key_chip, parse_agent_setup, parse_classify, parse_key_status_value, parse_policy,
+        parse_role_answer, role_answer_line, skill_readers, skills_need_install, token_delta,
     };
     use serde_json::json;
 
     #[test]
-    fn skill_folders_list_a_shared_folder_once() {
-        let folders = skill_folders(&[
-            SkillRow {
-                agent: "claude".into(),
-                path: "/h/.claude/skills/dispatch/SKILL.md".into(),
-                state: InstallState::Outdated,
-            },
-            SkillRow {
-                agent: "codex".into(),
-                path: "/h/.agents/skills/dispatch/SKILL.md".into(),
-                state: InstallState::Current,
-            },
-            SkillRow {
-                agent: "grok".into(),
-                path: "/h/.agents/skills/dispatch/SKILL.md".into(),
-                state: InstallState::Current,
-            },
-        ]);
-        assert_eq!(folders.len(), 2);
-        assert_eq!(folders[0].path, "/h/.claude/skills/dispatch/SKILL.md");
-        assert_eq!(folders[0].agents, vec!["claude".to_string()]);
-        assert_eq!(folders[0].state, InstallState::Outdated);
-        assert_eq!(
-            folders[1].agents,
-            vec!["codex".to_string(), "grok".to_string()]
-        );
-        assert_eq!(folders[1].state, InstallState::Current);
-        assert_eq!(folder_agents_label(&folders[1].agents), "Codex, Grok");
-        assert_eq!(folder_agents_label(&folders[0].agents), "Claude Code");
+    fn says_when_no_classifier_can_pick_a_role() {
+        let blocked = |classifier: &str| {
+            parse_policy(&json!({ "classifier": classifier }).to_string()).pick_blocked()
+        };
+        assert!(blocked("").unwrap().contains("No classifier is set"));
+        assert!(blocked("openai").unwrap().contains("stay on General"));
+        assert_eq!(blocked("jev"), None);
     }
 
     #[test]
-    fn agent_setup_reads_unknown_states_as_missing() {
+    fn a_skills_folder_names_the_agents_here_that_read_it() {
         let view = parse_agent_setup(
-            r#"{"cli":{"path":"/h/.local/bin/dispatch","state":"other","target":"/h/.local/bin/dispatch","binary":"/app/dispatch"},"skills":[{"agent":"codex","path":"/h/.agents/skills/dispatch/SKILL.md","state":"outdated"},{"agent":"claude","path":"/c","state":"weird"}],"hook":{"on":true,"settings":"/h/.claude/settings.json","command":"dispatch hook","current":false}}"#,
+            r#"{"agents":["codex","grok"],"skills":[{"dir":"/h/.agents/skills","path":"/h/.agents/skills/dispatch/SKILL.md","agents":["codex","cursor","grok"],"state":"current"},{"dir":"/h/.cursor/skills","path":"/h/.cursor/skills/dispatch/SKILL.md","agents":["cursor"],"state":"outdated","extra":true}]}"#,
+        );
+        let shared = &view.skills[0];
+        let extra = &view.skills[1];
+        assert!(!shared.extra && extra.extra);
+        assert_eq!(extra.state, InstallState::Outdated);
+        let names = |skill| {
+            let readers: Vec<String> = skill_readers(skill, &view.agents)
+                .into_iter()
+                .cloned()
+                .collect();
+            folder_agents_label(&readers)
+        };
+        assert_eq!(names(shared), "Codex, Grok", "only the agents here");
+        assert_eq!(names(extra), "Cursor", "every reader when none is here");
+        assert!(
+            !skills_need_install(&view.skills),
+            "a second copy never asks to be installed"
+        );
+    }
+
+    #[test]
+    fn agent_setup_reads_an_older_cores_rows() {
+        let view = parse_agent_setup(
+            r#"{"cli":{"path":"/h/.local/bin/dispatch","state":"other","target":"/h/.local/bin/dispatch","binary":"/app/dispatch"},"skills":[{"agent":"codex","path":"/h/.agents/skills/dispatch/SKILL.md","state":"outdated"},{"agent":"grok","path":"/h/.agents/skills/dispatch/SKILL.md","state":"outdated"},{"agent":"claude","path":"/c/dispatch/SKILL.md","state":"weird"}],"hook":{"on":true,"settings":"/h/.claude/settings.json","command":"dispatch hook","current":false}}"#,
         );
         assert_eq!(view.cli.state, CliState::Other);
         assert_eq!(
             view.skills
                 .iter()
-                .map(|skill| skill.state)
+                .map(|skill| (skill.dir.as_str(), skill.agents.len(), skill.state))
                 .collect::<Vec<_>>(),
-            vec![InstallState::Outdated, InstallState::Missing]
+            vec![
+                ("/h/.agents/skills", 2, InstallState::Outdated),
+                ("/c", 1, InstallState::Missing)
+            ]
         );
         assert_eq!(
-            view.hook,
-            HookSetup {
+            view.hooks,
+            vec![HookSetup {
+                agent: "claude".into(),
                 on: true,
                 settings: "/h/.claude/settings.json".into(),
                 command: "dispatch hook".into(),
                 current: false,
-            }
+            }]
         );
+        assert!(hook_points_elsewhere(&view.hooks[0]));
+    }
+
+    #[test]
+    fn agent_setup_reads_a_hook_per_agent() {
+        let view = parse_agent_setup(
+            r#"{"hooks":[{"agent":"claude","on":false,"settings":"/h/.claude/settings.json","current":false},{"agent":"codex","on":true,"settings":"/h/.codex/hooks.json","command":"/a/dispatch hook --agent codex","current":true}]}"#,
+        );
+        let agents: Vec<(&str, bool)> = view
+            .hooks
+            .iter()
+            .map(|hook| (hook.agent.as_str(), hook.on))
+            .collect();
+        assert_eq!(agents, vec![("claude", false), ("codex", true)]);
+        assert!(hook_note(&view.hooks[1].agent).is_some_and(|note| note.contains("/hooks")));
+        assert_eq!(hook_note(&view.hooks[0].agent), None);
     }
 
     #[test]
@@ -1076,7 +1053,7 @@ mod tests {
         let empty = parse_agent_setup("{}");
         assert_eq!(empty.cli.state, CliState::Missing);
         assert!(empty.skills.is_empty());
-        assert!(!empty.hook.on);
+        assert!(empty.hooks.is_empty());
         let _typed: AgentSetup = empty;
     }
 
@@ -1160,33 +1137,6 @@ mod tests {
         assert_eq!(key_chip("env").label, "Environment");
         assert_eq!(key_chip("missing").label, "Not set");
         assert!(!key_chip("missing").ok);
-    }
-
-    #[test]
-    fn route_report_reads_candidates_cost_and_the_role_pick() {
-        let route = parse_route(
-            r#"{"reason":"auto","difficulty":1.25,"candidates":[{"Agent":"codex","Model":"gpt","reason":"table","auto":{"pPass":0.91,"effectiveCost":0.2,"quotaMultiplier":1.5,"qualified":true}}],"eliminated":["no quota"],"rolePick":{"role":"reviewer","probs":{"reviewer":0.8}}}"#,
-        );
-        assert_eq!(route.reason, "auto");
-        assert_eq!(route.difficulty.map(fixed2).as_deref(), Some("1.25"));
-        assert_eq!(route.eliminated, vec!["no quota".to_string()]);
-        assert_eq!(
-            route.role.as_deref(),
-            Some("Role reviewer, picked (P 0.80)")
-        );
-        let candidate = &route.candidates[0];
-        assert_eq!(candidate.agent, "codex");
-        assert_eq!(candidate.model, "gpt");
-        let auto = candidate.auto.as_ref().unwrap();
-        assert!((auto.p_pass - 0.91).abs() < 1e-9);
-        assert!(auto.qualified);
-        let named = parse_route(r#"{"role":"implementer","candidates":[]}"#);
-        assert_eq!(named.role.as_deref(), Some("Role implementer"));
-        let general = parse_route(r#"{"rolePick":{"role":"general"}}"#);
-        assert_eq!(
-            general.role.as_deref(),
-            Some("General: no role fits clearly")
-        );
     }
 
     #[test]

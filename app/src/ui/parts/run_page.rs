@@ -46,11 +46,12 @@ pub fn file_change_line(counts: &FileCounts, theme: Theme) -> AnyElement {
             theme.color_text_secondary,
         ));
     if let Some(files) = &counts.files_label {
-        row = row.child(div().child(files.clone()));
+        row = row.child(div().flex_none().child(files.clone()));
     }
     if let Some(insertions) = &counts.insertions_label {
         row = row.child(
             div()
+                .flex_none()
                 .text_color(theme.color_success)
                 .child(insertions.clone()),
         );
@@ -58,6 +59,7 @@ pub fn file_change_line(counts: &FileCounts, theme: Theme) -> AnyElement {
     if let Some(deletions) = &counts.deletions_label {
         row = row.child(
             div()
+                .flex_none()
                 .text_color(theme.color_danger)
                 .child(deletions.clone()),
         );

@@ -59,7 +59,7 @@ What GPUI cannot draw and what is not ported yet, so the pixels differ on purpos
 | `src/dock_icon.rs` | The Dock icon of a build with no bundle. |
 | `src/shots.rs` | The screenshot tour behind `DISPATCH_GPUI_SHOTS`. |
 | `src/ui/` | Re-exports polterware-ui's controls (`avatar`, `motion`, `vibrancy`, `window_drag` among them); `parts/` holds the pieces only Dispatch's pages draw. |
-| `resources/` | `dispatch.icon` (Icon Composer, the bundle's icon) and `dispatch-icon.png` (rendered by `tooling/render-icon.swift`). |
+| `resources/` | `dispatch.icon` (Icon Composer, the bundle's icon), `dispatch Exports` (its PNG exports), and `dispatch-icon.png` (the Default export on the macOS icon grid, the Dock icon of an unbundled build). |
 | `src/views/<view>.rs` | One screen each: `sidebar`, `run_page`, `transcript`, `roles`, `intelligence`, `spend`, `stats`, `settings`, `commander`, `runs`. `TranscriptView` is not a route: the run page mounts it, and the sidebar's long-hover card mounts it compact. |
 | `src/models/<view>.rs` | The pure logic of that view and its tests. |
 | `src/ui/parts/<view>.rs` | UI helpers only that view uses. |

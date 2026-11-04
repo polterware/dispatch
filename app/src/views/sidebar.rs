@@ -24,13 +24,16 @@ use crate::models::sidebar::{
 use crate::motion::{Animator, SpringTier, SpringValue};
 use crate::state::{AppState, ConnectionState, Route, SettingsPage, observe};
 use crate::theme::Theme;
-use crate::ui::parts::sidebar::{
-    action_row, menu_heading, menu_separator, preview_surface, run_dot, run_none,
-};
+use crate::ui::list_skeleton;
+use crate::ui::parts::sidebar::{preview_surface, run_dot, run_none};
+use crate::ui::patterns::{FadeEdges, fade_item, fade_scroll};
 use crate::ui::{
-    Button, ButtonKind, ButtonSize, Icon, Menu, MenuEntry, RadioOption, SidebarItem,
-    SidebarSectionLabel, TextInput, ToastTone, button, ellipsis, icon_button, kbd, radio_group,
+    Button, ButtonKind, ButtonSize, Icon, Menu, MenuEntry, MenuItem, SidebarItem,
+    SidebarSectionLabel, TextInput, ToastTone, button, ellipsis, icon_button, kbd,
 };
+
+/// The Display menu's width (`min-w-48`, 12rem).
+const DISPLAY_MENU_WIDTH: f32 = 12.0 * crate::theme::REM;
 
 #[derive(Clone)]
 struct SectionDraft {
@@ -44,6 +47,8 @@ enum SectionJob {
 }
 
 struct Snapshot {
+    /// The core has not answered yet: the runs show as bones.
+    connecting: bool,
     groups: Vec<SidebarGroup>,
     route: Route,
     show_error: bool,
@@ -69,8 +74,8 @@ pub struct SidebarView {
     preview_card_hover: bool,
     preview_progress: SpringValue,
     hover_gen: u64,
+    /// Whether the open context menu is the Display menu, so its button toggles it.
     display_open: bool,
-    display_progress: SpringValue,
     context_menu: Entity<Menu>,
     context_x: f32,
     context_y: f32,
@@ -138,7 +143,6 @@ impl SidebarView {
             preview_progress: SpringValue::new(0.0, SpringTier::Fast),
             hover_gen: 0,
             display_open: false,
-            display_progress: SpringValue::new(0.0, SpringTier::Fast),
             context_menu: cx.new(Menu::new),
             context_x: 0.0,
             context_y: 0.0,
@@ -161,6 +165,7 @@ impl SidebarView {
             groups,
             route: app.route().clone(),
             show_error,
+            connecting: matches!(app.connection(), ConnectionState::Connecting),
         }
     }
 
@@ -175,8 +180,6 @@ impl SidebarView {
             self.preview_open = false;
         }
         self.row_bounds.borrow_mut().retain(|id, _| live(id));
-        self.display_progress
-            .set_target(if self.display_open { 1.0 } else { 0.0 });
         self.editor_progress
             .set_target(if self.editor.is_some() { 1.0 } else { 0.0 });
         self.preview_progress
@@ -187,7 +190,6 @@ impl SidebarView {
         let dt = self.animator.dt(window, self.moving());
         if dt > 0.0 {
             self.preview_progress.step(dt);
-            self.display_progress.step(dt);
             self.editor_progress.step(dt);
         }
         if self.moving() {
@@ -200,9 +202,7 @@ impl SidebarView {
     }
 
     fn moving(&self) -> bool {
-        !self.preview_progress.settled()
-            || !self.display_progress.settled()
-            || !self.editor_progress.settled()
+        !self.preview_progress.settled() || !self.editor_progress.settled()
     }
 
     fn is_collapsed(&self, id: &str) -> bool {
@@ -271,14 +271,135 @@ impl SidebarView {
         }
     }
 
-    fn toggle_display(&mut self, cx: &mut Context<Self>) {
-        self.display_open = !self.display_open;
-        if self.display_open {
-            self.editor = None;
-            self.editor_focus = false;
+    /// The Display menu, as the Solid app's `DropdownMenu`: Group by, Sort by, and Show as
+    /// submenus of radio items, then Reset to defaults and View all. It hangs
+    /// under its button with their right edges lined up.
+    pub(crate) fn toggle_display(&mut self, cx: &mut Context<Self>) {
+        if self.display_open && self.context_menu.read(cx).is_open() {
             self.close_menu(cx);
+            self.display_open = false;
+            cx.notify();
+            return;
         }
+        self.editor = None;
+        self.editor_focus = false;
+        let theme = *Theme::global(cx);
+        let items = self.display_items(cx);
+        self.context_x =
+            (theme.sidebar_width - theme.space_2 - DISPLAY_MENU_WIDTH).max(theme.space_2);
+        self.context_y = self.overlay_top(theme) - theme.control_height_md;
+        self.context_menu.update(cx, |menu, cx| {
+            menu.set_menu(items);
+            menu.set_width(DISPLAY_MENU_WIDTH);
+            menu.set_open(true);
+            cx.notify();
+        });
+        self.display_open = true;
         cx.notify();
+    }
+
+    fn display_items(&self, cx: &mut Context<Self>) -> Vec<MenuItem> {
+        let view = cx.entity();
+        let radios = |labels: &[&str],
+                      picked: usize,
+                      pick: fn(&mut Self, usize, &mut Context<Self>)|
+         -> Vec<MenuItem> {
+            labels
+                .iter()
+                .enumerate()
+                .map(|(index, label)| {
+                    let view = view.clone();
+                    MenuItem::radio(
+                        label.to_string(),
+                        index == picked,
+                        Rc::new(move |_, cx| {
+                            let _ = view.update(cx, |this, cx| {
+                                this.display_open = false;
+                                pick(this, index, cx);
+                            });
+                        }),
+                    )
+                })
+                .collect()
+        };
+        let group_index = match self.display.group_by {
+            GroupBy::Conversation => 0,
+            GroupBy::Workspace => 1,
+            GroupBy::Date => 2,
+            GroupBy::Status => 3,
+            GroupBy::Agent => 4,
+            GroupBy::None => 5,
+        };
+        let sort_index = match self.display.sort_by {
+            SortBy::Updated => 0,
+            SortBy::Created => 1,
+            SortBy::Name => 2,
+        };
+        let direction_index = match self.display.direction {
+            Direction::Desc => 0,
+            Direction::Asc => 1,
+        };
+        let show_index = match self.display.show {
+            Show::All => 0,
+            Show::Unmerged => 1,
+            Show::Active => 2,
+        };
+        let mut sort = radios(
+            &["Last updated", "Date created", "Name"],
+            sort_index,
+            Self::pick_sort,
+        );
+        sort.push(MenuItem::Separator);
+        sort.extend(radios(
+            &["Descending", "Ascending"],
+            direction_index,
+            Self::pick_direction,
+        ));
+        let reset = view.clone();
+        let all = view.clone();
+        vec![
+            MenuItem::submenu(
+                "Group by",
+                Some(Icon::Layers),
+                radios(
+                    &[
+                        "Conversation",
+                        "Workspace",
+                        "Date",
+                        "Status",
+                        "Agent",
+                        "None",
+                    ],
+                    group_index,
+                    Self::pick_group,
+                ),
+            ),
+            MenuItem::submenu("Sort by", Some(Icon::ListOrdered), sort),
+            MenuItem::submenu(
+                "Show",
+                Some(Icon::ListFilter),
+                radios(
+                    &["All runs", "Hide merged", "Running and needs merge"],
+                    show_index,
+                    Self::pick_show,
+                ),
+            ),
+            MenuItem::Separator,
+            MenuItem::action(
+                "Reset to defaults",
+                Some(Icon::RefreshCw),
+                Rc::new(move |_, cx| {
+                    let _ = reset.update(cx, |this, cx| this.reset_display(cx));
+                }),
+            ),
+            MenuItem::action(
+                "View all",
+                Some(Icon::ListOrdered),
+                Rc::new(move |_, cx| {
+                    let _ = all.update(cx, |this, cx| this.view_all(cx));
+                }),
+            ),
+        ]
     }
 
     fn reset_display(&mut self, cx: &mut Context<Self>) {
@@ -359,6 +480,11 @@ impl SidebarView {
         cx.notify();
     }
 
+    /// Rests the pointer on run `id`'s row, as the hover does (the screenshot tour).
+    pub(crate) fn hover_run(&mut self, id: String, cx: &mut Context<Self>) {
+        self.hover_run_row(id, true, cx);
+    }
+
     fn hover_run_row(&mut self, id: String, hovered: bool, cx: &mut Context<Self>) {
         if hovered {
             if self.hover_run.as_deref() == Some(id.as_str()) {
@@ -433,6 +559,14 @@ impl SidebarView {
         }
     }
 
+    /// The screenshot tour's way in: lights row `index` of the open menu.
+    pub(crate) fn highlight_menu_row(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.context_menu.update(cx, |menu, cx| {
+            menu.highlight(index);
+            cx.notify();
+        });
+    }
+
     fn close_menu(&mut self, cx: &mut Context<Self>) {
         self.context_menu.update(cx, |menu, cx| {
             if menu.is_open() {
@@ -460,6 +594,7 @@ impl SidebarView {
         self.display_open = false;
         self.context_menu.update(cx, |menu, cx| {
             menu.set_items(items);
+            menu.set_width(0.0);
             menu.set_open(true);
             cx.notify();
         });
@@ -689,7 +824,13 @@ impl SidebarView {
     }
 
     /// The pages: `<nav class="pw-sidebar-group">`, Commander and then each page, 2px apart.
-    fn nav_block(&self, theme: Theme, route: &Route, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn nav_block(
+        &self,
+        theme: Theme,
+        route: &Route,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let view = cx.entity();
         let mut column = div()
             .flex_none()
@@ -698,24 +839,39 @@ impl SidebarView {
             .gap(px(theme.sidebar_row_gap))
             .child({
                 let view = view.clone();
-                SidebarItem::new("sidebar-nav-Commander", "Commander")
+                let item = SidebarItem::new("sidebar-nav-Commander", "Commander")
                     .icon(Icon::Search)
                     .trailing(kbd("⌘K", &theme))
                     .on_click(move |_, cx| {
                         let _ = view.update(cx, |this, cx| this.open_commander(cx));
-                    })
+                    });
+                fade_item(
+                    "sidebar-nav-Commander",
+                    &self.scroll,
+                    fade_edges(theme),
+                    item,
+                    window,
+                    cx,
+                )
             });
         for (label, icon_name, target) in NAV.iter() {
             let view = view.clone();
             let target = target.clone();
-            column = column.child(
-                SidebarItem::new(SharedString::from(format!("sidebar-nav-{label}")), *label)
-                    .icon(*icon_name)
-                    .active(page_selected(route, label))
-                    .on_click(move |_, cx| {
-                        let _ = view.update(cx, |this, cx| this.go(target.clone(), false, cx));
-                    }),
-            );
+            let id = SharedString::from(format!("sidebar-nav-{label}"));
+            let item = SidebarItem::new(id.clone(), *label)
+                .icon(*icon_name)
+                .active(page_selected(route, label))
+                .on_click(move |_, cx| {
+                    let _ = view.update(cx, |this, cx| this.go(target.clone(), false, cx));
+                });
+            column = column.child(fade_item(
+                id,
+                &self.scroll,
+                fade_edges(theme),
+                item,
+                window,
+                cx,
+            ));
         }
         column.into_any_element()
     }
@@ -726,28 +882,41 @@ impl SidebarView {
         &self,
         theme: Theme,
         snapshot: &Snapshot,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let selected = self.selected_id(&snapshot.route);
         let mut column = div()
-            .id("sidebar-scroll")
             .mt(px(theme.space_2))
-            .flex_1()
-            .min_h(px(0.0))
-            .overflow_y_scroll()
-            .track_scroll(&self.scroll)
             .flex()
             .flex_col()
             .gap(px(theme.space_2))
-            .child(self.runs_header(theme, cx));
+            .child({
+                let header = self.runs_header(theme, cx);
+                fade_item(
+                    "sidebar-runs-header",
+                    &self.scroll,
+                    fade_edges(theme),
+                    header,
+                    window,
+                    cx,
+                )
+            });
         if snapshot.show_error {
             column = column.child(run_none("Could not refresh runs and sections.", &theme));
         }
-        if snapshot.groups.is_empty() {
+        if snapshot.groups.is_empty() && snapshot.connecting {
+            // The core is starting: the runs, in bones, until it answers.
+            column = column.child(
+                div()
+                    .px(px(theme.space_2))
+                    .child(list_skeleton(6, 32.0, window, cx)),
+            );
+        } else if snapshot.groups.is_empty() {
             column = column.child(run_none("No runs to show.", &theme));
         }
         for group in &snapshot.groups {
-            column = column.child(self.group_block(group, selected.as_deref(), theme, cx));
+            column = column.child(self.group_block(group, selected.as_deref(), theme, window, cx));
         }
         column.into_any_element()
     }
@@ -789,11 +958,10 @@ impl SidebarView {
         group: &SidebarGroup,
         selected: Option<&str>,
         theme: Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let collapsed = self.is_collapsed(&group.id);
-        let conversation =
-            group.kind == GroupKind::Conversation && conversation_ref(&group.id).is_some();
         let custom = group.kind == GroupKind::Section;
         let view = cx.entity();
         let label = {
@@ -806,10 +974,7 @@ impl SidebarView {
                 group.title.clone(),
                 collapsed,
             )
-            .padding(
-                if conversation { 36.0 } else { theme.space_2 },
-                if custom { 32.0 } else { theme.space_2 },
-            )
+            .padding(theme.space_2, if custom { 32.0 } else { theme.space_2 })
             .on_toggle(move |_, cx| {
                 let id = toggle_id.clone();
                 let _ = toggle_view.update(cx, |this, cx| this.toggle_group(id, cx));
@@ -823,28 +988,14 @@ impl SidebarView {
             })
         };
 
-        let mut section = div()
-            .relative()
-            .w_full()
-            .flex_none()
-            .flex()
-            .flex_col()
-            .gap(px(theme.sidebar_row_gap))
-            .child(label);
-        if conversation {
-            section = section.child(
-                div()
-                    .absolute()
-                    .top(px(theme.space_1))
-                    .left(px(theme.space_2))
-                    .child(agent_avatar(group.agent.as_deref().unwrap_or(""), "", 20.0)),
-            );
-        }
+        // The heading row: its label, and a section's "…" over it. A conversation reads as
+        // its title alone, cut short, with the chevron after it.
+        let mut heading = div().relative().w_full().child(label);
         if custom {
             let section_id = group.id.clone();
             let section_name = group.title.clone();
             let view = view.clone();
-            section = section.child(
+            heading = heading.child(
                 div()
                     .absolute()
                     .top(px(0.0))
@@ -873,10 +1024,32 @@ impl SidebarView {
                     ),
             );
         }
+        let mut section = div()
+            .relative()
+            .w_full()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap(px(theme.sidebar_row_gap))
+            .child(fade_item(
+                format!("sidebar-header-{}", group.id),
+                &self.scroll,
+                fade_edges(theme),
+                heading,
+                window,
+                cx,
+            ));
         if !collapsed {
             for run in &group.runs {
-                section =
-                    section.child(self.run_row(run, selected == Some(run.id.as_str()), theme, cx));
+                let row = self.run_row(run, selected == Some(run.id.as_str()), theme, cx);
+                section = section.child(fade_item(
+                    format!("sidebar-run-{}", run.id),
+                    &self.scroll,
+                    fade_edges(theme),
+                    row,
+                    window,
+                    cx,
+                ));
             }
         }
         section.into_any_element()
@@ -1002,12 +1175,22 @@ impl SidebarView {
             .into_any_element()
     }
 
+    /// Scrolls the list `y` down from its top (the screenshot tour).
+    pub(crate) fn scroll_to(&mut self, y: f32, cx: &mut Context<Self>) {
+        self.scroll.set_offset(gpui::point(px(0.0), px(-y)));
+        cx.notify();
+    }
+
     fn overlay_top(&self, theme: Theme) -> f32 {
         let bounds = self.scroll.bounds();
         if px_of(bounds.size.height) > 1.0 {
+            // The runs header sits under the pages, inside the same scroll.
             px_of(bounds.origin.y)
                 + px_of(self.scroll.offset().y)
-                + theme.space_2
+                + theme.titlebar_height
+                + theme.space_3
+                + nav_height(theme)
+                + theme.space_2 * 2.0
                 + theme.control_height_md
         } else {
             theme.titlebar_height
@@ -1016,197 +1199,6 @@ impl SidebarView {
                 + theme.space_2 * 3.0
                 + theme.control_height_md
         }
-    }
-
-    fn display_panel(
-        &self,
-        theme: Theme,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> Option<gpui::AnyElement> {
-        let t = self.display_progress.value().clamp(0.0, 1.0);
-        if !self.display_open && t < 0.01 {
-            return None;
-        }
-        let view = cx.entity();
-        let top = self.overlay_top(theme) + (1.0 - t) * theme.space_2;
-        let viewport_h = px_of(window.viewport_size().height);
-        let max_h = (viewport_h - top - theme.space_3)
-            .max(theme.row_height * 3.0)
-            .min(theme.row_height * 8.0);
-        let width = theme.sidebar_width - theme.space_4;
-        let group_labels = [
-            "Conversation",
-            "Workspace",
-            "Date",
-            "Status",
-            "Agent",
-            "None",
-        ];
-        let group_index = match self.display.group_by {
-            GroupBy::Conversation => 0,
-            GroupBy::Workspace => 1,
-            GroupBy::Date => 2,
-            GroupBy::Status => 3,
-            GroupBy::Agent => 4,
-            GroupBy::None => 5,
-        };
-        let sort_index = match self.display.sort_by {
-            SortBy::Updated => 0,
-            SortBy::Created => 1,
-            SortBy::Name => 2,
-        };
-        let direction_index = match self.display.direction {
-            Direction::Desc => 0,
-            Direction::Asc => 1,
-        };
-        let show_index = match self.display.show {
-            Show::All => 0,
-            Show::Unmerged => 1,
-            Show::Active => 2,
-        };
-        Some(
-            deferred(
-                div()
-                    .absolute()
-                    .left(px(theme.space_2))
-                    .top(px(top))
-                    .w(px(width))
-                    .occlude()
-                    .opacity(t)
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .child(
-                        div()
-                            .rounded(px(theme.radius_lg))
-                            .bg(theme.color_surface_raised)
-                            .border_1()
-                            .border_color(theme.color_border)
-                            .child(
-                                div()
-                                    .id("sidebar-display-scroll")
-                                    .max_h(px(max_h))
-                                    .overflow_y_scroll()
-                                    .p(px(theme.space_2))
-                                    .flex()
-                                    .flex_col()
-                                    .child(menu_heading("Group by", &theme))
-                                    .child(radio_group(
-                                        "sidebar-group-by",
-                                        &labels(&group_labels),
-                                        group_index,
-                                        Rc::new({
-                                            let view = view.clone();
-                                            move |index, _, cx| {
-                                                let _ = view.update(cx, |this, cx| {
-                                                    this.pick_group(index, cx)
-                                                });
-                                            }
-                                        }),
-                                        cx,
-                                    ))
-                                    .child(menu_heading("Sort by", &theme))
-                                    .child(radio_group(
-                                        "sidebar-sort-by",
-                                        &labels(&["Last updated", "Date created", "Name"]),
-                                        sort_index,
-                                        Rc::new({
-                                            let view = view.clone();
-                                            move |index, _, cx| {
-                                                let _ = view.update(cx, |this, cx| {
-                                                    this.pick_sort(index, cx)
-                                                });
-                                            }
-                                        }),
-                                        cx,
-                                    ))
-                                    .child(menu_separator(&theme))
-                                    .child(radio_group(
-                                        "sidebar-direction",
-                                        &labels(&["Descending", "Ascending"]),
-                                        direction_index,
-                                        Rc::new({
-                                            let view = view.clone();
-                                            move |index, _, cx| {
-                                                let _ = view.update(cx, |this, cx| {
-                                                    this.pick_direction(index, cx)
-                                                });
-                                            }
-                                        }),
-                                        cx,
-                                    ))
-                                    .child(menu_heading("Show", &theme))
-                                    .child(radio_group(
-                                        "sidebar-show",
-                                        &labels(&[
-                                            "All runs",
-                                            "Hide merged",
-                                            "Running and needs merge",
-                                        ]),
-                                        show_index,
-                                        Rc::new({
-                                            let view = view.clone();
-                                            move |index, _, cx| {
-                                                let _ = view.update(cx, |this, cx| {
-                                                    this.pick_show(index, cx)
-                                                });
-                                            }
-                                        }),
-                                        cx,
-                                    ))
-                                    .child(menu_separator(&theme))
-                                    .child(action_row(
-                                        "sidebar-new-section",
-                                        Icon::Plus,
-                                        "New section",
-                                        false,
-                                        Rc::new({
-                                            let view = view.clone();
-                                            move |window, cx| {
-                                                let _ = view.update(cx, |this, cx| {
-                                                    this.open_editor(
-                                                        None,
-                                                        String::new(),
-                                                        window,
-                                                        cx,
-                                                    );
-                                                });
-                                            }
-                                        }),
-                                        &theme,
-                                        cx,
-                                    ))
-                                    .child(action_row(
-                                        "sidebar-reset-display",
-                                        Icon::Close,
-                                        "Reset to defaults",
-                                        false,
-                                        Rc::new({
-                                            let view = view.clone();
-                                            move |_, cx| {
-                                                let _ = view
-                                                    .update(cx, |this, cx| this.reset_display(cx));
-                                            }
-                                        }),
-                                        &theme,
-                                        cx,
-                                    ))
-                                    .child(action_row(
-                                        "sidebar-view-all",
-                                        Icon::More,
-                                        "View all",
-                                        false,
-                                        Rc::new(move |_, cx| {
-                                            let _ = view.update(cx, |this, cx| this.view_all(cx));
-                                        }),
-                                        &theme,
-                                        cx,
-                                    )),
-                            ),
-                    ),
-            )
-            .with_priority(1)
-            .into_any_element(),
-        )
     }
 
     fn editor_panel(
@@ -1365,10 +1357,9 @@ impl Render for SidebarView {
             self.section_name.read(cx).focus_handle(cx).focus(window);
             self.editor_focus = false;
         }
-        let nav = self.nav_block(theme, &snapshot.route, cx);
-        let runs = self.runs_block(theme, &snapshot, cx);
+        let nav = self.nav_block(theme, &snapshot.route, window, cx);
+        let runs = self.runs_block(theme, &snapshot, window, cx);
         let footer = self.footer_block(theme, &snapshot.route, cx);
-        let display = self.display_panel(theme, window, cx);
         let editor = self.editor_panel(theme, window, cx);
         let preview = self.preview_card(theme, &snapshot, window, cx);
         let menu = self.menu_anchor(theme);
@@ -1383,25 +1374,46 @@ impl Render for SidebarView {
             .flex_none()
             .overflow_hidden()
             .window_drag_region()
-            .pt(px(theme.titlebar_height + theme.space_3))
             .px(px(theme.space_2))
-            .pb(px(theme.space_2))
             .flex()
             .flex_col()
-            .gap(px(theme.space_2))
             .font_family(theme.font_sans)
             .text_color(theme.color_text_primary)
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| this.dismiss_panels(cx)),
             )
-            .child(nav)
-            .child(runs)
-            .child(footer)
+            // The pages and the runs scroll as one list that runs up under the titlebar and
+            // down under Settings, which stays put; the rows fade out before either covers
+            // them.
+            .child(
+                fade_scroll("sidebar-scroll", &self.scroll, theme.color_shell_glass)
+                    // Over the glass and the window material: the rows fade themselves.
+                    .bands(false)
+                    .column(|column| {
+                        column
+                            .flex()
+                            .flex_col()
+                            .gap(px(theme.space_2))
+                            .pt(px(theme.titlebar_height + theme.space_3))
+                            .pb(px(footer_height(theme) + theme.space_2))
+                    })
+                    .child(nav)
+                    .child(runs),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(theme.space_2))
+                    .right(px(theme.space_2))
+                    .bottom(px(0.0))
+                    .pb(px(theme.space_2))
+                    // The list runs on under Settings: a press here is Settings', never the
+                    // faded row beneath it.
+                    .occlude()
+                    .child(footer),
+            )
             .child(menu);
-        if let Some(display) = display {
-            root = root.child(display);
-        }
         if let Some(editor) = editor {
             root = root.child(editor);
         }
@@ -1422,17 +1434,25 @@ fn page_selected(route: &Route, label: &str) -> bool {
     }
 }
 
-fn nav_height(theme: Theme) -> f32 {
-    5.0 * theme.sidebar_row_height + 4.0 * theme.sidebar_row_gap
+/// Settings at the foot, over the list: its 8px above, its row, and the sidebar's 8px under.
+fn footer_height(theme: Theme) -> f32 {
+    theme.space_2 * 2.0 + theme.sidebar_row_height
 }
 
-fn labels(items: &[&str]) -> Vec<RadioOption> {
-    items
-        .iter()
-        .map(|label| RadioOption {
-            label: SharedString::from(label.to_string()),
-        })
-        .collect()
+/// Where the list's rows fade: out under the traffic lights by the titlebar's middle, and
+/// out under Settings by the middle of its row, each over a 40-odd px stretch.
+fn fade_edges(theme: Theme) -> FadeEdges {
+    let top_inset = theme.titlebar_height * 0.5;
+    let bottom_inset = footer_height(theme) - theme.space_2;
+    FadeEdges::new(
+        theme.titlebar_height + theme.space_3 - top_inset + theme.space_4,
+        theme.space_4 * 2.5,
+    )
+    .insets(top_inset, bottom_inset)
+}
+
+fn nav_height(theme: Theme) -> f32 {
+    5.0 * theme.sidebar_row_height + 4.0 * theme.sidebar_row_gap
 }
 
 fn core_message(error: CoreError) -> String {

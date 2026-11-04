@@ -16,12 +16,54 @@ pub const BY_OPTIONS: &[(&str, &str)] = &[
     ("area", "Area"),
 ];
 
-/// Window choices, in the original select order.
-pub const SINCE_OPTIONS: &[(&str, &str)] = &[
+/// Windows for a day chart: each draws one bar per day.
+const DAY_WINDOWS: &[(&str, &str)] = &[
+    ("7d", "Last 7 days"),
+    ("14d", "Last 14 days"),
+    ("30d", "Last 30 days"),
+];
+
+/// Windows for a week chart: each draws one bar per ISO week.
+const WEEK_WINDOWS: &[(&str, &str)] = &[
+    ("4w", "Last 4 weeks"),
+    ("12w", "Last 12 weeks"),
+    ("26w", "Last 26 weeks"),
+];
+
+/// Windows for a grouping by model, agent, provider, tier, or area.
+const GROUP_WINDOWS: &[(&str, &str)] = &[
+    ("24h", "Last 24 hours"),
     ("7d", "Last 7 days"),
     ("30d", "Last 30 days"),
     ("all", "All time"),
 ];
+
+/// The windows that fit a grouping: days over days, weeks over weeks, any span for a group.
+/// The core reads every id (`Nh`, `Nd`, `Nw`, `all`).
+pub fn since_options(by: &str) -> &'static [(&'static str, &'static str)] {
+    match by {
+        "day" => DAY_WINDOWS,
+        "week" => WEEK_WINDOWS,
+        _ => GROUP_WINDOWS,
+    }
+}
+
+/// The window a grouping opens on.
+pub fn default_since(by: &str) -> &'static str {
+    match by {
+        "week" => "12w",
+        _ => "7d",
+    }
+}
+
+/// `since` when it fits `by`, else the grouping's default.
+pub fn fitting_since<'a>(by: &str, since: &'a str) -> &'a str {
+    if since_options(by).iter().any(|(id, _)| *id == since) {
+        since
+    } else {
+        default_since(by)
+    }
+}
 
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 /// Column bars scale into 100px, and a zero period still draws a 4px mark.
@@ -58,7 +100,11 @@ pub fn by_label(by: &str) -> String {
 }
 
 pub fn since_label(since: &str) -> String {
-    option_label(SINCE_OPTIONS, since)
+    [DAY_WINDOWS, WEEK_WINDOWS, GROUP_WINDOWS]
+        .iter()
+        .find_map(|options| options.iter().find(|(id, _)| *id == since))
+        .map(|(_, label)| (*label).to_string())
+        .unwrap_or_else(|| since.to_string())
 }
 
 fn option_label(options: &[(&str, &str)], value: &str) -> String {
@@ -67,15 +113,6 @@ fn option_label(options: &[(&str, &str)], value: &str) -> String {
         .find(|(id, _)| *id == value)
         .map(|(_, label)| (*label).to_string())
         .unwrap_or_else(|| value.to_string())
-}
-
-pub fn section_titles(by: &str) -> (String, String) {
-    let label = by_label(by).to_ascii_lowercase();
-    if is_time_series(by) {
-        (format!("Runs per {label}"), format!("By {label}"))
-    } else {
-        (format!("Runs by {label}"), format!("By {label}"))
-    }
 }
 
 pub fn empty_rank() -> DispatchStatRank {
@@ -100,11 +137,25 @@ pub fn empty_stats(by: &str, since: &str) -> StatsResponse {
     }
 }
 
-/// Periods of an empty window, oldest first. Days use 30 only for `30d` (7 otherwise, including all time).
-/// Weeks use 1, 5, or 8. Any other grouping is empty.
+/// A window's length in `unit`-sized steps: `Nd` and `Nw` ids, rounded up to whole steps.
+fn window_steps(since: &str, unit_days: i64) -> Option<i64> {
+    let (count, scale) = if let Some(days) = since.strip_suffix('d') {
+        (days, 1)
+    } else if let Some(weeks) = since.strip_suffix('w') {
+        (weeks, 7)
+    } else {
+        return None;
+    };
+    let days = count.parse::<i64>().ok()?.checked_mul(scale)?;
+    (days > 0).then(|| (days + unit_days - 1) / unit_days)
+}
+
+/// Every period of a window, oldest first, at zero: a day chart draws one per day of its
+/// window (7 when it has no length), a week chart one per week touched (8 for all time).
+/// Any other grouping is empty.
 pub fn empty_periods(by: &str, since: &str, now_ms: i64) -> Vec<PeriodPoint> {
     if by == "day" {
-        let days: i64 = if since == "30d" { 30 } else { 7 };
+        let days = window_steps(since, 1).unwrap_or(7);
         return (0..days)
             .map(|index| PeriodPoint {
                 key: utc_date_key(now_ms - (days - 1 - index) * DAY_MS),
@@ -113,13 +164,7 @@ pub fn empty_periods(by: &str, since: &str, now_ms: i64) -> Vec<PeriodPoint> {
             .collect();
     }
     if by == "week" {
-        let weeks: i64 = if since == "7d" {
-            1
-        } else if since == "30d" {
-            5
-        } else {
-            8
-        };
+        let weeks = window_steps(since, 7).unwrap_or(8);
         return (0..weeks)
             .map(|index| PeriodPoint {
                 key: iso_week_key(now_ms - (weeks - 1 - index) * 7 * DAY_MS),
@@ -130,13 +175,15 @@ pub fn empty_periods(by: &str, since: &str, now_ms: i64) -> Vec<PeriodPoint> {
     Vec::new()
 }
 
+/// The chart's points. A time chart spans its whole window, the periods with no runs at
+/// zero, so a longer window shows as more bars; a grouping lists its rows.
 pub fn chart_columns(
     by: &str,
     since: &str,
     rows: &[DispatchStatsRow],
     now_ms: i64,
 ) -> Vec<PeriodPoint> {
-    if !rows.is_empty() {
+    if !is_time_series(by) {
         return rows
             .iter()
             .map(|row| PeriodPoint {
@@ -145,7 +192,19 @@ pub fn chart_columns(
             })
             .collect();
     }
-    empty_periods(by, since, now_ms)
+    let mut points = empty_periods(by, since, now_ms);
+    for row in rows {
+        match points.iter_mut().find(|point| point.key == row.key) {
+            Some(point) => point.runs = row.runs,
+            None => points.push(PeriodPoint {
+                key: row.key.clone(),
+                runs: row.runs,
+            }),
+        }
+    }
+    // Day and week keys sort as text.
+    points.sort_by(|left, right| left.key.cmp(&right.key));
+    points
 }
 
 pub fn chart_bars(by: &str, since: &str, rows: &[DispatchStatsRow], now_ms: i64) -> Vec<ChartBar> {
@@ -175,6 +234,70 @@ pub fn chart_bars(by: &str, since: &str, rows: &[DispatchStatsRow], now_ms: i64)
             runs: point.runs,
         })
         .collect()
+}
+
+/// Above this many columns, a column's tick is cut short.
+const DENSE_COLUMNS: usize = 10;
+
+/// The ticks under a time chart's columns. Past ten columns a day keeps only its day of the
+/// month, with the month on the first column and where a month starts, and a week drops its
+/// year; their full names are in [`column_title`].
+pub fn column_ticks(bars: &[ChartBar]) -> Vec<String> {
+    let dense = bars.len() > DENSE_COLUMNS;
+    let mut month = None;
+    bars.iter()
+        .map(|bar| {
+            if let Some((_, m, d)) = date_parts(&bar.key) {
+                let starts = month != Some(m);
+                month = Some(m);
+                if dense && !starts {
+                    return d.to_string();
+                }
+                return bar.label.clone();
+            }
+            if let Some((_, week)) = week_parts(&bar.key) {
+                return format!("W{week}");
+            }
+            bar.label.clone()
+        })
+        .collect()
+}
+
+/// A column's full name and runs, for its tooltip: "Oct 21, 2026 · 3 runs".
+pub fn column_title(bar: &ChartBar) -> String {
+    let runs = if bar.runs == 1 {
+        "1 run".to_string()
+    } else {
+        format!("{} runs", bar.runs)
+    };
+    let name = if let Some((y, m, d)) = date_parts(&bar.key) {
+        format!("{} {d}, {y}", MONTHS[(m - 1) as usize])
+    } else if let Some((y, week)) = week_parts(&bar.key) {
+        format!("Week {week} of {y}")
+    } else {
+        bar.label.clone()
+    };
+    format!("{name} · {runs}")
+}
+
+/// A `YYYY-MM-DD` key's year, month, and day.
+fn date_parts(key: &str) -> Option<(i32, u32, u32)> {
+    let bytes = key.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return None;
+    }
+    let (y, m, d) = (
+        key[0..4].parse::<i32>().ok()?,
+        key[5..7].parse::<u32>().ok()?,
+        key[8..10].parse::<u32>().ok()?,
+    );
+    ((1..=12).contains(&m) && (1..=31).contains(&d)).then_some((y, m, d))
+}
+
+/// A `YYYY-Www` key's year and week.
+fn week_parts(key: &str) -> Option<(i32, u32)> {
+    let (year, week) = key.split_once("-W")?;
+    Some((year.parse().ok()?, week.parse().ok()?))
 }
 
 pub fn max_runs(values: impl IntoIterator<Item = i32>) -> i32 {
@@ -260,6 +383,9 @@ pub fn millis(value: Option<ProtoI64>) -> Option<f64> {
 /// The core's reason a ranking has no answer, in plain words.
 pub fn rank_reason(reason: &str) -> String {
     if let Some(needed) = minimum_samples(reason) {
+        if reason.trim_start().starts_with("needs two models") {
+            return format!("Needs two models with {needed} runs");
+        }
         return format!("Needs {needed} runs to rank");
     }
     let text = reason.trim();
@@ -293,6 +419,8 @@ pub fn most_used_detail(rank: &DispatchStatRank) -> String {
     plural(rank.runs, "run")
 }
 
+/// The core times only completed runs (the heading's tooltip says so); a card has room for
+/// little more than the figure.
 pub fn slowest_detail(rank: &DispatchStatRank) -> String {
     format!(
         "p50 {} over {}",
@@ -301,17 +429,22 @@ pub fn slowest_detail(rank: &DispatchStatRank) -> String {
     )
 }
 
+/// How many of the runs the model ended itself failed, read back from the success rate the
+/// core rounds to a tenth of a percent.
 pub fn most_failed_detail(rank: &DispatchStatRank) -> String {
-    if let Some(pct) = rank.success_pct {
-        format!(
-            "{} passed over {}",
-            format_pct(pct, 0),
-            plural(rank.runs, "run")
-        )
-    } else {
-        plural(rank.runs, "run")
+    match rank.success_pct {
+        Some(pct) if rank.runs > 0 => {
+            let passed = (rank.runs as f64 * pct / 100.0).round() as i64;
+            let failed = (rank.runs as i64 - passed).max(0);
+            format!("{failed} of {} failed", plural(rank.runs, "run"))
+        }
+        _ => plural(rank.runs, "run"),
     }
 }
+
+/// What each comparison ranking reads, for its card's tooltip.
+pub const SLOWEST_ABOUT: &str = "The median time of each model's completed runs, among models with at least 5. A model handed bigger tasks takes longer, so this reads your runs, not the model's speed.";
+pub const MOST_FAILED_ABOUT: &str = "Failed or timed-out runs, over the runs each model ended itself: cancels, orphans, and rate-limited ends are left out. Ranked by the failure rate's 95% lower bound, so a rate from few runs weighs less.";
 
 /// The breakdown table's columns, in order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -480,6 +613,31 @@ fn civil_from_days(mut z: i64) -> (i32, u32, u32) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn many_columns_cut_their_ticks_short_and_keep_full_titles() {
+        let bar = |key: &str, runs| super::ChartBar {
+            key: key.into(),
+            label: super::period_label(key),
+            runs,
+            fraction: 0.0,
+            color_index: 0,
+        };
+        let few = vec![bar("2026-10-30", 0), bar("2026-10-31", 1)];
+        assert_eq!(super::column_ticks(&few), ["Oct 30", "Oct 31"]);
+        let many: Vec<_> = (20..=31)
+            .map(|d| bar(&format!("2026-10-{d}"), 0))
+            .chain([bar("2026-11-01", 2)])
+            .collect();
+        let ticks = super::column_ticks(&many);
+        assert_eq!(ticks[0], "Oct 20");
+        assert_eq!(ticks[1], "21");
+        assert_eq!(ticks.last().unwrap(), "Nov 1");
+        assert_eq!(super::column_title(&many[12]), "Nov 1, 2026 · 2 runs");
+        let week = bar("2026-W45", 1);
+        assert_eq!(super::column_ticks(std::slice::from_ref(&week)), ["W45"]);
+        assert_eq!(super::column_title(&week), "Week 45 of 2026 · 1 run");
+    }
+
     use super::{
         STATS_COLUMNS, StatsColumn, bar_fraction, chart_bars, compact_lines, days_from_civil,
         display_key, empty_periods, format_duration_ms, format_pct, most_failed_detail,
@@ -528,6 +686,38 @@ mod tests {
         );
         assert_eq!(empty_periods("week", "all", now).len(), 8);
         assert!(empty_periods("model", "7d", now).is_empty());
+        assert_eq!(empty_periods("day", "14d", now).len(), 14);
+        assert_eq!(empty_periods("week", "12w", now).len(), 12);
+        assert_eq!(empty_periods("week", "4w", now).len(), 4);
+    }
+
+    #[test]
+    fn a_time_chart_spans_its_window_around_the_days_that_ran() {
+        let now = at(2026, 11, 1, 12, 0, 0);
+        let rows = vec![crate::client::DispatchStatsRow {
+            key: "2026-10-31".into(),
+            runs: 5,
+            ..crate::client::DispatchStatsRow::default()
+        }];
+        let week = super::chart_columns("day", "7d", &rows, now);
+        assert_eq!(week.len(), 7);
+        assert_eq!(week[5].key, "2026-10-31");
+        assert_eq!(week[5].runs, 5);
+        assert_eq!(super::chart_columns("day", "30d", &rows, now).len(), 30);
+        assert_eq!(super::chart_columns("model", "7d", &rows, now).len(), 1);
+    }
+
+    #[test]
+    fn each_grouping_offers_the_windows_that_fit_it() {
+        use super::{default_since, fitting_since, since_label, since_options};
+        assert_eq!(since_options("day")[1].0, "14d");
+        assert_eq!(since_options("week")[0].0, "4w");
+        assert_eq!(since_options("model").last().unwrap().0, "all");
+        assert_eq!(default_since("week"), "12w");
+        assert_eq!(fitting_since("week", "7d"), "12w");
+        assert_eq!(fitting_since("model", "30d"), "30d");
+        assert_eq!(fitting_since("day", "all"), "7d");
+        assert_eq!(since_label("12w"), "Last 12 weeks");
     }
 
     #[test]
@@ -580,7 +770,19 @@ mod tests {
             ..DispatchStatRank::default()
         }));
         assert_eq!(slowest_detail(&known), "p50 1.5s over 6 runs");
-        assert_eq!(most_failed_detail(&known), "66% passed over 4 runs");
+        assert_eq!(
+            most_failed_detail(&DispatchStatRank {
+                runs: 16,
+                success_pct: Some(93.8),
+                ..known.clone()
+            }),
+            "1 of 16 runs failed"
+        );
+        assert_eq!(
+            rank_reason("needs two models with enough runs (minimum 5)"),
+            "Needs two models with 5 runs"
+        );
+        assert_eq!(rank_reason("no failures in range"), "No failures in range");
         assert_eq!(
             most_failed_detail(&DispatchStatRank {
                 runs: 2,

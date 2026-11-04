@@ -9,45 +9,53 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, AppContext as _, Bounds, Context, CursorStyle, DispatchPhase, Entity, FontWeight,
-    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render,
-    SharedString, Window, canvas, div, point, prelude::*, px,
+    AnyElement, App, AppContext as _, Bounds, Context, CursorStyle, DispatchPhase, Entity,
+    FontWeight, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Render, SharedString, Window, canvas, deferred, div, point, prelude::*, px,
 };
 
 use crate::avatar::agent_avatar;
 use crate::client::{
-    BuildTiersRequest, CheckTiersRequest, ConfigRequest, CoreClient, CoreError, DispatchAgent,
-    DispatchTier, ListAgentsRequest, ListModelsRequest, ListTiersRequest, ReplaceTiersRequest,
-    SubagentsRequest,
+    BuildTiersRequest, CheckTiersRequest, CoreClient, CoreError, DispatchAgent, DispatchTier,
+    ListAgentsRequest, ListModelsRequest, ListTiersRequest, ReplaceTiersRequest, SubagentsRequest,
 };
 use crate::models::roles::{
     GENERAL_ROLE, PaletteModel, RoleDraft, RoleListRow, RoleProfile, RoleRow, RoleSource,
     RolesList, TIER_COLUMNS, TierBuild, TierCardInput, TierColumns, TierSlot, board_row_count,
-    classifier_from_config, compose_profile, is_build_empty, models_label, palette_card,
-    palette_groups, parse_roles_list, parse_tier_build, pick_note, place_tier_card,
-    profile_with_board, remove_tier_card, rename_drops_previous, role_board_tiers, role_list_rows,
-    role_name_error, tier_columns, tier_matches, toggle_name, when_display,
+    build_board, compose_profile, is_build_empty, models_label, palette_card, palette_groups,
+    parse_roles_list, parse_tier_build, place_tier_card, profile_error, profile_with_board,
+    remove_tier_card, rename_drops_previous, role_board_tiers, role_list_rows, role_models_prompt,
+    role_name_error, tier_columns, tier_matches, when_display,
 };
 use crate::motion::{Animator, SpringTier, SpringValue};
 use crate::state::{AppState, Route, ToastTone, observe};
 use crate::theme::{StatusTone, Theme, mix, tw};
 use crate::ui::ellipsis;
+use crate::ui::hang::hang;
 use crate::ui::parts::roles::{
-    build_sections, field_label, muted_note, order_mark, role_board_note, role_summary, tier_meter,
+    build_sections, muted_note, order_mark, role_board_note, role_summary, tier_meter,
 };
-use crate::ui::patterns::{composer_actions, composer_card, modal_layer};
+use crate::ui::patterns::{
+    Property, PropertyOption, PropertyPills, PropertyPillsEvent, composer_card, composer_field,
+    composer_footer, modal_layer, window_layer,
+};
 use crate::ui::{
-    Button, ButtonKind, ButtonSize, Column, DataTable, Icon, IconTile, MascotMood, PointerTiming,
-    RadioOption, Switch, TextInput, TileTone, button, card, chip, drop, fade_text, icon,
-    icon_button, icon_colored, mono, page_content, page_empty, page_inner_height, primary_cell,
-    radio_group, sans, switch_row, tabular, text_width, toolbar, track, use_pointer_timed,
+    Button, ButtonKind, ButtonSize, Column, DataTable, Edge, Icon, IconTile, MascotMood, Menu,
+    MenuItem, PointerTiming, TextInput, TileTone, button, card, chip, control_drop, drop, edge,
+    face, fade_text, floating_panel, icon_button, icon_colored, mono, page_content, page_empty,
+    page_under, page_under_inset, primary_cell, sans, tabular, text_width, toolbar, toolbar_center,
+    track, use_pointer_timed, wrap_text,
 };
+use crate::ui::{SkeletonLayout, list_skeleton, page_skeleton};
 
 /// The list's `PageContent` scroll, and a board's.
 const ROLES_PAGE: &str = "roles-page";
 const ROLES_BOARD: &str = "roles-board";
 /// `DispatchAgentAvatar`'s default size.
 const AVATAR: f32 = 28.0;
+/// `TierModelPalette`: its popover's width and its tallest.
+const PALETTE_WIDTH: f32 = 360.0;
+const PALETTE_MAX_H: f32 = 360.0;
 /// The board grid's order column and its gap (`72px repeat(3, minmax(0, 1fr))`, `gap: 10px`).
 const ORDER_W: f32 = 72.0;
 const GAP: f32 = 10.0;
@@ -77,21 +85,23 @@ struct PointerDrag {
     pointer: (f32, f32),
 }
 
+/// What the page draws: answered at once, so it waits on no agent CLI.
 struct LoadBundle {
     tiers: Result<Vec<DispatchTier>, String>,
-    problems: Result<Vec<String>, String>,
     roles: Result<RolesList, String>,
-    classifier: Result<String, String>,
-    agents: Result<Vec<String>, String>,
+}
+
+/// What can come after: the tier check asks the agent CLIs for their models, and the agents'
+/// list probes their quota, either of which can take seconds when the core's copy is stale.
+struct Extras {
+    problems: Result<Vec<String>, String>,
+    agents: Vec<String>,
 }
 
 pub struct RolesView {
     state: Entity<AppState>,
     roles: Vec<RoleRow>,
     builtin: Vec<String>,
-    pick: bool,
-    pick_inflight: Option<bool>,
-    classifier: String,
     tiers: Vec<DispatchTier>,
     tier_problems: Vec<String>,
     agents: Vec<String>,
@@ -109,7 +119,8 @@ pub struct RolesView {
     instructions_input: Entity<TextInput>,
     when_input: Entity<TextInput>,
     timeout_input: Entity<TextInput>,
-    pick_switch: Entity<Switch>,
+    /// The Composer's Lowest tier, Access, Picked, Prefer, and Avoid pills.
+    pills: Entity<PropertyPills>,
     /// `None` is closed, `Some("")` is a new role, otherwise the name being edited.
     composer: Option<String>,
     draft_tier: usize,
@@ -122,6 +133,10 @@ pub struct RolesView {
     build_loading: bool,
     build_applying: bool,
     build_gen: u64,
+    /// The board the open proposal is for (General's name for the tier table), and who ranked it.
+    build_role: String,
+    build_judge: String,
+    build_menu: Entity<Menu>,
     drag: Option<PointerDrag>,
     motion_for: Option<String>,
     row_hover: HashMap<String, SpringValue>,
@@ -142,6 +157,8 @@ pub struct RolesView {
     loading: bool,
     visit: bool,
     loaded: bool,
+    /// A save is on its way: a second press waits for it.
+    saving: bool,
     announced_error: bool,
 }
 
@@ -153,12 +170,13 @@ impl RolesView {
             .detach();
 
         let tier_search = cx.new(|cx| TextInput::new(cx).placeholder("Search tiers…"));
-        let palette_search = cx.new(|cx| TextInput::new(cx).placeholder("Search models…"));
-        let custom_agent = cx.new(|cx| TextInput::new(cx).placeholder("Agent"));
+        let palette_search = cx.new(|cx| TextInput::new(cx).pill().placeholder("Search models…"));
+        let custom_agent = cx.new(|cx| TextInput::new(cx).bare().placeholder("Agent"));
         let custom_model = {
             let view = view.clone();
             cx.new(move |cx| {
                 TextInput::new(cx)
+                    .bare()
                     .placeholder("Model")
                     .on_submit(move |_, _, cx| {
                         view.update(cx, |this, cx| this.add_custom(cx));
@@ -170,6 +188,8 @@ impl RolesView {
             let cancel = view.clone();
             cx.new(move |cx| {
                 TextInput::new(cx)
+                    .bare()
+                    .title()
                     .placeholder("Name, such as reviewer")
                     .on_submit(move |_, _, cx| {
                         submit.update(cx, |this, cx| this.submit_composer(cx));
@@ -184,6 +204,7 @@ impl RolesView {
             let cancel = view.clone();
             cx.new(move |cx| {
                 TextInput::new(cx)
+                    .description()
                     .placeholder("Instructions put before every task it takes")
                     .on_submit(move |_, _, cx| {
                         submit.update(cx, |this, cx| this.submit_composer(cx));
@@ -197,6 +218,7 @@ impl RolesView {
             let cancel = view.clone();
             cx.new(move |cx| {
                 TextInput::new(cx)
+                    .inline()
                     .placeholder("The tasks it fits, for the classifier that picks it")
                     .on_cancel(move |_, cx| {
                         cancel.update(cx, |this, cx| this.close_composer(cx));
@@ -207,20 +229,18 @@ impl RolesView {
             let cancel = view.clone();
             cx.new(move |cx| {
                 TextInput::new(cx)
+                    .inline()
                     .placeholder("Such as 15m; empty uses the default")
                     .on_cancel(move |_, cx| {
                         cancel.update(cx, |this, cx| this.close_composer(cx));
                     })
             })
         };
-        let pick_switch = {
-            let view = view.clone();
-            cx.new(move |cx| {
-                Switch::new(true, cx).on_change(move |on, _, cx| {
-                    view.update(cx, |this, cx| this.write_pick(on, cx));
-                })
-            })
-        };
+        let pills = cx.new(PropertyPills::new);
+        cx.subscribe(&pills, |this, _, event: &PropertyPillsEvent, cx| {
+            this.on_property(event, cx);
+        })
+        .detach();
 
         let tier_watch = tier_search.clone();
         cx.observe(&tier_watch, |this, input, cx| {
@@ -249,9 +269,6 @@ impl RolesView {
             state,
             roles: Vec::new(),
             builtin: Vec::new(),
-            pick: true,
-            pick_inflight: None,
-            classifier: String::new(),
             tiers: Vec::new(),
             tier_problems: Vec::new(),
             agents: Vec::new(),
@@ -269,7 +286,7 @@ impl RolesView {
             instructions_input,
             when_input,
             timeout_input,
-            pick_switch,
+            pills,
             composer: None,
             draft_tier: 0,
             draft_readonly: false,
@@ -281,6 +298,9 @@ impl RolesView {
             build_loading: false,
             build_applying: false,
             build_gen: 0,
+            build_role: GENERAL_ROLE.to_string(),
+            build_judge: String::new(),
+            build_menu: cx.new(Menu::new),
             drag: None,
             motion_for: None,
             row_hover: HashMap::new(),
@@ -301,6 +321,7 @@ impl RolesView {
             loading: false,
             visit: false,
             loaded: false,
+            saving: false,
             announced_error: false,
         }
     }
@@ -325,14 +346,30 @@ impl RolesView {
         self.loading = true;
         let generation = self.bump_fetch();
         cx.spawn(async move |this, cx| {
-            let bundle = cx.background_spawn(async move { load_all(&client) }).await;
+            let first = client.clone();
+            let bundle = cx.background_spawn(async move { load_all(&first) }).await;
+            let current = this
+                .update(cx, |view, cx| {
+                    if view.fetch_gen != generation {
+                        view.loading = false;
+                        return false;
+                    }
+                    view.apply_load(bundle, cx);
+                    cx.notify();
+                    true
+                })
+                .unwrap_or(false);
+            if !current {
+                return;
+            }
+            let extras = cx
+                .background_spawn(async move { load_extras(&client) })
+                .await;
             let _ = this.update(cx, |view, cx| {
-                if view.fetch_gen != generation {
-                    view.loading = false;
-                    return;
+                if view.fetch_gen == generation {
+                    view.apply_extras(extras);
+                    cx.notify();
                 }
-                view.apply_load(bundle, cx);
-                cx.notify();
             });
         })
         .detach();
@@ -353,32 +390,29 @@ impl RolesView {
         } else if let Err(message) = bundle.tiers {
             self.note_error(message, cx);
         }
-        if let Ok(problems) = bundle.problems {
-            self.tier_problems = problems;
-        }
         if let Ok(list) = bundle.roles {
             self.roles = list.rows;
             self.builtin = list.builtin;
-            if self.pick_inflight.is_none() {
-                self.pick = list.pick;
-            }
             roles_ok = true;
             self.loaded = true;
             self.bounce_missing(cx);
         } else if let Err(message) = bundle.roles {
             self.note_error(message, cx);
         }
-        if let Ok(classifier) = bundle.classifier {
-            self.classifier = classifier;
-        }
-        if let Ok(agents) = bundle.agents {
-            self.agents = agents;
-        }
         if roles_ok && tiers_ok {
             self.visit = true;
             self.announced_error = false;
         } else {
             self.visit = false;
+        }
+    }
+
+    fn apply_extras(&mut self, extras: Extras) {
+        if let Ok(problems) = extras.problems {
+            self.tier_problems = problems;
+        }
+        if !extras.agents.is_empty() {
+            self.agents = extras.agents;
         }
     }
 
@@ -444,65 +478,6 @@ impl RolesView {
                 .unwrap_or_default(),
             None => Vec::new(),
         }
-    }
-
-    fn write_pick(&mut self, on: bool, cx: &mut Context<Self>) {
-        let Some(client) = self.state.read(cx).client() else {
-            self.toast("The local core is not running.", ToastTone::Danger, cx);
-            let switch = self.pick_switch.clone();
-            let view = cx.entity().clone();
-            self.pick_inflight = Some(on);
-            cx.defer(move |app| {
-                view.update(app, |this, cx| {
-                    switch.update(cx, |toggle, _| toggle.set_on(!on));
-                    this.pick_inflight = None;
-                    cx.notify();
-                });
-            });
-            return;
-        };
-        self.pick_inflight = Some(on);
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_spawn(async move {
-                    client.config(&ConfigRequest {
-                        action: "set".into(),
-                        key: "roles".into(),
-                        values: vec![if on { "true".into() } else { "false".into() }],
-                        ..Default::default()
-                    })
-                })
-                .await;
-            let _ = this.update(cx, |view, cx| {
-                match result {
-                    Ok(response) if response.ok => view.pick = on,
-                    Ok(response) => {
-                        view.force_switch(!on, cx);
-                        let message = if response.json.is_empty() {
-                            "Could not save the setting.".to_string()
-                        } else {
-                            response.json
-                        };
-                        view.toast(message, ToastTone::Danger, cx);
-                    }
-                    Err(err) => {
-                        view.force_switch(!on, cx);
-                        view.toast(
-                            core_message(err, "Could not save the setting."),
-                            ToastTone::Danger,
-                            cx,
-                        );
-                    }
-                }
-                view.pick_inflight = None;
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    fn force_switch(&self, on: bool, cx: &mut Context<Self>) {
-        self.pick_switch.update(cx, |toggle, _| toggle.set_on(on));
     }
 
     fn commit_board(&mut self, next: Vec<DispatchTier>, cx: &mut Context<Self>) {
@@ -646,7 +621,7 @@ impl RolesView {
         .detach();
     }
 
-    fn open_composer(&mut self, name: Option<&str>, cx: &mut Context<Self>) {
+    pub(crate) fn open_composer(&mut self, name: Option<&str>, cx: &mut Context<Self>) {
         let row = name
             .and_then(|name| self.roles.iter().find(|row| row.name == name))
             .cloned();
@@ -677,6 +652,139 @@ impl RolesView {
             .update(cx, |input, cx| input.set_text(when, cx));
         self.timeout_input
             .update(cx, |input, cx| input.set_text(timeout, cx));
+        let properties = self.role_properties();
+        self.pills
+            .update(cx, |pills, cx| pills.set_properties(properties, cx));
+        cx.notify();
+    }
+
+    /// The pills again from the draft, after a change one pill made to another.
+    fn refresh_pills(&mut self, cx: &mut Context<Self>) {
+        let properties = self.role_properties();
+        self.pills
+            .update(cx, |pills, cx| pills.set_properties(properties, cx));
+    }
+
+    /// Fills the draft's Prefer and Avoid (the screenshot tour).
+    pub(crate) fn draft_tokens(&mut self, prefer: &[&str], avoid: &[&str], cx: &mut Context<Self>) {
+        let owned = |list: &[&str]| list.iter().map(|name| name.to_string()).collect();
+        self.draft_prefer = owned(prefer);
+        self.draft_avoid = owned(avoid);
+        let properties = self.role_properties();
+        self.pills
+            .update(cx, |pills, cx| pills.set_properties(properties, cx));
+        cx.notify();
+    }
+
+    /// Opens the picker of the Composer's pill `index` (the screenshot tour).
+    pub(crate) fn open_pill(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.pills
+            .update(cx, |pills, cx| pills.toggle(index, window, cx));
+        cx.notify();
+    }
+
+    /// The Composer's pills from the draft, as the Solid roles page lists them.
+    fn role_properties(&self) -> Vec<Property> {
+        let options = |pairs: &[(&'static str, &'static str)]| -> Vec<PropertyOption> {
+            pairs
+                .iter()
+                .map(|(value, label)| PropertyOption::new(*value, *label))
+                .collect()
+        };
+        let agents: Vec<PropertyOption> = self
+            .agents
+            .iter()
+            .map(|name| {
+                let agent = name.clone();
+                PropertyOption::new(name.clone(), name.clone())
+                    .mark(move |size, _, _| agent_avatar(&agent, "", size).into_any_element())
+            })
+            .collect();
+        let names = |list: &[String]| -> Vec<SharedString> {
+            list.iter()
+                .map(|name| SharedString::from(name.clone()))
+                .collect()
+        };
+        vec![
+            Property::single(
+                "tier",
+                "Lowest tier",
+                options(&[
+                    ("", "Any tier"),
+                    ("easy", "Easy"),
+                    ("normal", "Normal"),
+                    ("hard", "Hard"),
+                ]),
+                ["", "easy", "normal", "hard"][self.draft_tier.min(3)],
+            )
+            .icon(Icon::Layers),
+            Property::single(
+                "access",
+                "Access",
+                vec![
+                    PropertyOption::new("edit", "Can change files").icon(Icon::Pencil),
+                    PropertyOption::new("readonly", "Read only").icon(Icon::Eye),
+                ],
+                if self.draft_readonly {
+                    "readonly"
+                } else {
+                    "edit"
+                },
+            ),
+            Property::single(
+                "pick",
+                "Picked",
+                vec![
+                    PropertyOption::new("auto", "Picked automatically").icon(Icon::Zap),
+                    PropertyOption::new("manual", "Only with --role").icon(Icon::Terminal),
+                ],
+                if self.draft_manual { "manual" } else { "auto" },
+            ),
+            Property::tokens(
+                "prefer",
+                "Prefer",
+                agents.clone(),
+                names(&self.draft_prefer),
+                "None",
+            )
+            .icon(Icon::ThumbsUpIcon),
+            Property::tokens("avoid", "Avoid", agents, names(&self.draft_avoid), "None")
+                .icon(Icon::ThumbsDownIcon),
+        ]
+    }
+
+    /// A pill changed: the draft takes its values.
+    fn on_property(&mut self, event: &PropertyPillsEvent, cx: &mut Context<Self>) {
+        let PropertyPillsEvent::Changed { id, values } = event;
+        let first = values.first().map(|value| value.as_ref()).unwrap_or("");
+        let names = || values.iter().map(|value| value.to_string()).collect();
+        match id.as_ref() {
+            "tier" => {
+                self.draft_tier = match first {
+                    "easy" => 1,
+                    "normal" => 2,
+                    "hard" => 3,
+                    _ => 0,
+                }
+            }
+            "access" => self.draft_readonly = first == "readonly",
+            "pick" => self.draft_manual = first == "manual",
+            // An agent is preferred or avoided, never both: picking it in one list takes it
+            // out of the other.
+            "prefer" => {
+                self.draft_prefer = names();
+                let prefer = self.draft_prefer.clone();
+                self.draft_avoid.retain(|agent| !prefer.contains(agent));
+                self.refresh_pills(cx);
+            }
+            "avoid" => {
+                self.draft_avoid = names();
+                let avoid = self.draft_avoid.clone();
+                self.draft_prefer.retain(|agent| !avoid.contains(agent));
+                self.refresh_pills(cx);
+            }
+            _ => {}
+        }
         cx.notify();
     }
 
@@ -719,6 +827,13 @@ impl RolesView {
             .map(|row| row.source)
             .unwrap_or(RoleSource::User);
         let profile = compose_profile(existing.as_ref().map(|row| &row.profile), &draft);
+        if let Some(error) = profile_error(&profile) {
+            self.toast(error, ToastTone::Danger, cx);
+            return;
+        }
+        if self.saving {
+            return;
+        }
         let profile_json = serde_json::to_string(&profile).unwrap_or_else(|_| "{}".to_string());
         let drops = rename_drops_previous(&previous, &name, source);
         let Some(client) = self.state.read(cx).client() else {
@@ -731,6 +846,7 @@ impl RolesView {
             let old = previous.clone();
             self.roles.retain(|row| row.name != old);
         }
+        self.saving = true;
         let generation = self.bump_fetch();
         let saved_name = name.clone();
         let drop_name = previous.clone();
@@ -747,6 +863,7 @@ impl RolesView {
                 })
                 .await;
             let _ = this.update(cx, |view, cx| {
+                view.saving = false;
                 match result {
                     Ok(list) => {
                         if view.fetch_gen == generation {
@@ -859,11 +976,23 @@ impl RolesView {
         .detach();
     }
 
-    fn open_build(&mut self, cx: &mut Context<Self>) {
+    /// Proposes `role`'s board (General's name for the tier table), ranked by the catalog or,
+    /// with `judge` "jev", by Jev.
+    fn open_build(&mut self, role: &str, judge: &str, cx: &mut Context<Self>) {
         let Some(client) = self.state.read(cx).client() else {
             self.toast("The local core is not running.", ToastTone::Danger, cx);
             return;
         };
+        self.build_role = role.to_string();
+        self.build_judge = judge.to_string();
+        let (role, judge) = (
+            if role == GENERAL_ROLE {
+                String::new()
+            } else {
+                role.to_string()
+            },
+            judge.to_string(),
+        );
         self.build_open = true;
         self.build = None;
         self.build_loading = true;
@@ -873,7 +1002,7 @@ impl RolesView {
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
-                .background_spawn(async move { run_build(&client, false) })
+                .background_spawn(async move { run_build(&client, false, &role, &judge) })
                 .await;
             let _ = this.update(cx, |view, cx| {
                 if view.build_gen != token {
@@ -897,6 +1026,22 @@ impl RolesView {
         if self.build.as_ref().is_none_or(is_build_empty) {
             return;
         }
+        // A role's board, or a table Jev ranked, is saved as shown: asking again could answer
+        // otherwise.
+        if self.build_role != GENERAL_ROLE || !self.build_judge.is_empty() {
+            let Some(next) = self.build.as_ref().map(build_board) else {
+                return;
+            };
+            let role = self.build_role.clone();
+            self.build_open = false;
+            if role == GENERAL_ROLE {
+                self.save_tiers(next, cx);
+            } else {
+                self.save_role_board(role, next, cx);
+            }
+            cx.notify();
+            return;
+        }
         let Some(client) = self.state.read(cx).client() else {
             self.toast("The local core is not running.", ToastTone::Danger, cx);
             return;
@@ -907,7 +1052,7 @@ impl RolesView {
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
-                .background_spawn(async move { run_build(&client, true) })
+                .background_spawn(async move { run_build(&client, true, "", "") })
                 .await;
             let _ = this.update(cx, |view, cx| {
                 if view.build_gen != token {
@@ -977,6 +1122,18 @@ impl RolesView {
             });
         })
         .detach();
+    }
+
+    /// Opens the model palette from tier `tier`'s cell `index` (the screenshot tour).
+    pub(crate) fn open_palette(&mut self, tier: &str, index: usize, cx: &mut Context<Self>) {
+        self.palette_slot = None;
+        self.toggle_palette(
+            TierSlot {
+                tier: tier.to_string(),
+                index,
+            },
+            cx,
+        );
     }
 
     fn toggle_palette(&mut self, slot: TierSlot, cx: &mut Context<Self>) {
@@ -1158,14 +1315,6 @@ impl RolesView {
             self.drag = None;
             self.palette_slot = None;
         }
-        if self.pick_inflight.is_none() {
-            let pick = self.pick;
-            self.pick_switch.update(cx, |toggle, _| {
-                if toggle.is_on() != pick {
-                    toggle.set_on(pick);
-                }
-            });
-        }
         let composer_on = self.composer.is_some();
         self.composer_opacity
             .set_target(if composer_on { 1.0 } else { 0.0 });
@@ -1297,102 +1446,207 @@ impl RolesView {
         let theme = *Theme::global(cx);
         let route = self.state.read(cx).route().clone();
         let view = cx.entity().clone();
-        let start = match &route {
-            Route::RoleBoard(name) => {
-                let title = if name == GENERAL_ROLE {
-                    "General".to_string()
-                } else {
-                    name.clone()
-                };
-                let general = name == GENERAL_ROLE;
-                let editable = self.editable(cx);
+        let board = match &route {
+            Route::RoleBoard(name) => Some(name.clone()),
+            _ => None,
+        };
+        let start = match &board {
+            Some(_) => {
                 let back_state = self.state.clone();
-                let build_view = view.clone();
-                let edit_view = view.clone();
+                Button::new("roles-back", ButtonKind::Secondary)
+                    .size(ButtonSize::Icon)
+                    .icon(Icon::Back)
+                    .tooltip("Back")
+                    .on_click(move |_, cx| {
+                        back_state.update(cx, |state, cx| {
+                            state.navigate(Route::Roles);
+                            cx.notify();
+                        });
+                    })
+                    .into_any_element()
+            }
+            None => div().into_any_element(),
+        };
+        let end = match &board {
+            Some(name) => {
+                // The tier search, then the button that proposes this board's models, at the
+                // toolbar's right edge. A repository's role is edited in its file.
+                let editable = name == GENERAL_ROLE || self.editable(cx);
+                let menu_view = view.clone();
                 div()
                     .flex()
                     .items_center()
                     .gap(px(theme.space_2))
-                    .child(
-                        Button::new("roles-back", ButtonKind::Secondary)
-                            .size(ButtonSize::Icon)
-                            .icon(Icon::Back)
-                            .tooltip("Back")
-                            .on_click(move |_, cx| {
-                                back_state.update(cx, |state, cx| {
-                                    state.navigate(Route::Roles);
-                                    cx.notify();
-                                });
-                            }),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(theme.font_size_md))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.color_text_primary)
-                            .child(title),
-                    )
-                    .when(general, |row| {
+                    .child(div().w(px(220.0)).child(self.tier_search.clone()))
+                    .when(editable, |row| {
                         row.child(
                             Button::new("roles-build", ButtonKind::Secondary)
-                                .size(ButtonSize::Sm)
-                                .pill()
+                                .size(ButtonSize::Icon)
                                 .icon(Icon::AiBrain01Icon)
-                                .label("Build from model")
+                                .tooltip("Pick models")
+                                .selected(self.build_menu.read(cx).is_open())
                                 .on_click(move |_, cx| {
-                                    build_view.update(cx, |this, cx| this.open_build(cx));
-                                }),
-                        )
-                    })
-                    .when(!general && editable, |row| {
-                        row.child(
-                            Button::new("roles-edit", ButtonKind::Secondary)
-                                .size(ButtonSize::Sm)
-                                .pill()
-                                .label("Edit role")
-                                .on_click(move |_, cx| {
-                                    edit_view.update(cx, |this, cx| {
-                                        let name = this.board_name(cx);
-                                        if let Some(name) = name {
-                                            this.open_composer(Some(&name), cx);
-                                        }
-                                    });
+                                    menu_view.update(cx, |this, cx| this.toggle_build_menu(cx));
                                 }),
                         )
                     })
                     .into_any_element()
             }
-            _ => {
-                let new_view = view.clone();
-                Button::new("roles-new", ButtonKind::Secondary)
-                    .size(ButtonSize::Sm)
-                    .pill()
-                    .icon(Icon::Bot)
-                    .label("New role")
-                    .on_click(move |_, cx| {
-                        new_view.update(cx, |this, cx| this.open_composer(None, cx));
-                    })
-                    .into_any_element()
-            }
+            None => Button::new("roles-new", ButtonKind::Secondary)
+                .size(ButtonSize::Icon)
+                .icon(Icon::Plus)
+                .tooltip("New role")
+                .on_click(move |_, cx| {
+                    view.update(cx, |this, cx| this.open_composer(None, cx));
+                })
+                .into_any_element(),
         };
-        let end = if matches!(&route, Route::RoleBoard(name) if name == GENERAL_ROLE) {
-            div()
-                .w(px(220.0))
-                .child(self.tier_search.clone())
-                .into_any_element()
-        } else {
-            div().into_any_element()
+        let Some(name) = board else {
+            return toolbar(start, end, cx).into_any_element();
         };
-        toolbar(start, end, cx).into_any_element()
+        toolbar_center(start, self.role_button(&name, cx), end, cx).into_any_element()
     }
 
-    fn loading_body(theme: &Theme) -> AnyElement {
+    /// The models button's menu: the catalog's pick, Jev's, or a prompt for an agent.
+    fn toggle_build_menu(&mut self, cx: &mut Context<Self>) {
+        let Some(name) = self.board_name(cx) else {
+            return;
+        };
+        let weak = cx.weak_entity();
+        let item =
+            |label: &str, icon: Icon, run: Rc<dyn Fn(&mut RolesView, &mut Context<RolesView>)>| {
+                let weak = weak.clone();
+                MenuItem::action(
+                    label.to_string(),
+                    Some(icon),
+                    Rc::new(move |_: &mut Window, cx: &mut App| {
+                        let run = run.clone();
+                        let _ = weak.update(cx, |this, cx| run(this, cx));
+                    }),
+                )
+            };
+        let (catalog, jev, prompt) = (name.clone(), name.clone(), name);
+        let items = vec![
+            item(
+                "From the catalog",
+                Icon::LibraryBig,
+                Rc::new(move |this, cx| this.open_build(&catalog, "", cx)),
+            ),
+            item(
+                "Ask Jev",
+                Icon::AiBrain01Icon,
+                Rc::new(move |this, cx| this.open_build(&jev, "jev", cx)),
+            ),
+            MenuItem::Separator,
+            item(
+                "Copy a prompt for an agent",
+                Icon::Copy,
+                Rc::new(move |this, cx| this.copy_models_prompt(&prompt, cx)),
+            ),
+        ];
+        let open = !self.build_menu.read(cx).is_open();
+        self.build_menu.update(cx, |menu, cx| {
+            menu.set_menu(items);
+            menu.set_width(232.0);
+            menu.set_open(open);
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    /// Puts a prompt on the clipboard that has a coding agent pick `name`'s models and save
+    /// them with the CLI.
+    fn copy_models_prompt(&mut self, name: &str, cx: &mut Context<Self>) {
+        let profile = self
+            .role_row(name)
+            .map(|row| row.profile.clone())
+            .unwrap_or_default();
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(role_models_prompt(
+            name, &profile,
+        )));
+        let whose = if name == GENERAL_ROLE {
+            "the tier table".to_string()
+        } else {
+            format!("{name}'s board")
+        };
+        self.toast(
+            format!("Copied a prompt that has an agent pick {whose}."),
+            ToastTone::Success,
+            cx,
+        );
+    }
+
+    /// The proposal's title: whose board, and who ranked it.
+    fn build_title(&self) -> String {
+        let general = self.build_role == GENERAL_ROLE;
+        match (general, self.build_judge.as_str()) {
+            (true, "jev") => "Tiers Jev picks".to_string(),
+            (true, _) => "Build tiers from the model".to_string(),
+            (false, "jev") => format!("{}'s board, as Jev picks it", self.build_role),
+            (false, _) => format!("{}'s board from the catalog", self.build_role),
+        }
+    }
+
+    /// The board's role at the toolbar's middle: its tile and name, opening its Composer, the
+    /// way the role is edited. General, the tier table, and a repository's role are shown,
+    /// not opened.
+    fn role_button(&self, name: &str, cx: &mut Context<Self>) -> AnyElement {
+        let general = name == GENERAL_ROLE;
+        let editable = !general && self.editable(cx);
+        let label = if general {
+            "General".to_string()
+        } else {
+            name.to_string()
+        };
+        let tile = IconTile::new(Icon::Bot).size(20.0, 12.0).tone(if general {
+            TileTone::Neutral
+        } else {
+            TileTone::Execution
+        });
+        let tip = if general {
+            "The tier table every role falls back on"
+        } else if editable {
+            "Edit role"
+        } else {
+            "In the repository's .dispatch/roles.json"
+        };
+        let view = cx.entity().clone();
+        let target = name.to_string();
+        let mut button = Button::new("roles-role", ButtonKind::Secondary)
+            .size(ButtonSize::Sm)
+            .pill()
+            .pad_x(5.0)
+            .leading(tile)
+            .label(label)
+            .tooltip(tip);
+        if editable {
+            button = button
+                .trailing(icon_colored(
+                    Icon::ChevronDown,
+                    12.0,
+                    Theme::global(cx).color_text_muted,
+                ))
+                .on_click(move |_, cx| {
+                    view.update(cx, |this, cx| this.open_composer(Some(&target), cx));
+                });
+        }
+        button.into_any_element()
+    }
+
+    /// The roles table, or a role's board, in bones until the roles load.
+    fn loading_body(board: bool, theme: &Theme) -> AnyElement {
+        let layout = if board {
+            SkeletonLayout::Canvas
+        } else {
+            SkeletonLayout::Table
+        };
         div()
             .flex_1()
+            .min_h(px(0.0))
             .flex()
-            .items_center()
-            .justify_center()
-            .child(muted_note("Loading roles…", theme))
+            .flex_col()
+            .px(px(theme.space_2))
+            .child(page_skeleton(layout).without_toolbar())
             .into_any_element()
     }
 
@@ -1415,11 +1669,17 @@ impl RolesView {
             Route::RoleBoard(name) => {
                 let row = self.roles.iter().find(|row| row.name == name).cloned()?;
                 let repository = row.source == RoleSource::Repository;
+                // The role's own details open from its name in the toolbar; a repository's
+                // role, which is not edited here, keeps them on the page.
+                let query = self.tier_query.clone();
                 Some(
                     column
-                        .child(role_summary(&row.profile, row.source, &theme, cx))
-                        .child(role_board_note(repository, &theme))
-                        .child(self.board(!repository, "", window, cx)),
+                        .when(repository, |column| {
+                            column
+                                .child(role_summary(&row.profile, row.source, &theme, cx))
+                                .child(role_board_note(&theme))
+                        })
+                        .child(self.board(!repository, &query, window, cx)),
                 )
             }
             _ => None,
@@ -1436,9 +1696,9 @@ impl RolesView {
             "roles-table",
             vec![
                 Column::new("Role").fixed(),
-                Column::new("When to use").fixed(),
-                Column::new("Tier"),
-                Column::new("Access"),
+                Column::new("When to use").fixed().shrinks(),
+                Column::new("Tier").shrinks(),
+                Column::new("Access").shrinks(),
                 Column::new("Models").end(),
                 Column::new("Source"),
             ],
@@ -1526,42 +1786,15 @@ impl RolesView {
             });
         })
         .empty("No roles");
-        // `.pw-data-table-root` is at least `calc(100% - 44px)` of `PageContent`, so the page
-        // scrolls by the card's height.
-        let table_height = page_inner_height(ROLES_PAGE, tw(4.0), window, cx);
+        // The table runs up under the toolbar, which fades it out on its trail.
+        let top = page_under_inset(ROLES_PAGE, false, theme.space_2, window, cx);
         div()
+            .flex_1()
+            .min_h(px(0.0))
             .flex()
             .flex_col()
-            .gap(px(tw(4.0)))
-            .child(self.pick_card(window, cx))
-            .child(div().h(px(table_height)).child(table))
+            .child(table.inset_top(top).fades(theme.color_surface))
             .text_color(theme.color_text_primary)
-    }
-
-    /// The `Card` with the `SwitchRow` and its note (`flex-col gap-1 px-4 py-3`).
-    fn pick_card(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
-        let theme = *Theme::global(cx);
-        card(cx)
-            .flex_none()
-            .px(px(tw(4.0)))
-            .py(px(tw(3.0)))
-            .flex()
-            .flex_col()
-            .gap(px(tw(1.0)))
-            .child(switch_row(
-                "roles-pick",
-                "Pick a role for Auto runs",
-                &self.pick_switch,
-                window,
-                cx,
-            ))
-            .child(
-                div()
-                    .text_size(px(12.0))
-                    .line_height(px(18.0))
-                    .text_color(theme.color_text_muted)
-                    .child(pick_note(&self.classifier)),
-            )
     }
 
     fn problems_card(&self, theme: &Theme, cx: &Context<Self>) -> gpui::Div {
@@ -1949,23 +2182,24 @@ impl RolesView {
             .child(body)
     }
 
-    fn palette_layer(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
+    /// `TierModelPalette` in its 360px popover from the Add model cell: the search pill, the
+    /// models grouped by agent (and the agents' problems after them) in one scroll at most
+    /// 360px tall, and the custom Agent / Model pair under a rule. It hangs under its cell,
+    /// or over it when the window has no room below, and draws above the page's clip.
+    fn palette_layer(
+        &self,
+        theme: &Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let t = self.palette_opacity.value();
-        let anchor = self.palette_anchor.clone();
-        let bounds = anchor.as_ref().and_then(|slot| {
+        let Some(bounds) = self.palette_anchor.as_ref().and_then(|slot| {
             self.cell_bounds
                 .borrow()
                 .get(&(slot.tier.clone(), slot.index))
                 .copied()
-        });
-        let (origin_x, origin_y) = *self.page_origin.borrow();
-        let (left, top) = if let Some(bounds) = bounds {
-            (
-                f32::from(bounds.left()) - origin_x,
-                f32::from(bounds.bottom()) - origin_y + 4.0 + self.palette_y.value(),
-            )
-        } else {
-            (0.0, 0.0)
+        }) else {
+            return div().into_any_element();
         };
         let groups = palette_groups(&self.palette_models, &self.palette_query);
         let view = cx.entity().clone();
@@ -1976,13 +2210,14 @@ impl RolesView {
             .overflow_y_scroll()
             .flex()
             .flex_col()
-            .gap(px(theme.space_2))
-            .p(px(theme.space_2));
+            .gap(px(theme.space_2));
         if self.palette_loading {
-            list = list.child(muted_note(
-                "Asking the installed agents for their models…",
-                theme,
-            ));
+            // The installed agents are asked for their models: their rows, in bones.
+            list = list.child(
+                div()
+                    .p(px(theme.space_2))
+                    .child(list_skeleton(5, 18.0, window, cx)),
+            );
         } else if groups.is_empty() {
             let (empty, mood) = if self.palette_query.trim().is_empty() {
                 ("No models listed", MascotMood::Sleeping)
@@ -1992,10 +2227,10 @@ impl RolesView {
             list = list.child(page_empty(empty, mood, cx));
         } else {
             for (agent, models) in groups {
-                list = list.child(
+                let mut group = div().flex().flex_col().gap(px(theme.space_1)).child(
                     div()
                         .px(px(theme.space_1))
-                        .text_size(px(theme.font_size_xs))
+                        .text_size(px(11.0))
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(theme.color_text_muted)
                         .child(agent),
@@ -2008,19 +2243,20 @@ impl RolesView {
                         .filter(|part| !part.is_empty())
                         .collect::<Vec<_>>()
                         .join(" / ");
-                    list = list.child(
+                    group = group.child(
                         div()
                             .id(SharedString::from(format!(
                                 "palette-{}-{}",
                                 model.agent, model.model
                             )))
-                            .h(px(theme.row_height))
                             .px(px(theme.space_2))
+                            .py(px(6.0))
                             .flex()
                             .items_center()
                             .gap(px(theme.space_2))
-                            .rounded(px(theme.radius_sm))
+                            .rounded(px(theme.radius_item))
                             .cursor_pointer()
+                            .hover(|row| row.bg(theme.color_surface_hover))
                             .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                                 cx.stop_propagation();
                                 view.update(cx, |this, cx| this.place_new(card.clone(), cx));
@@ -2035,71 +2271,94 @@ impl RolesView {
                                     .child(
                                         div()
                                             .font_family(theme.font_mono)
-                                            .text_size(px(theme.font_size_sm))
+                                            .text_size(px(12.0))
+                                            .line_height(px(18.0))
                                             .text_color(theme.color_text_primary)
                                             .child(ellipsis(model.model.clone())),
                                     )
                                     .child(
                                         div()
-                                            .text_size(px(theme.font_size_xs))
+                                            .text_size(px(11.0))
+                                            .line_height(px(16.5))
                                             .text_color(theme.color_text_muted)
                                             .child(ellipsis(subtitle)),
                                     ),
                             ),
                     );
                 }
+                list = list.child(group);
             }
         }
-        let mut problems = div()
-            .flex()
-            .flex_col()
-            .gap(px(theme.space_1))
-            .px(px(theme.space_3));
-        for problem in &self.palette_problems {
-            problems = problems.child(
-                div()
-                    .text_size(px(theme.font_size_xs))
-                    .text_color(theme.color_text_muted)
-                    .child(format!("• {problem}")),
-            );
+        if !self.palette_problems.is_empty() {
+            let mut problems = div()
+                .flex()
+                .flex_col()
+                .gap(px(theme.space_1))
+                .px(px(theme.space_1))
+                .text_size(px(11.0))
+                .line_height(px(16.5))
+                .text_color(theme.color_text_muted);
+            for problem in &self.palette_problems {
+                problems = problems.child(wrap_text(format!("• {problem}")));
+            }
+            list = list.child(problems);
         }
         let agent_text = self.custom_agent.read(cx).text().trim().to_string();
         let model_text = self.custom_model.read(cx).text().trim().to_string();
         let can_custom = !agent_text.is_empty() && !model_text.is_empty();
         let custom_view = view.clone();
-        div()
-            .absolute()
-            .left(px(left))
-            .top(px(top))
-            .w(px(360.0))
-            .h(px(420.0))
+        let pair = div()
+            .relative()
+            .flex_1()
+            .min_w(px(0.0))
+            .h(px(theme.control_height_sm))
             .flex()
-            .flex_col()
-            .gap(px(theme.space_2))
-            .p(px(theme.space_3))
-            .rounded(px(theme.radius_lg))
-            .bg(theme.color_surface_raised)
-            .border_1()
-            .border_color(theme.color_border)
-            .opacity(t)
-            .when(self.palette_slot.is_some(), |panel| panel.occlude())
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(self.palette_search.clone())
-            .child(list)
-            .when(!self.palette_problems.is_empty(), |panel| {
-                panel.child(problems)
-            })
+            .items_center()
+            .rounded_full()
+            .bg(face(theme.field_fill_top, theme.field_fill_bottom))
+            .shadow(control_drop(theme))
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .gap(px(theme.space_2))
-                    .child(div().flex_1().child(self.custom_agent.clone()))
-                    .child(div().flex_1().child(self.custom_model.clone()))
-                    .child(
-                        div()
-                            .opacity(if can_custom { 1.0 } else { 0.45 })
-                            .child(icon_button(
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .px(px(12.0))
+                    .child(self.custom_agent.clone()),
+            )
+            .child(div().w(px(1.0)).h(px(14.0)).bg(theme.color_border_subtle))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .px(px(12.0))
+                    .child(self.custom_model.clone()),
+            )
+            .child(edge(Edge::Well, theme.control_height_sm / 2.0, theme));
+        let body =
+            div()
+                .relative()
+                .w(px(PALETTE_WIDTH))
+                .max_h(px(PALETTE_MAX_H))
+                .flex()
+                .flex_col()
+                .gap(px(theme.space_2))
+                .px(px(theme.space_3))
+                .pt(px(theme.space_2))
+                .pb(px(theme.space_3))
+                .bg(theme.color_surface_subtle)
+                .child(div().flex_none().child(self.palette_search.clone()))
+                .child(list)
+                .child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .pt(px(theme.space_2))
+                        .border_t_1()
+                        .border_color(theme.color_border_subtle)
+                        .child(pair)
+                        .child(div().opacity(if can_custom { 1.0 } else { 0.45 }).child(
+                            icon_button(
                                 "palette-custom",
                                 Icon::Plus,
                                 "Add custom model",
@@ -2107,12 +2366,31 @@ impl RolesView {
                                     custom_view.update(cx, |this, cx| this.add_custom(cx));
                                 }),
                                 cx,
-                            )),
-                    ),
-            )
+                            ),
+                        )),
+                );
+        let panel = div()
+            .opacity(t)
+            .when(self.palette_slot.is_some(), |panel| panel.occlude())
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(floating_panel(body, theme.radius_menu, theme));
+        let height = f32::from(bounds.size.height);
+        deferred(window_layer(
+            div().size_full().child(
+                div()
+                    .absolute()
+                    .left(bounds.origin.x)
+                    .top(bounds.origin.y)
+                    .w(bounds.size.width)
+                    .h(bounds.size.height)
+                    .child(hang(height + 4.0, self.palette_y.value(), panel)),
+            ),
+        ))
+        .with_priority(1)
+        .into_any_element()
     }
 
-    fn composer_layer(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
+    fn composer_layer(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
         let t = self.composer_opacity.value();
         let title = match self.composer.as_deref() {
             Some(name) if !name.is_empty() => format!("Edit {name}"),
@@ -2130,98 +2408,8 @@ impl RolesView {
             .as_ref()
             .is_some_and(|name| self.builtin.iter().any(|item| item == name));
         let view = cx.entity().clone();
-        let mut card = composer_card(title, t, self.composer_y.value(), theme)
-            .child(self.name_input.clone())
-            .child(self.instructions_input.clone())
-            .child(field_label("Lowest tier", theme))
-            .child(radio_group(
-                "role-tier",
-                &[
-                    RadioOption {
-                        label: "Any tier".into(),
-                    },
-                    RadioOption {
-                        label: "Easy".into(),
-                    },
-                    RadioOption {
-                        label: "Normal".into(),
-                    },
-                    RadioOption {
-                        label: "Hard".into(),
-                    },
-                ],
-                self.draft_tier,
-                {
-                    let view = view.clone();
-                    Rc::new(move |index, _, cx| {
-                        view.update(cx, |this, cx| {
-                            this.draft_tier = index;
-                            cx.notify();
-                        });
-                    })
-                },
-                cx,
-            ))
-            .child(field_label("Access", theme))
-            .child(radio_group(
-                "role-access",
-                &[
-                    RadioOption {
-                        label: "Can change files".into(),
-                    },
-                    RadioOption {
-                        label: "Read only".into(),
-                    },
-                ],
-                usize::from(self.draft_readonly),
-                {
-                    let view = view.clone();
-                    Rc::new(move |index, _, cx| {
-                        view.update(cx, |this, cx| {
-                            this.draft_readonly = index == 1;
-                            cx.notify();
-                        });
-                    })
-                },
-                cx,
-            ))
-            .child(field_label("Picked", theme))
-            .child(radio_group(
-                "role-picked",
-                &[
-                    RadioOption {
-                        label: "Picked automatically".into(),
-                    },
-                    RadioOption {
-                        label: "Only with --role".into(),
-                    },
-                ],
-                usize::from(self.draft_manual),
-                {
-                    let view = view.clone();
-                    Rc::new(move |index, _, cx| {
-                        view.update(cx, |this, cx| {
-                            this.draft_manual = index == 1;
-                            cx.notify();
-                        });
-                    })
-                },
-                cx,
-            ))
-            .child(field_label("Prefer", theme))
-            .when(self.draft_prefer.is_empty(), |card| {
-                card.child(muted_note("No preference", theme))
-            })
-            .child(self.agent_toggles("prefer", &self.draft_prefer, theme, cx))
-            .child(field_label("Avoid", theme))
-            .when(self.draft_avoid.is_empty(), |card| {
-                card.child(muted_note("None", theme))
-            })
-            .child(self.agent_toggles("avoid", &self.draft_avoid, theme, cx))
-            .child(field_label("When to use", theme))
-            .child(self.when_input.clone())
-            .child(field_label("Time limit", theme))
-            .child(self.timeout_input.clone());
+        let closer = view.clone();
+        let mut start = Vec::new();
         if show_footer {
             let footer_view = view.clone();
             let label: SharedString = if restores {
@@ -2229,36 +2417,46 @@ impl RolesView {
             } else {
                 "Remove role".into()
             };
-            card = card.child(button(
-                "role-remove",
-                label,
-                ButtonKind::Ghost,
-                Rc::new(move |_, cx| {
-                    footer_view.update(cx, |this, cx| this.remove_editing(cx));
-                }),
-                cx,
-            ));
+            start.push(
+                button(
+                    "role-remove",
+                    label,
+                    ButtonKind::Ghost,
+                    Rc::new(move |_, cx| {
+                        footer_view.update(cx, |this, cx| this.remove_editing(cx));
+                    }),
+                    cx,
+                )
+                .size(ButtonSize::Sm)
+                .into_any_element(),
+            );
         }
-        let cancel = view.clone();
         let submit = view.clone();
         let submit_label: SharedString = if editing {
             "Save".into()
         } else {
             "Create role".into()
         };
-        card = card.child(composer_actions(
-            [
-                button(
-                    "role-cancel",
-                    "Cancel",
-                    ButtonKind::Ghost,
-                    Rc::new(move |_, cx| {
-                        cancel.update(cx, |this, cx| this.close_composer(cx));
-                    }),
-                    cx,
-                )
-                .into_any_element(),
-                button(
+        let card = composer_card(title, t, self.composer_y.value(), theme)
+            .on_close(Rc::new(move |_, cx| {
+                closer.update(cx, |this, cx| this.close_composer(cx));
+            }))
+            .child(self.name_input.clone())
+            .child(self.instructions_input.clone())
+            .child(composer_field(
+                "When to use",
+                self.when_input.clone(),
+                theme,
+            ))
+            .child(composer_field(
+                "Time limit",
+                self.timeout_input.clone(),
+                theme,
+            ))
+            .child(div().pt(px(4.0)).child(self.pills.clone()))
+            .footer(composer_footer(
+                start,
+                [button(
                     "role-save",
                     submit_label,
                     ButtonKind::Primary,
@@ -2267,10 +2465,11 @@ impl RolesView {
                     }),
                     cx,
                 )
-                .into_any_element(),
-            ],
-            theme,
-        ));
+                .size(ButtonSize::Sm)
+                .into_any_element()],
+                theme,
+            ))
+            .overlay(self.pills.read(cx).overlay(cx));
         let close = cx.entity().clone();
         modal_layer(
             t,
@@ -2283,81 +2482,7 @@ impl RolesView {
         )
     }
 
-    fn agent_toggles(
-        &self,
-        kind: &str,
-        selected: &[String],
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> gpui::Div {
-        let mut column = div().flex().flex_col().gap(px(theme.space_1));
-        for (index, agent) in self.agents.iter().enumerate() {
-            let on = selected.iter().any(|name| name == agent);
-            let key = format!("{kind}:{agent}");
-            let hover = self
-                .row_hover
-                .get(&key)
-                .map(SpringValue::value)
-                .unwrap_or(0.0);
-            let view = cx.entity().clone();
-            let agent_name = agent.clone();
-            let kind_name = kind.to_string();
-            column = column.child(
-                div()
-                    .id(SharedString::from(format!("role-{kind}-{index}")))
-                    .relative()
-                    .h(px(theme.control_height_md))
-                    .px(px(theme.space_2))
-                    .flex()
-                    .items_center()
-                    .gap(px(theme.space_2))
-                    .rounded(px(theme.radius_sm))
-                    .cursor_pointer()
-                    .on_hover({
-                        let view = view.clone();
-                        let key = key.clone();
-                        move |over, _, cx| {
-                            let over = *over;
-                            view.update(cx, |this, cx| this.set_hover(key.clone(), over, cx));
-                        }
-                    })
-                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                        cx.stop_propagation();
-                        view.update(cx, |this, cx| {
-                            let list = if kind_name == "prefer" {
-                                &mut this.draft_prefer
-                            } else {
-                                &mut this.draft_avoid
-                            };
-                            toggle_name(list, &agent_name);
-                            cx.notify();
-                        });
-                    })
-                    .child(
-                        div()
-                            .absolute()
-                            .size_full()
-                            .left(px(0.0))
-                            .top(px(0.0))
-                            .rounded(px(theme.radius_sm))
-                            .bg(theme.color_surface_hover)
-                            .opacity(hover),
-                    )
-                    .child(agent_avatar(agent, "", 14.0))
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_size(px(theme.font_size_sm))
-                            .text_color(theme.color_text_primary)
-                            .child(agent.clone()),
-                    )
-                    .when(on, |row| row.child(icon(Icon::Check, 14.0, cx))),
-            );
-        }
-        column
-    }
-
-    fn build_layer(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
+    fn build_layer(&self, theme: &Theme, window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
         let t = self.build_opacity.value();
         let view = cx.entity().clone();
         let empty = self.build.as_ref().is_none_or(is_build_empty);
@@ -2371,7 +2496,8 @@ impl RolesView {
             .flex_col()
             .gap(px(theme.space_3));
         if self.build_loading {
-            body = body.child(muted_note("Pricing every model…", theme));
+            // Every model is priced: the proposal's rows, in bones.
+            body = body.child(list_skeleton(6, 20.0, window, cx));
         } else if empty {
             body = body.child(muted_note("No models to propose.", theme));
         } else if let Some(build) = &self.build {
@@ -2420,7 +2546,7 @@ impl RolesView {
                         div()
                             .text_size(px(theme.font_size_lg))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .child("Build tiers from the model"),
+                            .child(self.build_title()),
                     )
                     .child(chip("Proposal", StatusTone::Muted, cx)),
             )
@@ -2571,10 +2697,12 @@ impl Render for RolesView {
                 if list {
                     let content = self.list_body(window, cx);
                     let toolbar = self.toolbar_view(cx);
-                    page.child(page_content(
+                    page.child(page_under(
                         ROLES_PAGE,
                         toolbar,
-                        tw(4.0),
+                        None,
+                        // The toolbar's inset, so the table's edges line up with its buttons.
+                        theme.space_2,
                         content,
                         window,
                         cx,
@@ -2590,18 +2718,30 @@ impl Render for RolesView {
                         cx,
                     ))
                 } else {
+                    let board = matches!(self.state.read(cx).route(), Route::RoleBoard(_));
                     page.child(self.toolbar_view(cx))
-                        .child(Self::loading_body(&theme))
+                        .child(Self::loading_body(board, &theme))
                 }
             })
             .when(show_composer, |page| {
                 page.child(self.composer_layer(&theme, cx))
             })
-            .when(show_build, |page| page.child(self.build_layer(&theme, cx)))
+            .when(show_build, |page| {
+                page.child(self.build_layer(&theme, window, cx))
+            })
             .when(show_palette, |page| {
-                page.child(self.palette_layer(&theme, cx))
+                page.child(self.palette_layer(&theme, window, cx))
             })
             .when(show_ghost, |page| page.child(self.ghost_layer(&theme, cx)))
+            // Under the models button at the toolbar's right edge; it defers nothing of its own.
+            .child(
+                div()
+                    .absolute()
+                    .top(px(theme.space_2))
+                    .right(px(theme.space_2))
+                    .w(px(232.0))
+                    .child(deferred(self.build_menu.clone()).with_priority(2)),
+            )
     }
 }
 
@@ -2618,29 +2758,22 @@ fn load_all(client: &CoreClient) -> LoadBundle {
         .list_tiers(&ListTiersRequest {})
         .map(|response| response.tiers)
         .map_err(|err| core_message(err, "Could not list the tiers."));
+    LoadBundle {
+        tiers,
+        roles: load_roles(client),
+    }
+}
+
+fn load_extras(client: &CoreClient) -> Extras {
     let problems = client
         .check_tiers(&CheckTiersRequest {})
         .map(|response| response.problems)
         .map_err(|err| core_message(err, "Could not check the tiers."));
-    let roles = load_roles(client);
-    let classifier = match client.config(&ConfigRequest {
-        action: "get".into(),
-        ..Default::default()
-    }) {
-        Ok(response) if response.ok => Ok(classifier_from_config(&response.json)),
-        _ => Ok(String::new()),
-    };
-    let agents = match client.list_agents(&ListAgentsRequest {}) {
-        Ok(response) => Ok(agent_names(response.agents)),
-        Err(_) => Ok(Vec::new()),
-    };
-    LoadBundle {
-        tiers,
-        problems,
-        roles,
-        classifier,
-        agents,
-    }
+    let agents = client
+        .list_agents(&ListAgentsRequest {})
+        .map(|response| agent_names(response.agents))
+        .unwrap_or_default();
+    Extras { problems, agents }
 }
 
 fn load_roles(client: &CoreClient) -> Result<RolesList, String> {
@@ -2714,11 +2847,18 @@ fn save_role_ops(
         .and_then(|response| parse_roles_list(&response.json).ok()))
 }
 
-fn run_build(client: &CoreClient, apply: bool) -> Result<TierBuild, String> {
+fn run_build(
+    client: &CoreClient,
+    apply: bool,
+    role: &str,
+    judge: &str,
+) -> Result<TierBuild, String> {
     let response = client
         .build_tiers(&BuildTiersRequest {
             apply,
             agent: String::new(),
+            role: role.to_string(),
+            judge: judge.to_string(),
         })
         .map_err(|err| core_message(err, "Could not build the tiers."))?;
     if !response.ok {

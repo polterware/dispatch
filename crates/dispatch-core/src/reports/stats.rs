@@ -2,8 +2,8 @@ use super::pace_history::{is_zero_utc, parse_time_or_zero};
 use crate::{
     Error,
     types::{
-        Area, Filters, Run, STATUS_COMPLETED, STATUS_ORPHANED, STATUS_PENDING, STATUS_RUNNING,
-        Store, Usage,
+        Area, Filters, Run, STATUS_COMPLETED, STATUS_FAILED, STATUS_ORPHANED, STATUS_PENDING,
+        STATUS_RUNNING, STATUS_TIMED_OUT, Store, Usage,
     },
 };
 use chrono::{DateTime, Datelike, SecondsFormat, Utc};
@@ -157,6 +157,9 @@ pub struct StatRank {
     pub p50_ms: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub success_pct: Option<f64>,
+    /// Most failed: the runs that failed or timed out, of `runs`.
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub failures: usize,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub reason: String,
 }
@@ -274,6 +277,13 @@ struct StatsAcc {
     rates: usize,
     orphans: usize,
     durs: Vec<i64>,
+    /// The completed runs' durations: how fast the model finishes what it finishes.
+    done_durs: Vec<i64>,
+    /// The runs the model itself ended (completed, failed, or timed out), leaving out a
+    /// cancel (the user's call), an orphan (the core went away), and a rate-limited end (the
+    /// account had no quota left, the model never tried), and of those, the failures.
+    judged: usize,
+    failed: usize,
     spend: Spend,
 }
 
@@ -298,8 +308,20 @@ fn stats_buckets(recs: &[&Run], by: &str) -> HashMap<String, StatsAcc> {
         if r.status == STATUS_ORPHANED {
             a.orphans += 1;
         }
+        let ended = r.status == STATUS_COMPLETED
+            || r.status == STATUS_FAILED
+            || r.status == STATUS_TIMED_OUT;
+        if ended && !(r.status != STATUS_COMPLETED && hit_rate_limit(r)) {
+            a.judged += 1;
+            if r.status != STATUS_COMPLETED {
+                a.failed += 1;
+            }
+        }
         if let Some(ms) = observed_ms(r) {
             a.durs.push(ms);
+            if r.status == STATUS_COMPLETED {
+                a.done_durs.push(ms);
+            }
         }
         a.spend.add(r.usage.as_ref());
     }
@@ -492,20 +514,42 @@ fn most_used_stat(groups: &HashMap<String, StatsAcc>) -> StatRank {
     }
 }
 
+/// Why a comparison ranking has no answer: no model has enough runs, or only one does, and
+/// one model is not slower or more failed than anything.
+fn too_few(qualified: usize) -> StatRank {
+    if qualified == 0 {
+        withheld_rank(format!("insufficient samples (minimum {MIN_SAMPLES})"))
+    } else {
+        withheld_rank(format!(
+            "needs two models with enough runs (minimum {MIN_SAMPLES})"
+        ))
+    }
+}
+
+/// The model whose completed runs take longest at the median, among the models with at
+/// least [`MIN_SAMPLES`] completed runs, once two have them. A failed or cancelled run's time
+/// says nothing of the model's speed, so it is left out.
 fn slowest_stat(groups: &HashMap<String, StatsAcc>) -> StatRank {
+    let qualified = groups
+        .values()
+        .filter(|a| a.done_durs.len() >= MIN_SAMPLES)
+        .count();
+    if qualified < 2 {
+        return too_few(qualified);
+    }
     let mut best: Option<(StatRank, i64, i64)> = None;
     for (k, a) in groups {
-        if a.durs.len() < MIN_SAMPLES {
+        if a.done_durs.len() < MIN_SAMPLES {
             continue;
         }
-        let Some(p50) = pctile(&a.durs, 0.50) else {
+        let Some(p50) = pctile(&a.done_durs, 0.50) else {
             continue;
         };
-        let p90 = pctile(&a.durs, 0.90).unwrap_or(p50);
+        let p90 = pctile(&a.done_durs, 0.90).unwrap_or(p50);
         let cand = StatRank {
             key: k.clone(),
             runs: a.runs,
-            samples: a.durs.len(),
+            samples: a.done_durs.len(),
             p50_ms: Some(p50),
             ..Default::default()
         };
@@ -522,45 +566,61 @@ fn slowest_stat(groups: &HashMap<String, StatsAcc>) -> StatRank {
     }
     match best {
         Some((rank, _, _)) => rank,
-        None => withheld_rank(format!("insufficient samples (minimum {MIN_SAMPLES})")),
+        None => too_few(0),
     }
 }
 
+/// The model that fails most, among the models with at least [`MIN_SAMPLES`] runs it ended
+/// itself, once two have them: ranked by the 95% Wilson lower bound of its failure rate, so
+/// 1 failure in 5 runs does not outrank 3 in 18 on a rate five runs cannot pin down. A model
+/// that never failed is never named; with no failures there is no answer.
 fn most_failed_stat(groups: &HashMap<String, StatsAcc>) -> StatRank {
-    let mut best: Option<(&str, &StatsAcc)> = None;
+    let qualified = groups.values().filter(|a| a.judged >= MIN_SAMPLES).count();
+    if qualified < 2 {
+        return too_few(qualified);
+    }
+    let mut best: Option<(&str, &StatsAcc, f64)> = None;
     for (k, a) in groups {
-        if a.runs < MIN_SAMPLES {
+        if a.judged < MIN_SAMPLES || a.failed == 0 {
             continue;
         }
+        let low = wilson_low(a.failed, a.judged);
         let take = match best {
             None => true,
-            Some((bk, ba)) => worse_stat(a, ba, k, bk),
+            Some((bk, ba, bl)) => {
+                low > bl
+                    || (low == bl
+                        && (a.failed > ba.failed || (a.failed == ba.failed && k.as_str() < bk)))
+            }
         };
         if take {
-            best = Some((k.as_str(), a));
+            best = Some((k.as_str(), a, low));
         }
     }
     match best {
-        Some((k, a)) => StatRank {
+        Some((k, a, _)) => StatRank {
             key: k.into(),
-            runs: a.runs,
-            success_pct: Some(stats_ratio(a.ok, a.runs)),
+            runs: a.judged,
+            success_pct: Some(stats_ratio(a.judged - a.failed, a.judged)),
+            failures: a.failed,
             ..Default::default()
         },
-        None => withheld_rank(format!("insufficient samples (minimum {MIN_SAMPLES})")),
+        None => withheld_rank("no failures in range"),
     }
 }
 
-fn worse_stat(a: &StatsAcc, b: &StatsAcc, ak: &str, bk: &str) -> bool {
-    let ap = stats_ratio(a.ok, a.runs);
-    let bp = stats_ratio(b.ok, b.runs);
-    if ap != bp {
-        return ap < bp;
+/// The 95% Wilson score interval's lower bound for `hits` in `n`.
+fn wilson_low(hits: usize, n: usize) -> f64 {
+    if n == 0 {
+        return 0.0;
     }
-    if a.runs != b.runs {
-        return a.runs > b.runs;
-    }
-    ak < bk
+    let z = 1.96_f64;
+    let n = n as f64;
+    let p = hits as f64 / n;
+    let z2 = z * z;
+    let center = p + z2 / (2.0 * n);
+    let margin = z * (p * (1.0 - p) / n + z2 / (4.0 * n * n)).sqrt();
+    ((center - margin) / (1.0 + z2 / n)).max(0.0)
 }
 
 impl Report {
@@ -635,6 +695,11 @@ impl StatRank {
                 self.key,
                 stats_fmt_dur(self.p50_ms),
                 self.samples
+            )
+        } else if self.failures > 0 {
+            format!(
+                "{label}: {} ({} of {} runs failed)\n",
+                self.key, self.failures, self.runs
             )
         } else if let Some(pct) = self.success_pct {
             format!("{label}: {} ({pct:.1}% ok, {} runs)\n", self.key, self.runs)

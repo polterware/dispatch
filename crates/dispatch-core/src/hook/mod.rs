@@ -1,5 +1,11 @@
-//! The Claude Code SessionStart hook that points agents at the dispatch skill,
-//! and the enabled flag.
+//! The SessionStart hooks that point agents at the dispatch skill, one per
+//! agent that has them, and the enabled flag.
+//!
+//! Each agent keeps its hooks in its own file and shape: Claude Code, Gemini
+//! CLI, and Qwen Code in their settings.json, Codex in hooks.json, Grok in a
+//! file of its own under ~/.grok/hooks, all as groups of `{type, command,
+//! timeout}`; Cursor as a flat list in hooks.json; Copilot as `{type, bash,
+//! timeoutSec}` in a file of its own under ~/.copilot/hooks.
 
 pub(crate) mod gojson;
 
@@ -61,6 +67,47 @@ pub fn context_block() -> &'static str {
     CONTEXT_MESSAGE
 }
 
+/// What agent's hook prints while dispatch is on: the context line in the
+/// shape that agent reads. Claude Code and Codex add plain output to the
+/// session; Gemini CLI, Qwen Code, and Grok read `hookSpecificOutput`; Cursor
+/// reads `additional_context`, and sets `env` (the caller variables) for the
+/// session; Copilot reads `additionalContext`.
+pub fn context_output(agent: &str, env: Map<String, Value>) -> String {
+    let mut body = Map::new();
+    match agent {
+        "cursor" => {
+            body.insert("additional_context".into(), CONTEXT_MESSAGE.into());
+            if !env.is_empty() {
+                body.insert("env".into(), Value::Object(env));
+            }
+        }
+        "copilot" => {
+            body.insert("additionalContext".into(), CONTEXT_MESSAGE.into());
+        }
+        "gemini" | "qwen" | "grok" => {
+            let mut out = Map::new();
+            out.insert("hookEventName".into(), SESSION_START.into());
+            out.insert("additionalContext".into(), CONTEXT_MESSAGE.into());
+            body.insert("hookSpecificOutput".into(), Value::Object(out));
+        }
+        _ => return CONTEXT_MESSAGE.to_string(),
+    }
+    Value::Object(body).to_string() + "\n"
+}
+
+/// Whether agent's hook keeps quiet under Grok, which runs Claude Code's and
+/// Cursor's hooks as well as its own: Grok's own hook speaks when it is
+/// registered, else Claude Code's, else Cursor's, so a session reads the line
+/// once.
+pub fn quiet_under_grok(home: &Path, agent: &str) -> bool {
+    let registered = |a: &str| agent_hook(home, a).is_some_and(|h| !h.registered().is_empty());
+    match agent {
+        "" | "claude" => registered("grok"),
+        "cursor" => registered("grok") || registered("claude"),
+        _ => false,
+    }
+}
+
 /// The Claude settings path: $CLAUDE_CONFIG_DIR/settings.json if set, else
 /// <user_home>/.claude/settings.json. An empty user_home means the user's home.
 pub fn settings_path(user_home: &Path) -> PathBuf {
@@ -104,7 +151,14 @@ fn shell_quote(p: &str) -> String {
 /// Reports whether cmd is recognized as our session hook command: a dispatch
 /// binary followed by HOOK_SUFFIX, or the legacy Polterware one.
 pub fn is_hook_command(cmd: &str) -> bool {
-    let cmd = cmd.trim().trim_matches('\'');
+    let mut cmd = cmd.trim();
+    if let Some((head, agent)) = cmd.rsplit_once(AGENT_FLAG)
+        && !agent.is_empty()
+        && agent.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        cmd = head.trim_end();
+    }
+    let cmd = cmd.trim_matches('\'');
     if cmd.ends_with(LEGACY_SUFFIX) {
         return true;
     }
@@ -129,146 +183,403 @@ fn go_base(p: &str) -> &str {
     }
 }
 
-// hook_commands yields the command of every hook action under hooks.SessionStart.
-fn hook_commands(root: &Map<String, Value>) -> impl Iterator<Item = &str> {
-    root.get("hooks")
+// hook_commands yields the command of every hook action under hooks.<event>.
+fn hook_commands<'a>(
+    root: &'a Map<String, Value>,
+    layout: Layout,
+    event: &str,
+) -> impl Iterator<Item = &'a str> {
+    let list = root
+        .get("hooks")
         .and_then(Value::as_object)
-        .and_then(|h| h.get(SESSION_START))
+        .and_then(|h| h.get(event))
         .and_then(Value::as_array)
         .into_iter()
-        .flatten()
-        .filter_map(|g| g.as_object()?.get("hooks")?.as_array())
-        .flatten()
-        .filter_map(Value::as_object)
-        .map(|a| a.get("command").and_then(Value::as_str).unwrap_or(""))
+        .flatten();
+    let actions: Vec<&Map<String, Value>> = match layout {
+        Layout::Grouped => list
+            .filter_map(|g| g.as_object()?.get("hooks")?.as_array())
+            .flatten()
+            .filter_map(Value::as_object)
+            .collect(),
+        Layout::Flat | Layout::Copilot => list.filter_map(Value::as_object).collect(),
+    };
+    let key = layout.command_key();
+    actions
+        .into_iter()
+        .map(move |a| a.get(key).and_then(Value::as_str).unwrap_or(""))
 }
 
 /// Reports whether the SessionStart hook is registered in settings_path.
 pub fn is_installed(settings_path: &Path) -> Result<bool, Error> {
     let root = read_settings(settings_path)?;
-    Ok(hook_commands(&root).any(is_hook_command))
+    Ok(hook_commands(&root, Layout::Grouped, SESSION_START).any(is_hook_command))
 }
 
 /// Adds or updates our SessionStart hook in settings_path atomically and
 /// idempotently. It preserves unknown keys and other hooks.
 pub fn install(settings_path: &Path, binary_path: &str) -> Result<(), Error> {
-    let mut root = read_settings(settings_path)?;
-    let target_cmd = hook_command(binary_path);
+    let spec = Spec::grouped(SESSION_START, DEFAULT_TIMEOUT);
+    install_at(settings_path, &spec, &hook_command(binary_path))
+}
 
+/// Removes our SessionStart hook from settings_path atomically. It preserves
+/// all other hooks, other hook events, and unknown keys.
+pub fn uninstall(settings_path: &Path) -> Result<(), Error> {
+    let spec = Spec::grouped(SESSION_START, DEFAULT_TIMEOUT);
+    uninstall_at(settings_path, &spec, false)
+}
+
+/// How an agent's hooks file lists a command under `hooks.<event>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layout {
+    /// Groups, each with a `hooks` list of `{type, command, timeout}`.
+    Grouped,
+    /// `{command, timeout}` entries, under `version: 1` (Cursor).
+    Flat,
+    /// `{type, bash, timeoutSec}` entries, under `version: 1` (Copilot).
+    Copilot,
+}
+
+impl Layout {
+    fn command_key(self) -> &'static str {
+        match self {
+            Layout::Copilot => "bash",
+            Layout::Grouped | Layout::Flat => "command",
+        }
+    }
+
+    fn timeout_key(self) -> &'static str {
+        match self {
+            Layout::Copilot => "timeoutSec",
+            Layout::Grouped | Layout::Flat => "timeout",
+        }
+    }
+
+    fn versioned(self) -> bool {
+        self != Layout::Grouped
+    }
+}
+
+/// Where and how one agent's hook is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Spec {
+    layout: Layout,
+    event: &'static str,
+    /// In the agent's unit: seconds, or milliseconds for Gemini CLI and Qwen Code.
+    timeout: u64,
+}
+
+impl Spec {
+    const fn grouped(event: &'static str, timeout: u64) -> Self {
+        Spec {
+            layout: Layout::Grouped,
+            event,
+            timeout,
+        }
+    }
+}
+
+// action is our hook entry in spec's shape.
+fn action(spec: &Spec, command: &str) -> Value {
+    let mut action = Map::new();
+    if spec.layout != Layout::Flat {
+        action.insert("type".into(), Value::String("command".into()));
+    }
+    action.insert(
+        spec.layout.command_key().into(),
+        Value::String(command.into()),
+    );
+    action.insert(spec.layout.timeout_key().into(), Value::from(spec.timeout));
+    Value::Object(action)
+}
+
+fn install_at(path: &Path, spec: &Spec, command: &str) -> Result<(), Error> {
+    let mut root = read_settings(path)?;
+    let layout = spec.layout;
+    if layout.versioned() && !root.contains_key("version") {
+        root.insert("version".into(), Value::from(1));
+    }
     let hooks = root
         .entry("hooks")
         .or_insert_with(|| Value::Object(Map::new()));
     let Some(hooks) = hooks.as_object_mut() else {
         return Err(Error::Message(format!(
             "malformed settings {}: 'hooks' is not an object",
-            settings_path.display()
+            path.display()
         )));
     };
-    let session_start = hooks
-        .entry(SESSION_START)
+    let event = spec.event;
+    let list = hooks
+        .entry(event)
         .or_insert_with(|| Value::Array(Vec::new()));
-    let Some(session_start) = session_start.as_array_mut() else {
+    let Some(list) = list.as_array_mut() else {
         return Err(Error::Message(format!(
-            "malformed settings {}: 'hooks.{SESSION_START}' is not an array",
-            settings_path.display()
+            "malformed settings {}: 'hooks.{event}' is not an array",
+            path.display()
         )));
     };
 
-    // Check if already installed.
-    let mut found = false;
-    'groups: for g in session_start.iter_mut() {
-        let Some(inner) = g.get_mut("hooks").and_then(Value::as_array_mut) else {
-            continue;
-        };
-        for h in inner.iter_mut() {
-            let Some(action) = h.as_object_mut() else {
-                continue;
+    let (command_key, timeout_key) = (layout.command_key(), layout.timeout_key());
+    let ours = |action: &Map<String, Value>| {
+        is_hook_command(
+            action
+                .get(command_key)
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+        )
+    };
+    // Where our entry is: its group and place in it, or its place in a flat list.
+    let found = match layout {
+        Layout::Grouped => list.iter().enumerate().find_map(|(g, group)| {
+            let inner = group.get("hooks")?.as_array()?;
+            let i = inner.iter().position(|h| h.as_object().is_some_and(ours))?;
+            Some((Some(g), i))
+        }),
+        Layout::Flat | Layout::Copilot => list
+            .iter()
+            .position(|h| h.as_object().is_some_and(ours))
+            .map(|i| (None, i)),
+    };
+
+    match found {
+        Some((group, i)) => {
+            let entry = match group {
+                Some(g) => &mut list[g]["hooks"][i],
+                None => &mut list[i],
             };
-            let cmd = action.get("command").and_then(Value::as_str).unwrap_or("");
-            if is_hook_command(cmd) {
-                let timeout = action.get("timeout").and_then(Value::as_u64);
-                if cmd == target_cmd && timeout == Some(DEFAULT_TIMEOUT) {
-                    // Already installed and matches exactly.
-                    return Ok(());
-                }
-                // Update command and timeout in-place.
-                action.insert("command".into(), Value::String(target_cmd.clone()));
-                action.insert("timeout".into(), Value::from(DEFAULT_TIMEOUT));
-                found = true;
-                break 'groups;
+            let Some(a) = entry.as_object_mut() else {
+                return Ok(());
+            };
+            let cmd = a.get(command_key).and_then(Value::as_str).unwrap_or("");
+            let timeout = a.get(timeout_key).and_then(Value::as_u64);
+            if cmd == command && timeout == Some(spec.timeout) {
+                return Ok(());
+            }
+            a.insert(command_key.into(), Value::String(command.into()));
+            a.insert(timeout_key.into(), Value::from(spec.timeout));
+        }
+        None => {
+            let entry = action(spec, command);
+            if layout == Layout::Grouped {
+                let mut group = Map::new();
+                group.insert("hooks".into(), Value::Array(vec![entry]));
+                list.push(Value::Object(group));
+            } else {
+                list.push(entry);
             }
         }
     }
 
-    if !found {
-        // Not found: add a new hook group to SessionStart.
-        let mut action = Map::new();
-        action.insert("type".into(), Value::String("command".into()));
-        action.insert("command".into(), Value::String(target_cmd));
-        action.insert("timeout".into(), Value::from(DEFAULT_TIMEOUT));
-        let mut group = Map::new();
-        group.insert("hooks".into(), Value::Array(vec![Value::Object(action)]));
-        session_start.push(Value::Object(group));
-    }
-
-    write_settings_atomic(settings_path, &root)
+    write_settings_atomic(path, &root)
 }
 
-/// Removes our SessionStart hook from settings_path atomically. It preserves
-/// all other hooks, other hook events, and unknown keys.
-pub fn uninstall(settings_path: &Path) -> Result<(), Error> {
-    let mut root = read_settings(settings_path)?;
+// uninstall_at removes our entries. When own_file is set and nothing but an
+// empty hooks list and the version are left, the file goes too.
+fn uninstall_at(path: &Path, spec: &Spec, own_file: bool) -> Result<(), Error> {
+    let mut root = read_settings(path)?;
     if root.is_empty() {
         return Ok(());
     }
     let Some(hooks) = root.get_mut("hooks").and_then(Value::as_object_mut) else {
         return Ok(());
     };
-    let Some(session_start) = hooks.get_mut(SESSION_START).and_then(Value::as_array_mut) else {
+    let event = spec.event;
+    let Some(list) = hooks.get_mut(event).and_then(Value::as_array_mut) else {
         return Ok(());
+    };
+    let command_key = spec.layout.command_key();
+    let ours = |h: &Value| {
+        h.as_object().is_some_and(|a| {
+            is_hook_command(a.get(command_key).and_then(Value::as_str).unwrap_or(""))
+        })
     };
 
     let mut modified = false;
-    let mut new_session_start = Vec::new();
-    for mut g in std::mem::take(session_start) {
+    let mut kept = Vec::new();
+    for mut g in std::mem::take(list) {
+        if spec.layout != Layout::Grouped {
+            if ours(&g) {
+                modified = true;
+            } else {
+                kept.push(g);
+            }
+            continue;
+        }
         let Some(inner) = g.get_mut("hooks").and_then(Value::as_array_mut) else {
-            new_session_start.push(g);
+            kept.push(g);
             continue;
         };
-        let mut new_inner = Vec::new();
-        for h in std::mem::take(inner) {
-            if let Some(action) = h.as_object() {
-                let cmd = action.get("command").and_then(Value::as_str).unwrap_or("");
-                if is_hook_command(cmd) {
-                    modified = true;
-                    continue;
-                }
-            }
-            new_inner.push(h);
+        let before = inner.len();
+        inner.retain(|h| !ours(h));
+        if inner.len() == before {
+            kept.push(g);
+            continue;
         }
-        if new_inner.is_empty() {
-            // Dropped our group.
-            modified = true;
-        } else {
-            *inner = new_inner;
-            new_session_start.push(g);
+        modified = true;
+        if !inner.is_empty() {
+            kept.push(g);
         }
     }
-
     if !modified {
+        *list = kept;
         return Ok(());
     }
 
-    if new_session_start.is_empty() {
-        hooks.remove(SESSION_START);
+    if kept.is_empty() {
+        hooks.remove(event);
         if hooks.is_empty() {
             root.remove("hooks");
         }
     } else {
-        *session_start = new_session_start;
+        *list = kept;
     }
 
-    write_settings_atomic(settings_path, &root)
+    if own_file && root.keys().all(|k| k == "version") {
+        return match fs::remove_file(path) {
+            Err(e) if e.kind() != ErrorKind::NotFound => Err(e.into()),
+            _ => Ok(()),
+        };
+    }
+    write_settings_atomic(path, &root)
+}
+
+/// One agent's SessionStart hook: the file it lives in and how it is written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentHook {
+    pub agent: &'static str,
+    /// The file holding the hook.
+    pub path: PathBuf,
+    /// Whether the file is Dispatch's alone, so removing the hook removes it.
+    pub own_file: bool,
+    spec: Spec,
+}
+
+/// The agents with a SessionStart hook, in the order Settings lists them.
+pub const HOOK_AGENTS: [&str; 7] = [
+    "claude", "codex", "cursor", "gemini", "qwen", "copilot", "grok",
+];
+
+/// Follows the binary and HOOK_SUFFIX for every agent but Claude Code, which
+/// keeps the bare command it always had.
+pub const AGENT_FLAG: &str = " --agent ";
+
+fn user_home(home: &Path) -> PathBuf {
+    if home.as_os_str().is_empty()
+        && let Some(u) = dirs::home_dir()
+    {
+        return u;
+    }
+    home.to_path_buf()
+}
+
+/// The hook for agent under home (an empty home means the user's), or None
+/// for an agent without SessionStart hooks.
+pub fn agent_hook(home: &Path, agent: &str) -> Option<AgentHook> {
+    let home = user_home(home);
+    let (agent, path, own_file, spec) = match agent {
+        "claude" => (
+            "claude",
+            settings_path(&home),
+            false,
+            Spec::grouped(SESSION_START, DEFAULT_TIMEOUT),
+        ),
+        "codex" => {
+            let dir = std::env::var_os("CODEX_HOME")
+                .map(PathBuf::from)
+                .filter(|d| d.is_absolute())
+                .unwrap_or_else(|| home.join(".codex"));
+            (
+                "codex",
+                dir.join("hooks.json"),
+                false,
+                Spec::grouped(SESSION_START, DEFAULT_TIMEOUT),
+            )
+        }
+        "cursor" => (
+            "cursor",
+            home.join(".cursor").join("hooks.json"),
+            false,
+            Spec {
+                layout: Layout::Flat,
+                event: "sessionStart",
+                timeout: DEFAULT_TIMEOUT,
+            },
+        ),
+        "gemini" => (
+            "gemini",
+            home.join(".gemini").join("settings.json"),
+            false,
+            Spec::grouped(SESSION_START, DEFAULT_TIMEOUT * 1000),
+        ),
+        "qwen" => (
+            "qwen",
+            home.join(".qwen").join("settings.json"),
+            false,
+            Spec::grouped(SESSION_START, DEFAULT_TIMEOUT * 1000),
+        ),
+        "copilot" => (
+            "copilot",
+            home.join(".copilot").join("hooks").join("dispatch.json"),
+            true,
+            Spec {
+                layout: Layout::Copilot,
+                event: "sessionStart",
+                timeout: DEFAULT_TIMEOUT,
+            },
+        ),
+        "grok" => (
+            "grok",
+            home.join(".grok").join("hooks").join("dispatch.json"),
+            true,
+            Spec::grouped(SESSION_START, DEFAULT_TIMEOUT),
+        ),
+        _ => return None,
+    };
+    Some(AgentHook {
+        agent,
+        path,
+        own_file,
+        spec,
+    })
+}
+
+/// The hook command agent runs for binary: `<binary> hook`, with
+/// `--agent <agent>` for every agent but Claude Code.
+pub fn agent_hook_command(binary_path: &str, agent: &str) -> String {
+    let command = hook_command(binary_path);
+    if agent == "claude" {
+        return command;
+    }
+    format!("{command}{AGENT_FLAG}{agent}")
+}
+
+impl AgentHook {
+    /// The command of our hook in the agent's file, or "" when it is not there
+    /// (or the file cannot be read).
+    pub fn registered(&self) -> String {
+        let Ok(root) = read_settings(&self.path) else {
+            return String::new();
+        };
+        hook_commands(&root, self.spec.layout, self.spec.event)
+            .find(|cmd| is_hook_command(cmd))
+            .unwrap_or("")
+            .to_string()
+    }
+
+    /// Adds or updates the hook for binary, keeping the rest of the file.
+    pub fn install(&self, binary_path: &str) -> Result<(), Error> {
+        install_at(
+            &self.path,
+            &self.spec,
+            &agent_hook_command(binary_path, self.agent),
+        )
+    }
+
+    /// Removes the hook, keeping the rest of the file.
+    pub fn uninstall(&self) -> Result<(), Error> {
+        uninstall_at(&self.path, &self.spec, self.own_file)
+    }
 }
 
 fn read_settings(path: &Path) -> Result<Map<String, Value>, Error> {
@@ -389,7 +700,7 @@ pub fn registered_command(settings_path: &Path) -> String {
     let Ok(root) = read_settings(settings_path) else {
         return String::new();
     };
-    hook_commands(&root)
+    hook_commands(&root, Layout::Grouped, SESSION_START)
         .find(|cmd| is_hook_command(cmd))
         .unwrap_or("")
         .to_string()

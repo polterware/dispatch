@@ -792,6 +792,16 @@ pub(super) async fn tiers(db_path: &Path, args: &[String]) -> CliResult {
         "agent",
         "",
         "with build: only this agent's entries and models; --apply replaces only its entries",
+    )
+    .string(
+        "role",
+        "",
+        "with build: the board for this role (its lowest tier leaves the tiers under it empty); not with --apply",
+    )
+    .string(
+        "judge",
+        "",
+        "with build: jev asks TypeSafe's Jev once which candidates fit the role's work",
     );
     common(&mut f);
     let positional = f.parse_interspersed(args)?;
@@ -799,6 +809,8 @@ pub(super) async fn tiers(db_path: &Path, args: &[String]) -> CliResult {
         let req = pb::BuildTiersRequest {
             apply: f.flag("apply"),
             agent: f.str("agent"),
+            role: f.str("role"),
+            judge: f.str("judge"),
         };
         return tiers_build(db_path, &f.str("project"), req, f.flag("json")).await;
     }

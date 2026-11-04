@@ -10,6 +10,7 @@ use gpui::{
 };
 
 use crate::client::{CancelRunRequest, CoreError};
+use crate::models::filter::Filters;
 use crate::models::runs::{COLUMNS, RunRow, SORTABLE, filter_specs, visible_rows, workspace_rows};
 use crate::models::sort::{SortDirection, next_sort};
 use crate::state::{AppState, ConnectionState, Route};
@@ -19,13 +20,13 @@ use crate::ui::parts::runs::{
 };
 use crate::ui::{
     Column, DataTable, FilterField, FilterPopover, FiltersChanged, Icon, MascotMood, TextInput,
-    ToastTone, page_empty, page_fill_bar, toolbar,
+    ToastTone, page_empty, page_under, page_under_inset, toolbar,
 };
 
+/// The page's chrome state.
+const PAGE: &str = "runs-page";
 /// `formatAgo` labels move on the page's 15s clock.
 const CLOCK: Duration = Duration::from_secs(15);
-/// `div.overflow-auto.p-3` inside `PageContent p-0`.
-const CONTENT_PAD: f32 = 9.75;
 
 pub struct RunsView {
     state: Entity<AppState>,
@@ -37,7 +38,17 @@ pub struct RunsView {
     fields_key: String,
     cancelling: Option<String>,
     now_ms: i64,
+    /// The workspace's rows, built once per runs revision and workspace: a scroll or a hover
+    /// redraws the page every frame, and rebuilding every run's row each time made it stutter.
+    rows: Rc<Vec<RunRow>>,
+    rows_key: Option<(u64, String)>,
+    /// The rows the filters, the search, and the sort keep, for the inputs that kept them.
+    visible: Rc<Vec<RunRow>>,
+    visible_key: Option<VisibleKey>,
 }
+
+/// What the visible rows depend on: the rows, the filters, the search, and the sort.
+type VisibleKey = (u64, String, Filters, String, Option<(usize, SortDirection)>);
 
 impl RunsView {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
@@ -79,6 +90,10 @@ impl RunsView {
             fields_key: String::new(),
             cancelling: None,
             now_ms: unix_ms(),
+            rows: Rc::default(),
+            rows_key: None,
+            visible: Rc::default(),
+            visible_key: None,
         }
     }
 
@@ -87,11 +102,38 @@ impl RunsView {
         &self.filters
     }
 
-    fn rows(&self, cx: &Context<Self>) -> Vec<RunRow> {
-        let state = self.state.read(cx);
-        match state.current_workspace() {
-            Some(workspace) => workspace_rows(state.runs(), &workspace.id),
-            None => Vec::new(),
+    /// The workspace's rows and the ones on show, rebuilt only when what they come from moved,
+    /// and the filter fields with them.
+    fn refresh_rows(&mut self, cx: &mut Context<Self>) {
+        let (revision, workspace) = {
+            let state = self.state.read(cx);
+            let workspace = state
+                .current_workspace()
+                .map(|workspace| workspace.id.clone())
+                .unwrap_or_default();
+            (state.runs_revision(), workspace)
+        };
+        let rows_key = (revision, workspace.clone());
+        if self.rows_key.as_ref() != Some(&rows_key) {
+            let rows = if workspace.is_empty() {
+                Vec::new()
+            } else {
+                workspace_rows(self.state.read(cx).runs(), &workspace)
+            };
+            self.sync_fields(&rows, cx);
+            self.rows = Rc::new(rows);
+            self.rows_key = Some(rows_key);
+        }
+        let filters = self.filters.read(cx).filters().clone();
+        let visible_key = (revision, workspace, filters, self.query.clone(), self.sort);
+        if self.visible_key.as_ref() != Some(&visible_key) {
+            self.visible = Rc::new(visible_rows(
+                &self.rows,
+                &visible_key.2,
+                &self.query,
+                self.sort,
+            ));
+            self.visible_key = Some(visible_key);
         }
     }
 
@@ -179,29 +221,38 @@ impl RunsView {
 impl Render for RunsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *Theme::global(cx);
-        let rows = self.rows(cx);
-        self.sync_fields(&rows, cx);
-        let visible = {
-            let filters = self.filters.read(cx).filters();
-            visible_rows(&rows, filters, &self.query, self.sort)
-        };
+        self.refresh_rows(cx);
+        let visible = self.visible.clone();
         let connecting = matches!(
             self.state.read(cx).connection(),
             ConnectionState::Connecting
         );
         let bar = FilterPopover::bar(&self.filters, window, cx);
+        // The toolbar's inset, so the table's edges line up with its buttons.
+        let padding = theme.space_2;
+        let top = page_under_inset(PAGE, bar.is_some(), padding, window, cx);
 
         let content: AnyElement = if !visible.is_empty() {
-            runs_table(visible, self, cx).into_any_element()
+            runs_table(visible, self, cx)
+                .inset_top(top)
+                .fades(theme.color_surface)
+                .into_any_element()
         } else if connecting {
             div().into_any_element()
         } else {
-            let (title, mood) = if rows.is_empty() {
+            let (title, mood) = if self.rows.is_empty() {
                 ("No runs yet", MascotMood::Sleeping)
             } else {
                 ("No matches", MascotMood::Lost)
             };
-            page_empty(title, mood, cx).into_any_element()
+            div()
+                .flex_1()
+                .min_h(px(0.0))
+                .flex()
+                .flex_col()
+                .pt(px(top))
+                .child(page_empty(title, mood, cx))
+                .into_any_element()
         };
 
         let end = div()
@@ -215,11 +266,14 @@ impl Render for RunsView {
             .flex()
             .flex_col()
             .text_color(theme.color_text_primary)
-            .child(page_fill_bar(
+            // The table runs up under the toolbar, which fades it out on its trail.
+            .child(page_under(
+                PAGE,
                 toolbar(div(), end, cx),
                 bar,
-                CONTENT_PAD,
+                padding,
                 content,
+                window,
                 cx,
             ))
     }
@@ -227,8 +281,7 @@ impl Render for RunsView {
 
 /// The runs `DataTable`: Run at its content's width (`44%` does not count when the browser
 /// measures), Status, Agent, Changes, and Started on the right; Changes does not sort.
-fn runs_table(rows: Vec<RunRow>, view: &RunsView, cx: &mut Context<RunsView>) -> DataTable {
-    let rows = Rc::new(rows);
+fn runs_table(rows: Rc<Vec<RunRow>>, view: &RunsView, cx: &mut Context<RunsView>) -> DataTable {
     let columns = COLUMNS
         .iter()
         .enumerate()
@@ -236,6 +289,10 @@ fn runs_table(rows: Vec<RunRow>, view: &RunsView, cx: &mut Context<RunsView>) ->
             let mut column = Column::new(*title);
             if index == 0 {
                 column = column.fixed();
+            }
+            // Run's title and Agent's `agent / model` fade, so they narrow to fit the page.
+            if index == 0 || index == 2 {
+                column = column.shrinks();
             }
             if index == 4 {
                 column = column.end();

@@ -224,3 +224,51 @@ fn tier_build_picks_cheapest_qualified_then_strongest() {
     assert!(built.tiers["hard"][0].auto.qualified);
     assert!(!built.tiers["hard"][1].auto.qualified);
 }
+
+#[test]
+fn a_judged_tier_keeps_its_best_in_the_judge_s_order() {
+    use dispatch_core::tiers_build::{build_tiers_n, clear_tier, rank_tier};
+    let cat = Catalog {
+        scores: ["one", "two", "three", "four"]
+            .into_iter()
+            .map(|model| BenchScore {
+                model: model.into(),
+                score: 0.6,
+                cost_per_task: Some(1.0),
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let entries = ["one", "two", "three", "four"]
+        .into_iter()
+        .map(|model| Entry {
+            agent: "a".into(),
+            model: model.into(),
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+    let mut built = build_tiers_n(&entries, &cat, "balanced", 8);
+    assert_eq!(built.tiers["normal"].len(), 4);
+    // The judge likes four best and has no word on one, which keeps its place among ties.
+    let score = |model: &str| match model {
+        "four" => 0.6,
+        "two" => 0.3,
+        "three" => 0.1,
+        _ => 0.0,
+    };
+    rank_tier(&mut built, "normal", |entry| score(&entry.entry.model), 3);
+    let kept: Vec<_> = built.tiers["normal"]
+        .iter()
+        .map(|entry| entry.entry.model.as_str())
+        .collect();
+    assert_eq!(kept, ["four", "two", "three"]);
+    let stored: Vec<_> = built.table.tiers["normal"]
+        .iter()
+        .map(|entry| entry.model.as_str())
+        .collect();
+    assert_eq!(stored, kept);
+    clear_tier(&mut built, "easy");
+    assert!(!built.tiers.contains_key("easy"));
+    assert!(!built.table.tiers.contains_key("easy"));
+}

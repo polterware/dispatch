@@ -8,7 +8,7 @@ mod keys;
 mod openai;
 
 pub use cli::{Cli, cli_prompt, parse_role, parse_tier};
-pub use jev::Jev;
+pub use jev::{Jev, JevChoice};
 pub use keychain::{KEYCHAIN_SERVICE, SecretStore, set_secret_store};
 pub use keys::{JEV_KEY, Key, OPENAI_KEY};
 pub use openai::{OpenAi, parse_level_probs};

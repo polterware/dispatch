@@ -7,10 +7,10 @@ use gpui::{
     MouseButton, Render, StyleRefinement, Window, actions, div, prelude::*, px,
 };
 
-use crate::state::{AppState, Route, observe};
+use crate::state::{AppState, Route, SettingsPage, observe};
 use crate::theme::Theme;
 use crate::ui::patterns::{main_surface, modal_layer};
-use crate::ui::toast_stack;
+use crate::ui::{toast_lifetime, toast_stack};
 use crate::views::{
     CommanderView, IntelligenceView, RolesView, RunPageView, RunsView, SettingsView, SidebarView,
     SpendView, StatsView,
@@ -18,7 +18,14 @@ use crate::views::{
 
 actions!(
     dispatch_app,
-    [Quit, CloseWindow, GoBack, ToggleCommander, CheckForUpdates]
+    [
+        Quit,
+        CloseWindow,
+        GoBack,
+        ToggleCommander,
+        OpenSettings,
+        CheckForUpdates
+    ]
 );
 
 pub fn register_key_bindings(cx: &mut App) {
@@ -29,6 +36,7 @@ pub fn register_key_bindings(cx: &mut App) {
         KeyBinding::new("cmd-w", CloseWindow, None),
         KeyBinding::new("cmd-[", GoBack, None),
         KeyBinding::new("cmd-k", ToggleCommander, None),
+        KeyBinding::new("cmd-,", OpenSettings, None),
     ]);
 }
 
@@ -46,17 +54,52 @@ pub struct AppView {
     commander: gpui::Entity<CommanderView>,
     /// While the sidebar's edge is dragged: the pointer's x and the width at the press.
     resizing: Option<(f32, f32)>,
+    /// The toasts whose lifetime is already counting down.
+    timed_toasts: Vec<u64>,
 }
 
 /// `ResizableSidebar`'s handle: 12px wide, centered on the sidebar's edge.
 const RESIZE_HANDLE_WIDTH: f32 = 12.0;
 
 impl AppView {
+    /// Starts the countdown of every toast that has none yet, and forgets the ones gone.
+    fn time_toasts(&mut self, state: &gpui::Entity<AppState>, cx: &mut Context<Self>) {
+        let shown: Vec<(u64, crate::ui::ToastTone)> = state
+            .read(cx)
+            .toasts()
+            .iter()
+            .map(|toast| (toast.id, toast.tone))
+            .collect();
+        self.timed_toasts
+            .retain(|id| shown.iter().any(|(shown, _)| shown == id));
+        for (id, tone) in shown {
+            if self.timed_toasts.contains(&id) {
+                continue;
+            }
+            self.timed_toasts.push(id);
+            let state = state.clone();
+            cx.spawn(async move |_, cx| {
+                cx.background_executor().timer(toast_lifetime(tone)).await;
+                let _ = state.update(cx, |state, cx| {
+                    state.dismiss_toast(id);
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+    }
+
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
         let state = AppState::open(cx);
         observe(&state, cx);
-        let commander = cx.new(|cx| CommanderView::new(state.clone(), cx));
+        // Each toast goes on its own once its lifetime has passed.
+        cx.observe(&state, |this: &mut Self, state, cx| {
+            this.time_toasts(&state, cx)
+        })
+        .detach();
+        let commander =
+            cx.new(|cx| CommanderView::new(state.clone(), focus_handle.clone(), window, cx));
         // The overlay stays mounted while the palette springs out.
         cx.observe(&commander, |_, _, cx| cx.notify()).detach();
         let view = Self {
@@ -72,6 +115,7 @@ impl AppView {
             commander,
             state,
             resizing: None,
+            timed_toasts: Vec::new(),
         };
         let width = view.state.read(cx).sidebar_width();
         cx.update_global::<Theme, _>(|theme, _| theme.sidebar_width = width);
@@ -85,7 +129,14 @@ impl AppView {
                 ("04-spend", view.spend.read(cx).filters().clone()),
                 ("12-runs", view.runs.read(cx).filters().clone()),
             ];
-            crate::shots::start_tour(dir, view.state.clone(), filters, window, cx);
+            let views = crate::shots::TourViews {
+                sidebar: view.sidebar.clone(),
+                roles: view.roles.clone(),
+                run_page: view.run_page.clone(),
+                stats: view.stats.clone(),
+                intelligence: view.intelligence.clone(),
+            };
+            crate::shots::start_tour(dir, view.state.clone(), filters, views, window, cx);
         }
         view
     }
@@ -117,9 +168,11 @@ impl AppView {
 impl Render for AppView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *Theme::global(cx);
-        let route = self.state.read(cx).route().clone();
+        // Settings opens as a dialog over the page it was opened from.
+        let route = self.state.read(cx).backdrop();
+        let settings_shown = self.settings.read(cx).is_presented(cx);
         let commander_open = self.state.read(cx).commander_open();
-        let commander_shown = commander_open || self.commander.read(cx).is_presented();
+        let commander_shown = commander_open || self.commander.read(cx).is_presented(cx);
         let toasts = self.state.read(cx).toasts().to_vec();
         let page = page_for_route(
             &route,
@@ -127,7 +180,6 @@ impl Render for AppView {
             &self.intelligence,
             &self.spend,
             &self.stats,
-            &self.settings,
             &self.run_page,
             &self.runs,
         );
@@ -172,6 +224,19 @@ impl Render for AppView {
             // `FilterPopover`'s F key: the page's filter menu, while nothing else has focus.
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
                 let keystroke = &event.keystroke;
+                // Escape closes the Settings dialog, as the Solid dialog's does.
+                if keystroke.key == "escape"
+                    && !keystroke.modifiers.modified()
+                    && !this.state.read(cx).commander_open()
+                    && matches!(this.state.read(cx).route(), Route::Settings(_))
+                {
+                    this.state.update(cx, |state, cx| {
+                        state.close_settings();
+                        cx.notify();
+                    });
+                    cx.stop_propagation();
+                    return;
+                }
                 if keystroke.key != "f"
                     || keystroke.modifiers.modified()
                     || !this.focus_handle.is_focused(window)
@@ -195,6 +260,16 @@ impl Render for AppView {
             .on_action(cx.listener(|this, _: &GoBack, _window, cx| {
                 this.state.update(cx, |state, cx| {
                     if state.go_back() {
+                        state.request_refresh(cx);
+                    }
+                    cx.notify();
+                });
+            }))
+            .on_action(cx.listener(|this, _: &OpenSettings, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.set_commander_open(false);
+                    if !matches!(state.route(), Route::Settings(_)) {
+                        state.navigate(Route::Settings(SettingsPage::Agents));
                         state.request_refresh(cx);
                     }
                     cx.notify();
@@ -246,10 +321,25 @@ impl Render for AppView {
                         }),
                     ),
             )
+            .when(settings_shown, |this| {
+                let state = self.state.clone();
+                this.child(modal_layer(
+                    self.settings.read(cx).presence(),
+                    matches!(self.state.read(cx).route(), Route::Settings(_)),
+                    Rc::new(move |_window, app| {
+                        state.update(app, |state, cx| {
+                            state.close_settings();
+                            cx.notify();
+                        });
+                    }),
+                    self.settings.clone(),
+                    &theme,
+                ))
+            })
             .when(commander_shown, |this| {
                 let state = self.state.clone();
                 this.child(modal_layer(
-                    self.commander.read(cx).presence(),
+                    self.commander.read(cx).presence(cx),
                     true,
                     Rc::new(move |_window, app| {
                         state.update(app, |state, cx| {
@@ -271,7 +361,6 @@ fn page_for_route(
     intelligence: &gpui::Entity<IntelligenceView>,
     spend: &gpui::Entity<SpendView>,
     stats: &gpui::Entity<StatsView>,
-    settings: &gpui::Entity<SettingsView>,
     run_page: &gpui::Entity<RunPageView>,
     runs: &gpui::Entity<RunsView>,
 ) -> AnyElement {
@@ -280,7 +369,8 @@ fn page_for_route(
         Route::Intelligence => intelligence.clone().into(),
         Route::Spend => spend.clone().into(),
         Route::Stats => stats.clone().into(),
-        Route::Settings(_) => settings.clone().into(),
+        // Never the backdrop: Settings draws in its dialog.
+        Route::Settings(_) => roles.clone().into(),
         Route::Run(_) => run_page.clone().into(),
         Route::Runs => runs.clone().into(),
     };

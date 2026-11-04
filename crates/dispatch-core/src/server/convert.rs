@@ -108,11 +108,17 @@ pub fn run_event(e: &RunEvent) -> pb::DispatchRunEvent {
 }
 
 pub fn watch_event(e: &RunEvent) -> pb::WatchRunResponse {
+    watch_slice(e, 0)
+}
+
+/// An event whose text is its whole text from byte `offset` on.
+pub fn watch_slice(e: &RunEvent, offset: u64) -> pb::WatchRunResponse {
     pb::WatchRunResponse {
         seq: e.seq,
         kind: e.kind.clone(),
         text: e.text.clone(),
         at: wire_time(&e.at),
+        text_offset: i64::try_from(offset).unwrap_or(i64::MAX),
     }
 }
 

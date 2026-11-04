@@ -1,4 +1,3 @@
-pub mod commander;
 pub mod intelligence;
 pub mod roles;
 pub mod run_page;

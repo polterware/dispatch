@@ -137,6 +137,11 @@ pub(super) fn router(core: Arc<Core>) -> Router {
     );
     let r = unary!(r, "/dispatch.v1.DispatchService/ListRuns", list_runs);
     let r = unary!(r, "/dispatch.v1.DispatchService/GetRun", get_run);
+    let r = unary!(
+        r,
+        "/dispatch.v1.DispatchService/ReadRunEvents",
+        read_run_events
+    );
     let r = unary!(r, "/dispatch.v1.DispatchService/StartRun", start_run);
     let r = unary!(r, "/dispatch.v1.DispatchService/CancelRun", cancel_run);
     let r = unary!(r, "/dispatch.v1.DispatchService/Result", result);

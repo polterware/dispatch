@@ -246,6 +246,10 @@ message ResultResponse {
 message WatchRunRequest {
   string id = 1;
   int64 after_seq = 2;
+  // With after_seq 0, the stream opens with only the last tail_bytes of the run's event text
+  // (ReadRunEvents reads what comes before it), then follows the run as usual. 0 sends every
+  // event.
+  int64 tail_bytes = 3;
 }
 
 message WatchRunResponse {
@@ -253,6 +257,25 @@ message WatchRunResponse {
   string kind = 2;
   string text = 3;
   string at = 4;
+  // Where text starts in the event's whole text, in bytes: above 0 when a page edge cut the
+  // event, so its text is the end of the event's.
+  int64 text_offset = 5;
+}
+
+// The page of a run's event text that ends where before_seq's event, at before_offset bytes
+// into its text, starts: the last max_bytes of it, oldest first. before_seq 0 reads from the
+// run's end.
+message ReadRunEventsRequest {
+  string id = 1;
+  int64 before_seq = 2;
+  int64 before_offset = 3;
+  int64 max_bytes = 4;
+}
+
+message ReadRunEventsResponse {
+  repeated WatchRunResponse events = 1;
+  // Text remains before the page.
+  bool more = 2;
 }
 
 message ListWorktreesRequest {
@@ -400,6 +423,14 @@ message BuildTiersRequest {
   // One agent's models only; with apply, only that agent's entries are
   // replaced, after the others in each tier.
   string agent = 2;
+  // A role to build the board for, by name; its lowest tier leaves the
+  // tiers under it empty. Not with apply: the role's board is saved through
+  // Subagents.
+  string role = 3;
+  // Who ranks each tier's candidates: empty for the catalog's order (skill,
+  // then cost), or "jev" for TypeSafe's Jev, asked once which candidates fit
+  // the role's work.
+  string judge = 4;
 }
 
 message BuildTiersResponse {
@@ -611,6 +642,7 @@ service DispatchService {
   rpc CancelRun(CancelRunRequest) returns (CancelRunResponse);
   rpc Result(ResultRequest) returns (ResultResponse);
   rpc WatchRun(WatchRunRequest) returns (stream WatchRunResponse);
+  rpc ReadRunEvents(ReadRunEventsRequest) returns (ReadRunEventsResponse);
   rpc ListWorktrees(ListWorktreesRequest) returns (ListWorktreesResponse);
   rpc ListQuota(ListQuotaRequest) returns (ListQuotaResponse);
   rpc ListTiers(ListTiersRequest) returns (ListTiersResponse);

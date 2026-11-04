@@ -507,38 +507,40 @@ impl Core {
         )
     }
 
-    /// Installs the dispatch skill for the agent CLIs, or refreshes the
-    /// copies already installed.
+    /// Installs the dispatch skill for the agent CLIs, removes it from a
+    /// folder, or refreshes the copies already installed.
     pub(crate) async fn skill(&self, m: pb::SkillRequest) -> RpcResult<pb::SkillResponse> {
         let home = dirs::home_dir().ok_or_else(|| RpcError::internal("no home folder"))?;
         let out = match m.action.as_str() {
             "refresh" => json!({"refreshed": skill::refresh(&home).map_err(RpcError::internal)?}),
             "install" => {
-                let agent = m.agent.trim();
-                let targets = skill::targets(&home);
-                let names: Vec<&String> = targets
-                    .keys()
-                    .filter(|n| agent.is_empty() || agent == n.as_str())
-                    .collect();
-                if names.is_empty() {
-                    return Err(RpcError::invalid(format!("unknown agent {agent:?}")));
-                }
-                let (mut done, mut skipped, mut seen) = (Vec::new(), Vec::new(), HashSet::new());
-                for name in names {
-                    let dir = &targets[name].dir;
-                    if !seen.insert(dir.clone()) {
-                        continue;
-                    }
-                    match skill::install(dir, m.force) {
+                let key = m.agent.trim();
+                let folders: Vec<skill::Folder> = if key.is_empty() {
+                    skill::folders(&home)
+                        .into_iter()
+                        .filter(|f| !f.extra)
+                        .collect()
+                } else {
+                    let folder = skill::resolve(&home, key).ok_or_else(|| {
+                        RpcError::invalid(format!("unknown agent or skills folder {key:?}"))
+                    })?;
+                    vec![folder]
+                };
+                let (mut done, mut skipped) = (Vec::new(), Vec::new());
+                for folder in folders {
+                    match skill::install(&folder.dir, m.force) {
                         Ok(p) => done.push(p),
-                        Err(e) => skipped.push(format!("{name}: {e}")),
+                        Err(e) => skipped.push(format!("{}: {e}", folder.dir.display())),
                     }
                 }
                 json!({"installed": done, "skipped": skipped})
             }
+            "remove" => {
+                json!({"removed": setup::remove_skill(&home, &m.agent).map_err(invalid)?})
+            }
             _ => {
                 return Err(RpcError::invalid(
-                    "unknown skill action: use install or refresh",
+                    "unknown skill action: use install, remove, or refresh",
                 ));
             }
         };
@@ -548,8 +550,9 @@ impl Core {
         })
     }
 
-    /// How the agent CLIs reach dispatch: the command on the PATH, each
-    /// agent's skill, the Claude Code SessionStart hook, and the OpenCode plugin.
+    /// How the agent CLIs reach dispatch: the command on the PATH, the skill
+    /// in each skills folder, each agent's SessionStart hook, and the OpenCode
+    /// plugin.
     pub(crate) async fn get_agent_setup(
         &self,
         _: pb::GetAgentSetupRequest,
@@ -560,7 +563,7 @@ impl Core {
         })
     }
 
-    /// Links the command, installs the skill, switches the hook, or
+    /// Links the command, installs or removes the skill, switches an agent's hook, or
     /// installs, removes, or switches the OpenCode plugin, pointing each at
     /// this core's binary, and answers the setup after it.
     pub(crate) async fn apply_agent_setup(
@@ -572,8 +575,9 @@ impl Core {
         let r = match m.action.as_str() {
             "link_cli" => setup::link_cli(&home, &binary).map(|_| ()),
             "install_skill" => setup::install_skill(&home, &m.agent).map(|_| ()),
+            "remove_skill" => setup::remove_skill(&home, &m.agent).map(|_| ()),
             "hook_on" | "hook_off" => {
-                setup::set_hook(&home, &binary, &state, m.action == "hook_on")
+                setup::set_hook(&home, &binary, &state, &m.agent, m.action == "hook_on")
             }
             "install_opencode" => setup::install_opencode_plugin(
                 &home,
@@ -665,15 +669,52 @@ impl Core {
             .map(|p| p.priority)
             .filter(|p| !p.is_empty())
             .unwrap_or_else(|| PRIORITY_BALANCED.into());
-        let mut built = tiers_build::build_tiers(
+        let role = m.role.trim().to_owned();
+        let judge = m.judge.trim().to_owned();
+        if !judge.is_empty() && judge != JUDGE_JEV {
+            return Err(RpcError::invalid(format!(
+                "unknown judge {judge} (want {JUDGE_JEV})"
+            )));
+        }
+        if !role.is_empty() && m.apply {
+            return Err(RpcError::invalid(
+                "a role's board is saved through Subagents, not applied here",
+            ));
+        }
+        let profile = if role.is_empty() || role == GENERAL_ROLE {
+            None
+        } else {
+            let profiles = self.profiles("").map_err(invalid)?;
+            Some(
+                profiles
+                    .get(&role)
+                    .cloned()
+                    .ok_or_else(|| RpcError::invalid(format!("unknown role {role}")))?,
+            )
+        };
+        let per_tier = if judge == JUDGE_JEV {
+            JEV_POOL
+        } else {
+            tiers_build::BUILD_PER_TIER
+        };
+        let mut built = tiers_build::build_tiers_n(
             &entries,
             &runner::load_catalog(&self.state_dir().to_string_lossy()),
             &priority,
+            per_tier,
         );
+        // A role never runs under its lowest tier, so those tiers stay empty.
+        let floor = profile.as_ref().map(|p| p.tier.clone()).unwrap_or_default();
+        for tier in tiers_under(&floor) {
+            tiers_build::clear_tier(&mut built, tier);
+        }
+        if judge == JUDGE_JEV {
+            judge_with_jev(&mut built, &role, profile.as_ref()).await?;
+        }
         let mut out = json!({
             "priority": priority, "agent": agent, "tiers": built.tiers,
             "problems": if problems.is_empty() { Value::Null } else { json!(problems) },
-            "applied": false,
+            "applied": false, "role": role, "judge": judge,
         });
         if m.apply {
             if !agent.is_empty() {
@@ -690,6 +731,111 @@ impl Core {
             json: body(&out)?,
         })
     }
+}
+
+/// The judge that asks TypeSafe's Jev which candidates fit a role.
+const JUDGE_JEV: &str = "jev";
+/// How many candidates per tier Jev chooses among; it keeps the build's usual three.
+const JEV_POOL: usize = 8;
+
+/// The tiers under `floor`, which a role with that lowest tier never runs at.
+fn tiers_under(floor: &str) -> &'static [&'static str] {
+    match floor {
+        "normal" => &["easy"],
+        "hard" => &["easy", "normal"],
+        _ => &[],
+    }
+}
+
+/// Asks Jev once, with one choice question per tier, which of each tier's candidates fit
+/// `role`'s work, and keeps each tier's three it rates highest.
+async fn judge_with_jev(
+    built: &mut tiers_build::TierBuild,
+    role: &str,
+    profile: Option<&Profile>,
+) -> RpcResult<()> {
+    let key = |b: &tiers_build::BuiltEntry| {
+        if b.entry.effort.is_empty() {
+            format!("{}/{}", b.entry.agent, b.entry.model)
+        } else {
+            format!("{}/{}@{}", b.entry.agent, b.entry.model, b.entry.effort)
+        }
+    };
+    let mut questions = BTreeMap::new();
+    for (tier, work) in [
+        ("easy", "small, clear tasks"),
+        ("normal", "typical tasks"),
+        ("hard", "the hardest tasks"),
+    ] {
+        let Some(candidates) = built.tiers.get(tier).filter(|c| c.len() > 1) else {
+            continue;
+        };
+        let criteria: BTreeMap<String, String> = candidates
+            .iter()
+            .map(|b| {
+                let cost = b
+                    .auto
+                    .cost
+                    .map(|c| format!("about ${c:.2} a run"))
+                    .unwrap_or_else(|| "price unknown".into());
+                (
+                    key(b),
+                    format!(
+                        "{} running {}{}: passes {:.0}% of {work} by its benchmarks ({}), {cost}",
+                        b.entry.agent,
+                        b.entry.model,
+                        if b.entry.effort.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" at {} effort", b.entry.effort)
+                        },
+                        b.auto.p_pass * 100.0,
+                        b.auto.theta_source,
+                    ),
+                )
+            })
+            .collect();
+        questions.insert(
+            tier.to_string(),
+            classifier::JevChoice {
+                instructions: format!(
+                    "Which coding agent and model should run this role's {work}? Pick the one most likely to do this kind of work well for what it costs; a dearer model is worth it only where the work needs it."
+                ),
+                criteria,
+            },
+        );
+    }
+    if questions.is_empty() {
+        return Ok(());
+    }
+    let state = match profile {
+        Some(p) => json!({
+            "role": role,
+            "when to use": p.when,
+            "instructions": p.instructions,
+            "access": if p.read_only { "read only" } else { "can change files" },
+        }),
+        None => json!({"role": "general", "when to use": "any task no other role takes"}),
+    };
+    let answers = classifier::Jev::default()
+        .choices(state, questions)
+        .await
+        .map_err(|e| RpcError::invalid(format!("jev: {e}")))?;
+    for (tier, probs) in &answers {
+        tiers_build::rank_tier(
+            built,
+            tier,
+            |b| probs.get(&key(b)).copied().unwrap_or(0.0),
+            tiers_build::BUILD_PER_TIER,
+        );
+    }
+    // A tier Jev was not asked about keeps the catalog's first three.
+    for tier in ["easy", "normal", "hard"] {
+        if !answers.contains_key(tier) {
+            tiers_build::rank_tier(built, tier, |_| 0.0, tiers_build::BUILD_PER_TIER);
+        }
+    }
+    Ok(())
 }
 
 /// Applies a set, allow-, or deny- action to `f` and names the key it writes.

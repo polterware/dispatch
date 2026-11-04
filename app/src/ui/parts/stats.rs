@@ -10,8 +10,8 @@ use gpui::{
 use crate::client::{DispatchStatRank, DispatchStatsRankings, DispatchStatsRow};
 use crate::models::sort::SortDirection;
 use crate::models::stats::{
-    STATS_COLUMNS, StatsColumn, compact_lines, most_failed_detail, most_used_detail, plural,
-    rank_is_known, rank_reason, slowest_detail,
+    MOST_FAILED_ABOUT, SLOWEST_ABOUT, STATS_COLUMNS, StatsColumn, compact_lines,
+    most_failed_detail, most_used_detail, plural, rank_is_known, rank_reason, slowest_detail,
 };
 use crate::theme::{Theme, mix_oklab, tw};
 use crate::ui::data_table::{Column, DataTable, sans, tabular, text_width};
@@ -19,7 +19,7 @@ use crate::ui::ellipsis::ellipsis;
 use crate::ui::icon_tile::{IconTile, TileTone};
 use crate::ui::icons::Icon;
 use crate::ui::material::{self, Edge, face};
-use crate::ui::{card, progress_bar, tooltip};
+use crate::ui::{card, progress_bar, rich_tooltip, tooltip, tooltip_heading};
 
 /// A runs column's bar: its count over the busiest period's, into 100px, at least 4px.
 const COLUMN_BAR_PX: f32 = 100.0;
@@ -32,6 +32,8 @@ pub const COMPACT_ROW_HEIGHT: f32 = TABLE_ROW_HEIGHT + 3.25 + 32.0;
 #[derive(Clone, Debug)]
 pub struct ChartMark {
     pub label: String,
+    /// The column's full name and runs, in its tooltip; empty for a group's bar.
+    pub title: String,
     pub runs: i32,
     /// The bar's extent, 0 to 1, its minimum included.
     pub fraction: f32,
@@ -70,6 +72,7 @@ pub fn ranking_grid(rankings: &DispatchStatsRankings, window: &Window, cx: &App)
             TileTone::Execution,
             &rankings.most_used_model,
             most_used_detail,
+            None,
             cx,
         ))
         .child(ranking_card(
@@ -78,6 +81,7 @@ pub fn ranking_grid(rankings: &DispatchStatsRankings, window: &Window, cx: &App)
             TileTone::Integration,
             &rankings.most_used_provider,
             most_used_detail,
+            None,
             cx,
         ))
         .child(ranking_card(
@@ -86,6 +90,7 @@ pub fn ranking_grid(rankings: &DispatchStatsRankings, window: &Window, cx: &App)
             TileTone::Observability,
             &rankings.slowest_model,
             slowest_detail,
+            Some(SLOWEST_ABOUT),
             cx,
         ))
         .child(ranking_card(
@@ -94,18 +99,21 @@ pub fn ranking_grid(rankings: &DispatchStatsRankings, window: &Window, cx: &App)
             TileTone::Security,
             &rankings.most_failed_model,
             most_failed_detail,
+            Some(MOST_FAILED_ABOUT),
             cx,
         ))
         .into_any_element()
 }
 
-/// `RankingCard`: what it ranks, the winner (or a muted dash), and why.
+/// `RankingCard`: what it ranks, the winner (or a muted dash), and why. A comparison's
+/// heading says, on hover, what it reads.
 fn ranking_card(
     title: &'static str,
     icon: Icon,
     tone: TileTone,
     rank: &DispatchStatRank,
     detail: fn(&DispatchStatRank) -> String,
+    about: Option<&'static str>,
     cx: &App,
 ) -> AnyElement {
     let theme = Theme::global(cx);
@@ -141,10 +149,16 @@ fn ranking_card(
         .p(px(tw(3.5)))
         .child(
             div()
+                .id(SharedString::from(format!("stats-rank-title-{title}")))
                 .flex()
                 .min_w(px(0.0))
                 .items_center()
                 .gap(px(tw(2.0)))
+                .when_some(about, |heading, about| {
+                    heading.tooltip(rich_tooltip(280.0, move |_, cx| {
+                        tooltip_heading(title, Some(about.into()), cx).into_any_element()
+                    }))
+                })
                 .child(
                     div()
                         .flex_none()
@@ -187,14 +201,17 @@ pub fn runs_columns(marks: &[ChartMark], cx: &App) -> AnyElement {
     let top = mix_oklab(theme.chart_cyan, theme.material_face_top, 0.65);
     let bottom = mix_oklab(theme.chart_cyan, theme.material_face_bottom, 0.65);
     let radius = theme.radius_control;
-    let mut strip = div().h(px(148.0)).flex().items_end().gap(px(tw(2.0)));
-    for mark in marks {
+    // The columns share the card's whole width, however many the window holds.
+    let gap = if marks.len() > 20 { 4.0 } else { tw(2.0) };
+    let mut strip = div().h(px(148.0)).flex().items_end().gap(px(gap));
+    for (index, mark) in marks.iter().enumerate() {
         strip = strip.child(
             div()
+                .id(("runs-column", index))
                 .h_full()
                 .min_w(px(0.0))
-                .max_w(px(72.0))
                 .flex_1()
+                .tooltip(tooltip(mark.title.clone()))
                 .flex()
                 .flex_col()
                 .items_center()

@@ -122,6 +122,60 @@ impl Jev {
     }
 }
 
+/// One choice question: its instructions and each choice's description, by key.
+pub struct JevChoice {
+    pub instructions: String,
+    pub criteria: BTreeMap<String, String>,
+}
+
+impl Jev {
+    /// Asks the choice `questions` about `state` in one request, and answers each question's
+    /// probability per choice key. A question Jev does not answer is left out.
+    pub async fn choices(
+        &self,
+        state: serde_json::Value,
+        questions: BTreeMap<String, JevChoice>,
+    ) -> Result<BTreeMap<String, BTreeMap<String, f64>>, Error> {
+        let k = self.key();
+        let key = k
+            .read()
+            .map_err(|e| Error::Message(format!("no TypeSafe key: {e}")))?;
+        if key.is_empty() {
+            return Err(Error::Message(format!(
+                "no TypeSafe key: save one in Settings › Classifier or with `dispatch config key set jev`, or set {}",
+                k.env
+            )));
+        }
+        let asked: serde_json::Map<String, serde_json::Value> = questions
+            .into_iter()
+            .map(|(id, q)| {
+                (
+                    id,
+                    json!({"type": "choice", "instructions": q.instructions, "criteria": q.criteria}),
+                )
+            })
+            .collect();
+        let body = json!({
+            "model": or_default(&self.model, JEV_MODEL),
+            "state": state,
+            "questions": asked,
+        });
+        let out: JevAnswer = post_json(
+            self.client.as_ref(),
+            &or_default(&self.url, JEV_URL),
+            &key,
+            &body,
+        )
+        .await?;
+        Ok(out
+            .answers
+            .into_iter()
+            .filter(|(_, a)| !a.probabilities.is_empty())
+            .map(|(id, a)| (id, a.probabilities))
+            .collect())
+    }
+}
+
 impl Classifier for Jev {
     fn name(&self) -> String {
         CLASSIFIER_JEV.into()

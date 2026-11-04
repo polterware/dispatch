@@ -40,9 +40,9 @@ pub(crate) const OPS_USAGE: &str = "       dispatch wait <id> [--timeout <dur>] 
        dispatch recover <id>
        dispatch roles [--check] [--dir <repo>]
        dispatch roles save <name> [--when <text>] [--tier easy|normal|hard] [--easy|--normal|--hard agent/model,...] [--readonly] [--instructions <text>] [--manual] [--prefer a,b] [--avoid a,b] [--timeout <dur>] | remove <name>
-       dispatch on|off|hook
-       dispatch setup [--json] | link | skill [<agent>] | hook on|off | opencode [--remove | on | off]
-       dispatch skill install [--agent <name>] [--force] | show | refresh
+       dispatch on|off|hook [--agent <name>]
+       dispatch setup [--json] | link | skill [--remove] [<agent> | <folder>] | hook [<agent>] on|off | opencode [--remove | on | off]
+       dispatch skill install|remove [--agent <name> | --dir <folder>] [--force] | show | refresh
        dispatch update [--check]";
 
 const PROJECT_USAGE: &str = "workspace id (default: the workspace holding the cwd)";
@@ -895,47 +895,67 @@ fn home() -> Result<std::path::PathBuf, Error> {
     dirs::home_dir().ok_or_else(|| Error::Message("$HOME is not defined".into()))
 }
 
+/// Turns on Claude Code's SessionStart hook (`dispatch setup hook <agent> on`
+/// turns on another agent's).
 pub(super) fn on(db_path: &Path) -> CliResult {
     let exe = executable()?;
-    hook::set_enabled(&state_dir(db_path), true)?;
-    let settings = hook::settings_path(Path::new(""));
-    hook::install(&settings, &exe)?;
+    setup::set_hook(&home()?, &exe, &state_dir(db_path), "claude", true)?;
     println!(
         "dispatch on: SessionStart hook registered in {}",
-        settings.display()
+        hook::settings_path(Path::new("")).display()
     );
     Ok(())
 }
 
+/// Turns off Claude Code's SessionStart hook; dispatch stays on for the
+/// other agents whose hook is registered.
 pub(super) fn off(db_path: &Path) -> CliResult {
-    hook::set_enabled(&state_dir(db_path), false)?;
-    let settings = hook::settings_path(Path::new(""));
-    hook::uninstall(&settings)?;
+    let exe = executable()?;
+    setup::set_hook(&home()?, &exe, &state_dir(db_path), "claude", false)?;
     println!(
         "dispatch off: SessionStart hook removed from {}",
-        settings.display()
+        hook::settings_path(Path::new("")).display()
     );
     Ok(())
 }
 
-/// The SessionStart hook target. It prints one line of context while
-/// dispatch is on and nothing otherwise, so a stale hook is harmless.
-pub(super) fn hook(db_path: &Path) -> CliResult {
-    let recorded = caller::record_hook_stdin();
+/// The SessionStart hook target. `--agent` names the agent running it, Claude
+/// Code when it is absent. It prints the context line, in the shape that
+/// agent reads, while dispatch is on and nothing otherwise, so a stale hook
+/// is harmless.
+pub(super) fn hook(db_path: &Path, args: &[String]) -> CliResult {
+    let mut f = Flags::new("dispatch hook");
+    f.string(
+        "agent",
+        "claude",
+        "the agent running the hook: claude|codex|cursor|gemini|qwen|copilot|grok",
+    );
+    f.parse_silent(args)?;
+    let agent = f.str("agent");
+    let (session, recorded) = caller::record_hook_stdin(&agent);
     if hook::is_enabled(&state_dir(db_path)) {
-        print!("{}", hook::context_block());
+        // Grok runs Claude Code's and Cursor's hooks too: under it one hook speaks, in
+        // Grok's shape.
+        let grok = std::env::var_os("GROK_HOOK_EVENT").is_some_and(|v| !v.is_empty());
+        if !(grok && hook::quiet_under_grok(Path::new(""), &agent)) {
+            let shape = if grok { "grok" } else { agent.as_str() };
+            let env = caller::hook_caller_env(&session, &agent);
+            print!("{}", hook::context_output(shape, env));
+        }
     }
     recorded.map_err(Fail::from)
 }
 
 pub(super) fn skill(args: &[String]) -> CliResult {
-    let usage =
-        || usage_err("usage: dispatch skill install [--agent <name>] [--force] | show | refresh");
+    let usage = || {
+        usage_err(
+            "usage: dispatch skill install [--agent <name> | --dir <folder>] [--force] | remove [--agent <name> | --dir <folder>] | show | refresh",
+        )
+    };
     let Some(sub) = args.first() else {
         return Err(usage());
     };
     let home = home()?;
-    let targets = skill::targets(&home);
     match sub.as_str() {
         "show" => {
             print!("{}", String::from_utf8_lossy(skill::CONTENT));
@@ -955,32 +975,49 @@ pub(super) fn skill(args: &[String]) -> CliResult {
             }
             r.map(|_| ()).map_err(Fail::from)
         }
-        "install" => {
-            let mut f = Flags::new("dispatch skill install");
+        "install" | "remove" => {
+            let mut f = Flags::new(format!("dispatch skill {sub}"));
             f.string(
                 "agent",
                 "",
-                "install for one agent (claude|cursor|codex|grok|antigravity); default all",
+                "the folder this agent reads (claude, antigravity, or any other for ~/.agents/skills)",
             )
-            .bool("force", false, "overwrite an existing skill");
-            f.parse(&args[1..])?;
-            let agent = f.str("agent");
-            let names: Vec<&String> = targets
-                .keys()
-                .filter(|name| agent.is_empty() || **name == agent)
-                .collect();
-            if names.is_empty() {
-                return Err(usage_err(format!("unknown agent {agent:?}")));
+            .string("dir", "", "a skills folder by its path");
+            if sub == "install" {
+                f.bool("force", false, "overwrite an existing skill");
             }
-            let mut seen = std::collections::HashSet::new();
-            for name in names {
-                let dir = &targets[name].dir;
-                if !seen.insert(dir.clone()) {
-                    continue;
+            f.parse(&args[1..])?;
+            let key = match f.str("dir") {
+                dir if !dir.is_empty() => dir,
+                _ => f.str("agent"),
+            };
+            if sub == "remove" {
+                let removed = setup::remove_skill(&home, &key)?;
+                for p in &removed {
+                    println!("removed {}", p.display());
                 }
-                match skill::install(dir, f.flag("force")) {
+                if removed.is_empty() {
+                    println!("no dispatch skill to remove");
+                }
+                return Ok(());
+            }
+            let folders: Vec<skill::Folder> = if key.is_empty() {
+                skill::folders(&home)
+                    .into_iter()
+                    .filter(|folder| !folder.extra)
+                    .collect()
+            } else {
+                match skill::resolve(&home, &key) {
+                    Some(folder) => vec![folder],
+                    None => {
+                        return Err(usage_err(format!("unknown agent or skills folder {key:?}")));
+                    }
+                }
+            };
+            for folder in folders {
+                match skill::install(&folder.dir, f.flag("force")) {
                     Ok(path) => println!("installed {}", path.display()),
-                    Err(e) => eprintln!("skip {name}: {e}"),
+                    Err(e) => eprintln!("skip {}: {e}", folder.dir.display()),
                 }
             }
             Ok(())
@@ -991,8 +1028,9 @@ pub(super) fn skill(args: &[String]) -> CliResult {
 
 /// Reports how the agent CLIs reach dispatch, or changes one part of it: link
 /// points ~/.local/bin/dispatch at this binary, skill installs the current
-/// skill (for one agent or all), hook switches the Claude Code SessionStart
-/// hook, and opencode installs or removes the Dispatch plugin in OpenCode or
+/// skill (into one folder, or the three Dispatch uses) or removes it, hook
+/// switches an agent's SessionStart hook (Claude Code's when none is named),
+/// and opencode installs or removes the Dispatch plugin in OpenCode or
 /// switches its delegation. The app's Settings › Agents does the same.
 pub(super) fn setup(db_path: &Path, args: &[String]) -> CliResult {
     let home = home()?;
@@ -1008,23 +1046,36 @@ pub(super) fn setup(db_path: &Path, args: &[String]) -> CliResult {
             println!("linked {} -> {binary}", path.display());
         }
         "skill" => {
-            let agent = args.get(1).map_or("", String::as_str);
-            let r = setup::install_skill(&home, agent);
+            let remove = args.get(1).is_some_and(|a| a == "--remove");
+            let key = args
+                .get(if remove { 2 } else { 1 })
+                .map_or("", String::as_str);
+            let (r, verb) = if remove {
+                (setup::remove_skill(&home, key), "removed")
+            } else {
+                (setup::install_skill(&home, key), "installed")
+            };
             if let Ok(paths) = &r {
                 for p in paths {
-                    println!("installed {}", p.display());
+                    println!("{verb} {}", p.display());
                 }
             }
             r?;
         }
         "hook" => {
-            let on = match args.get(1).map(String::as_str) {
-                Some("on") => true,
-                Some("off") => false,
-                _ => return Err(usage_err("usage: dispatch setup hook on|off")),
+            let usage = || usage_err("usage: dispatch setup hook [<agent>] on|off");
+            let (agent, switch) = match (args.get(1), args.get(2)) {
+                (Some(agent), Some(switch)) => (agent.as_str(), switch.as_str()),
+                (Some(switch), None) => ("claude", switch.as_str()),
+                _ => return Err(usage()),
             };
-            setup::set_hook(&home, &binary, &state, on)?;
-            println!("hook {}", args[1]);
+            let on = match switch {
+                "on" => true,
+                "off" => false,
+                _ => return Err(usage()),
+            };
+            setup::set_hook(&home, &binary, &state, agent, on)?;
+            println!("{agent} hook {switch}");
         }
         "opencode" => match args.get(1).map_or("", String::as_str) {
             "" => {
@@ -1058,7 +1109,7 @@ pub(super) fn setup(db_path: &Path, args: &[String]) -> CliResult {
         },
         _ => {
             return Err(usage_err(
-                "usage: dispatch setup [--json] | link | skill [<agent>] | hook on|off | opencode [--remove | on | off]",
+                "usage: dispatch setup [--json] | link | skill [--remove] [<agent> | <folder>] | hook [<agent>] on|off | opencode [--remove | on | off]",
             ));
         }
     }
@@ -1080,16 +1131,25 @@ fn print_setup(r: &setup::Report) {
     };
     println!("command  {}: {cli}", r.cli.path);
     for s in &r.skills {
-        println!("skill    {:<12} {}  {}", s.agent, s.state, s.path);
+        let extra = if s.extra { ", a second copy" } else { "" };
+        println!(
+            "skill    {:<9} {}  ({}{extra})",
+            s.state,
+            s.dir,
+            s.agents.join(", ")
+        );
     }
-    let mut hook_state = "off".to_owned();
-    if r.hook.on {
-        hook_state = "on".into();
-        if !r.hook.current {
-            hook_state += &format!(" (runs {})", r.hook.command);
+    for h in &r.hooks {
+        let mut state = if h.on {
+            "on".to_owned()
+        } else {
+            "off".to_owned()
+        };
+        if h.on && !h.current {
+            state += &format!(" (runs {})", h.command);
         }
+        println!("hook     {:<9} {state}  {}", h.agent, h.settings);
     }
-    println!("hook     Claude Code SessionStart: {hook_state}");
     let mut plugin = match r.opencode.state.as_str() {
         setup::CURRENT => "current",
         setup::OUTDATED => "outdated",

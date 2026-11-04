@@ -8,11 +8,12 @@ use dispatch_core::{
     host::NoHost,
     proto::{
         AddWorkspaceRequest, CheckRequest, CheckResponse, GetRunRequest, ListRunsRequest,
-        ListWorkspacesRequest, ShutdownRequest,
+        ListWorkspacesRequest, ReadRunEventsRequest, ShutdownRequest, WatchRunRequest,
     },
     runstate,
     server::{self, Core},
     store::Store,
+    types::{self, Store as _},
 };
 use prost::Message;
 use std::sync::Arc;
@@ -26,8 +27,11 @@ struct Running {
 }
 
 async fn start() -> Running {
+    start_with(Store::new(":memory:").unwrap()).await
+}
+
+async fn start_with(store: Store) -> Running {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::new(":memory:").unwrap();
     let token = server::mint_token();
     let core = Core::new(
         Arc::new(store),
@@ -167,4 +171,88 @@ async fn shutdown_stops_the_core() {
     tokio::time::timeout(Duration::from_secs(5), r.core.done().cancelled())
         .await
         .expect("core stopped");
+}
+
+#[tokio::test]
+async fn a_watch_opens_at_the_end_and_reads_back_page_by_page() {
+    let store = Store::new(":memory:").unwrap();
+    store
+        .save_run(&types::Run {
+            id: "run".into(),
+            project_id: "p".into(),
+            status: types::STATUS_COMPLETED.into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let event = |kind: &str, text: &str| types::RunEvent {
+        run_id: "run".into(),
+        kind: kind.into(),
+        text: text.into(),
+        ..Default::default()
+    };
+    store
+        .append_event(&event(types::EVENT_STARTED, "go"))
+        .unwrap();
+    store
+        .append_event(&event(types::EVENT_OUTPUT, "first line\nsecond line\n"))
+        .unwrap();
+    store
+        .append_event(&event(types::EVENT_MERGED, "into main"))
+        .unwrap();
+    let r = start_with(store).await;
+    let c = clients(&r);
+
+    // The tail: the merged line whole, then the last 12 bytes of the output before it.
+    let mut stream = c
+        .dispatch
+        .watch_run(&WatchRunRequest {
+            id: "run".into(),
+            after_seq: 0,
+            tail_bytes: 21,
+        })
+        .await
+        .unwrap();
+    let mut tail = Vec::new();
+    while let Some(event) = stream.receive().await.unwrap() {
+        tail.push(event);
+    }
+    let read: Vec<_> = tail
+        .iter()
+        .map(|e| (e.seq, e.text.as_str(), e.text_offset))
+        .collect();
+    assert_eq!(read, [(2, "second line\n", 11), (3, "into main", 0)]);
+
+    // Back from where the tail starts: the rest of the output and the started line.
+    let earlier = c
+        .dispatch
+        .read_run_events(&ReadRunEventsRequest {
+            id: "run".into(),
+            before_seq: 2,
+            before_offset: 11,
+            max_bytes: 0,
+        })
+        .await
+        .unwrap();
+    let read: Vec<_> = earlier
+        .events
+        .iter()
+        .map(|e| (e.seq, e.text.as_str(), e.text_offset))
+        .collect();
+    assert_eq!(read, [(1, "go", 0), (2, "first line\n", 0)]);
+    assert!(!earlier.more);
+
+    // A watch with no tail still sends every event.
+    let mut stream = c
+        .dispatch
+        .watch_run(&WatchRunRequest {
+            id: "run".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let mut all = 0;
+    while stream.receive().await.unwrap().is_some() {
+        all += 1;
+    }
+    assert_eq!(all, 3);
 }

@@ -35,6 +35,37 @@ pub fn unique_entries(entries: &[Entry]) -> Vec<Entry> {
     out
 }
 
+/// `tier`'s candidates ranked by `score` (highest first, ties keep the catalog's order), the
+/// first `keep` of them kept, and the table made to match.
+pub fn rank_tier(
+    build: &mut TierBuild,
+    tier: &str,
+    score: impl Fn(&BuiltEntry) -> f64,
+    keep: usize,
+) {
+    let Some(built) = build.tiers.get_mut(tier) else {
+        return;
+    };
+    let mut ranked: Vec<(usize, f64)> = built.iter().map(&score).enumerate().collect();
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    let next: Vec<BuiltEntry> = ranked
+        .into_iter()
+        .take(keep)
+        .map(|(index, _)| built[index].clone())
+        .collect();
+    *built = next;
+    build
+        .table
+        .tiers
+        .insert(tier.into(), built.iter().map(|b| b.entry.clone()).collect());
+}
+
+/// Empties `tier`, a tier a role never runs at.
+pub fn clear_tier(build: &mut TierBuild, tier: &str) {
+    build.tiers.remove(tier);
+    build.table.tiers.remove(tier);
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct BuiltEntry {
     #[serde(flatten)]
@@ -50,6 +81,16 @@ pub struct TierBuild {
 }
 
 pub fn build_tiers(entries: &[Entry], cat: &Catalog, priority: &str) -> TierBuild {
+    build_tiers_n(entries, cat, priority, BUILD_PER_TIER)
+}
+
+/// Each tier's first `per_tier` candidates in the catalog's order, one per base model.
+pub fn build_tiers_n(
+    entries: &[Entry],
+    cat: &Catalog,
+    priority: &str,
+    per_tier: usize,
+) -> TierBuild {
     let known = known_adapters();
     let mut expanded = Vec::new();
     for e in unique_entries(entries) {
@@ -123,7 +164,7 @@ pub fn build_tiers(entries: &[Entry], cat: &Catalog, priority: &str) -> TierBuil
                     entry: e.clone(),
                     auto,
                 });
-                if built.len() == BUILD_PER_TIER {
+                if built.len() == per_tier {
                     break;
                 }
             }

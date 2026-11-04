@@ -5,6 +5,7 @@
 mod agent_models;
 mod connect;
 pub(crate) mod convert;
+mod event_pages;
 mod ops;
 mod routes;
 mod runs;

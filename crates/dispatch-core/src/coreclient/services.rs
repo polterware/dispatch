@@ -231,6 +231,12 @@ impl DispatchClient {
         proto::ResultResponse
     );
     unary_rpc!(
+        read_run_events,
+        "ReadRunEvents",
+        proto::ReadRunEventsRequest,
+        proto::ReadRunEventsResponse
+    );
+    unary_rpc!(
         list_worktrees,
         "ListWorktrees",
         proto::ListWorktreesRequest,

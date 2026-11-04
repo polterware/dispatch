@@ -40,10 +40,8 @@ const RUNS_LIMIT: i32 = 50;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SettingsPage {
     Agents,
-    TryRoute,
     Classifier,
     PickRole,
-    ClassifyPrompt,
     RoutingPolicy,
 }
 
@@ -95,8 +93,35 @@ impl Navigation {
         if self.route == route {
             return;
         }
-        self.history.push(self.route.clone());
+        // Settings is a dialog over a page: moving between its sections is not history.
+        if !(matches!(self.route, Route::Settings(_)) && matches!(route, Route::Settings(_))) {
+            self.history.push(self.route.clone());
+        }
         self.route = route;
+    }
+
+    /// The page drawn under the Settings dialog: the route itself when it is a page, else the
+    /// page Settings was opened from.
+    pub fn backdrop(&self) -> Route {
+        std::iter::once(&self.route)
+            .chain(self.history.iter().rev())
+            .find(|route| !matches!(route, Route::Settings(_)))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Closes Settings onto the page it was opened from.
+    pub fn close_settings(&mut self) {
+        if !matches!(self.route, Route::Settings(_)) {
+            return;
+        }
+        while let Some(previous) = self.history.pop() {
+            if !matches!(previous, Route::Settings(_)) {
+                self.route = previous;
+                return;
+            }
+        }
+        self.route = Route::default();
     }
 
     pub fn go_back(&mut self) -> bool {
@@ -358,6 +383,9 @@ pub struct AppState {
     commander_open: bool,
     generation: u64,
     applied_generation: u64,
+    /// Moves on whenever [`Self::runs`] changes, so views can keep what they build from the
+    /// runs until it does.
+    runs_revision: u64,
 }
 
 impl AppState {
@@ -393,6 +421,7 @@ impl AppState {
             commander_open: false,
             generation: 0,
             applied_generation: 0,
+            runs_revision: 0,
         };
         Self::spawn_poll(cx);
         state
@@ -466,18 +495,32 @@ impl AppState {
         self.navigation.route()
     }
 
+    /// The page under the Settings dialog (the route itself outside Settings).
+    pub fn backdrop(&self) -> Route {
+        self.navigation.backdrop()
+    }
+
+    pub fn close_settings(&mut self) {
+        self.navigation.close_settings();
+    }
+
     pub fn client(&self) -> Option<CoreClient> {
         self.client.clone()
     }
 
     pub fn push_toast(&mut self, message: impl Into<SharedString>, tone: ToastTone) -> u64 {
+        let message = message.into();
+        // The same words already up stay one toast, however often they are said.
+        if let Some(shown) = self
+            .toasts
+            .iter()
+            .find(|toast| toast.message == message && toast.tone == tone)
+        {
+            return shown.id;
+        }
         self.next_toast = self.next_toast.wrapping_add(1);
         let id = self.next_toast;
-        self.toasts.push(Toast {
-            id,
-            message: message.into(),
-            tone,
-        });
+        self.toasts.push(Toast { id, message, tone });
         id
     }
 
@@ -507,6 +550,18 @@ impl AppState {
 
     pub fn runs(&self) -> &[DispatchRun] {
         &self.runs
+    }
+
+    /// The revision of [`Self::runs`]: equal revisions mean equal runs.
+    pub fn runs_revision(&self) -> u64 {
+        self.runs_revision
+    }
+
+    fn set_runs(&mut self, runs: Vec<DispatchRun>) {
+        if self.runs != runs {
+            self.runs = runs;
+            self.runs_revision = self.runs_revision.wrapping_add(1);
+        }
     }
 
     pub fn sections(&self) -> &[DispatchSection] {
@@ -625,7 +680,7 @@ impl AppState {
                 self.workspaces.clear();
                 self.linked = false;
                 self.sections.clear();
-                self.runs.clear();
+                self.set_runs(Vec::new());
                 self.replies.clear();
                 self.pending_reply = None;
             }
@@ -637,7 +692,7 @@ impl AppState {
                 self.workspaces = snapshot.workspaces;
                 self.linked = snapshot.linked;
                 self.sections = snapshot.sections;
-                self.runs = snapshot.runs;
+                self.set_runs(snapshot.runs);
                 if let Some((id, reply)) = snapshot.reply {
                     self.replies.insert(id.clone(), reply);
                     if self.pending_reply.as_deref() == Some(id.as_str()) {
@@ -683,6 +738,23 @@ mod tests {
         assert!(navigation.go_back());
         assert!(!navigation.go_back());
         assert_eq!(navigation.route(), &Route::Roles);
+    }
+
+    #[test]
+    fn settings_opens_over_a_page_and_closes_back_onto_it() {
+        let mut navigation = Navigation::new(Route::Roles);
+        navigation.navigate(Route::Spend);
+        navigation.navigate(Route::Settings(SettingsPage::Agents));
+        navigation.navigate(Route::Settings(SettingsPage::Classifier));
+        assert_eq!(navigation.backdrop(), Route::Spend);
+        navigation.close_settings();
+        assert_eq!(navigation.route(), &Route::Spend);
+        assert!(navigation.go_back());
+        assert_eq!(navigation.route(), &Route::Roles);
+        let mut fresh = Navigation::new(Route::Settings(SettingsPage::Agents));
+        assert_eq!(fresh.backdrop(), Route::Roles);
+        fresh.close_settings();
+        assert_eq!(fresh.route(), &Route::Roles);
     }
 
     #[test]

@@ -42,17 +42,24 @@ pub fn parse_opencode_models(out: &str) -> Vec<String> {
         .map(str::to_owned)
         .collect()
 }
+/// `pi --list-models` prints a table under a `provider  model  …` header. Only the rows
+/// under that header are models: with no provider logged in it prints "No models available.
+/// Use /login …" and the docs' paths instead, none of which is one.
 pub fn parse_pi_models(out: &str) -> Vec<String> {
-    out.split('\n')
+    let mut lines = out.split('\n');
+    let header = lines.by_ref().any(|line| {
+        let mut words = line.split_whitespace();
+        words.next() == Some("provider") && words.next() == Some("model")
+    });
+    if !header {
+        return Vec::new();
+    }
+    lines
         .filter_map(|line| {
             let mut words = line.split_whitespace();
             let provider = words.next()?;
             let model = words.next()?;
-            if provider == "provider" {
-                None
-            } else {
-                Some(format!("{provider}/{model}"))
-            }
+            Some(format!("{provider}/{model}"))
         })
         .collect()
 }

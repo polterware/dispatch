@@ -1642,7 +1642,6 @@ dependencies = [
  "serde_json",
  "smallvec",
  "syntect",
- "unicode-segmentation",
  "ureq",
 ]
 

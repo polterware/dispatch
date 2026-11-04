@@ -452,17 +452,6 @@ pub fn instructions_preview(instructions: &str) -> String {
     }
 }
 
-/// Why a pick does or does not happen, under the switch.
-pub fn pick_note(classifier: &str) -> &'static str {
-    if classifier.is_empty() {
-        "Needs a classifier: set one in Settings › Classifier. Until then a run takes a role only with --role."
-    } else if classifier == "openai" {
-        "OpenAI Decisions judges difficulty only, so runs stay general. Jev or the agent CLI model picks a role."
-    } else {
-        "On an Auto run that names no role, the classifier picks the one whose When fits, at P 0.5 or more, else General. The task's difficulty picks the column of that role's board."
-    }
-}
-
 /// A row of the roles list: General first, then each role.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RoleListRow {
@@ -560,29 +549,72 @@ pub fn role_name_error(name: &str) -> Option<String> {
     }
 }
 
+/// What the core would refuse in `profile`, said for the Composer before it is sent: a time
+/// limit that is no duration, an agent both preferred and avoided, or a role with nothing in it.
+pub fn profile_error(profile: &RoleProfile) -> Option<String> {
+    let timeout = profile.timeout.trim();
+    if !timeout.is_empty() && !is_duration(timeout) {
+        return Some(format!(
+            "Time limit \"{timeout}\" is not a duration; use one such as 15m or 1h30m."
+        ));
+    }
+    if let Some(agent) = profile
+        .prefer
+        .iter()
+        .find(|agent| profile.avoid.contains(agent))
+    {
+        return Some(format!(
+            "{agent} is both preferred and avoided; keep it in one list."
+        ));
+    }
+    let empty = profile.provider.is_empty()
+        && profile.model.is_empty()
+        && profile.agent.is_empty()
+        && profile.effort.is_empty()
+        && profile.priority.is_empty()
+        && profile.instructions.trim().is_empty()
+        && profile.tier.is_empty()
+        && profile.when.trim().is_empty()
+        && profile.tiers.is_empty()
+        && !profile.manual
+        && profile.prefer.is_empty()
+        && profile.avoid.is_empty();
+    empty.then(|| "Give the role instructions or a When to use.".to_string())
+}
+
+/// A Go duration, as the core reads a time limit: numbers each with a unit (ns, us, µs, ms,
+/// s, m, h), such as 15m or 1h30m, or 0.
+pub fn is_duration(value: &str) -> bool {
+    let text = value.strip_prefix(['+', '-']).unwrap_or(value);
+    if text == "0" {
+        return true;
+    }
+    if text.is_empty() {
+        return false;
+    }
+    let mut rest = text;
+    while !rest.is_empty() {
+        let end = rest
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
+            .unwrap_or(rest.len());
+        if end == 0 || rest[..end].parse::<f64>().is_err() {
+            return false;
+        }
+        rest = &rest[end..];
+        let Some(unit) = ["ns", "us", "µs", "μs", "ms", "s", "m", "h"]
+            .into_iter()
+            .find(|unit| rest.starts_with(unit))
+        else {
+            return false;
+        };
+        rest = &rest[unit.len()..];
+    }
+    true
+}
+
 /// A rename saves the new name, then drops the old one. A built-in name is never dropped, only its copy.
 pub fn rename_drops_previous(previous: &str, next: &str, source: RoleSource) -> bool {
     !previous.is_empty() && previous != next && source == RoleSource::User
-}
-
-pub fn toggle_name(list: &mut Vec<String>, name: &str) {
-    if let Some(index) = list.iter().position(|item| item == name) {
-        list.remove(index);
-    } else {
-        list.push(name.to_string());
-    }
-}
-
-/// The classifier string inside a Config `get` body.
-pub fn classifier_from_config(json: &str) -> String {
-    let Ok(value) = serde_json::from_str::<Value>(json) else {
-        return String::new();
-    };
-    value
-        .get("classifier")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string()
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -612,6 +644,92 @@ pub fn built_price(entry: &BuiltEntry) -> String {
         text.push_str(&format!(" · ${cost:.2}"));
     }
     text
+}
+
+/// The proposal as board rows, primary first in each tier, an effort written into its model
+/// as the tier table stores it.
+pub fn build_board(build: &TierBuild) -> Vec<DispatchTier> {
+    let mut rows = Vec::new();
+    for (tier, _) in TIER_COLUMNS {
+        for (position, entry) in build.tiers.get(*tier).into_iter().flatten().enumerate() {
+            let model = if entry.effort.is_empty()
+                || entry.model.ends_with(&format!("-{}", entry.effort))
+            {
+                entry.model.clone()
+            } else {
+                format!("{}-{}", entry.model, entry.effort)
+            };
+            rows.push(DispatchTier {
+                name: tier.to_string(),
+                provider: entry.provider.clone(),
+                agent: entry.agent.clone(),
+                model,
+                position: position as i32,
+                ..DispatchTier::default()
+            });
+        }
+    }
+    rows
+}
+
+/// A prompt for a coding agent to pick a role's models and save them with the CLI, its other
+/// fields kept as they are (`dispatch roles save` writes the whole role).
+pub fn role_models_prompt(name: &str, profile: &RoleProfile) -> String {
+    let general = name == "general";
+    let mut lines = Vec::new();
+    if general {
+        lines.push("Pick the models of Dispatch's tier table, General: the models every run whose role has no models of its own falls back on.".to_string());
+    } else {
+        lines.push(format!(
+            "Pick the models for the Dispatch role \"{name}\": the agent and model that run its tasks at each difficulty tier."
+        ));
+        lines.push(String::new());
+        lines.push(format!("When to use: {}", when_display(&profile.when)));
+        if !profile.instructions.trim().is_empty() {
+            lines.push(format!("Instructions: {}", profile.instructions.trim()));
+        }
+        lines.push(format!("Access: {}", access_label(profile.readonly)));
+        lines.push(format!("Lowest tier: {}", role_tier(profile)));
+    }
+    lines.push(String::new());
+    lines.push("Read what there is to pick from: `dispatch models` lists every model the installed agent CLIs report, with its skill and price, and `dispatch tiers build --role <role>` shows what the catalog proposes. Choose up to three per tier (easy, normal, hard), primary first, as agent/model with the effort in the model's name where it has one (claude/claude-opus-5-5-high). Weigh how well each model does this kind of work against what it costs: a dearer model only earns its price where the work needs it.".to_string());
+    lines.push(String::new());
+    if general {
+        // The CLI saves only the catalog's proposal (`tiers build --apply`), not a pick.
+        lines.push("Then answer with the three lists, one line per tier (easy: agent/model, agent/model), for the board in Dispatch's Roles page, General.".to_string());
+    } else {
+        lines.push("Then save them with this command, filling in the three lists; it writes the whole role, so keep the other flags as they are:".to_string());
+        lines.push(String::new());
+        lines.push(roles_save_command(name, profile));
+    }
+    lines.join("\n")
+}
+
+/// `dispatch roles save` with every field the role holds, and the three model lists to fill.
+fn roles_save_command(name: &str, profile: &RoleProfile) -> String {
+    let quote = |text: &str| format!("'{}'", text.replace('\'', "'\\''"));
+    let mut parts = vec!["dispatch roles save".to_string(), name.to_string()];
+    let mut text = |flag: &str, value: &str| {
+        if !value.trim().is_empty() {
+            parts.push(format!("--{flag} {}", quote(value.trim())));
+        }
+    };
+    text("when", &profile.when);
+    text("instructions", &profile.instructions);
+    text("tier", &profile.tier);
+    text("timeout", &profile.timeout);
+    text("prefer", &profile.prefer.join(","));
+    text("avoid", &profile.avoid.join(","));
+    if profile.readonly {
+        parts.push("--readonly".to_string());
+    }
+    if profile.manual {
+        parts.push("--manual".to_string());
+    }
+    for tier in ["easy", "normal", "hard"] {
+        parts.push(format!("--{tier} '<agent/model,…>'"));
+    }
+    parts.join(" ")
 }
 
 pub fn is_build_empty(build: &TierBuild) -> bool {
@@ -755,6 +873,105 @@ pub fn placed_cards(tiers: &[DispatchTier]) -> Vec<PlacedCard> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_built_board_names_each_model_at_its_effort_once() {
+        let entry = |model: &str, effort: &str| super::BuiltEntry {
+            agent: "claude".into(),
+            model: model.into(),
+            provider: "anthropic".into(),
+            effort: effort.into(),
+            p_pass: 0.9,
+            p_pass_low: 0.8,
+            effective_cost: None,
+            qualified: true,
+        };
+        let build = super::TierBuild {
+            priority: "balanced".into(),
+            applied: false,
+            problems: Vec::new(),
+            tiers: [(
+                "hard".to_string(),
+                vec![
+                    entry("claude-opus-5-5", "high"),
+                    entry("claude-sonnet-5-5-high", "high"),
+                    entry("claude-haiku-5-5", ""),
+                ],
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let board = super::build_board(&build);
+        let models: Vec<_> = board
+            .iter()
+            .map(|row| (row.name.as_str(), row.model.as_str(), row.position))
+            .collect();
+        assert_eq!(
+            models,
+            [
+                ("hard", "claude-opus-5-5-high", 0),
+                ("hard", "claude-sonnet-5-5-high", 1),
+                ("hard", "claude-haiku-5-5", 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_models_prompt_ends_in_a_command_that_keeps_the_role() {
+        let profile = super::RoleProfile {
+            when: "Review a diff".into(),
+            instructions: "Don't edit files.".into(),
+            readonly: true,
+            ..Default::default()
+        };
+        let prompt = super::role_models_prompt("reviewer", &profile);
+        assert!(prompt.contains("dispatch roles save reviewer"));
+        assert!(prompt.contains("--instructions 'Don'\\''t edit files.'"));
+        assert!(prompt.contains("--readonly"));
+        // General has no CLI to save a pick: the agent answers with the lists.
+        let general = super::role_models_prompt("general", &super::RoleProfile::default());
+        assert!(!general.contains("roles save"));
+        assert!(general.contains("answer with the three lists"));
+    }
+
+    #[test]
+    fn a_time_limit_reads_as_the_core_reads_it() {
+        for good in ["15m", "1h30m", "90s", "1.5h", "0", "250ms"] {
+            assert!(super::is_duration(good), "{good}");
+        }
+        for bad in ["gdsg", "15", "m", "15 m", "1h30", ""] {
+            assert!(!super::is_duration(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_composer_says_what_the_core_would_refuse() {
+        let mut profile = super::RoleProfile {
+            when: "tests".into(),
+            timeout: "gdsg".into(),
+            ..Default::default()
+        };
+        assert!(
+            super::profile_error(&profile)
+                .unwrap()
+                .contains("not a duration")
+        );
+        profile.timeout = "15m".into();
+        assert_eq!(super::profile_error(&profile), None);
+        profile.prefer = vec!["claude".into()];
+        profile.avoid = vec!["claude".into()];
+        assert!(
+            super::profile_error(&profile)
+                .unwrap()
+                .contains("both preferred and avoided")
+        );
+        let empty = super::RoleProfile::default();
+        assert!(
+            super::profile_error(&empty)
+                .unwrap()
+                .contains("instructions")
+        );
+    }
+
     use super::*;
 
     fn row(name: &str, position: i32, agent: &str, model: &str) -> DispatchTier {
@@ -1078,13 +1295,6 @@ mod tests {
             "audit",
             RoleSource::Builtin
         ));
-    }
-
-    #[test]
-    fn explains_the_pick_switch() {
-        assert!(pick_note("").contains("Needs a classifier"));
-        assert!(pick_note("openai").contains("stay general"));
-        assert!(pick_note("jev").contains("P 0.5 or more"));
     }
 
     #[test]

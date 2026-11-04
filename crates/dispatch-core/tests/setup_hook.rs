@@ -218,3 +218,52 @@ fn hook_command_quotes_unsafe_paths() {
         );
     }
 }
+
+#[test]
+fn every_agents_command_is_ours() {
+    for agent in ["codex", "cursor", "gemini", "qwen", "copilot", "grok"] {
+        let got = agent_hook_command("/Users/a b/bin/dispatch", agent);
+        assert_eq!(
+            got,
+            format!("'/Users/a b/bin/dispatch' hook --agent {agent}")
+        );
+        assert!(is_hook_command(&got), "{got:?}");
+    }
+    assert_eq!(
+        agent_hook_command("/bin/dispatch", "claude"),
+        "/bin/dispatch hook",
+        "Claude Code keeps the bare command"
+    );
+    assert!(!is_hook_command("/bin/other hook --agent cursor"));
+    assert!(!is_hook_command("/bin/dispatch hook --agent"));
+}
+
+#[test]
+fn the_context_line_comes_in_each_agents_shape() {
+    for agent in ["claude", "codex"] {
+        assert_eq!(context_output(agent, Default::default()), CONTEXT_MESSAGE);
+    }
+    let parse = |out: String| -> Value { serde_json::from_str(out.trim_end()).unwrap() };
+    for agent in ["gemini", "qwen", "grok"] {
+        let out = parse(context_output(agent, Default::default()));
+        assert_eq!(out["hookSpecificOutput"]["hookEventName"], "SessionStart");
+        assert_eq!(
+            out["hookSpecificOutput"]["additionalContext"],
+            CONTEXT_MESSAGE
+        );
+    }
+    assert_eq!(
+        parse(context_output("copilot", Default::default()))["additionalContext"],
+        CONTEXT_MESSAGE
+    );
+    let mut env = serde_json::Map::new();
+    env.insert("DISPATCH_CALLER_SESSION".into(), "c1".into());
+    let cursor = parse(context_output("cursor", env));
+    assert_eq!(cursor["additional_context"], CONTEXT_MESSAGE);
+    assert_eq!(cursor["env"]["DISPATCH_CALLER_SESSION"], "c1");
+    assert!(
+        parse(context_output("cursor", Default::default()))
+            .get("env")
+            .is_none()
+    );
+}

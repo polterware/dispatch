@@ -2,7 +2,8 @@
 //! so no `Assets.car`: the same icon the bundle and the Electron app show. A bundled
 //! app keeps its Icon Composer icon.
 
-/// The icon rendered from `resources/dispatch.icon` by `tooling/render-icon.swift`.
+/// The Icon Composer export of `resources/dispatch.icon` (`dispatch Exports`, Default) on the macOS
+/// icon grid.
 const ICON_PNG: &[u8] = include_bytes!("../resources/dispatch-icon.png");
 
 #[cfg(target_os = "macos")]

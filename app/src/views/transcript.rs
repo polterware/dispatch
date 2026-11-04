@@ -21,9 +21,11 @@ use gpui::{
     ScrollWheelEvent, SharedString, Task, Window, canvas, div, list, prelude::*, px,
 };
 
-use crate::client::{CoreClient, ProtoI64, ResultRequest, WatchRunRequest};
+use crate::client::{CoreClient, ProtoI64, ReadRunEventsRequest, ResultRequest, WatchRunRequest};
 use crate::format::is_active_status;
-use crate::models::transcript::{LogEvent, TranscriptBuilder, TranscriptEntry, run_log};
+use crate::models::transcript::{
+    LogEvent, PagedEvent, StreamedLog, TranscriptBuilder, TranscriptEntry,
+};
 use crate::motion::{Animator, SpringTier, SpringValue};
 use crate::state::{AppState, observe};
 use crate::theme::{Theme, tw};
@@ -31,10 +33,17 @@ use crate::ui::parts::transcript::{
     HighlightCache, PREVIEW_ENTRIES, RowFrame, TranscriptRow, flatten_transcript, render_row,
     terminal_font,
 };
+use crate::ui::patterns::{JUMP_TO_END_REST, SCROLL_FADE, jump_to_end};
+use crate::ui::text_skeleton;
 use crate::ui::{
     ListScroll, SCROLLBAR_GUTTER, ScrollAxis, ScrollGeometry, WIDE_MEASURE, scrollbar,
 };
 
+/// How fast the glide to the end closes the distance left: the share left after `t` seconds
+/// is `e^(-rate·t)`, so about 0.3s to the end.
+const GLIDE_RATE: f32 = 14.0;
+/// The jump-to-end button over the bottom of the log.
+const JUMP_INSET: f32 = 16.0;
 const SUFFIX_INLINE: usize = 64 * 1024;
 const WATCH_BATCH: usize = 400;
 /// Reserved so an empty or live row cannot share a hash with a real line.
@@ -65,8 +74,30 @@ enum Follow {
 }
 
 enum StreamMsg {
-    Event(LogEvent),
+    Event(PagedEvent),
     End,
+}
+
+/// How much of a run's end the stream opens with: a long run's transcript starts there and
+/// reads further back only as the reader scrolls up.
+const TAIL_BYTES: i64 = 256 * 1024;
+/// How much each scroll up reads back at first.
+const PAGE_BYTES: i64 = 512 * 1024;
+/// The most one read back asks for: a page inside one long line doubles toward it.
+const MAX_PAGE_BYTES: i64 = 8 * 1024 * 1024;
+/// How close to the top, in rows, a scroll up asks for the page before.
+const EARLIER_ROWS: usize = 4;
+
+/// A wire event as the stream and the page reads hand it on.
+fn paged(event: crate::client::WatchRunResponse) -> PagedEvent {
+    PagedEvent {
+        event: LogEvent {
+            kind: event.kind,
+            text: event.text,
+        },
+        seq: event.seq.0,
+        offset: u64::try_from(event.text_offset.0).unwrap_or(0),
+    }
 }
 
 pub struct TranscriptView {
@@ -81,11 +112,15 @@ pub struct TranscriptView {
     builder: TranscriptBuilder,
     processed: String,
     stored: String,
-    events: Vec<LogEvent>,
+    /// What the stream has sent, written once per event as it arrives.
+    streamed: StreamedLog,
     pinned: bool,
     held_start: usize,
     shown_live: bool,
     parse_inflight: bool,
+    /// The stored log has come back once: until then the text shows as bones, not as a run
+    /// with no output.
+    fetched: bool,
     started: bool,
     font: gpui::Font,
     animator: Animator,
@@ -99,6 +134,32 @@ pub struct TranscriptView {
     overflowed: Rc<Cell<bool>>,
     /// The width the run page's list measured every row at, for the scrollbar's true length.
     measured_width: Rc<Cell<f32>>,
+    /// How tall the header floating over the run page's list is: the list runs up under it
+    /// and keeps that much clear above its first row.
+    top_inset: f32,
+    /// The jump-to-end button's presence: in while the reader is away from the end.
+    end_button: SpringValue,
+    /// Text may come before what the stream opened with, and no read has said otherwise.
+    earlier_more: bool,
+    /// A read of the page before is out.
+    earlier_inflight: bool,
+    /// The next read back's size: doubled while pages land inside one long line.
+    earlier_page: i64,
+    /// The next rows put a page in front of the last ones: the list keeps the row the reader
+    /// is on where it is.
+    prepended: bool,
+    /// How many rows there were before a page went in front, until its rows land: a page
+    /// that adds none (stream deltas, usage lines) reads on further.
+    rows_before_page: Option<usize>,
+    /// The first events came in.
+    opened: bool,
+    /// A run longer than its first page opens at its end: the first rows with entries scroll
+    /// there.
+    open_at_end: bool,
+    /// Gliding to the end after the button was pressed.
+    glide: bool,
+    /// The last motion frame's step, which the glide moves by.
+    frame_dt: f32,
 }
 
 impl TranscriptView {
@@ -118,9 +179,12 @@ impl TranscriptView {
         // browser lays the whole log out.
         let list = if compact { list } else { list.measure_all() };
         let weak = cx.entity().downgrade();
+        // GPUI calls this while it holds the list's state, so the handler must not read the
+        // list back (`logical_scroll_top` would panic on the borrow): the event says what shows.
         list.set_scroll_handler(move |event, _, cx| {
             if let Some(entity) = weak.upgrade() {
-                entity.update(cx, |this, cx| this.on_scroll(event.is_scrolled, cx));
+                let first = event.visible_range.start;
+                entity.update(cx, |this, cx| this.on_scroll(event.is_scrolled, first, cx));
             }
         });
         observe(&state, cx);
@@ -136,11 +200,12 @@ impl TranscriptView {
             builder: TranscriptBuilder::new(),
             processed: String::new(),
             stored: String::new(),
-            events: Vec::new(),
+            streamed: StreamedLog::default(),
             pinned: true,
             held_start: 0,
             shown_live: false,
             parse_inflight: false,
+            fetched: false,
             started: false,
             font: terminal_font(cx),
             animator: Animator::new(),
@@ -152,6 +217,17 @@ impl TranscriptView {
             follow: Follow::Idle,
             overflowed: Rc::new(Cell::new(false)),
             measured_width: Rc::new(Cell::new(0.0)),
+            top_inset: 0.0,
+            end_button: SpringValue::new(0.0, SpringTier::Moderate),
+            earlier_more: false,
+            earlier_inflight: false,
+            earlier_page: PAGE_BYTES,
+            prepended: false,
+            rows_before_page: None,
+            opened: false,
+            open_at_end: false,
+            glide: false,
+            frame_dt: 0.0,
         };
         view.ensure_stream(cx);
         view.rebuild_rows(cx);
@@ -192,7 +268,9 @@ impl TranscriptView {
             if this
                 .update(cx, |view, cx| {
                     view.stored = stored;
+                    view.fetched = true;
                     view.apply_log(cx);
+                    cx.notify();
                 })
                 .is_err()
             {
@@ -215,7 +293,14 @@ impl TranscriptView {
                 let alive = this
                     .update(cx, |view, cx| {
                         if !events.is_empty() {
-                            view.events.extend(events);
+                            view.streamed.extend_paged(&events);
+                            if !view.opened {
+                                view.opened = true;
+                                view.earlier_more = view.streamed.may_have_earlier();
+                                // A run longer than its first page opens where it is now, once
+                                // its rows are in.
+                                view.open_at_end = view.earlier_more && !view.compact;
+                            }
                             view.apply_log(cx);
                         }
                     })
@@ -235,7 +320,7 @@ impl TranscriptView {
         if !self.compact && self.live_now(cx) {
             self.follow = Follow::Pending;
         }
-        let log = run_log(&self.stored, &self.events);
+        let log = self.streamed.join(&self.stored);
         let (stable, tail) = split_stable(&log);
         let answer = self.stored.clone();
         if stable == self.processed {
@@ -338,8 +423,36 @@ impl TranscriptView {
                 body: crate::ui::parts::transcript::RowBody::Live,
             });
         }
+        let rows_now = rows.len();
         self.install_rows(rows);
+        if let Some(before) = self.rows_before_page.take() {
+            if rows_now > before {
+                self.earlier_page = PAGE_BYTES;
+            } else {
+                self.read_on(cx);
+            }
+        }
+        if self.open_at_end && !self.entries.is_empty() {
+            self.open_at_end = false;
+            self.follow = Follow::Pending;
+        }
         cx.notify();
+    }
+
+    /// After a page went in front: what came in is rows above the old ones, so the row the
+    /// reader was on moves down by how many came. The old first rows may parse anew with
+    /// their start, but they stay the same stretch of text.
+    fn keep_place_after_prepend(&mut self, old_len: usize, new_len: usize) {
+        let top = self.list.logical_scroll_top();
+        let item_ix = top.item_ix + new_len.saturating_sub(old_len);
+        self.list.splice(0..old_len, new_len);
+        self.list.scroll_to(ListOffset {
+            item_ix: item_ix.min(new_len),
+            offset_in_item: top.offset_in_item,
+        });
+        if !self.compact {
+            let _ = self.list.clone().measure_all();
+        }
     }
 
     fn visible_entries(&self) -> Vec<TranscriptEntry> {
@@ -365,6 +478,10 @@ impl TranscriptView {
             .take_while(|(left, right)| left == right)
             .count();
         *self.rows.borrow_mut() = rows;
+        if std::mem::take(&mut self.prepended) {
+            self.keep_place_after_prepend(old_len, new_len);
+            return;
+        }
         if new_len == old_len && shared == old_len {
             return;
         }
@@ -392,7 +509,11 @@ impl TranscriptView {
         }
     }
 
-    fn on_scroll(&mut self, scrolled: bool, cx: &mut Context<Self>) {
+    /// `first` is the first row on show.
+    fn on_scroll(&mut self, scrolled: bool, first: usize, cx: &mut Context<Self>) {
+        if !self.compact && first < EARLIER_ROWS {
+            self.load_earlier(cx);
+        }
         let pinned = !scrolled;
         if self.pinned && !pinned && self.compact {
             self.held_start = self.entries.len().saturating_sub(PREVIEW_ENTRIES);
@@ -400,8 +521,68 @@ impl TranscriptView {
         let was = self.pinned;
         self.pinned = pinned;
         if self.compact && pinned && !was {
-            self.rebuild_rows(cx);
+            // Rebuilding splices the list, which the scroll handler's caller still holds.
+            cx.spawn(async move |this, cx| {
+                let _ = this.update(cx, |view, cx| view.rebuild_rows(cx));
+            })
+            .detach();
         }
+    }
+
+    /// Reads the page before the text the transcript holds and puts it in front, keeping the
+    /// row the reader is on in place.
+    fn load_earlier(&mut self, cx: &mut Context<Self>) {
+        if !self.earlier_more || self.earlier_inflight || self.parse_inflight {
+            return;
+        }
+        let Some((seq, offset)) = self.streamed.head() else {
+            return;
+        };
+        let Some(client) = self.state.read(cx).client() else {
+            return;
+        };
+        self.earlier_inflight = true;
+        let request = ReadRunEventsRequest {
+            id: self.run_id.clone(),
+            before_seq: ProtoI64(seq),
+            before_offset: ProtoI64(i64::try_from(offset).unwrap_or(i64::MAX)),
+            max_bytes: ProtoI64(self.earlier_page),
+        };
+        cx.spawn(async move |this, cx| {
+            let page = cx
+                .background_spawn(async move { client.read_run_events(&request) })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                view.earlier_inflight = false;
+                let Ok(page) = page else {
+                    // A core from before pages answers nothing: the text stays as it is.
+                    view.earlier_more = false;
+                    return;
+                };
+                let events: Vec<PagedEvent> = page.events.into_iter().map(paged).collect();
+                view.earlier_more = page.more && !events.is_empty();
+                if events.is_empty() {
+                    return;
+                }
+                if view.streamed.prepend(&events) {
+                    view.prepended = true;
+                    view.rows_before_page = Some(view.rows.borrow().len());
+                    view.apply_log(cx);
+                } else {
+                    // Inside one long line: nothing new to show yet.
+                    view.read_on(cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// A page brought nothing to show: read the one before it, twice as large, until rows
+    /// come or the run's start does.
+    fn read_on(&mut self, cx: &mut Context<Self>) {
+        self.earlier_page = (self.earlier_page * 2).min(MAX_PAGE_BYTES);
+        self.load_earlier(cx);
     }
 
     fn expand(&mut self, entry: usize, cx: &mut Context<Self>) {
@@ -451,8 +632,7 @@ impl TranscriptView {
             window.request_animation_frame();
             return;
         };
-        // `bounds_for_item` leaves out the list's top padding.
-        let end = last.bottom() + px(tw(PAGE_TOP) + tw(LOG_END_GAP));
+        let end = last.bottom() + px(tw(LOG_END_GAP));
         let overflow = end - viewport.bottom();
         if overflow > px(0.5) || (passes.is_some() && overflow < px(-0.5)) {
             self.list.scroll_by(overflow);
@@ -467,12 +647,16 @@ impl TranscriptView {
         let moving = self.shown_live
             || !self.enter.settled()
             || !self.reveal.settled()
-            || !self.cursor.settled();
+            || !self.cursor.settled()
+            || !self.end_button.settled()
+            || self.glide;
         let dt = self.animator.dt(window, moving);
+        self.frame_dt = dt;
         if dt > 0.0 {
             self.enter.step(dt);
             self.reveal.step(dt);
             self.cursor.step(dt);
+            self.end_button.step(dt);
         }
         if self.shown_live && self.cursor.settled() {
             let next = if self.cursor.value() < 0.5 { 1.0 } else { 0.0 };
@@ -481,8 +665,89 @@ impl TranscriptView {
     }
 }
 
+impl TranscriptView {
+    /// The text in bones while its log loads: a few lines in a preview, a page of them on
+    /// the run page, at the column's measure under the header.
+    fn loading(
+        &self,
+        top_inset: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let lines = if self.compact { 4 } else { 14 };
+        div()
+            .size_full()
+            .min_h(px(0.0))
+            .flex()
+            .flex_col()
+            .when(!self.compact, |column| {
+                column.items_center().pt(px(tw(PAGE_TOP) + top_inset + 8.0))
+            })
+            .child(
+                div()
+                    .w_full()
+                    .max_w(px(WIDE_MEASURE))
+                    .child(text_skeleton(lines, 12.0, window, cx)),
+            )
+            .into_any_element()
+    }
+
+    /// Keeps `inset` clear above the first row for a header that floats over the list.
+    pub(crate) fn set_top_inset(&mut self, inset: f32, cx: &mut Context<Self>) {
+        if (self.top_inset - inset).abs() > 0.5 {
+            self.top_inset = inset;
+            // The first row carries the inset: measure the rows again.
+            self.measured_width.set(-1.0);
+            cx.notify();
+        }
+    }
+
+    /// The jump-to-end button: glide down to the end, where the log follows again.
+    pub(crate) fn jump_to_end(&mut self, cx: &mut Context<Self>) {
+        self.glide = true;
+        self.frame_dt = 0.0;
+        self.end_button.set_target(0.0);
+        cx.notify();
+    }
+
+    /// One frame of the glide to the end, `left` short of it in a `viewport` tall list: a
+    /// long way is cut to one screen at once, and the last screen eases in, a share of what
+    /// is left each frame.
+    fn step_glide(&mut self, left: f32, viewport: f32, window: &mut Window) {
+        if !self.glide {
+            return;
+        }
+        if left <= 0.5 {
+            self.glide = false;
+            return;
+        }
+        if left > viewport * 1.5 {
+            self.list.scroll_by(px(left - viewport));
+        } else {
+            let dt = if self.frame_dt > 0.0 {
+                self.frame_dt.min(0.05)
+            } else {
+                1.0 / 60.0
+            };
+            let share = 1.0 - (-dt * GLIDE_RATE).exp();
+            self.list.scroll_by(px((left * share).max(1.0).min(left)));
+        }
+        window.request_animation_frame();
+    }
+
+    /// Scrolls the text `y` down (the screenshot tour).
+    pub(crate) fn scroll_by(&mut self, y: f32, cx: &mut Context<Self>) {
+        self.list.scroll_by(px(y));
+        // As a reader's scroll: near the top it reads the page before.
+        let first = self.list.logical_scroll_top().item_ix;
+        self.on_scroll(true, first, cx);
+        cx.notify();
+    }
+}
+
 impl Render for TranscriptView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let top_inset = self.top_inset;
         self.ensure_stream(cx);
         let live = self.live_now(cx);
         if live != self.shown_live {
@@ -491,6 +756,9 @@ impl Render for TranscriptView {
         }
         self.step_motion(window);
         self.step_follow(window);
+        if !self.fetched || (self.parse_inflight && self.entries.is_empty()) {
+            return self.loading(top_inset, window, cx);
+        }
         let theme = *Theme::global(cx);
         let rows = self.rows.clone();
         let cache = self.cache.clone();
@@ -526,9 +794,12 @@ impl Render for TranscriptView {
             if compact {
                 return row;
             }
-            // `.pw-document__column > *`: at most the log's measure, centered.
+            // `.pw-document__column > *`: at most the log's measure, centered. The space over
+            // the transcript (and under the floating header) rides on the first row: a
+            // list's own top padding stays put, and the rows would never pass beneath it.
             div()
                 .w_full()
+                .when(index == 0, |row| row.pt(px(tw(PAGE_TOP) + top_inset)))
                 .flex()
                 .justify_center()
                 .child(
@@ -543,10 +814,7 @@ impl Render for TranscriptView {
         .size_full()
         // On the run page the space over the transcript, the gap to `logEnd`, and the
         // column's 64px under it scroll with the text, as they do in `splitScroll`.
-        .when(!compact, |list| {
-            list.pt(px(tw(PAGE_TOP)))
-                .pb(px(tw(LOG_END_GAP) + COLUMN_END))
-        });
+        .when(!compact, |list| list.pb(px(tw(LOG_END_GAP) + COLUMN_END)));
         let root = div()
             .size_full()
             .min_h(px(0.0))
@@ -572,6 +840,11 @@ impl Render for TranscriptView {
         self.overflowed.set(overflows);
         // Overflow and width are known once the list has laid out, so a frame whose layout
         // changes either draws again.
+        // The fades under the toolbar and over the end read how far the text has scrolled.
+        let scrolled = -f32::from(self.list.scroll_px_offset_for_scrollbar().y);
+        let left = page.map_or(0.0, |page| {
+            (page.content - page.viewport - scrolled).max(0.0)
+        });
         let watched = self.list.clone();
         let overflowed = self.overflowed.clone();
         let measured_width = self.measured_width.clone();
@@ -580,7 +853,11 @@ impl Render for TranscriptView {
                 let now =
                     page_scroll(&watched).is_some_and(|page| page.content > page.viewport + 0.5);
                 let width = f32::from(watched.viewport_bounds().size.width);
-                if now != overflowed.get() || (width - measured_width.get()).abs() > 0.5 {
+                let at = -f32::from(watched.scroll_px_offset_for_scrollbar().y);
+                if now != overflowed.get()
+                    || (width - measured_width.get()).abs() > 0.5
+                    || (at - scrolled).abs() > 0.5
+                {
                     window.refresh();
                 }
             },
@@ -596,6 +873,60 @@ impl Render for TranscriptView {
                 .child(lines)
                 .child(watcher),
         );
+        let gutter = if overflows { SCROLLBAR_GUTTER } else { 0.0 };
+        // The jump-to-end button: in while the reader is away from the end, out at it.
+        let viewport = page.map_or(0.0, |page| page.viewport);
+        self.step_glide(left, viewport, window);
+        let away = overflows && left > JUMP_TO_END_REST && !self.glide;
+        let target = if away { 1.0 } else { 0.0 };
+        if (self.end_button.target() - target).abs() > 0.01 {
+            self.end_button.set_target(target);
+            window.request_animation_frame();
+        }
+        let jump = jump_to_end(
+            SharedString::from(format!("transcript-end-{}", cx.entity_id())),
+            "Jump to the end",
+            self.end_button.value(),
+            Rc::new({
+                let entity = cx.entity();
+                move |_, cx| entity.update(cx, |view, cx| view.jump_to_end(cx))
+            }),
+            cx,
+        );
+        let bottom = left.clamp(0.0, SCROLL_FADE);
+        if bottom > 0.5 {
+            area = area.child(
+                div()
+                    .absolute()
+                    .bottom(px(0.0))
+                    .left(px(0.0))
+                    .right(px(gutter))
+                    .h(px(bottom))
+                    .bg(gpui::linear_gradient(
+                        180.0,
+                        gpui::linear_color_stop(
+                            gpui::Rgba {
+                                a: 0.0,
+                                ..theme.color_surface
+                            },
+                            0.0,
+                        ),
+                        gpui::linear_color_stop(theme.color_surface, 1.0),
+                    )),
+            );
+        }
+        if let Some(jump) = jump {
+            area = area.child(
+                div()
+                    .absolute()
+                    .left(px(0.0))
+                    .right(px(gutter))
+                    .bottom(px(JUMP_INSET))
+                    .flex()
+                    .justify_center()
+                    .child(jump),
+            );
+        }
         if let Some(page) = page.filter(|_| overflows) {
             let id = SharedString::from(format!("transcript-bar-{}", cx.entity_id()));
             let bar = scrollbar(
@@ -606,7 +937,7 @@ impl Render for TranscriptView {
                 },
                 ScrollAxis::Vertical,
                 ScrollGeometry {
-                    track: page.viewport,
+                    track: (page.viewport - top_inset).max(0.0),
                     viewport: page.viewport,
                     content: page.content,
                 },
@@ -620,7 +951,8 @@ impl Render for TranscriptView {
                 div()
                     .id("transcript-gutter")
                     .absolute()
-                    .top(px(0.0))
+                    // The bar starts under the header, clear of its trail.
+                    .top(px(top_inset))
                     .right(px(0.0))
                     .bottom(px(0.0))
                     .w(px(SCROLLBAR_GUTTER))
@@ -657,7 +989,7 @@ fn page_scroll(list: &ListState) -> Option<PageScroll> {
         None => f32::from(list.max_offset_for_scrollbar().height) + viewport,
     };
     Some(PageScroll {
-        content: items + tw(PAGE_TOP) + tw(LOG_END_GAP) + COLUMN_END,
+        content: items + tw(LOG_END_GAP) + COLUMN_END,
         viewport,
     })
 }
@@ -669,30 +1001,56 @@ fn split_stable(log: &str) -> (&str, &str) {
     }
 }
 
+/// Streams the run's log into `tx`, opening at its last [`TAIL_BYTES`]. A core from before
+/// pages rejects the tail and ends the stream before any event: the watch then asks again
+/// for the whole log, as that core expects.
 fn produce_watch(client: CoreClient, run_id: String, tx: mpsc::Sender<StreamMsg>) {
-    let request = WatchRunRequest {
-        id: run_id,
-        after_seq: ProtoI64(0),
-    };
-    let Ok(iter) = client.watch_run(&request) else {
-        let _ = tx.send(StreamMsg::End);
-        return;
-    };
-    for item in iter {
-        match item {
-            Ok(event) => {
-                let message = StreamMsg::Event(LogEvent {
-                    kind: event.kind,
-                    text: event.text,
-                });
-                if tx.send(message).is_err() {
-                    return;
-                }
-            }
-            Err(_) => break,
+    for tail in [TAIL_BYTES, 0] {
+        let request = WatchRunRequest {
+            id: run_id.clone(),
+            after_seq: ProtoI64(0),
+            tail_bytes: ProtoI64(tail),
+        };
+        match stream_watch(&client, &request, &tx) {
+            Watched::Rejected if tail > 0 => continue,
+            Watched::Gone => return,
+            _ => break,
         }
     }
     let _ = tx.send(StreamMsg::End);
+}
+
+enum Watched {
+    /// The stream ran and ended.
+    Ended,
+    /// The core failed it before sending an event.
+    Rejected,
+    /// The view went away.
+    Gone,
+}
+
+fn stream_watch(
+    client: &CoreClient,
+    request: &WatchRunRequest,
+    tx: &mpsc::Sender<StreamMsg>,
+) -> Watched {
+    let Ok(iter) = client.watch_run(request) else {
+        return Watched::Rejected;
+    };
+    let mut sent = false;
+    for item in iter {
+        match item {
+            Ok(event) => {
+                if tx.send(StreamMsg::Event(paged(event))).is_err() {
+                    return Watched::Gone;
+                }
+                sent = true;
+            }
+            Err(_) if !sent => return Watched::Rejected,
+            Err(_) => break,
+        }
+    }
+    Watched::Ended
 }
 
 fn recv_batch(rx: &Mutex<mpsc::Receiver<StreamMsg>>) -> Option<Vec<StreamMsg>> {

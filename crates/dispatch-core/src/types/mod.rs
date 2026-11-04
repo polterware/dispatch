@@ -226,6 +226,38 @@ pub struct RunEvent {
     pub at: String,
 }
 
+/// Where one event sits in a run's text: its seq, its kind, and how many bytes its text has.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EventSize {
+    pub seq: i64,
+    pub kind: String,
+    pub bytes: u64,
+}
+
+fn is_continuation(byte: u8) -> bool {
+    byte & 0b1100_0000 == 0b1000_0000
+}
+
+/// Cuts `wanted` bytes off the front of `window` to whole characters: the cut's start moves on
+/// past the bytes that continue a character begun before it, and its end moves back onto the
+/// start of a character the cut would split. `window` may hold one byte past `wanted`, which
+/// tells whether the end splits one. Returns the text and how many bytes its start moved on.
+pub fn cut_utf8(window: &[u8], wanted: usize) -> (String, usize) {
+    let wanted = wanted.min(window.len());
+    let mut start = 0;
+    while start < wanted && is_continuation(window[start]) {
+        start += 1;
+    }
+    let mut end = wanted;
+    while end > start && end < window.len() && is_continuation(window[end]) {
+        end -= 1;
+    }
+    (
+        String::from_utf8_lossy(&window[start..end]).into_owned(),
+        start,
+    )
+}
+
 /// One row of the declarative difficulty table.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Tier {
@@ -294,6 +326,47 @@ pub trait Store: Send + Sync {
     fn append_event(&self, event: &RunEvent) -> Result<(), Error>;
     fn list_events(&self, run_id: &str, after_seq: i64, limit: i64)
     -> Result<Vec<RunEvent>, Error>;
+    /// The run's events oldest first, by size alone, so a page of their text is planned
+    /// without reading it.
+    fn event_sizes(&self, run_id: &str) -> Result<Vec<EventSize>, Error> {
+        Ok(self
+            .list_events(run_id, 0, 0)?
+            .into_iter()
+            .map(|e| EventSize {
+                seq: e.seq,
+                kind: e.kind,
+                bytes: e.text.len() as u64,
+            })
+            .collect())
+    }
+    /// Event `seq` with its text cut to the bytes `start..end`, both moved inward to whole
+    /// characters, and where its text now starts. None when the run has no such event.
+    fn event_slice(
+        &self,
+        run_id: &str,
+        seq: i64,
+        start: u64,
+        end: u64,
+    ) -> Result<Option<(RunEvent, u64)>, Error> {
+        let Some(mut event) = self
+            .list_events(run_id, seq - 1, 1)?
+            .into_iter()
+            .find(|e| e.seq == seq)
+        else {
+            return Ok(None);
+        };
+        let bytes = event.text.as_bytes();
+        let from = usize::try_from(start)
+            .unwrap_or(usize::MAX)
+            .min(bytes.len());
+        let to = usize::try_from(end)
+            .unwrap_or(usize::MAX)
+            .clamp(from, bytes.len());
+        let window = &bytes[from..(to + 1).min(bytes.len())];
+        let (text, moved) = cut_utf8(window, to - from);
+        event.text = text;
+        Ok(Some((event, (from + moved) as u64)))
+    }
     fn list_history(
         &self,
         project_id: &str,

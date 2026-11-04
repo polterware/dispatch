@@ -11,8 +11,9 @@ use crate::format::prompt_first_line;
 pub const DISPLAY_PREFERENCE: &str = "pwdispatch.sidebar.display";
 pub const COLLAPSED_PREFERENCE: &str = "pwdispatch.sidebar.collapsed";
 
-/// How long a pointer must rest on a run before its transcript card opens.
-pub const HOVER_OPEN_MS: u64 = 600;
+/// How long a pointer must rest on a run before its transcript card opens: long enough that
+/// passing down the list opens nothing, short enough that a pause still does.
+pub const HOVER_OPEN_MS: u64 = 900;
 /// How long the card stays up while the pointer crosses from the row into it.
 pub const HOVER_CLOSE_MS: u64 = 150;
 

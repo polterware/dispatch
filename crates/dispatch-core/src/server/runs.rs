@@ -2,7 +2,9 @@
 //! agents, and stats.
 
 use super::{
-    Core, RpcError, RpcResult, convert, is_terminal, lock, now_rfc3339,
+    Core, RpcError, RpcResult, convert,
+    event_pages::{page_before, page_bytes},
+    is_terminal, lock, now_rfc3339,
     workspace::{HOST_TIMEOUT, expand_path, run_area},
 };
 use crate::{
@@ -505,6 +507,44 @@ impl Core {
         })
     }
 
+    /// The page of the run's event text that ends at `before` (an event's seq and a byte
+    /// offset into its text), for a client that opened the run at its end and scrolls back.
+    pub(crate) async fn read_run_events(
+        &self,
+        m: pb::ReadRunEventsRequest,
+    ) -> RpcResult<pb::ReadRunEventsResponse> {
+        let id = required(&m.id, "run id")?;
+        self.store.get_run(&id).map_err(store_error)?;
+        let before =
+            (m.before_seq > 0).then(|| (m.before_seq, u64::try_from(m.before_offset).unwrap_or(0)));
+        let (events, more, _) = self.event_page(&id, before, page_bytes(m.max_bytes))?;
+        Ok(pb::ReadRunEventsResponse { events, more })
+    }
+
+    /// The events of the page that ends at `before`, cut to it, whether text remains before
+    /// it, and the run's newest seq.
+    fn event_page(
+        &self,
+        id: &str,
+        before: Option<(i64, u64)>,
+        max_bytes: u64,
+    ) -> RpcResult<(Vec<pb::WatchRunResponse>, bool, i64)> {
+        let sizes = self.store.event_sizes(id).map_err(RpcError::internal)?;
+        let newest = sizes.last().map_or(0, |size| size.seq);
+        let (cuts, more) = page_before(&sizes, before, max_bytes);
+        let mut events = Vec::with_capacity(cuts.len());
+        for cut in cuts {
+            if let Some((event, start)) = self
+                .store
+                .event_slice(id, cut.seq, cut.start, cut.end)
+                .map_err(RpcError::internal)?
+            {
+                events.push(convert::watch_slice(&event, start));
+            }
+        }
+        Ok((events, more, newest))
+    }
+
     /// Streams the run's events from `after_seq`, turning the agent's live log
     /// into output events, until the run ends.
     pub(crate) fn watch_run(
@@ -517,9 +557,12 @@ impl Core {
         let (tx, rx) = tokio::sync::mpsc::channel::<RpcResult<pb::WatchRunResponse>>(64);
         tokio::spawn(async move {
             let _guard = core.stream_guard();
-            let _ = core.watch_loop(run, m.after_seq, &tx).await.map_err(|e| {
-                let _ = tx.try_send(Err(e));
-            });
+            let _ = core
+                .watch_loop(run, m.after_seq, m.tail_bytes, &tx)
+                .await
+                .map_err(|e| {
+                    let _ = tx.try_send(Err(e));
+                });
         });
         Ok(tokio_stream_from(rx))
     }
@@ -528,10 +571,21 @@ impl Core {
         &self,
         mut run: Run,
         after: i64,
+        tail_bytes: i64,
         tx: &tokio::sync::mpsc::Sender<RpcResult<pb::WatchRunResponse>>,
     ) -> RpcResult<()> {
         let id = run.id.clone();
         let mut last = after;
+        // Opened at the end: the last page first, then whatever comes after it.
+        if after <= 0 && tail_bytes > 0 {
+            let (page, _, newest) = self.event_page(&id, None, page_bytes(tail_bytes))?;
+            for event in page {
+                if tx.send(Ok(event)).await.is_err() {
+                    return Ok(());
+                }
+            }
+            last = newest;
+        }
         let log = self
             .state_dir()
             .join("logs")
@@ -817,11 +871,20 @@ impl Core {
         (entries, listed.problems)
     }
 
+    /// The agents as last probed. A probe of their quota asks every installed CLI and can take
+    /// seconds, so once there is an answer it runs behind this one, and only the very first
+    /// list waits for it.
     pub(crate) async fn list_agents(
-        &self,
+        self: &Arc<Self>,
         _: pb::ListAgentsRequest,
     ) -> RpcResult<pb::ListAgentsResponse> {
-        self.probe_once("", Utc::now()).await;
+        let stored = self.store.list_agents().map_err(RpcError::internal)?;
+        if stored.is_empty() {
+            self.probe_once("", Utc::now()).await;
+        } else {
+            let core = self.clone();
+            tokio::spawn(async move { core.probe_once("", Utc::now()).await });
+        }
         let agents = self.store.list_agents().map_err(RpcError::internal)?;
         let installed: HashMap<String, bool> = known::known()
             .iter()

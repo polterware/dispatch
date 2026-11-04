@@ -173,5 +173,12 @@ async fn pi_run_reads_its_stream() {
         ),
         ["openai/gpt-x"]
     );
+    // With no provider logged in, pi says so and lists no model: "No" and "models" are words.
+    assert!(
+        dispatch_core::adapters::cli::parse_pi_models(
+            "No models available. Use /login to log into a provider via OAuth or API key. See:\n  /Users/someone/.pi/docs/providers.md\n"
+        )
+        .is_empty()
+    );
     binaries::set_binaries(HashMap::new());
 }

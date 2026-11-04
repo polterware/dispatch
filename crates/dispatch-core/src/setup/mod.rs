@@ -1,6 +1,6 @@
 //! Agent setup: reports and changes how the agent CLIs on this machine reach
-//! dispatch: the `dispatch` command on the PATH, the dispatch skill in each
-//! agent's skills folder, the Claude Code SessionStart hook, and the Dispatch
+//! dispatch: the `dispatch` command on the PATH, the dispatch skill in the
+//! skills folders they read, each agent's SessionStart hook, and the Dispatch
 //! plugin in OpenCode.
 
 mod jsonc;
@@ -30,21 +30,30 @@ pub struct Cli {
     pub binary: String,
 }
 
-/// The dispatch skill for one agent: Current, Outdated (another version of
-/// it), or Missing.
+/// The dispatch skill in one skills folder: Current, Outdated (another
+/// version of it), or Missing.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Skill {
-    pub agent: String,
+    /// The skills folder.
+    pub dir: String,
+    /// The skill's SKILL.md in it.
     pub path: String,
+    /// The agents that read the folder.
+    pub agents: Vec<String>,
     pub state: String,
+    /// An agent's own folder the shared one already reaches, listed only
+    /// while it holds a copy, so the copy can be removed.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub extra: bool,
 }
 
-/// The Claude Code SessionStart hook: On when it is registered and the
-/// enabled flag is set; command is what it runs, current when that is this
-/// binary.
+/// One agent's SessionStart hook: On when it is registered and the enabled
+/// flag is set; command is what it runs, current when that is this binary.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Hook {
+    pub agent: String,
     pub on: bool,
+    /// The file the hook lives in.
     pub settings: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub command: String,
@@ -56,7 +65,11 @@ pub struct Hook {
 pub struct Report {
     pub cli: Cli,
     pub skills: Vec<Skill>,
-    pub hook: Hook,
+    /// The hook of every agent on this machine that has one, and of any
+    /// other agent whose hook is still registered.
+    pub hooks: Vec<Hook>,
+    /// The agents whose config folder is on this machine.
+    pub agents: Vec<String>,
     pub opencode: OpenCode,
 }
 
@@ -98,28 +111,87 @@ pub fn read(home: &Path, binary: &str, state_dir: &Path) -> Report {
         opencode: opencode::read_opencode(home, &opencode_binary(home, binary), state_dir),
         ..Report::default()
     };
-    for (agent, target) in skill::targets(home) {
-        let path = target.dir.join(skill::NAME).join("SKILL.md");
+    let mut seen = HashSet::new();
+    for folder in skill::folders(home) {
+        if !seen.insert(folder.dir.clone()) {
+            continue;
+        }
+        let path = folder.skill_path();
         let state = match fs::read(&path) {
             Ok(b) if b == skill::CONTENT => CURRENT,
             Ok(_) => OUTDATED,
             Err(_) => MISSING,
         };
+        if folder.extra && state == MISSING {
+            continue;
+        }
         r.skills.push(Skill {
-            agent,
+            dir: lossy(&folder.dir),
             path: lossy(&path),
+            agents: folder.agents,
             state: state.into(),
+            extra: folder.extra,
         });
     }
-    let settings = hook::settings_path(home);
-    let command = hook::registered_command(&settings);
-    r.hook = Hook {
-        on: !command.is_empty() && hook::is_enabled(state_dir),
-        settings: lossy(&settings),
-        current: !command.is_empty() && command == hook::hook_command(binary),
-        command,
-    };
+    r.agents = present_agents(home);
+    let enabled = hook::is_enabled(state_dir);
+    for agent in hook::HOOK_AGENTS {
+        let Some(h) = hook::agent_hook(home, agent) else {
+            continue;
+        };
+        let command = h.registered();
+        if command.is_empty() && !r.agents.iter().any(|a| a == agent) {
+            continue;
+        }
+        r.hooks.push(Hook {
+            agent: agent.into(),
+            on: !command.is_empty() && enabled,
+            settings: lossy(&h.path),
+            current: !command.is_empty() && command == hook::agent_hook_command(binary, agent),
+            command,
+        });
+    }
     r
+}
+
+/// The agents whose config folder is on this machine, the sign an agent CLI
+/// was installed and run here.
+pub fn present_agents(home: &Path) -> Vec<String> {
+    let env = |key: &str| {
+        std::env::var_os(key)
+            .map(PathBuf::from)
+            .filter(|d| d.is_absolute())
+    };
+    let config = env("XDG_CONFIG_HOME").unwrap_or_else(|| home.join(".config"));
+    let claude = hook::claude_config_dir().unwrap_or_else(|| home.join(".claude"));
+    let codex = env("CODEX_HOME").unwrap_or_else(|| home.join(".codex"));
+    let signs: [(&str, Vec<PathBuf>); 11] = [
+        ("claude", vec![claude]),
+        ("codex", vec![codex]),
+        ("cursor", vec![home.join(".cursor")]),
+        (
+            "gemini",
+            vec![
+                home.join(".gemini/settings.json"),
+                home.join(".gemini/oauth_creds.json"),
+            ],
+        ),
+        ("antigravity", vec![home.join(".gemini/antigravity")]),
+        (
+            "opencode",
+            vec![config.join("opencode"), home.join(".local/share/opencode")],
+        ),
+        ("grok", vec![home.join(".grok")]),
+        ("pi", vec![home.join(".pi/agent")]),
+        ("qwen", vec![home.join(".qwen")]),
+        ("kimi", vec![home.join(".kimi-code"), home.join(".kimi")]),
+        ("copilot", vec![home.join(".copilot")]),
+    ];
+    signs
+        .into_iter()
+        .filter(|(_, paths)| paths.iter().any(|p| fs::metadata(p).is_ok()))
+        .map(|(agent, _)| agent.to_string())
+        .collect()
 }
 
 /// The dispatch the OpenCode plugin runs: the linked command when it is this
@@ -177,40 +249,74 @@ pub fn link_cli(home: &Path, binary: &str) -> Result<PathBuf, Error> {
     Ok(path)
 }
 
-/// Writes the current skill for agent, or for every agent when it is empty,
-/// over any older copy. It returns the paths written.
-pub fn install_skill(home: &Path, agent: &str) -> Result<Vec<PathBuf>, Error> {
-    let targets = skill::targets(home);
-    let agent = agent.trim();
-    if !agent.is_empty() && !targets.contains_key(agent) {
-        return Err(Error::Message(format!("unknown agent {agent:?}")));
+// skill_folder is the folder key names (a folder's path, or an agent).
+fn skill_folder(home: &Path, key: &str) -> Result<skill::Folder, Error> {
+    skill::resolve(home, key)
+        .ok_or_else(|| Error::Message(format!("unknown agent or skills folder {:?}", key.trim())))
+}
+
+/// Writes the current skill into the folder key names (a folder's path, or
+/// an agent, for the folder that agent reads), or into the three Dispatch
+/// installs into when it is empty, over any older copy. It returns the paths
+/// written.
+pub fn install_skill(home: &Path, key: &str) -> Result<Vec<PathBuf>, Error> {
+    if !key.trim().is_empty() {
+        let folder = skill_folder(home, key)?;
+        return Ok(vec![skill::install(&folder.dir, true)?]);
     }
     let mut out = Vec::new();
-    let mut seen = HashSet::new();
-    for (name, target) in &targets {
-        if (!agent.is_empty() && name != agent) || seen.contains(&target.dir) {
-            continue;
-        }
-        seen.insert(target.dir.clone());
-        out.push(skill::install(&target.dir, true)?);
+    for folder in skill::folders(home).into_iter().filter(|f| !f.extra) {
+        out.push(skill::install(&folder.dir, true)?);
     }
     Ok(out)
 }
 
-/// Registers the SessionStart hook for binary and sets the enabled flag, or
-/// removes both.
-pub fn set_hook(home: &Path, binary: &str, state_dir: &Path, on: bool) -> Result<(), Error> {
-    let settings = hook::settings_path(home);
-    if !on {
-        let errs = [
-            hook::set_enabled(state_dir, false),
-            hook::uninstall(&settings),
-        ]
-        .into_iter()
-        .filter_map(Result::err)
-        .collect();
-        return join_errors(errs);
+/// Removes the skill from the folder key names (a folder's path, or an
+/// agent), or from every folder when it is empty. It returns what it removed.
+pub fn remove_skill(home: &Path, key: &str) -> Result<Vec<PathBuf>, Error> {
+    let folders = if key.trim().is_empty() {
+        skill::folders(home)
+    } else {
+        vec![skill_folder(home, key)?]
+    };
+    let mut out = Vec::new();
+    for folder in folders {
+        out.extend(skill::remove(&folder.dir)?);
     }
-    hook::set_enabled(state_dir, true)?;
-    hook::install(&settings, binary)
+    Ok(out)
+}
+
+/// Registers agent's SessionStart hook for binary and sets the enabled flag,
+/// or removes the hook, and the flag with the last one. An empty agent is
+/// Claude Code.
+pub fn set_hook(
+    home: &Path,
+    binary: &str,
+    state_dir: &Path,
+    agent: &str,
+    on: bool,
+) -> Result<(), Error> {
+    let agent = match agent.trim() {
+        "" => "claude",
+        agent => agent,
+    };
+    let Some(h) = hook::agent_hook(home, agent) else {
+        return Err(Error::Message(format!(
+            "{agent:?} has no session hook: use one of {}",
+            hook::HOOK_AGENTS.join(", ")
+        )));
+    };
+    if on {
+        hook::set_enabled(state_dir, true)?;
+        return h.install(binary);
+    }
+    h.uninstall()?;
+    let none_left = hook::HOOK_AGENTS
+        .iter()
+        .filter_map(|a| hook::agent_hook(home, a))
+        .all(|h| h.registered().is_empty());
+    if none_left {
+        hook::set_enabled(state_dir, false)?;
+    }
+    Ok(())
 }

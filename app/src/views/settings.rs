@@ -1,6 +1,6 @@
 //! Settings: one page per concern, with a rail.
 //!
-//! Agent setup, routing policy, classifier keys, route, and classify all go
+//! Agent setup, routing policy, classifier keys, and the key's test classify all go
 //! through `CoreClient` on the background executor. Key values are never copied
 //! into a label, a toast, or the view's own fields.
 
@@ -15,43 +15,37 @@ use gpui::{
 use crate::avatar::agent_avatar;
 use crate::client::{
     ApplyAgentSetupRequest, ClassifyRequest, ConfigRequest, ConfigResponse, CoreClient, CoreError,
-    GetAgentSetupRequest, ListAgentsRequest, ListModelsRequest, RouteRequest, Workspace,
+    GetAgentSetupRequest, ListAgentsRequest, ListModelsRequest, Workspace,
 };
 use crate::models::settings::{
-    CLASSIFIERS, CliState, Dimension, InstallState, ListedModel, Policy, RouteView, RuleSide,
-    SAMPLE_TASK, agent_label, bool_wire, classifier_trailing, classify_meta, cli_description,
-    draft_ready, env_key_sentence, fixed2, folder_agents_label, hook_points_elsewhere, key_chip,
+    CLASSIFIERS, CliState, Dimension, InstallState, ListedModel, Policy, RuleSide, SAMPLE_TASK,
+    agent_label, bool_wire, classifier_trailing, classify_meta, cli_description, draft_ready,
+    env_key_sentence, fixed2, folder_agents_label, hook_note, hook_points_elsewhere, key_chip,
     key_placeholder, key_test_enabled, key_uses_replace, keyed_classifier, opencode_description,
     parse_agent_setup, parse_classify, parse_cli_model, parse_key_map, parse_key_status_value,
-    parse_policy, parse_route, policy_options, priority_label, priority_value, prob_line,
-    radio_value, role_answer_line, route_tier_label, route_tier_options, skill_folders,
-    skills_need_install, token_delta, trimmed_draft, with_token, without_token,
+    parse_policy, policy_options, priority_label, priority_value, prob_line, radio_value,
+    role_answer_line, skill_readers, skills_need_install, token_delta, trimmed_draft, with_token,
+    without_token,
 };
 use crate::motion::{Animator, Spring, SpringTier, SpringValue};
 use crate::state::{AppState, Route, SettingsPage, ToastTone};
 use crate::theme::{StatusTone, Theme};
-use crate::ui::parts::settings::{
-    radio_mark, settings_field, settings_row, settings_section, wash,
-};
+use crate::ui::parts::settings::{radio_mark, settings_row, settings_section, wash};
+use crate::ui::patterns::{SETTINGS_SECTION_GAP, SettingsNavItem, settings_dialog};
 use crate::ui::{
-    ButtonKind, Icon, Menu, MenuEntry, Popover, Switch, TextInput, button, chip, icon, icon_button,
-    rail_group, toolbar, tooltip,
+    ButtonKind, Icon, Menu, MenuItem, Popover, Switch, TextInput, TileTone, button, chip, icon,
+    icon_button,
 };
+use crate::ui::{SkeletonLayout, page_skeleton};
 
 const RAIL_ROW: f32 = 32.0;
 const RAIL_GAP: f32 = 2.0;
 const EDITOR_HEIGHT: f32 = 120.0;
 
-const RAIL: [(SettingsPage, &str, Icon); 6] = [
+const RAIL: [(SettingsPage, &str, Icon); 4] = [
     (SettingsPage::Agents, "Agents", Icon::Settings),
-    (SettingsPage::TryRoute, "Try a route", Icon::Route),
     (SettingsPage::Classifier, "Classifier", Icon::AiBrain01Icon),
     (SettingsPage::PickRole, "Pick a role", Icon::Route),
-    (
-        SettingsPage::ClassifyPrompt,
-        "Classify a prompt",
-        Icon::Search,
-    ),
     (SettingsPage::RoutingPolicy, "Routing policy", Icon::Sliders),
 ];
 
@@ -80,32 +74,23 @@ pub struct SettingsView {
     setup_ticket: u64,
     busy: String,
     busy_ticket: u64,
-    route_tier: String,
-    route_agent: String,
-    route_report: Option<RouteView>,
     classify_report: Option<crate::models::settings::ClassifyView>,
-    route_prompt: Entity<TextInput>,
-    classify_prompt: Entity<TextInput>,
     jev_key: Entity<TextInput>,
     openai_key: Entity<TextInput>,
     jev_placeholder: &'static str,
     openai_placeholder: &'static str,
     token_draft: Entity<TextInput>,
-    hook: Entity<Switch>,
+    /// Each agent's session hook switch, made when the setup first lists the agent.
+    hooks: BTreeMap<String, Entity<Switch>>,
     opencode: Entity<Switch>,
     roles: Entity<Switch>,
     discover: Entity<Switch>,
     scope: Entity<Switch>,
-    read_only: Entity<Switch>,
     priority_menu: Entity<Menu>,
-    tier_menu: Entity<Menu>,
-    agent_menu: Entity<Menu>,
     token_popover: Entity<Popover>,
     token_slot: Option<TokenSlot>,
-    indicator: Spring,
-    indicator_ready: bool,
-    rail_hover: [SpringValue; 6],
-    rail_press: [SpringValue; 6],
+    /// How far the dialog is in, 0 to 1.
+    open: SpringValue,
     option_hover: [SpringValue; 4],
     option_press: [SpringValue; 4],
     enter: SpringValue,
@@ -119,12 +104,9 @@ pub struct SettingsView {
 impl SettingsView {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let view = cx.entity().downgrade();
-        let route_prompt = prompt_input(cx);
-        let classify_prompt = prompt_input(cx);
         let token_draft = token_input(view.clone(), cx);
         let jev_key = key_input("jev", "Paste a key", view.clone(), cx);
         let openai_key = key_input("openai", "Paste a key", view.clone(), cx);
-        let hook = switch(false, view.clone(), cx, |this, on, cx| this.on_hook(on, cx));
         let opencode = switch(true, view.clone(), cx, |this, on, cx| {
             this.on_opencode(on, cx)
         });
@@ -135,10 +117,7 @@ impl SettingsView {
         let scope = switch(false, view.clone(), cx, |this, on, cx| {
             this.on_scope(on, cx)
         });
-        let read_only = cx.new(|cx| Switch::new(false, cx));
         let priority_menu = cx.new(Menu::new);
-        let tier_menu = cx.new(Menu::new);
-        let agent_menu = cx.new(Menu::new);
         let token_popover = cx.new(Popover::new);
         let panel_view = view.clone();
         token_popover.update(cx, |popover, _| {
@@ -149,8 +128,6 @@ impl SettingsView {
             cx.notify();
         })
         .detach();
-        watch_input(&route_prompt, cx);
-        watch_input(&classify_prompt, cx);
         watch_input(&jev_key, cx);
         watch_input(&openai_key, cx);
         watch_input(&token_draft, cx);
@@ -173,32 +150,21 @@ impl SettingsView {
             setup_ticket: 0,
             busy: String::new(),
             busy_ticket: 0,
-            route_tier: "normal".to_string(),
-            route_agent: String::new(),
-            route_report: None,
             classify_report: None,
-            route_prompt,
-            classify_prompt,
             jev_key,
             openai_key,
             jev_placeholder: "Paste a key",
             openai_placeholder: "Paste a key",
             token_draft,
-            hook,
+            hooks: BTreeMap::new(),
             opencode,
             roles,
             discover,
             scope,
-            read_only,
             priority_menu,
-            tier_menu,
-            agent_menu,
             token_popover,
             token_slot: None,
-            indicator: Spring::selection(0.0),
-            indicator_ready: false,
-            rail_hover: [SpringValue::new(0.0, SpringTier::Fast); 6],
-            rail_press: [SpringValue::new(0.0, SpringTier::Fast); 6],
+            open: SpringValue::new(0.0, SpringTier::Slow),
             option_hover: [SpringValue::new(0.0, SpringTier::Fast); 4],
             option_press: [SpringValue::new(0.0, SpringTier::Fast); 4],
             enter: SpringValue::new(0.0, SpringTier::Moderate),
@@ -252,11 +218,24 @@ impl SettingsView {
         }
     }
 
+    /// The open section; while the dialog plays out, the one it showed.
     fn page(&self, cx: &App) -> SettingsPage {
         match self.state.read(cx).route() {
             Route::Settings(page) => page.clone(),
-            _ => SettingsPage::Agents,
+            _ => self.shown.clone().unwrap_or(SettingsPage::Agents),
         }
+    }
+
+    /// How far the dialog is presented, 0 to 1, for the scrim behind it.
+    pub fn presence(&self) -> f32 {
+        self.open.value().clamp(0.0, 1.0)
+    }
+
+    /// Whether the dialog must stay mounted: open, or still playing out.
+    pub fn is_presented(&self, cx: &App) -> bool {
+        matches!(self.state.read(cx).route(), Route::Settings(_))
+            || !self.open.settled()
+            || self.open.value() > 0.001
     }
 
     fn client(&self, cx: &App) -> Option<CoreClient> {
@@ -331,25 +310,31 @@ impl SettingsView {
                 .update(cx, |switch, _| switch.set_on(policy.roles));
             self.discover
                 .update(cx, |switch, _| switch.set_on(policy.discover));
-            if !policy.classifier_on() && self.route_tier == "auto" {
-                self.route_tier = "normal".to_string();
-            }
         }
     }
 
     fn sync_setup_switches(&mut self, cx: &mut Context<Self>) {
         if let Some(setup) = self.setup.clone() {
-            self.hook
-                .update(cx, |switch, _| switch.set_on(setup.hook.on));
+            let view = cx.entity().downgrade();
+            for hook in &setup.hooks {
+                let agent = hook.agent.clone();
+                let toggle = self
+                    .hooks
+                    .entry(agent.clone())
+                    .or_insert_with(|| {
+                        switch(hook.on, view.clone(), cx, move |this, on, cx| {
+                            this.on_hook(&agent, on, cx)
+                        })
+                    })
+                    .clone();
+                toggle.update(cx, |switch, _| switch.set_on(hook.on));
+            }
             self.opencode
                 .update(cx, |switch, _| switch.set_on(setup.opencode.on));
         }
     }
 
     fn apply_policy(&mut self, policy: Policy, cx: &mut Context<Self>) {
-        if !policy.classifier_on() && self.route_tier == "auto" {
-            self.route_tier = "normal".to_string();
-        }
         let roles = policy.roles;
         let discover = policy.discover;
         self.policy = Some(policy);
@@ -623,9 +608,6 @@ impl SettingsView {
                 }
                 _ => {}
             }
-            if !policy.classifier_on() && self.route_tier == "auto" {
-                self.route_tier = "normal".to_string();
-            }
         }
         self.policy_ticket = self.policy_ticket.wrapping_add(1);
         let ticket = self.policy_ticket;
@@ -884,50 +866,6 @@ impl SettingsView {
         self.submit_key(name, draft, cx);
     }
 
-    fn run_route(&mut self, cx: &mut Context<Self>) {
-        let Some(client) = self.client(cx) else {
-            self.toast("This core does not support it yet.", ToastTone::Danger, cx);
-            return;
-        };
-        let request = RouteRequest {
-            tier: self.route_tier.clone(),
-            agent: self.route_agent.clone(),
-            read_only: self.read_only.read(cx).is_on(),
-            dir: self.project_dir.clone(),
-            prompt: self.route_prompt.read(cx).text().to_string(),
-            project_id: self.project_id.clone(),
-            ..Default::default()
-        };
-        let epoch = self.epoch;
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_spawn(async move { client.route(&request) })
-                .await;
-            let _ = this.update(cx, |view, cx| {
-                if view.epoch != epoch {
-                    return;
-                }
-                match result {
-                    Ok(response) => {
-                        // `ok` is omitted when no candidate qualifies. The body is still the report.
-                        view.route_report = Some(parse_route(&response.json));
-                        view.result_enter.snap(0.0);
-                        view.result_enter.set_target(1.0);
-                    }
-                    Err(err) => {
-                        view.toast(
-                            core_message(&err, "Could not route."),
-                            ToastTone::Danger,
-                            cx,
-                        );
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
     fn classify_text(&mut self, prompt: String, cx: &mut Context<Self>) {
         if !draft_ready(&prompt) {
             return;
@@ -969,18 +907,21 @@ impl SettingsView {
         .detach();
     }
 
-    fn on_hook(&mut self, on: bool, cx: &mut Context<Self>) {
+    fn on_hook(&mut self, agent: &str, on: bool, cx: &mut Context<Self>) {
         if self.busy() {
-            self.hook.update(cx, |switch, _| switch.set_on(!on));
+            if let Some(toggle) = self.hooks.get(agent) {
+                toggle.update(cx, |switch, _| switch.set_on(!on));
+            }
             cx.notify();
             return;
         }
+        let name = agent_label(agent);
         let (action, done) = if on {
-            ("hook_on", "Hook on.")
+            ("hook_on", format!("{name} hook on."))
         } else {
-            ("hook_off", "Hook off.")
+            ("hook_off", format!("{name} hook off."))
         };
-        self.apply_setup("hook", action, "", done, cx);
+        self.apply_setup(&format!("hook:{agent}"), action, agent, &done, cx);
     }
 
     fn on_opencode(&mut self, on: bool, cx: &mut Context<Self>) {
@@ -1051,11 +992,10 @@ impl SettingsView {
             .map(|value| {
                 let view = view.clone();
                 let picked = current == value;
-                MenuEntry {
-                    label: priority_label(value).into(),
-                    icon: picked.then_some(Icon::Check),
-                    danger: false,
-                    on_select: Rc::new(move |_, app| {
+                MenuItem::radio(
+                    priority_label(value),
+                    picked,
+                    Rc::new(move |_, app| {
                         let view = view.clone();
                         app.defer(move |app| {
                             if let Some(view) = view.upgrade() {
@@ -1072,80 +1012,11 @@ impl SettingsView {
                             }
                         });
                     }),
-                }
+                )
             })
             .collect();
         self.priority_menu.update(cx, |menu, cx| {
-            menu.set_items(items);
-            menu.set_open(true);
-            cx.notify();
-        });
-    }
-
-    fn open_tier(&mut self, cx: &mut Context<Self>) {
-        let current = self.route_tier.clone();
-        let view = cx.entity().downgrade();
-        let items = route_tier_options(self.classifier_on())
-            .into_iter()
-            .map(|(value, label)| {
-                let view = view.clone();
-                let picked = current == value;
-                MenuEntry {
-                    label: label.into(),
-                    icon: picked.then_some(Icon::Check),
-                    danger: false,
-                    on_select: Rc::new(move |_, app| {
-                        let view = view.clone();
-                        app.defer(move |app| {
-                            if let Some(view) = view.upgrade() {
-                                let _ = view.update(app, |this, cx| {
-                                    this.route_tier = value.to_string();
-                                    cx.notify();
-                                });
-                            }
-                        });
-                    }),
-                }
-            })
-            .collect();
-        self.tier_menu.update(cx, |menu, cx| {
-            menu.set_items(items);
-            menu.set_open(true);
-            cx.notify();
-        });
-    }
-
-    fn open_agent(&mut self, cx: &mut Context<Self>) {
-        let current = self.route_agent.clone();
-        let mut options = vec![("".to_string(), "Any agent".to_string())];
-        options.extend(self.agents.iter().cloned().map(|name| (name.clone(), name)));
-        let view = cx.entity().downgrade();
-        let items = options
-            .into_iter()
-            .map(|(value, label)| {
-                let view = view.clone();
-                let picked = current == value;
-                MenuEntry {
-                    label: label.into(),
-                    icon: picked.then_some(Icon::Check),
-                    danger: false,
-                    on_select: Rc::new(move |_, app| {
-                        let view = view.clone();
-                        let value = value.clone();
-                        app.defer(move |app| {
-                            if let Some(view) = view.upgrade() {
-                                let _ = view.update(app, |this, cx| {
-                                    this.route_agent = value;
-                                    cx.notify();
-                                });
-                            }
-                        });
-                    }),
-                }
-            })
-            .collect();
-        self.agent_menu.update(cx, |menu, cx| {
-            menu.set_items(items);
+            menu.set_menu(items);
             menu.set_open(true);
             cx.notify();
         });
@@ -1162,12 +1033,10 @@ impl SettingsView {
     }
 
     fn moving(&self) -> bool {
-        !self.indicator.is_settled()
+        !self.open.settled()
             || !self.editor.is_settled()
             || !self.enter.settled()
             || !self.result_enter.settled()
-            || self.rail_hover.iter().any(|spring| !spring.settled())
-            || self.rail_press.iter().any(|spring| !spring.settled())
             || self.option_hover.iter().any(|spring| !spring.settled())
             || self.option_press.iter().any(|spring| !spring.settled())
     }
@@ -1183,14 +1052,8 @@ impl SettingsView {
             self.enter.set_target(1.0);
             self.shown = Some(page.clone());
         }
-        let stride = RAIL_ROW + RAIL_GAP;
-        let y = page_index(&page) as f32 * stride;
-        if !self.indicator_ready {
-            self.indicator.snap(y);
-            self.indicator_ready = true;
-        } else {
-            self.indicator.set_target(y);
-        }
+        let open = matches!(self.state.read(cx).route(), Route::Settings(_));
+        self.open.set_target(if open { 1.0 } else { 0.0 });
         let editor_open = matches!(page, SettingsPage::Classifier) && self.classifier_on();
         if editor_open && let Some(policy) = &self.policy {
             self.editor_slot = Some(picked_index(&policy.classifier));
@@ -1198,26 +1061,17 @@ impl SettingsView {
         self.editor
             .set_target(if editor_open { EDITOR_HEIGHT } else { 0.0 });
         let show_result = match page {
-            SettingsPage::TryRoute => self.route_report.is_some(),
-            SettingsPage::Classifier | SettingsPage::ClassifyPrompt => {
-                self.classify_report.is_some()
-            }
+            SettingsPage::Classifier => self.classify_report.is_some(),
             _ => false,
         };
         self.result_enter
             .set_target(if show_result { 1.0 } else { 0.0 });
         let dt = self.animator.dt(window, self.moving());
         if dt > 0.0 {
-            self.indicator.step(dt);
+            self.open.step(dt);
             self.editor.step(dt);
             self.enter.step(dt);
             self.result_enter.step(dt);
-            for spring in &mut self.rail_hover {
-                spring.step(dt);
-            }
-            for spring in &mut self.rail_press {
-                spring.step(dt);
-            }
             for spring in &mut self.option_hover {
                 spring.step(dt);
             }
@@ -1230,100 +1084,6 @@ impl SettingsView {
         }
     }
 
-    fn rail(&self, theme: Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let view = cx.entity().downgrade();
-        let state = self.state.clone();
-        let mut rows = div().relative().w_full().flex().flex_col().child(
-            div()
-                .absolute()
-                .top(px(self.indicator.value()))
-                .left(px(0.0))
-                .right(px(0.0))
-                .h(px(RAIL_ROW))
-                .rounded(px(theme.radius_sm))
-                .bg(theme.color_surface_selected),
-        );
-        for (index, (page, label, icon_name)) in RAIL.iter().enumerate() {
-            let selected = &self.page(cx) == page;
-            let hover = self.rail_hover[index].value();
-            let press = self.rail_press[index].value();
-            let view_hover = view.clone();
-            let view_press = view.clone();
-            let view_up = view.clone();
-            let state_click = state.clone();
-            let page = page.clone();
-            rows = rows.child(
-                div().h(px(RAIL_ROW + RAIL_GAP)).w_full().child(
-                    div()
-                        .id(("settings-rail", index))
-                        .h(px(RAIL_ROW))
-                        .w_full()
-                        .px(px(theme.space_2))
-                        .flex()
-                        .items_center()
-                        .gap(px(theme.space_2))
-                        .rounded(px(theme.radius_sm))
-                        .bg(row_wash(&theme, hover, press))
-                        .cursor_pointer()
-                        .on_hover(move |over, _, app| {
-                            let over = *over;
-                            let _ = view_hover.update(app, |this, cx| {
-                                this.rail_hover[index].set_target(if over { 1.0 } else { 0.0 });
-                                cx.notify();
-                            });
-                        })
-                        .on_mouse_down(MouseButton::Left, move |_, _, app| {
-                            let _ = view_press.update(app, |this, cx| {
-                                this.rail_press[index].set_target(1.0);
-                                cx.notify();
-                            });
-                        })
-                        .on_mouse_up(MouseButton::Left, {
-                            let view_up = view_up.clone();
-                            move |_, _, app| {
-                                let _ = view_up.update(app, |this, cx| {
-                                    this.rail_press[index].set_target(0.0);
-                                    cx.notify();
-                                });
-                            }
-                        })
-                        .on_mouse_up_out(MouseButton::Left, move |_, _, app| {
-                            let _ = view_up.update(app, |this, cx| {
-                                this.rail_press[index].set_target(0.0);
-                                cx.notify();
-                            });
-                        })
-                        .on_click(move |_, _, app| {
-                            state_click.update(app, |state, cx| {
-                                state.navigate(Route::Settings(page.clone()));
-                                cx.notify();
-                            });
-                        })
-                        .child(icon(*icon_name, 16.0, cx))
-                        .child(
-                            div()
-                                .text_size(px(theme.font_size_sm))
-                                .text_color(if selected {
-                                    theme.color_text_primary
-                                } else {
-                                    theme.color_text_secondary
-                                })
-                                .child(*label),
-                        ),
-                ),
-            );
-        }
-        div()
-            .w(px(220.0))
-            .h_full()
-            .flex_none()
-            .bg(theme.color_sidebar_background)
-            .border_r_1()
-            .border_color(theme.color_border_subtle)
-            .p(px(theme.space_3))
-            .child(rail_group("Dispatch", cx).child(rows))
-    }
-
     fn page_body(
         &self,
         page: &SettingsPage,
@@ -1332,10 +1092,8 @@ impl SettingsView {
     ) -> gpui::AnyElement {
         match page {
             SettingsPage::Agents => self.agents_page(theme, cx),
-            SettingsPage::TryRoute => self.route_page(theme, cx),
             SettingsPage::Classifier => self.classifier_page(theme, cx),
             SettingsPage::PickRole => self.roles_page(theme, cx),
-            SettingsPage::ClassifyPrompt => self.classify_page(theme, cx),
             SettingsPage::RoutingPolicy => self.policy_page(theme, cx),
         }
     }
@@ -1345,11 +1103,16 @@ impl SettingsView {
             return note("This core does not report the agent setup yet.", theme);
         }
         let Some(setup) = self.setup.clone() else {
-            return div().into_any_element();
+            // The core is asked for the agent setup: its rows, in bones.
+            return settings_skeleton(5);
         };
         let enabled = !self.busy();
         let view = cx.entity().downgrade();
-        let mut column = div().w_full().flex().flex_col().gap(px(theme.space_6));
+        let mut column = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(SETTINGS_SECTION_GAP));
         let cli_tone = cli_tone(setup.cli.state);
         let mut cli_trailing = div()
             .flex()
@@ -1375,6 +1138,8 @@ impl SettingsView {
             ));
         }
         column = column.child(settings_section(
+            Icon::SquareTerminal,
+            TileTone::Execution,
             "Command line",
             "Agents delegate by running dispatch in their shell.",
             None,
@@ -1398,7 +1163,7 @@ impl SettingsView {
                         "skills",
                         "install_skill",
                         "",
-                        "Skill installed for every agent.",
+                        "Skill installed in every folder.",
                         cx,
                     );
                 }),
@@ -1406,89 +1171,156 @@ impl SettingsView {
             )
         });
         let mut skills = div().flex().flex_col();
-        for folder in skill_folders(&setup.skills) {
-            let path = folder.path.clone();
-            let agent = folder.agents.first().cloned().unwrap_or_default();
-            let avatar_agent = agent.clone();
-            let label = folder_agents_label(&folder.agents);
+        for skill in &setup.skills {
+            let dir = skill.dir.clone();
+            let readers = skill_readers(skill, &setup.agents);
+            let names: Vec<String> = readers.iter().map(|agent| (*agent).clone()).collect();
             let mut trailing = div()
                 .flex()
                 .items_center()
                 .gap(px(theme.space_2))
-                .child(chip(folder.state.label(), install_tone(folder.state), cx));
-            if let Some(action) = folder.state.action_label() {
-                let path_for_id = path.clone();
+                .child(chip(skill.state.label(), install_tone(skill.state), cx));
+            if let Some(action) = skill.state.action_label().filter(|_| !skill.extra) {
+                // The agent names the folder to a core from before skills folders too.
+                let key = skill.agents.first().cloned().unwrap_or_else(|| dir.clone());
+                let busy_key = format!("skill:{dir}");
                 trailing = trailing.child(dim_button(
-                    SharedString::from(format!("settings-skill-{path_for_id}")),
+                    SharedString::from(format!("settings-skill-{dir}")),
                     action,
                     ButtonKind::Secondary,
                     enabled,
                     gated(enabled, view.clone(), move |this, cx| {
+                        this.apply_setup(&busy_key, "install_skill", &key, "Skill installed.", cx);
+                    }),
+                    cx,
+                ));
+            }
+            if skill.state != InstallState::Missing {
+                let dir = dir.clone();
+                trailing = trailing.child(dim_button(
+                    SharedString::from(format!("settings-skill-remove-{dir}")),
+                    "Remove",
+                    ButtonKind::Ghost,
+                    enabled,
+                    gated(enabled, view.clone(), move |this, cx| {
                         this.apply_setup(
-                            &format!("skill:{path}"),
-                            "install_skill",
-                            &agent,
-                            "Skill installed.",
+                            &format!("skill:{dir}"),
+                            "remove_skill",
+                            &dir,
+                            "Skill removed.",
                             cx,
                         );
                     }),
                     cx,
                 ));
             }
+            let mut avatars = div().flex().items_center().gap(px(2.0));
+            for agent in readers.iter().take(6) {
+                avatars = avatars.child(agent_avatar(agent, "", 18.0));
+            }
+            let readers_line = folder_agents_label(&names);
+            // The shared folder this agent's own folder sits beside, and whether it has the
+            // skill already.
+            let shared_has_it = setup.skills.iter().any(|other| {
+                !other.extra
+                    && other.state != InstallState::Missing
+                    && skill
+                        .agents
+                        .iter()
+                        .any(|agent| other.agents.contains(agent))
+            });
+            let description = if skill.extra && shared_has_it {
+                format!("A second copy: {readers_line} also reads ~/.agents/skills, which has it.")
+            } else if skill.extra {
+                format!(
+                    "{readers_line}'s own folder: a copy in ~/.agents/skills serves it with the others."
+                )
+            } else {
+                format!("Read by {readers_line}.")
+            };
             skills = skills.child(settings_row(
                 div()
                     .flex()
                     .items_center()
                     .gap(px(theme.space_2))
-                    .child(agent_avatar(&avatar_agent, "", 20.0))
-                    .child(label),
-                text_or_none(&folder.path),
+                    .child(avatars)
+                    .child(
+                        div()
+                            .font_family(theme.font_mono)
+                            .child(SharedString::from(home_relative(&skill.dir))),
+                    ),
+                Some(SharedString::from(description)),
                 trailing,
                 cx,
             ));
         }
         column = column.child(settings_section(
+            Icon::BookOpen,
+            TileTone::Knowledge,
             "Skill",
-            "Teaches each agent when to delegate with dispatch run and how to read the result.",
+            "Teaches agents when to delegate with dispatch run. Most of them read ~/.agents/skills, so one copy there serves them all; Claude Code and Antigravity read their own folders.",
             install_all,
             skills,
             cx,
         ));
 
-        let mut hook_body = div().flex().flex_col().child(settings_row(
-            "Name dispatch when a Claude Code session starts",
-            None,
-            div()
-                .when(!enabled, |row| row.opacity(0.45))
-                .child(self.hook.clone()),
-            cx,
-        ));
-        if hook_points_elsewhere(&setup.hook) {
+        let mut hook_body = div().flex().flex_col();
+        if setup.hooks.is_empty() {
             hook_body = hook_body.child(settings_row(
-                "Runs another dispatch",
-                text_or_none(&setup.hook.command),
-                dim_button(
-                    "settings-point-hook",
+                "No agent here has session hooks",
+                None,
+                div(),
+                cx,
+            ));
+        }
+        for hook in &setup.hooks {
+            let mut trailing = div().flex().items_center().gap(px(theme.space_2));
+            if hook_points_elsewhere(hook) {
+                let agent = hook.agent.clone();
+                trailing = trailing.child(dim_button(
+                    SharedString::from(format!("settings-point-hook-{agent}")),
                     "Point to this app",
                     ButtonKind::Secondary,
                     enabled,
-                    gated(enabled, view.clone(), |this, cx| {
+                    gated(enabled, view.clone(), move |this, cx| {
                         this.apply_setup(
-                            "hook",
+                            &format!("hook:{agent}"),
                             "hook_on",
-                            "",
+                            &agent,
                             "The hook runs this app's core.",
                             cx,
                         );
                     }),
                     cx,
-                ),
+                ));
+            }
+            if let Some(toggle) = self.hooks.get(&hook.agent) {
+                trailing = trailing.child(
+                    div()
+                        .when(!enabled, |row| row.opacity(0.45))
+                        .child(toggle.clone()),
+                );
+            }
+            hook_body = hook_body.child(settings_row(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(theme.space_2))
+                    .child(agent_avatar(&hook.agent, "", 20.0))
+                    .child(agent_label(&hook.agent)),
+                Some(SharedString::from(match hook_note(&hook.agent) {
+                    Some(note) => format!("{} · {note}", home_relative(&hook.settings)),
+                    None => home_relative(&hook.settings),
+                })),
+                trailing,
                 cx,
             ));
         }
         column = column.child(settings_section(
+            Icon::Webhook,
+            TileTone::Integration,
             "Session hook",
-            "Claude Code reads one line at the start of each session saying dispatch is here and where its skill is.",
+            "At the start of each session the agent reads one line saying dispatch is here and where its skill is. Each agent keeps its hooks in its own file, so each has its own switch.",
             None,
             hook_body,
             cx,
@@ -1561,6 +1393,8 @@ impl SettingsView {
             ));
         }
         column = column.child(settings_section(
+            Icon::Plug,
+            TileTone::Integration,
             "OpenCode plugin",
             "Replaces OpenCode's subagents with dispatch runs and shows each conversation's runs in OpenCode Desktop. It loads from OpenCode's global config.",
             None,
@@ -1570,168 +1404,9 @@ impl SettingsView {
         column.into_any_element()
     }
 
-    fn route_page(&self, theme: Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let view = cx.entity().downgrade();
-        let tier_label = route_tier_label(&self.route_tier);
-        let agent_label = if self.route_agent.is_empty() {
-            "Any agent".to_string()
-        } else {
-            self.route_agent.clone()
-        };
-        let mut column = div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .gap(px(theme.space_3))
-            .child(settings_field("Prompt", self.route_prompt.clone(), cx))
-            .child(
-                div()
-                    .flex()
-                    .gap(px(theme.space_3))
-                    .child(settings_field(
-                        "Route",
-                        menu_trigger(
-                            "settings-tier",
-                            tier_label.into(),
-                            self.tier_menu.clone(),
-                            gated(true, view.clone(), |this, cx| this.open_tier(cx)),
-                            theme,
-                            cx,
-                        ),
-                        cx,
-                    ))
-                    .child(settings_field(
-                        "Agent",
-                        menu_trigger(
-                            "settings-agent",
-                            agent_label.into(),
-                            self.agent_menu.clone(),
-                            gated(true, view.clone(), |this, cx| this.open_agent(cx)),
-                            theme,
-                            cx,
-                        ),
-                        cx,
-                    )),
-            )
-            .child(settings_row("Read only", None, self.read_only.clone(), cx))
-            .child(dim_button(
-                "settings-route",
-                "Route",
-                ButtonKind::Primary,
-                true,
-                gated(true, view, |this, cx| this.run_route(cx)),
-                cx,
-            ));
-        if let Some(report) = &self.route_report {
-            column = column.child(self.route_result(report, theme, cx));
-        }
-        settings_section(
-            "Try a route",
-            "Which agent a run with these options would get, in order, without starting it. Auto asks the classifier, then prices each model for the prompt.",
-            None,
-            column,
-            cx,
-        )
-    }
-
-    fn route_result(&self, report: &RouteView, theme: Theme, cx: &App) -> gpui::AnyElement {
-        let mut column = div()
-            .flex()
-            .flex_col()
-            .gap(px(theme.space_2))
-            .opacity(self.result_enter.value().clamp(0.0, 1.0))
-            .text_size(px(theme.font_size_sm));
-        if !report.reason.is_empty() {
-            column = column.child(
-                div()
-                    .text_color(theme.color_text_secondary)
-                    .child(report.reason.clone()),
-            );
-        }
-        if let Some(difficulty) = report.difficulty {
-            column = column.child(
-                div()
-                    .text_color(theme.color_text_muted)
-                    .child(format!("Difficulty {}", fixed2(difficulty))),
-            );
-        }
-        if let Some(role) = &report.role {
-            column = column.child(div().text_color(theme.color_text_muted).child(role.clone()));
-        }
-        if report.candidates.is_empty() {
-            column = column.child(
-                div()
-                    .text_color(theme.color_text_muted)
-                    .child("No agent can take this run."),
-            );
-        }
-        for (index, candidate) in report.candidates.iter().enumerate() {
-            let mut row = div()
-                .flex()
-                .items_center()
-                .gap(px(theme.space_2))
-                .child(
-                    div()
-                        .w(px(20.0))
-                        .text_color(theme.color_text_muted)
-                        .child((index + 1).to_string()),
-                )
-                .child(
-                    div()
-                        .font_family(theme.font_mono)
-                        .child(candidate.agent.clone()),
-                )
-                .child(
-                    div()
-                        .font_family(theme.font_mono)
-                        .text_color(theme.color_text_muted)
-                        .child(candidate.model.clone()),
-                )
-                .child(div().flex_1());
-            if let Some(auto) = &candidate.auto {
-                let tone = if auto.qualified {
-                    StatusTone::Ok
-                } else {
-                    StatusTone::Muted
-                };
-                let chip_label = if auto.qualified {
-                    "Likely to pass"
-                } else {
-                    "Below the bar"
-                };
-                let mut metrics = div()
-                    .id(("settings-auto", index))
-                    .flex()
-                    .items_center()
-                    .gap(px(theme.space_2))
-                    .text_size(px(theme.font_size_xs))
-                    .text_color(theme.color_text_muted)
-                    .child(format!("P {}", fixed2(auto.p_pass)))
-                    .child(format!("${}", fixed2(auto.effective_cost)))
-                    .child(format!("q {}", fixed2(auto.quota_multiplier)))
-                    .child(chip(chip_label, tone, cx));
-                if !candidate.reason.is_empty() {
-                    metrics = metrics.tooltip(tooltip(candidate.reason.clone()));
-                }
-                row = row.child(metrics);
-            } else if !candidate.reason.is_empty() {
-                row = row.child(
-                    div()
-                        .text_color(theme.color_text_muted)
-                        .child(candidate.reason.clone()),
-                );
-            }
-            column = column.child(row);
-        }
-        for line in &report.eliminated {
-            column = column.child(div().text_color(theme.color_text_muted).child(line.clone()));
-        }
-        column.into_any_element()
-    }
-
     fn classifier_page(&self, theme: Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
         let body = if self.policy.is_none() {
-            note("No policy read yet.", theme)
+            settings_skeleton(4)
         } else {
             let picked = self
                 .policy
@@ -1859,7 +1534,9 @@ impl SettingsView {
             column.into_any_element()
         };
         settings_section(
-            "Classifier",
+            Icon::AiBrain01Icon,
+            TileTone::Knowledge,
+            "Difficulty classifier",
             "What judges how hard a task is before it is routed. Auto exists only with one; without it, every run takes a tier. A key is kept in the macOS Keychain, where only Dispatch reads it, and never shown again.",
             None,
             body,
@@ -2021,58 +1698,51 @@ impl SettingsView {
 
     fn roles_page(&self, theme: Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
         let body = if let Some(policy) = &self.policy {
-            let _ = policy.roles;
-            settings_row(
-                "Pick a role",
-                Some(
-                    "A pick never makes a run read-only, and its tier is a floor. Edit the roles and their boards on the Roles page."
-                        .into(),
-                ),
-                self.roles.clone(),
-                cx,
-            )
+            let mut column = div()
+                .flex()
+                .flex_col()
+                .gap(px(theme.space_2))
+                .child(settings_row(
+                    "Pick a role for Auto runs",
+                    Some("The classifier chooses a role for an Auto run that names none.".into()),
+                    self.roles.clone(),
+                    cx,
+                ));
+            for line in [
+                "It reads the run's prompt and picks the role whose When to use fits, at P 0.5 or more; if none fits, the run stays on General. The task's difficulty then picks the column of that role's board, and the run draws its model from there.",
+                "A run that names a role with --role always keeps it; the pick only fills in a missing one.",
+                "A pick never makes a run read-only, and the role's tier is a floor: a role set to Hard or harder never runs on an easier model, even for an easy task.",
+                "Turned off, every Auto run without --role uses General.",
+            ] {
+                column = column.child(
+                    div()
+                        .text_size(px(theme.font_size_xs))
+                        .line_height(px(18.0))
+                        .text_color(theme.color_text_muted)
+                        .child(line),
+                );
+            }
+            if let Some(blocked) = policy.pick_blocked() {
+                column = column.child(
+                    div()
+                        .mt(px(theme.space_1))
+                        .text_size(px(theme.font_size_xs))
+                        .line_height(px(18.0))
+                        .text_color(theme.color_text_secondary)
+                        .child(blocked),
+                );
+            }
+            column.into_any_element()
         } else {
-            note("No policy read yet.", theme)
+            settings_skeleton(4)
         };
         settings_section(
+            Icon::Bot,
+            TileTone::Identity,
             "Roles",
-            "With a classifier on, an Auto run that names no role gets the one whose When fits, asked in the same call. Jev and the agent CLI model pick one; OpenAI Decisions does not.",
+            "A role is a kind of task, such as explorer, implementer or reviewer: when it fits, what a run may touch, and a board of models per difficulty. Edit them on the Roles page.",
             None,
             body,
-            cx,
-        )
-    }
-
-    fn classify_page(&self, theme: Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let prompt = self.classify_prompt.read(cx).text().to_string();
-        let enabled = draft_ready(&prompt) && self.classifier_on();
-        let view = cx.entity().downgrade();
-        let mut column = div()
-            .flex()
-            .flex_col()
-            .gap(px(theme.space_3))
-            .child(settings_field("Prompt", self.classify_prompt.clone(), cx))
-            .child(dim_button(
-                "settings-classify",
-                "Classify",
-                ButtonKind::Primary,
-                enabled,
-                gated(enabled, view, |this, cx| {
-                    let prompt = trimmed_draft(this.classify_prompt.read(cx).text());
-                    if this.classifier_on() {
-                        this.classify_text(prompt, cx);
-                    }
-                }),
-                cx,
-            ));
-        if self.classify_report.is_some() {
-            column = column.child(self.classify_result(theme, cx));
-        }
-        settings_section(
-            "Classify a prompt",
-            "How hard the classifier judges a prompt, the tier Auto would route it to, and the role it would pick.",
-            None,
-            column,
             cx,
         )
     }
@@ -2169,15 +1839,17 @@ impl SettingsView {
                     cx,
                 ));
         } else {
-            body = body.child(note("No policy read yet.", theme));
+            body = body.child(settings_skeleton(4));
         }
         let mut column = div()
             .w_full()
             .flex()
             .flex_col()
-            .gap(px(theme.space_6))
+            .gap(px(SETTINGS_SECTION_GAP))
             .child(settings_section(
-                "Routing policy",
+                Icon::Route,
+                TileTone::Architecture,
+                "Model choice",
                 "How runs pick a model, for every repository or only this project.",
                 None,
                 body,
@@ -2200,6 +1872,8 @@ impl SettingsView {
                     ));
                 }
                 column = column.child(settings_section(
+                    side_icon(side),
+                    TileTone::Security,
                     side.title(),
                     side.description(),
                     None,
@@ -2284,31 +1958,43 @@ impl Render for SettingsView {
         let theme = *Theme::global(cx);
         let page = self.page(cx);
         let entered = self.enter.value().clamp(0.0, 1.0);
-        div()
-            .size_full()
-            .min_w(px(0.0))
-            .flex()
-            .flex_col()
-            .font_family(theme.font_sans)
-            .text_color(theme.color_text_primary)
-            .child(toolbar(div(), div(), cx))
+        let active = RAIL
+            .iter()
+            .find(|(item, _, _)| *item == page)
+            .map_or("Agents", |(_, label, _)| *label);
+        let items = RAIL
+            .iter()
+            .map(|(_, label, icon)| SettingsNavItem::new(*label, *label).icon(*icon))
+            .collect();
+        let select = self.state.clone();
+        let close = self.state.clone();
+        settings_dialog(self.presence())
+            .items(items)
+            .active(active)
+            .on_select(Rc::new(
+                move |id: &SharedString, _: &mut Window, cx: &mut App| {
+                    let Some((page, _, _)) =
+                        RAIL.iter().find(|(_, label, _)| *label == id.as_ref())
+                    else {
+                        return;
+                    };
+                    select.update(cx, |state, cx| {
+                        state.navigate(Route::Settings(page.clone()));
+                        cx.notify();
+                    });
+                },
+            ))
+            .on_close(Rc::new(move |_, cx| {
+                close.update(cx, |state, cx| {
+                    state.close_settings();
+                    cx.notify();
+                });
+            }))
             .child(
                 div()
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .flex()
-                    .child(self.rail(theme, cx))
-                    .child(
-                        div()
-                            .id("settings-scroll")
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .min_h(px(0.0))
-                            .overflow_y_scroll()
-                            .p(px(theme.space_6))
-                            .opacity(entered)
-                            .child(self.page_body(&page, theme, cx)),
-                    ),
+                    .opacity(entered)
+                    .font_family(theme.font_sans)
+                    .child(self.page_body(&page, theme, cx)),
             )
     }
 }
@@ -2375,6 +2061,17 @@ fn note(text: &str, theme: Theme) -> gpui::AnyElement {
         .into_any_element()
 }
 
+/// A path under the home folder as `~/…`.
+fn home_relative(path: &str) -> String {
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() => match path.strip_prefix(&home) {
+            Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("~{rest}"),
+            _ => path.to_string(),
+        },
+        _ => path.to_string(),
+    }
+}
+
 fn text_or_none(text: &str) -> Option<SharedString> {
     if text.is_empty() {
         None
@@ -2383,12 +2080,16 @@ fn text_or_none(text: &str) -> Option<SharedString> {
     }
 }
 
-fn watch_input(input: &Entity<TextInput>, cx: &mut Context<SettingsView>) {
-    cx.observe(input, |_, _, cx| cx.notify()).detach();
+/// The allow list's shield, the deny list's wall.
+fn side_icon(side: RuleSide) -> Icon {
+    match side {
+        RuleSide::Allow => Icon::ShieldCheck,
+        RuleSide::Deny => Icon::FirewallIcon,
+    }
 }
 
-fn prompt_input(cx: &mut Context<SettingsView>) -> Entity<TextInput> {
-    cx.new(TextInput::new)
+fn watch_input(input: &Entity<TextInput>, cx: &mut Context<SettingsView>) {
+    cx.observe(input, |_, _, cx| cx.notify()).detach();
 }
 
 fn key_input(
@@ -2515,7 +2216,8 @@ fn menu_trigger(
                 .items_center()
                 .justify_between()
                 .gap(px(theme.space_2))
-                .rounded(px(theme.radius_sm))
+                // Round-ended, as every button and field is.
+                .rounded_full()
                 .bg(theme.color_surface_subtle)
                 .border_1()
                 .border_color(theme.color_border)
@@ -2596,5 +2298,13 @@ fn token_panel(view: &WeakEntity<SettingsView>, cx: &mut App) -> gpui::AnyElemen
         .gap(px(theme.space_2))
         .child(list)
         .child(draft)
+        .into_any_element()
+}
+
+/// A settings section in bones while the core answers: `rows` rows, no toolbar.
+fn settings_skeleton(rows: usize) -> gpui::AnyElement {
+    page_skeleton(SkeletonLayout::Table)
+        .without_toolbar()
+        .rows(rows)
         .into_any_element()
 }
