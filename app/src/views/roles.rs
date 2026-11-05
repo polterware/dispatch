@@ -30,7 +30,7 @@ use crate::models::roles::{
 };
 use crate::motion::{Animator, SpringTier, SpringValue};
 use crate::state::{AppState, Route, ToastTone, observe};
-use crate::theme::{StatusTone, Theme, mix, tw};
+use crate::theme::{REM, StatusTone, Theme, mix, tw};
 use crate::ui::ellipsis;
 use crate::ui::hang::hang;
 use crate::ui::parts::roles::{
@@ -62,8 +62,9 @@ const ORDER_W: f32 = 72.0;
 const GAP: f32 = 10.0;
 /// `DRAG_THRESHOLD`: a press becomes a drag after 4px.
 const DRAG_DISTANCE_SQ: f32 = 16.0;
-/// `.pw-tier-board__empty`.
-const EMPTY_MIN_H: f32 = 96.0;
+/// A one-line tier card's height: its padding around the name and the agent / provider line
+/// (taller than the bot). Add model and an empty slot take it, so a slot is a card's size.
+const CARD_MIN_H: f32 = 2.0 * (3.0 * REM / 4.0) + 13.0 * 1.35 + 0.5 * REM / 4.0 + 11.0 * 1.5;
 /// `.pw-tier-ghost__card`, 12px below and right of the pointer.
 const GHOST_W: f32 = 220.0;
 const GHOST_OFFSET: f32 = 12.0;
@@ -1608,11 +1609,14 @@ impl RolesView {
         } else {
             name.to_string()
         };
-        let tile = IconTile::new(Icon::Bot).size(20.0, 12.0).tone(if general {
-            TileTone::Neutral
-        } else {
-            TileTone::Execution
-        });
+        let tile = IconTile::new(Icon::Bot)
+            .size(20.0, 12.0)
+            .round()
+            .tone(if general {
+                TileTone::Neutral
+            } else {
+                TileTone::Execution
+            });
         let tip = if general {
             "The tier table every role falls back on"
         } else if editable {
@@ -1988,7 +1992,7 @@ impl RolesView {
             None if editable && is_next => {
                 cell.child(self.add_button(tier, row, theme, window, cx))
             }
-            None if editable => cell.child(div().flex_1().min_h(px(EMPTY_MIN_H))),
+            None if editable => cell.child(div().flex_1().min_h(px(CARD_MIN_H))),
             None => cell,
         };
         if self.drop_over(tier, row) {
@@ -2041,7 +2045,7 @@ impl RolesView {
             .id(id)
             .flex_1()
             .min_w(px(0.0))
-            .min_h(px(EMPTY_MIN_H))
+            .min_h(px(CARD_MIN_H))
             .flex()
             .items_center()
             .justify_center()
@@ -2165,6 +2169,7 @@ impl RolesView {
             .flex()
             .flex_1()
             .min_w(px(0.0))
+            .min_h(px(CARD_MIN_H))
             .p(px(tw(3.0)))
             .opacity(opacity)
             .child(body)

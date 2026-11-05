@@ -6,11 +6,14 @@
 //! background executor; they use the same button colors with fast hover and press springs.
 
 use std::rc::Rc;
+
+use crate::format::agent_display_name;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    AnyElement, App, AppContext as _, Context, Entity, Font, FontWeight, Hsla, IntoElement,
-    MouseButton, SharedString, StyledText, TextRun, WeakEntity, Window, div, prelude::*, px,
+    AnyElement, AnyView, App, AppContext as _, Context, Entity, Font, FontWeight, Hsla,
+    IntoElement, MouseButton, SharedString, StyleRefinement, StyledText, TextRun, WeakEntity,
+    Window, div, prelude::*, px,
 };
 
 use crate::avatar::{agent_avatar, agent_avatar_live};
@@ -22,10 +25,10 @@ use crate::client::{
 use crate::models::run_page::{
     AttemptCard, LinkedRow, MoreAction, ReviewAction, RouteDecision, TokenUsage,
     agent_attempt_cards, area_label, candidate_price, coalesce_text, context_usage,
-    decision_summary, duration_label, file_counts, format_duration, format_tokens, has_worktree,
-    is_run_active, linked_rows, map_route_decision, policy_label, proto_ms, rail_tokens,
-    role_summary, route_label, run_cost, run_more_actions, run_review_action, stored_usage,
-    timing_label, token_breakdown, total_tokens, worktree_display_status,
+    decision_summary, duration_label, file_counts, format_tokens, has_worktree, is_run_active,
+    linked_rows, map_route_decision, policy_label, proto_ms, rail_tokens, role_summary,
+    route_label, run_cost, run_more_actions, run_review_action, stored_usage, timing_label,
+    token_breakdown, total_tokens, worktree_display_status,
 };
 use crate::motion::{Animator, SpringTier, SpringValue};
 use crate::state::{AppState, ConnectionState, Route, observe};
@@ -69,7 +72,6 @@ pub struct RunPageView {
     state: Entity<AppState>,
     transcript: Entity<super::transcript::TranscriptView>,
     transcript_run: String,
-    agent: Entity<RailGroup>,
     run_section: Entity<RailGroup>,
     routing: Entity<RailGroup>,
     changes: Entity<RailGroup>,
@@ -118,13 +120,6 @@ impl RunPageView {
             .update(cx, |transcript, cx| transcript.scroll_by(y, cx));
     }
 
-    /// Folds the Agent group, so the run's properties show (the screenshot tour).
-    pub(crate) fn fold_agent_group(&mut self, cx: &mut Context<Self>) {
-        self.agent
-            .update(cx, |section, cx| section.set_open(false, cx));
-        cx.notify();
-    }
-
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         observe(&state, cx);
         let run_id = match state.read(cx).route() {
@@ -134,7 +129,6 @@ impl RunPageView {
         let transcript = cx.new(|cx| {
             super::transcript::TranscriptView::new(state.clone(), run_id.clone(), false, cx)
         });
-        let agent = cx.new(|cx| RailGroup::new("Agent", Icon::Bot, cx));
         let run_section = cx.new(|cx| RailGroup::new("Run", Icon::InformationCircle, cx));
         let routing = cx.new(|cx| RailGroup::new("Routing", Icon::Route, cx));
         let changes = cx.new(|cx| RailGroup::new("Changes", Icon::FileDiff, cx));
@@ -150,7 +144,6 @@ impl RunPageView {
             state,
             transcript,
             transcript_run: run_id,
-            agent,
             run_section,
             routing,
             changes,
@@ -190,7 +183,6 @@ impl RunPageView {
 
     fn install_bodies(&mut self, cx: &mut Context<Self>) {
         let weak = cx.weak_entity();
-        bind_body(&self.agent, weak.clone(), paint_agent, cx);
         bind_body(&self.run_section, weak.clone(), paint_run, cx);
         bind_body(&self.routing, weak.clone(), paint_routing, cx);
         bind_body(&self.changes, weak.clone(), paint_changes, cx);
@@ -820,7 +812,7 @@ impl Render for RunPageView {
                             let _ = toggle_view.update(cx, |view, cx| view.toggle_rail(cx));
                         }),
                 );
-            rail_page_header(div(), end, cx).into_any_element()
+            rail_page_header(header_agent(&run, cx), end, cx).into_any_element()
         } else {
             toolbar(div(), div(), cx).into_any_element()
         };
@@ -828,7 +820,6 @@ impl Render for RunPageView {
         let header = theme.page_header_height;
         let mut drawer = None;
         let body = if self.snapshot_run.is_some() {
-            let agent = self.agent.clone();
             let run_section = self.run_section.clone();
             let routing = self.routing.clone();
             let changes = self.changes.clone();
@@ -837,7 +828,6 @@ impl Render for RunPageView {
                 .w_full()
                 .flex()
                 .flex_col()
-                .child(agent)
                 .child(run_section)
                 .when(show_routing, |rail| rail.child(routing))
                 .child(changes)
@@ -852,7 +842,12 @@ impl Render for RunPageView {
                 .min_w(px(0.0))
                 .flex()
                 .flex_col()
-                .child(self.transcript.clone());
+                // Cached: a live bot's frames redraw the window, and the transcript keeps its
+                // last layout and paint until it notifies.
+                .child(
+                    AnyView::from(self.transcript.clone())
+                        .cached(StyleRefinement::default().flex_1().min_h_0().w_full()),
+                );
             // The transcript runs up under the header, which fades it out on its trail.
             self.transcript
                 .update(cx, |transcript, cx| transcript.set_top_inset(header, cx));
@@ -1029,56 +1024,44 @@ fn read_pack(view: &WeakEntity<RunPageView>, cx: &App) -> Option<Pack> {
     })
 }
 
-/// `RunAgentBar`: the agent that runs (or ran) the job, its 28px bot animated while it works,
-/// its title, and its measured duration; failed attempts before it follow as 18px bots and a
-/// line each with their error. `px-1` around it.
-fn paint_agent(view: &WeakEntity<RunPageView>, window: &mut Window, cx: &mut App) -> AnyElement {
-    let _ = window;
-    let Some(pack) = read_pack(view, cx) else {
-        return div().into_any_element();
-    };
-    let theme = *Theme::global(cx);
-    let cards = agent_attempt_cards(&pack.run);
-    let Some(current) = cards.last() else {
-        return div().into_any_element();
-    };
-    let duration = current.duration_ms.map(format_duration);
-    let lead = div()
-        .flex()
-        .min_w(px(0.0))
-        .items_center()
-        .gap(px(tw(2.5)))
-        .child(agent_avatar_live(&current.agent, &pack.run.status, 28.0))
-        .child(
+/// The header's lead, in Roles' role title (a small secondary pill button): the run's live
+/// bot, the agent's name, and the model in muted ink. Inert: the material, not a control.
+fn header_agent(run: &DispatchRun, cx: &App) -> AnyElement {
+    let theme = Theme::global(cx);
+    let model = run.model.trim();
+    let mut title = Button::new("run-agent", ButtonKind::Secondary)
+        .size(ButtonSize::Sm)
+        .pill()
+        .pad_x(5.0)
+        .inert()
+        .leading(agent_avatar_live(&run.agent, &run.status, 20.0))
+        .label(agent_display_name(&run.agent));
+    if !model.is_empty() {
+        title = title.trailing(
             div()
-                .min_w(px(0.0))
-                .text_size(px(13.0))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(theme.color_text_primary)
-                .child(ellipsis(current_title(&pack.run, current))),
-        )
-        .children(duration.map(|duration| {
-            div()
-                .flex_none()
-                .font(tabular(sans(&theme, FontWeight::NORMAL)))
-                .text_size(px(12.0))
+                .text_size(px(theme.font_size_xs))
                 .text_color(theme.color_text_muted)
-                .child(duration)
-        }));
-    let mut bar = div()
-        .flex()
-        .min_w(px(0.0))
-        .flex_col()
-        .gap(px(tw(1.5)))
-        .child(lead);
+                .child(SharedString::from(model.to_string())),
+        );
+    }
+    title.into_any_element()
+}
+
+/// The attempts that failed before the one that ran, as 18px bots and a line each with their
+/// error, for the top of the Run group. `None` when the first attempt is the last.
+fn failed_attempts(run: &DispatchRun, theme: &Theme) -> Option<gpui::Div> {
+    let cards = agent_attempt_cards(run);
+    if cards.len() < 2 {
+        return None;
+    }
+    let mut list = div().flex().min_w(px(0.0)).flex_col().gap(px(tw(1.5)));
     for card in &cards[..cards.len() - 1] {
-        bar = bar.child(
+        list = list.child(
             div()
                 .flex()
                 .min_w(px(0.0))
                 .items_center()
                 .gap(px(tw(2.0)))
-                .pl(px(tw(1.0)))
                 .text_size(px(12.0))
                 .text_color(theme.color_text_muted)
                 .child(agent_avatar(&card.agent, "failed", 18.0))
@@ -1093,7 +1076,7 @@ fn paint_agent(view: &WeakEntity<RunPageView>, window: &mut Window, cx: &mut App
                 }),
         );
     }
-    div().px(px(tw(1.0))).child(bar).into_any_element()
+    Some(list)
 }
 
 fn current_title(run: &DispatchRun, card: &AttemptCard) -> String {
@@ -1198,7 +1181,16 @@ fn paint_run(view: &WeakEntity<RunPageView>, window: &mut Window, cx: &mut App) 
     if !run.note.trim().is_empty() {
         rows = rows.child(rail_property("Note", wrapped(run.note.trim()), false, cx));
     }
-    rows.into_any_element()
+    match failed_attempts(run, &theme) {
+        Some(attempts) => div()
+            .flex()
+            .flex_col()
+            .gap(px(tw(3.0)))
+            .child(attempts)
+            .child(rows)
+            .into_any_element(),
+        None => rows.into_any_element(),
+    }
 }
 
 /// `RunRoutingGroup`: the decision's policy, task, role, and area, then each candidate in

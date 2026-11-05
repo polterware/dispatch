@@ -12,7 +12,7 @@ use gpui::{
 };
 
 use super::TranscriptView;
-use crate::avatar::agent_avatar;
+use crate::avatar::agent_avatar_live;
 use crate::client::{CoreError, DeleteSectionRequest, MoveToSectionRequest, SaveSectionRequest};
 use crate::format::agent_display_name;
 use crate::models::sidebar::{
@@ -1150,7 +1150,7 @@ impl SidebarView {
         let item = SidebarItem::new(SharedString::from(format!("run-row-{}", run.id)), "")
             .run_row()
             .active(active)
-            .leading(agent_avatar(&run.agent, &run.status, 40.0), 36.0)
+            .leading(agent_avatar_live(&run.agent, &run.status, 40.0), 36.0)
             .content(content)
             .when(
                 self.seen
