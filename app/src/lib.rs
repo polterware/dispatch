@@ -17,7 +17,7 @@ pub use polterware_ui::window::vibrancy;
 pub mod views;
 pub use polterware_ui::window::window_drag;
 
-use app::{CheckForUpdates, OpenSettings, Quit, register_key_bindings};
+use app::{CheckForUpdates, NewConversation, OpenSettings, Quit, register_key_bindings};
 use gpui::{App, AppContext as _, Application, Menu, MenuItem, px, size};
 use theme::Theme;
 use ui::IconAssets;
@@ -36,6 +36,7 @@ pub fn run() {
             register_key_bindings(cx);
             let updates = updater::start().is_ok();
             let mut items = vec![
+                MenuItem::action("New Conversation", NewConversation),
                 MenuItem::action("Settings…", OpenSettings),
                 MenuItem::separator(),
             ];

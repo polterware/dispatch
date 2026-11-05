@@ -145,7 +145,6 @@ pub struct TranscriptView {
     animator: Animator,
     enter: SpringValue,
     reveal: SpringValue,
-    cursor: SpringValue,
     cache: Rc<RefCell<HighlightCache>>,
     watch_task: Option<Task<()>>,
     follow: Follow,
@@ -253,7 +252,6 @@ impl TranscriptView {
             animator: Animator::new(),
             enter: SpringValue::new(1.0, SpringTier::Moderate),
             reveal: SpringValue::new(1.0, SpringTier::Moderate),
-            cursor: SpringValue::new(1.0, SpringTier::Slow),
             cache: Rc::new(RefCell::new(HighlightCache::new())),
             watch_task: None,
             follow: Follow::Idle,
@@ -622,15 +620,13 @@ impl TranscriptView {
         self.shown_live = self.live_now(cx);
         let slice = self.visible_entries();
         let mut rows = flatten_transcript(&slice, &self.expanded, self.reveal_entry);
-        if rows.is_empty() {
-            let text = if self.shown_live {
-                "Waiting for agent output…"
-            } else {
-                "No agent output recorded."
-            };
+        // A live run with nothing yet shows only its thinking bot.
+        if rows.is_empty() && !self.shown_live {
             rows.push(TranscriptRow {
                 signature: SIG_MUTED,
-                body: crate::ui::parts::transcript::RowBody::Muted(text.to_string()),
+                body: crate::ui::parts::transcript::RowBody::Muted(
+                    "No agent output recorded.".to_string(),
+                ),
             });
         }
         if self.shown_live {
@@ -642,7 +638,14 @@ impl TranscriptView {
             }
             rows.push(TranscriptRow {
                 signature: SIG_LIVE,
-                body: crate::ui::parts::transcript::RowBody::Live,
+                body: crate::ui::parts::transcript::RowBody::Live {
+                    agent: self
+                        .state
+                        .read(cx)
+                        .run(&self.run_id)
+                        .map(|run| run.agent.clone())
+                        .unwrap_or_default(),
+                },
             });
         }
         let bubble = self.prompt_bubble(cx);
@@ -945,10 +948,8 @@ impl TranscriptView {
     }
 
     fn step_motion(&mut self, window: &mut Window) {
-        let moving = self.shown_live
-            || !self.enter.settled()
+        let moving = !self.enter.settled()
             || !self.reveal.settled()
-            || !self.cursor.settled()
             || !self.end_button.settled()
             || self.glide;
         let dt = self.animator.dt(window, moving);
@@ -956,12 +957,7 @@ impl TranscriptView {
         if dt > 0.0 {
             self.enter.step(dt);
             self.reveal.step(dt);
-            self.cursor.step(dt);
             self.end_button.step(dt);
-        }
-        if self.shown_live && self.cursor.settled() {
-            let next = if self.cursor.value() < 0.5 { 1.0 } else { 0.0 };
-            self.cursor.set_target(next);
         }
     }
 }
@@ -1082,7 +1078,6 @@ impl Render for TranscriptView {
         let count = rows.borrow().len();
         let enter = self.enter.value();
         let reveal = self.reveal.value();
-        let cursor = self.cursor.value();
         let font = self.font.clone();
         let compact = self.compact;
         let lines = list(self.list.clone(), move |index, window, cx| {
@@ -1096,7 +1091,6 @@ impl Render for TranscriptView {
                 count,
                 enter,
                 reveal,
-                cursor,
                 cache: cache.clone(),
                 on_expand: on_expand.clone(),
                 on_prompt_toggle: on_prompt_toggle.clone(),

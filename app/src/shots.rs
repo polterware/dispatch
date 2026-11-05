@@ -16,6 +16,8 @@
 //! `DISPATCH_GPUI_SHOTS_RUN=<id>` picks the run `13-run` opens, whose `13-run-earlier` scrolls
 //! to the top, where a long run reads the page before.
 //!
+//! `13-new-run` opens a new conversation (⌘N), and `13-new-run-picker` its route picker.
+//!
 //! `00-launch` captures the first page 0.2s to 3s after the window opens, while its
 //! data is still on the way.
 //!
@@ -123,6 +125,7 @@ pub fn start_tour(
             if let Some(id) = first_run {
                 stops.push(("13-run", Route::Run(id)));
             }
+            stops.push(("13-new-run", Route::NewRun));
             let only: Option<Vec<String>> = std::env::var("DISPATCH_GPUI_SHOTS_ONLY")
                 .ok()
                 .filter(|list| !list.is_empty())
@@ -190,6 +193,17 @@ pub fn start_tour(
                         settle(cx, 1500).await;
                         capture(cx, &dir.join("05-stats-chart-week.png"));
                     }
+                }
+                if name == "13-new-run" {
+                    // Its route picker, as a press on the Auto pill opens it.
+                    settle(cx, 1500).await;
+                    let _ = cx.update(|window, app| {
+                        views
+                            .run_page
+                            .update(app, |page, cx| page.toggle_route_picker(window, cx));
+                    });
+                    settle(cx, 800).await;
+                    capture(cx, &dir.join("13-new-run-picker.png"));
                 }
                 if name == "13-run" {
                     // The rail's properties.

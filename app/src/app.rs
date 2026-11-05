@@ -24,6 +24,7 @@ actions!(
         GoBack,
         ToggleCommander,
         OpenSettings,
+        NewConversation,
         CheckForUpdates
     ]
 );
@@ -37,6 +38,7 @@ pub fn register_key_bindings(cx: &mut App) {
         KeyBinding::new("cmd-[", GoBack, None),
         KeyBinding::new("cmd-k", ToggleCommander, None),
         KeyBinding::new("cmd-,", OpenSettings, None),
+        KeyBinding::new("cmd-n", NewConversation, None),
     ]);
 }
 
@@ -284,6 +286,13 @@ impl Render for AppView {
                     cx.notify();
                 });
             }))
+            .on_action(cx.listener(|this, _: &NewConversation, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    state.set_commander_open(false);
+                    state.navigate(Route::NewRun);
+                    cx.notify();
+                });
+            }))
             .on_action(cx.listener(|this, _: &ToggleCommander, _window, cx| {
                 this.state.update(cx, |state, cx| {
                     state.toggle_commander();
@@ -380,7 +389,7 @@ fn page_for_route(
         Route::Stats => stats.clone().into(),
         // Never the backdrop: Settings draws in its dialog.
         Route::Settings(_) => roles.clone().into(),
-        Route::Run(_) => run_page.clone().into(),
+        Route::Run(_) | Route::NewRun => run_page.clone().into(),
         Route::Runs => runs.clone().into(),
     };
     view.cached(StyleRefinement::default().size_full())

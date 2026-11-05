@@ -20,6 +20,7 @@ use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use syntect::easy::ScopeRegionIterator;
 use syntect::parsing::{ParseState, ScopeStack, SyntaxSet};
 
+use crate::avatar::{BotAvatarState, agent_avatar_playing};
 use crate::models::transcript::{PromptBubble, TranscriptEntry, looks_like_diff, looks_like_json};
 use crate::theme::{StatusTone, Theme, status_tone};
 use crate::ui::{ChatBubble, sans};
@@ -70,7 +71,10 @@ pub struct InlineSpan {
 pub enum RowBody {
     Gap,
     Muted(String),
-    Live,
+    /// The end of a live run: its agent's bot, thinking.
+    Live {
+        agent: String,
+    },
     Step {
         entry: usize,
         verb: String,
@@ -185,7 +189,6 @@ pub struct RowFrame {
     pub count: usize,
     pub enter: f32,
     pub reveal: f32,
-    pub cursor: f32,
     pub cache: Rc<RefCell<HighlightCache>>,
     pub on_expand: Rc<dyn Fn(usize, &mut Window, &mut App)>,
     /// The prompt bubble's fold: called with whether it is now open.
@@ -255,8 +258,9 @@ pub fn flatten_transcript(
     reveal_entry: Option<usize>,
 ) -> Vec<TranscriptRow> {
     let mut rows = Vec::new();
-    for (index, entry) in entries.iter().enumerate() {
-        if index > 0 {
+    for (shown, (index, repeats)) in fold_repeats(entries).into_iter().enumerate() {
+        let entry = &entries[index];
+        if shown > 0 {
             push_row(&mut rows, RowBody::Gap);
         }
         match entry {
@@ -265,16 +269,23 @@ pub fn flatten_transcript(
                 detail,
                 failed,
                 output,
-            } => push_step(
-                &mut rows,
-                index,
-                text,
-                detail.as_deref(),
-                *failed,
-                output.as_deref(),
-                expanded,
-                reveal_entry,
-            ),
+            } => {
+                let detail = match (detail.as_deref(), repeats) {
+                    (Some(detail), Some(count)) => Some(format!("{detail} ×{count}")),
+                    (None, Some(count)) => Some(format!("×{count}")),
+                    (detail, None) => detail.map(str::to_string),
+                };
+                push_step(
+                    &mut rows,
+                    index,
+                    text,
+                    detail.as_deref(),
+                    *failed,
+                    output.as_deref(),
+                    expanded,
+                    reveal_entry,
+                )
+            }
             TranscriptEntry::Thinking { text } => {
                 push_row(&mut rows, RowBody::Thinking(strip_bold(text)));
             }
@@ -297,6 +308,54 @@ pub fn flatten_transcript(
         }
     }
     rows
+}
+
+/// The entries to draw, each with how many times its step ran in a row. An agent that polls
+/// (the same step again and again, each with a line about waiting, as Antigravity checks a
+/// background command) shows its last poll once, its step marked `×n`, and its last line.
+pub fn fold_repeats(entries: &[TranscriptEntry]) -> Vec<(usize, Option<usize>)> {
+    let step = |index: usize| match entries.get(index) {
+        Some(TranscriptEntry::Step { text, failed, .. }) if *failed != Some(true) => {
+            Some(text.as_str())
+        }
+        _ => None,
+    };
+    let said = |index: usize| {
+        matches!(
+            entries.get(index),
+            Some(TranscriptEntry::Message { .. } | TranscriptEntry::Thinking { .. })
+        )
+    };
+    let mut shown = Vec::with_capacity(entries.len());
+    let mut index = 0;
+    while index < entries.len() {
+        let Some(text) = step(index) else {
+            shown.push((index, None));
+            index += 1;
+            continue;
+        };
+        // Each poll is the step, then at most one line of its own.
+        let unit = |at: usize| if said(at + 1) { 2 } else { 1 };
+        let mut last = index;
+        let mut count = 1;
+        let mut next = index + unit(index);
+        while step(next) == Some(text) {
+            last = next;
+            count += 1;
+            next += unit(next);
+        }
+        if count == 1 {
+            shown.push((index, None));
+            index += 1;
+            continue;
+        }
+        shown.push((last, Some(count)));
+        if said(last + 1) {
+            shown.push((last + 1, None));
+        }
+        index = next;
+    }
+    shown
 }
 
 /// The row that opens a run's transcript: the prompt's bubble, open or folded.
@@ -339,7 +398,7 @@ pub fn render_row(
             .text_color(theme.color_text_muted)
             .child(text.clone())
             .into_any_element(),
-        RowBody::Live => live_row(theme, frame.cursor).into_any_element(),
+        RowBody::Live { agent } => live_row(agent).into_any_element(),
         RowBody::Step {
             entry,
             verb,
@@ -631,6 +690,50 @@ fn event_color(theme: Theme, tone: StatusTone) -> gpui::Rgba {
     crate::theme::tone_color(&theme, tone)
 }
 
+/// How many lines of a step's command show: a script written through a heredoc shows its
+/// start, as a terminal folds it.
+const STEP_TARGET_LINES: usize = 3;
+
+/// A step's command, cut to [`STEP_TARGET_LINES`] with a mark where the rest was.
+fn step_target(target: &str) -> String {
+    let mut lines = target.lines();
+    let head: Vec<&str> = lines.by_ref().take(STEP_TARGET_LINES).collect();
+    let rest = lines.count();
+    let mut text = head.join("\n");
+    if rest > 0 {
+        text.push_str(&format!(" … +{rest} lines"));
+    }
+    text
+}
+
+/// The styles of `text[from..to]`: `spans` (relative to `from`) where they color it, `base`
+/// in the gaps, so every byte has exactly one style.
+fn fill_highlights(
+    out: &mut Vec<(std::ops::Range<usize>, HighlightStyle)>,
+    from: usize,
+    to: usize,
+    spans: Vec<(std::ops::Range<usize>, HighlightStyle)>,
+    base: HighlightStyle,
+) {
+    let mut at = from;
+    for (range, style) in spans {
+        let (start, end) = (range.start + from, range.end + from);
+        if start < at || end > to {
+            continue;
+        }
+        if start > at {
+            out.push((at..start, base));
+        }
+        out.push((start..end, style));
+        at = end;
+    }
+    if at < to {
+        out.push((at..to, base));
+    }
+}
+
+/// `› verb target detail` as one run of text, so a long command wraps with the line instead
+/// of running past the column.
 fn step_row(
     frame: &RowFrame,
     entry: usize,
@@ -656,16 +759,68 @@ fn step_row(
     } else {
         theme.color_text_muted
     };
-    let target_node = target.map(|target| {
-        if shell {
-            highlighted_text(frame, target, "bash", theme.chart_cyan)
+    let style = |color: gpui::Rgba| HighlightStyle {
+        color: Some(Hsla::from(color)),
+        ..HighlightStyle::default()
+    };
+    let mut text = verb.to_string();
+    let mut highlights = vec![(
+        0..text.len(),
+        HighlightStyle {
+            font_weight: Some(FontWeight::SEMIBOLD),
+            ..style(verb_color)
+        },
+    )];
+    if let Some(target) = target {
+        let shown = step_target(target);
+        text.push(' ');
+        let from = text.len();
+        text.push_str(&shown);
+        let spans = if shell {
+            shown
+                .lines()
+                .scan(0usize, |offset, line| {
+                    let at = *offset;
+                    *offset += line.len() + 1;
+                    Some((at, line))
+                })
+                .flat_map(|(at, line)| {
+                    frame
+                        .cache
+                        .borrow_mut()
+                        .spans(line, "bash")
+                        .into_iter()
+                        .filter(|span| {
+                            span.start < span.end
+                                && line.is_char_boundary(span.start)
+                                && line.is_char_boundary(span.end)
+                        })
+                        .map(|span| {
+                            (
+                                at + span.start..at + span.end,
+                                role_highlight(&theme, span.role),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect()
         } else {
-            div()
-                .text_color(theme.chart_cyan)
-                .child(target.to_string())
-                .into_any_element()
-        }
-    });
+            Vec::new()
+        };
+        fill_highlights(
+            &mut highlights,
+            from,
+            text.len(),
+            spans,
+            style(theme.chart_cyan),
+        );
+    }
+    if let Some(detail) = detail {
+        let from = text.len();
+        text.push(' ');
+        text.push_str(detail);
+        highlights.push((from..text.len(), style(detail_color)));
+    }
     div()
         .id(("term-step", entry))
         .w_full()
@@ -673,30 +828,14 @@ fn step_row(
         .flex()
         .gap(px(TERM_CH_PX))
         .child(div().flex_none().text_color(bullet).child("›"))
-        .child({
-            let mut line = div()
+        .child(
+            div()
                 .min_w(px(0.0))
                 .flex_1()
-                .flex()
-                .flex_wrap()
                 .whitespace_normal()
-                .child(
-                    div()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(verb_color)
-                        .child(verb.to_string()),
-                );
-            if target_node.is_some() {
-                line = line.child(div().text_color(theme.color_text_primary).child(" "));
-            }
-            if let Some(target_node) = target_node {
-                line = line.child(target_node);
-            }
-            if let Some(detail) = detail {
-                line = line.child(div().text_color(detail_color).child(format!(" {detail}")));
-            }
-            line
-        })
+                .text_color(theme.color_text_primary)
+                .child(StyledText::new(SharedString::from(text)).with_highlights(highlights)),
+        )
         .into_any_element()
 }
 
@@ -755,26 +894,22 @@ fn more_row(
     .into_any_element()
 }
 
-fn live_row(theme: Theme, cursor: f32) -> gpui::Div {
+/// How big the thinking bot at a live run's end is.
+const LIVE_BOT_PX: f32 = 28.0;
+
+/// A live run's end: its agent's bot thinking, its body folded into bouncing dots, as a
+/// chat app shows its agent is still at it.
+fn live_row(agent: &str) -> gpui::Div {
     div()
         .w_full()
-        .min_h(px(TERM_LINE_PX))
+        .py(px(6.0))
         .flex()
         .items_center()
-        .gap(px(TERM_CH_PX))
-        .child(
-            div()
-                .w(px(7.5))
-                .h(px(16.0))
-                .flex_none()
-                .bg(theme.color_text_primary)
-                .opacity(cursor.clamp(0.0, 1.0)),
-        )
-        .child(
-            div()
-                .text_color(theme.color_text_muted)
-                .child("The agent is still writing."),
-        )
+        .child(agent_avatar_playing(
+            agent,
+            BotAvatarState::Thinking,
+            LIVE_BOT_PX,
+        ))
 }
 
 fn code_row(
@@ -1145,7 +1280,10 @@ fn body_signature(body: &RowBody) -> u64 {
             3u8.hash(&mut hasher);
             text.hash(&mut hasher);
         }
-        RowBody::Live => 4u8.hash(&mut hasher),
+        RowBody::Live { agent } => {
+            4u8.hash(&mut hasher);
+            agent.hash(&mut hasher);
+        }
         RowBody::Step {
             entry,
             verb,
@@ -1595,9 +1733,78 @@ impl MdBuilder {
 
 #[cfg(test)]
 mod tests {
-    use super::{OUTPUT_LINES, TokenRole, flatten_transcript, highlight_line};
+    use super::{
+        OUTPUT_LINES, TokenRole, fill_highlights, flatten_transcript, fold_repeats, highlight_line,
+        step_target,
+    };
     use crate::models::transcript::TranscriptEntry;
+    use gpui::HighlightStyle;
     use std::collections::HashSet;
+
+    fn run(text: &str) -> TranscriptEntry {
+        TranscriptEntry::Step {
+            text: text.into(),
+            detail: None,
+            failed: None,
+            output: None,
+        }
+    }
+
+    fn said(text: &str) -> TranscriptEntry {
+        TranscriptEntry::Message { text: text.into() }
+    }
+
+    #[test]
+    fn a_polling_agent_shows_its_last_poll_once() {
+        let entries = vec![
+            said("checking"),
+            run("Run manage_task"),
+            said("Waiting for the task."),
+            run("Run manage_task"),
+            said("Waiting for the check."),
+            run("Run manage_task"),
+            run("Read a.rs"),
+            run("Read b.rs"),
+        ];
+        assert_eq!(
+            fold_repeats(&entries),
+            vec![(0, None), (5, Some(3)), (6, None), (7, None)]
+        );
+    }
+
+    #[test]
+    fn a_step_run_once_or_failed_is_not_folded() {
+        let failed = TranscriptEntry::Step {
+            text: "Run cargo test".into(),
+            detail: None,
+            failed: Some(true),
+            output: None,
+        };
+        let entries = vec![run("Run cargo test"), failed.clone(), failed];
+        assert_eq!(
+            fold_repeats(&entries),
+            vec![(0, None), (1, None), (2, None)]
+        );
+    }
+
+    #[test]
+    fn a_long_command_shows_its_first_lines() {
+        assert_eq!(step_target("ls"), "ls");
+        let script = "cat > a.rs <<'EOF'\nfn a() {}\nfn b() {}\nfn c() {}\nEOF";
+        assert_eq!(
+            step_target(script),
+            "cat > a.rs <<'EOF'\nfn a() {}\nfn b() {} … +2 lines"
+        );
+    }
+
+    #[test]
+    fn highlights_cover_every_byte_once() {
+        let base = HighlightStyle::default();
+        let mut out = Vec::new();
+        fill_highlights(&mut out, 4, 12, vec![(1..3, base), (5..6, base)], base);
+        let ranges: Vec<_> = out.into_iter().map(|(range, _)| range).collect();
+        assert_eq!(ranges, vec![4..5, 5..7, 7..9, 9..10, 10..12]);
+    }
 
     fn step_output(lines: usize) -> TranscriptEntry {
         let text = (1..=lines)

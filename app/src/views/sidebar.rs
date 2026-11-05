@@ -861,7 +861,8 @@ impl SidebarView {
         .detach();
     }
 
-    /// The pages: `<nav class="pw-sidebar-group">`, Commander and then each page, 2px apart.
+    /// The pages: `<nav class="pw-sidebar-group">`, New conversation, Commander, and then each
+    /// page, 2px apart.
     fn nav_block(
         &self,
         theme: Theme,
@@ -875,6 +876,24 @@ impl SidebarView {
             .flex()
             .flex_col()
             .gap(px(theme.sidebar_row_gap))
+            .child({
+                let view = view.clone();
+                let item = SidebarItem::new("sidebar-nav-New", "New conversation")
+                    .icon(Icon::Pencil)
+                    .trailing(kbd("⌘N", &theme))
+                    .active(matches!(route, Route::NewRun))
+                    .on_click(move |_, cx| {
+                        let _ = view.update(cx, |this, cx| this.go(Route::NewRun, false, cx));
+                    });
+                fade_item(
+                    "sidebar-nav-New",
+                    &self.scroll,
+                    fade_edges(theme),
+                    item,
+                    window,
+                    cx,
+                )
+            })
             .child({
                 let view = view.clone();
                 let item = SidebarItem::new("sidebar-nav-Commander", "Commander")
@@ -1504,7 +1523,7 @@ fn fade_edges(theme: Theme) -> FadeEdges {
 }
 
 fn nav_height(theme: Theme) -> f32 {
-    5.0 * theme.sidebar_row_height + 4.0 * theme.sidebar_row_gap
+    6.0 * theme.sidebar_row_height + 5.0 * theme.sidebar_row_gap
 }
 
 fn core_message(error: CoreError) -> String {

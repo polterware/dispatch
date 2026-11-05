@@ -56,6 +56,8 @@ pub enum Route {
     Settings(SettingsPage),
     Run(String),
     Runs,
+    /// A new conversation (⌘N): the run page before its first message.
+    NewRun,
 }
 
 impl Default for Route {
@@ -98,6 +100,12 @@ impl Navigation {
         if !(matches!(self.route, Route::Settings(_)) && matches!(route, Route::Settings(_))) {
             self.history.push(self.route.clone());
         }
+        self.route = route;
+    }
+
+    /// Moves to `route` in place of the current one, so Back skips it: a new conversation
+    /// becomes the run its first message started.
+    pub fn replace(&mut self, route: Route) {
         self.route = route;
     }
 
@@ -538,6 +546,16 @@ impl AppState {
             }
         }
         self.navigation.navigate(route);
+    }
+
+    /// Opens the run a new conversation's first message started, in the conversation's place.
+    pub fn open_started_run(&mut self, id: String) {
+        self.navigate(Route::Run(id.clone()));
+        // Back goes where the new conversation was opened from, not to it.
+        self.navigation
+            .history
+            .retain(|route| *route != Route::NewRun);
+        self.navigation.replace(Route::Run(id));
     }
 
     /// The workspace the pages read (`current()` in the Electron app): the remembered one

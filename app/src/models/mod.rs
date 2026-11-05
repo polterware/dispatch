@@ -1,6 +1,7 @@
 pub mod commander;
 pub use polterware_ui::filter;
 pub mod intelligence;
+pub mod new_run;
 pub mod roles;
 pub mod run_page;
 pub mod runs;

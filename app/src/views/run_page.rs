@@ -5,22 +5,25 @@
 //! and shows (remembered as `polterware.run.rail`). Header actions call the core on the
 //! background executor; they use the same button colors with fast hover and press springs.
 
+use std::cell::Cell;
 use std::rc::Rc;
 
-use crate::format::agent_display_name;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    AnyElement, AnyView, App, AppContext as _, Context, Entity, Font, FontWeight, Hsla,
-    IntoElement, MouseButton, ScrollHandle, SharedString, StyleRefinement, StyledText, TextRun,
-    WeakEntity, Window, div, prelude::*, px,
+    AnyElement, AnyView, App, AppContext as _, Bounds, Context, Entity, Font, FontWeight, Hsla,
+    IntoElement, MouseButton, Pixels, ScrollHandle, SharedString, StyleRefinement, StyledText,
+    TextRun, WeakEntity, Window, canvas, div, prelude::*, px,
 };
 
-use crate::avatar::{agent_avatar, agent_avatar_live};
+use crate::avatar::{agent_avatar, route_avatar};
 use crate::client::{
-    CancelRunRequest, CleanRunRequest, CoreClient, CoreError, DispatchRun, DispatchWorktree,
-    GetRouteDecisionRequest, ListWorktreesRequest, MergeRunRequest, RecoverRunRequest,
-    ResultRequest, StartRunRequest,
+    CancelRunRequest, CleanRunRequest, ConfigRequest, CoreClient, CoreError, DispatchRun,
+    DispatchWorktree, GetRouteDecisionRequest, ListModelsRequest, ListTiersRequest,
+    ListWorktreesRequest, MergeRunRequest, RecoverRunRequest, ResultRequest, StartRunRequest,
+};
+use crate::models::new_run::{
+    RouteChoice, RouteLabel, default_pick, pick_label, route_choices, run_label, start_request,
 };
 use crate::models::run_page::{
     AttemptCard, LinkedRow, MoreAction, ReviewAction, RouteDecision, TokenUsage,
@@ -30,18 +33,21 @@ use crate::models::run_page::{
     role_summary, route_label, run_cost, run_more_actions, run_review_action, stored_usage,
     timing_label, token_breakdown, total_tokens, worktree_display_status,
 };
+use crate::models::settings::parse_policy;
 use crate::motion::{Animator, SpringTier, SpringValue};
 use crate::state::{AppState, ConnectionState, Route, observe};
 use crate::theme::{Theme, status_tone, tw};
 use crate::ui::ellipsis;
 use crate::ui::parts::run_page::{context_meter, file_change_line};
 use crate::ui::patterns::trailing_toolbar;
+use crate::ui::patterns::window_layer;
 use crate::ui::patterns::{message_composer, message_input};
 use crate::ui::{
     Button, ButtonKind, ButtonSize, Icon, MascotMood, Menu, MenuEntry, PageWidth, RailGroup,
     RailPresence, ToastTone, chip, mono, page_empty_with, rail_page_body_under, rail_page_header,
     rail_properties, rail_property, rail_toggle_label, sans, tabular, toolbar, tooltip, wrap_text,
 };
+use crate::ui::{PropertyOption, PropertyPicker, PropertyPickerEvent, text_swap};
 use crate::ui::{SkeletonLayout, TextInput, WIDE_MEASURE, page_skeleton};
 
 /// Where the rail's open state is remembered, as `railStorageKey` names it.
@@ -111,6 +117,36 @@ pub struct RunPageView {
     message_scroll: ScrollHandle,
     /// A follow-up is on its way to the core.
     sending: bool,
+    /// The new conversation (⌘N) before its first message.
+    draft: Draft,
+}
+
+/// The new conversation page: the run page before its run, with its route in the header.
+struct Draft {
+    /// The page shows the new conversation: entering it again starts a fresh one.
+    open: bool,
+    /// Counts new conversations, so each one's header starts on its own route.
+    generation: u64,
+    /// The picked route (`models::new_run` values).
+    pick: String,
+    /// The user picked a route, so the routes coming in leave it.
+    picked: bool,
+    /// The routes offered, once the core has answered.
+    choices: Vec<RouteChoice>,
+    /// The routes were asked for in this new conversation.
+    asked: bool,
+    picker: Entity<PropertyPicker>,
+    /// Where the header pill is, which the picker hangs from.
+    anchor: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// The run the last new conversation started: its id, the conversation's generation, and
+    /// the route it was started on, which its header shows until the run has an agent and
+    /// then turns into it.
+    started: Option<(String, u64, String)>,
+}
+
+/// The header pill's key for a new conversation's route, which the run it starts keeps.
+fn draft_key(generation: u64) -> String {
+    format!("route-draft-{generation}")
 }
 
 /// The composer's placeholder.
@@ -154,10 +190,19 @@ impl RunPageView {
             MESSAGE_PLACEHOLDER,
             move |text, _, cx| {
                 let text = text.to_string();
-                let _ = weak.update(cx, |view, cx| view.send_message(text, cx));
+                let _ = weak.update(cx, |view, cx| view.submit(text, cx));
             },
             cx,
         );
+        let picker = cx.new(PropertyPicker::new);
+        cx.subscribe(&picker, |view, _, event: &PropertyPickerEvent, cx| {
+            if let PropertyPickerEvent::Pick(value) = event {
+                view.draft.pick = value.to_string();
+                view.draft.picked = true;
+                cx.notify();
+            }
+        })
+        .detach();
         let mut view = Self {
             state,
             transcript,
@@ -197,6 +242,17 @@ impl RunPageView {
             message,
             message_scroll: ScrollHandle::new(),
             sending: false,
+            draft: Draft {
+                open: false,
+                generation: 0,
+                pick: default_pick(false).to_string(),
+                picked: false,
+                choices: Vec::new(),
+                asked: false,
+                picker,
+                anchor: Rc::new(Cell::new(None)),
+                started: None,
+            },
         };
         view.install_bodies(cx);
         view
@@ -241,6 +297,331 @@ impl RunPageView {
             cx.notify();
         });
         cx.notify();
+    }
+
+    /// What Enter or the send button does: the new conversation's first message starts its
+    /// run, and on a run page a message follows it up.
+    fn submit(&mut self, text: String, cx: &mut Context<Self>) {
+        if matches!(self.state.read(cx).route(), Route::NewRun) {
+            self.start_conversation(text, cx);
+        } else {
+            self.send_message(text, cx);
+        }
+    }
+
+    /// Starts a fresh new conversation the first time the page shows it: Auto again (or
+    /// normal with no classifier), an empty composer, and the routes asked for again.
+    fn enter_draft(&mut self, cx: &mut Context<Self>) {
+        if self.draft.open {
+            return;
+        }
+        self.draft.open = true;
+        self.draft.generation = self.draft.generation.wrapping_add(1);
+        let auto = self
+            .draft
+            .choices
+            .iter()
+            .any(|choice| choice.value == crate::models::new_run::AUTO);
+        self.draft.pick = default_pick(auto).to_string();
+        self.draft.picked = false;
+        self.draft.asked = false;
+        self.message.update(cx, |input, cx| input.set_text("", cx));
+        self.load_routes(cx);
+    }
+
+    /// Reads whether a classifier is on, the tier table, and the agents' models, and offers
+    /// them in the header's picker.
+    fn load_routes(&mut self, cx: &mut Context<Self>) {
+        if self.draft.asked {
+            return;
+        }
+        let Some(client) = self.state.read(cx).client() else {
+            return;
+        };
+        self.draft.asked = true;
+        cx.spawn(async move |this, cx| {
+            let routes = cx
+                .background_spawn(async move {
+                    let auto = client
+                        .config(&ConfigRequest {
+                            action: "get".to_string(),
+                            ..Default::default()
+                        })
+                        .map(|response| parse_policy(&response.json).classifier_on())
+                        .unwrap_or(false);
+                    let tiers = client
+                        .list_tiers(&ListTiersRequest {})
+                        .map(|response| response.tiers)
+                        .unwrap_or_default();
+                    let models = client
+                        .list_models(&ListModelsRequest {})
+                        .map(|response| response.models)
+                        .unwrap_or_default();
+                    (auto, route_choices(auto, &tiers, &models))
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                let (auto, choices) = routes;
+                if !view.draft.picked {
+                    view.draft.pick = default_pick(auto).to_string();
+                }
+                view.draft.choices = choices;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Opens the header's picker of routes under its pill, or closes it.
+    pub(crate) fn toggle_route_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.draft.picker.read(cx).is_open() {
+            self.draft.picker.update(cx, |picker, cx| picker.close(cx));
+            return;
+        }
+        let options = self
+            .draft
+            .choices
+            .iter()
+            .map(|choice| {
+                let mut option = PropertyOption::new(choice.value.clone(), choice.label.clone())
+                    .group(choice.group.clone());
+                if !choice.hint.is_empty() {
+                    option = option.hint(choice.hint.clone());
+                }
+                match &choice.agent {
+                    Some(agent) => {
+                        let agent = agent.clone();
+                        option.mark(move |size, _, _| {
+                            agent_avatar(&agent, "", size).into_any_element()
+                        })
+                    }
+                    None => option.icon(Icon::Activity),
+                }
+            })
+            .collect();
+        let height = self
+            .draft
+            .anchor
+            .get()
+            .map_or(28.0, |bounds| f32::from(bounds.size.height));
+        let value = SharedString::from(self.draft.pick.clone());
+        self.draft.picker.update(cx, |picker, cx| {
+            picker.set_options("Route", options, Some(value), 320.0, cx);
+            picker.set_trigger_height(height);
+            picker.open(window, cx);
+        });
+    }
+
+    /// Starts the new conversation's run with its first message, on the picked route in the
+    /// open workspace, and opens it in the conversation's place.
+    fn start_conversation(&mut self, text: String, cx: &mut Context<Self>) {
+        let prompt = text.trim().to_string();
+        if prompt.is_empty() || self.sending {
+            return;
+        }
+        let (client, workspace) = {
+            let state = self.state.read(cx);
+            (
+                state.client(),
+                state
+                    .current_workspace()
+                    .map(|workspace| workspace.id.clone()),
+            )
+        };
+        let Some(client) = client else {
+            self.toast("Dispatch core is not running", ToastTone::Danger, cx);
+            return;
+        };
+        let Some(workspace) = workspace else {
+            self.toast(
+                "Add a workspace to start a conversation",
+                ToastTone::Danger,
+                cx,
+            );
+            return;
+        };
+        let pick = self.draft.pick.clone();
+        let generation = self.draft.generation;
+        let request = start_request(&pick, &prompt, &workspace);
+        self.sending = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { client.start_run(&request) })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                view.sending = false;
+                match result {
+                    Ok(response) if !response.run.id.is_empty() => {
+                        let id = response.run.id.clone();
+                        view.message.update(cx, |input, cx| input.set_text("", cx));
+                        view.draft.started = Some((id.clone(), generation, pick));
+                        view.draft.open = false;
+                        view.state.update(cx, |state, cx| {
+                            state.note_run(response.run);
+                            state.open_started_run(id);
+                            state.request_refresh(cx);
+                            cx.notify();
+                        });
+                    }
+                    Ok(_) => cx.notify(),
+                    Err(error) => {
+                        let message = match error {
+                            CoreError::Rpc(message) if !message.is_empty() => {
+                                format!("The conversation did not start: {message}")
+                            }
+                            _ => "The conversation did not start.".to_string(),
+                        };
+                        view.toast(message, ToastTone::Danger, cx);
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// The header pill's key and route for `run`: a run a new conversation started keeps
+    /// that conversation's key, so its pill turns from the route into the agent it got.
+    fn run_route(&self, run: &DispatchRun) -> (String, RouteLabel) {
+        match &self.draft.started {
+            Some((id, generation, pick)) if *id == run.id => (
+                draft_key(*generation),
+                run_label(&run.agent, &run.model, Some(pick)),
+            ),
+            _ => (run.id.clone(), run_label(&run.agent, &run.model, None)),
+        }
+    }
+
+    /// The new conversation's page: the run page's header with its route, which opens the
+    /// picker, an empty rail, and the composer, whose first message starts the run.
+    fn render_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        self.enter_draft(cx);
+        self.sync_menu("", &[], cx);
+        let theme = *Theme::global(cx);
+        let weak = cx.weak_entity();
+        let visible = self.rail_visible();
+        self.rail.set_open(visible);
+        let label = pick_label(&self.draft.pick);
+        let open_picker: PillClick = Rc::new({
+            let weak = weak.clone();
+            move |window, cx| {
+                let _ = weak.update(cx, |view, cx| view.toggle_route_picker(window, cx));
+            }
+        });
+        let anchor = self.draft.anchor.clone();
+        let pill = div()
+            .relative()
+            .child(route_pill(
+                &draft_key(self.draft.generation),
+                &label,
+                "",
+                Some(open_picker),
+                cx,
+            ))
+            .child(
+                canvas(
+                    move |bounds, _, _| anchor.set(Some(bounds)),
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full(),
+            );
+        let toggle_view = weak.clone();
+        let end = Button::new("run-rail-toggle", ButtonKind::Secondary)
+            .size(ButtonSize::Icon)
+            .icon(Icon::SidebarRightIcon)
+            .tooltip(rail_toggle_label(visible))
+            .selected(visible)
+            .on_click(move |_, cx| {
+                let _ = toggle_view.update(cx, |view, cx| view.toggle_rail(cx));
+            });
+        let bar = rail_page_header(pill, end, cx).into_any_element();
+        let header = theme.page_header_height;
+        let can_send = self.state.read(cx).current_workspace().is_some();
+        let input = self.message.clone();
+        let send = weak.clone();
+        let mut card = message_composer("run-message", &self.message, &self.message_scroll)
+            .busy(self.sending)
+            .on_send(Rc::new(move |_, cx| {
+                let text = input.read(cx).text().to_string();
+                let _ = send.update(cx, |view, cx| view.start_conversation(text, cx));
+            }));
+        if !can_send {
+            card = card.can_send(false);
+        }
+        let column = div()
+            .flex_1()
+            .min_h(px(0.0))
+            .w_full()
+            .min_w(px(0.0))
+            .flex()
+            .flex_col()
+            .child(div().flex_1().min_h(px(0.0)))
+            .child(
+                div()
+                    .w_full()
+                    .flex_none()
+                    .flex()
+                    .justify_center()
+                    .px(px(16.0))
+                    .pb(px(16.0))
+                    .child(div().w_full().max_w(px(WIDE_MEASURE)).child(card)),
+            );
+        // Nothing has run yet, so the rail has nothing to hold.
+        let (row, drawer) = rail_page_body_under(
+            column,
+            div().into_any_element(),
+            &self.rail,
+            &self.page_width,
+            header,
+            window,
+            cx,
+        );
+        let picker = self.draft.picker.clone();
+        let overlay = (picker.read(cx).is_presented())
+            .then(|| self.draft.anchor.get())
+            .flatten()
+            .map(|anchor| {
+                window_layer(
+                    div().size_full().child(
+                        div()
+                            .absolute()
+                            .left(anchor.origin.x)
+                            .top(anchor.origin.y)
+                            .w(anchor.size.width)
+                            .h(anchor.size.height)
+                            .child(picker),
+                    ),
+                )
+            });
+        div()
+            .relative()
+            .size_full()
+            .min_w(px(0.0))
+            .flex()
+            .flex_col()
+            .text_color(theme.color_text_primary)
+            .child(self.page_width.probe())
+            .child(row)
+            .child(
+                div()
+                    .absolute()
+                    .top(px(0.0))
+                    .left(px(0.0))
+                    .right(px(0.0))
+                    .child(trailing_toolbar(
+                        bar,
+                        theme.color_surface,
+                        header,
+                        theme.radius_surface,
+                    )),
+            )
+            .children(drawer)
+            .children(overlay)
+            .into_any_element()
     }
 
     /// Sends `text` to the open run's agent session: a new run that resumes it, which the
@@ -870,6 +1251,13 @@ impl RunPageView {
 
 impl Render for RunPageView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if matches!(self.state.read(cx).route(), Route::NewRun) {
+            return self.render_draft(window, cx);
+        }
+        self.draft.open = false;
+        if self.draft.picker.read(cx).is_open() {
+            self.draft.picker.update(cx, |picker, cx| picker.close(cx));
+        }
         let theme = *Theme::global(cx);
         let (route_id, connection, run, links, reply) = {
             let state = self.state.read(cx);
@@ -934,7 +1322,9 @@ impl Render for RunPageView {
                             let _ = toggle_view.update(cx, |view, cx| view.toggle_rail(cx));
                         }),
                 );
-            rail_page_header(header_agent(&run, cx), end, cx).into_any_element()
+            let (key, label) = self.run_route(&run);
+            rail_page_header(route_pill(&key, &label, &run.status, None, cx), end, cx)
+                .into_any_element()
         } else {
             toolbar(div(), div(), cx).into_any_element()
         };
@@ -1040,6 +1430,7 @@ impl Render for RunPageView {
                     .child(menu),
             )
             .child(self.confirm_layer(&confirm_id, weak, theme))
+            .into_any_element()
     }
 }
 
@@ -1153,25 +1544,56 @@ fn read_pack(view: &WeakEntity<RunPageView>, cx: &App) -> Option<Pack> {
 
 /// The header's lead, in Roles' role title (a small secondary pill button): the run's live
 /// bot, the agent's name, and the model in muted ink. Inert: the material, not a control.
-fn header_agent(run: &DispatchRun, cx: &App) -> AnyElement {
+/// What a press on the header pill does.
+type PillClick = Rc<dyn Fn(&mut Window, &mut App)>;
+
+/// The header pill: the route's bot (the Polterware ghost for a tier, the agent's live bot
+/// once it has one) in Roles' role title material, then its name and, muted, its model. A new
+/// conversation's pill opens the route picker; a run's is inert. `key` holds what it showed,
+/// so a route that gets its agent turns into it: the bot spins into the agent's, and the
+/// name and model roll into theirs.
+fn route_pill(
+    key: &str,
+    label: &RouteLabel,
+    status: &str,
+    on_click: Option<PillClick>,
+    cx: &App,
+) -> AnyElement {
     let theme = Theme::global(cx);
-    let model = run.model.trim();
-    let mut title = Button::new("run-agent", ButtonKind::Secondary)
+    let model = div()
+        .when(!label.model.is_empty(), |model| model.ml(px(6.0)))
+        .text_size(px(theme.font_size_xs))
+        .text_color(theme.color_text_muted)
+        .child(text_swap(
+            SharedString::from(format!("{key}-model")),
+            label.model.clone(),
+        ));
+    let title = Button::new("run-agent", ButtonKind::Secondary)
         .size(ButtonSize::Sm)
         .pill()
         .pad_x(5.0)
-        .inert()
-        .leading(agent_avatar_live(&run.agent, &run.status, 20.0))
-        .label(agent_display_name(&run.agent));
-    if !model.is_empty() {
-        title = title.trailing(
+        .leading(route_avatar(
+            SharedString::from(format!("{key}-bot")),
+            label.agent.as_deref(),
+            status,
+            20.0,
+        ))
+        .trailing(
             div()
-                .text_size(px(theme.font_size_xs))
-                .text_color(theme.color_text_muted)
-                .child(SharedString::from(model.to_string())),
+                .flex()
+                .items_center()
+                .child(text_swap(
+                    SharedString::from(format!("{key}-name")),
+                    label.name.clone(),
+                ))
+                .child(model),
         );
+    match on_click {
+        Some(click) => title
+            .on_click(move |window, cx| click(window, cx))
+            .into_any_element(),
+        None => title.inert().into_any_element(),
     }
-    title.into_any_element()
 }
 
 /// The attempts that failed before the one that ran, as 18px bots and a line each with their
