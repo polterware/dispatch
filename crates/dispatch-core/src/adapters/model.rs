@@ -47,7 +47,7 @@ pub fn provider_of(agent: &str, model: &str) -> String {
 }
 
 pub fn valid_effort(e: &str) -> bool {
-    matches!(e, "low" | "medium" | "high" | "xhigh")
+    matches!(e, "low" | "medium" | "high" | "xhigh" | "max")
 }
 pub fn base_model(m: &str) -> &str {
     let effort = effort_of(m);
@@ -56,10 +56,4 @@ pub fn base_model(m: &str) -> &str {
     } else {
         m.strip_suffix(&format!("-{effort}")).unwrap_or(m)
     }
-}
-pub fn allowed_model(agent: &str, model: &str) -> bool {
-    agent == "claude"
-        || !["claude", "sonnet", "opus", "haiku", "fable"]
-            .iter()
-            .any(|p| model.to_lowercase().contains(p))
 }

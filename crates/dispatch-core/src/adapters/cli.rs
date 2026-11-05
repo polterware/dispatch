@@ -64,10 +64,7 @@ pub fn parse_pi_models(out: &str) -> Vec<String> {
         .collect()
 }
 
-use super::{
-    Request, RunResult, binaries, livelog::LiveLog, model::allowed_model, proc::run_command,
-    stream, usage,
-};
+use super::{Request, RunResult, binaries, livelog::LiveLog, proc::run_command, stream, usage};
 use crate::{Error, sandbox};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
@@ -199,11 +196,6 @@ pub async fn run(
     model: &str,
     cancel: CancellationToken,
 ) -> Result<RunResult, Error> {
-    if !allowed_model(name, model) {
-        return Err(Error::Message(format!(
-            "{name}: claude models are not routed through this CLI"
-        )));
-    }
     let session = if !req.resume_session.is_empty() {
         req.resume_session.clone()
     } else if matches!(name, "pi" | "grok") {

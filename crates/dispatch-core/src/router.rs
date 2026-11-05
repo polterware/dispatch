@@ -603,12 +603,6 @@ pub fn select_candidates(
             rejected.push(format!("{label}: agent unavailable"));
             continue;
         };
-        if e.agent != "claude" && e.model.to_lowercase().contains("claude") {
-            rejected.push(format!(
-                "{label}: Claude models refused in third-party CLIs"
-            ));
-            continue;
-        }
         if options.read_only && !a.read_only {
             rejected.push(format!("{label}: does not support readOnly"));
             continue;
@@ -884,7 +878,7 @@ pub fn route(
     }
     if !o.filters.effort.is_empty() && !crate::tiers::valid_effort(&o.filters.effort) {
         return Err(crate::Error::Message(format!(
-            "invalid effort {:?} (want low|medium|high|xhigh)",
+            "invalid effort {:?} (want low|medium|high|xhigh|max)",
             o.filters.effort
         )));
     }

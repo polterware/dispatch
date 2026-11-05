@@ -124,7 +124,7 @@ pub fn provider_of(agent: &str, model: &str) -> String {
 }
 
 pub fn valid_effort(e: &str) -> bool {
-    matches!(e, "low" | "medium" | "high" | "xhigh")
+    matches!(e, "low" | "medium" | "high" | "xhigh" | "max")
 }
 
 pub fn default_tiers() -> Result<Table, Error> {

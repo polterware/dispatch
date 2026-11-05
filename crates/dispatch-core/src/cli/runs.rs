@@ -500,7 +500,11 @@ pub(super) async fn run(db_path: &Path, args: &[String]) -> CliResult {
     .string("worktree", "", "optional worktree path")
     .string("provider", "", "restrict to a provider")
     .string("model", "", "restrict to a model")
-    .string("effort", "", "restrict to an effort: low|medium|high|xhigh")
+    .string(
+        "effort",
+        "",
+        "restrict to an effort: low|medium|high|xhigh|max",
+    )
     .string("priority", "", "speed|balanced|quality")
     .bool(
         "relax",

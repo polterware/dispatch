@@ -91,7 +91,7 @@ pub fn validate_options(o: &Options) -> Result<(), Error> {
     }
     if !o.filters.effort.is_empty() && !valid_effort(&o.filters.effort) {
         return Err(msg(format!(
-            "invalid effort {:?} (want low|medium|high|xhigh)",
+            "invalid effort {:?} (want low|medium|high|xhigh|max)",
             o.filters.effort
         )));
     }

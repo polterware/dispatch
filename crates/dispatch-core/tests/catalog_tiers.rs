@@ -2,7 +2,8 @@ use dispatch_core::{
     catalog::{BenchScore, Catalog, CatalogModel, EciScore},
     pass_model::{pass_probability, sigmoid},
     router::{self, Candidate},
-    tiers::Table,
+    tiers::{Entry, Table},
+    tiers_build::build_tiers,
 };
 fn near(a: f64, b: f64) -> bool {
     (a - b).abs() < 1e-9
@@ -194,5 +195,55 @@ fn test_auto_theta_traces_to_the_catalog() {
         let auto = c.auto.unwrap();
         assert!(auto.theta_source.starts_with("cursorbench"));
         assert!(auto.cost.is_some());
+    }
+}
+#[test]
+fn test_antigravity_claude_ids_read_the_claude_benchmarks() {
+    let cat = Catalog::embedded().unwrap();
+    for (listed, model, effort) in [
+        ("claude-sonnet-5-5-high", "claude-sonnet-5-5", "high"),
+        ("claude-opus-5-5-low", "claude-opus-5-5", "low"),
+    ] {
+        let agy = cat.estimate(listed, "");
+        let claude = cat.estimate(model, effort);
+        assert_eq!(agy.key, claude.key);
+        assert!(
+            agy.theta_source.starts_with("cursorbench"),
+            "{listed}: {}",
+            agy.theta_source
+        );
+        assert!(near(agy.theta, claude.theta), "{listed}");
+        assert!(agy.cost_per_task.is_some(), "{listed}: unpriced");
+        assert_eq!(agy.cost_per_task, claude.cost_per_task, "{listed}");
+    }
+}
+#[test]
+fn test_build_tiers_offers_antigravity_claude_models() {
+    let cat = Catalog::embedded().unwrap();
+    let entries: Vec<Entry> = ["claude-opus-5-5-high", "claude-sonnet-5-5-medium"]
+        .map(|model| Entry {
+            agent: "antigravity".into(),
+            model: model.into(),
+            provider: "anthropic".into(),
+            ..Default::default()
+        })
+        .to_vec();
+    let built = build_tiers(&entries, &cat, "balanced");
+    for tier in ["easy", "normal", "hard"] {
+        let rows = built.tiers.get(tier).cloned().unwrap_or_default();
+        assert!(!rows.is_empty(), "{tier}: no antigravity claude model");
+        for b in rows {
+            assert_eq!(b.entry.agent, "antigravity");
+            assert!(
+                b.entry.model.starts_with("claude-"),
+                "{tier}: {}",
+                b.entry.model
+            );
+            assert!(
+                b.auto.theta_source.starts_with("cursorbench"),
+                "{tier}: {}",
+                b.auto.theta_source
+            );
+        }
     }
 }

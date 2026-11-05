@@ -74,10 +74,10 @@ Explicit flags win over the role. `prefer` and `avoid` are weights in the rankin
 
 ## Filters and routing (optional; Auto is the default with a classifier, else normal)
 
-`run` accepts `--provider`, `--model`, `--effort low|medium|high|xhigh`, `--agent`, `--priority speed|balanced|quality`, `--relax`.
+`run` accepts `--provider`, `--model`, `--effort low|medium|high|xhigh|max` (an agent that lacks one is passed over), `--agent`, `--priority speed|balanced|quality`, `--relax`.
 A filter narrows candidates and fallback; with none left the run fails (`--relax` returns to tier routing, with a note). `--model` or `--provider` replaces Auto. `--priority` sets how sure Auto must be: speed 0.70, balanced 0.80, quality 0.90.
 `dispatch route [same filters] [--json] "<prompt>"` shows candidates, eliminations, and the winner without running anything; on Auto, with each one's pass probability and cost. `dispatch models` lists how Auto prices each model.
-`dispatch config get|set|allow|deny` keeps the persistent policy, one for every repository (allow/deny of providers, models, agents; deny wins).
+`dispatch config get|set|allow|deny` keeps the persistent policy, one for every repository (allow/deny of providers, models, agents; deny wins). Every model an installed agent CLI lists is a candidate, from any provider (`antigravity/claude-sonnet-5-5-high` as much as `claude/claude-sonnet-5-5`); the policy is the only thing that narrows them.
 `dispatch agents` lists the installed agents; `dispatch agents add <name> -- <command>` adds any agent CLI that speaks ACP (the Agent Client Protocol), and `dispatch agents remove <name>` drops it.
 
 ## Rules

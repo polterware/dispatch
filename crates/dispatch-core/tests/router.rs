@@ -1,7 +1,11 @@
 use dispatch_core::{
     catalog::{BenchScore, Catalog},
+    config::Policy,
     pass_model::sigmoid,
-    router::{self, AVOID_BIAS, Candidate, History, PREFER_BIAS, Pace},
+    router::{
+        self, AVOID_BIAS, Agent, Candidate, Filters, History, PREFER_BIAS, Pace, RouteOptions,
+    },
+    tiers::Table,
 };
 
 fn candidate(model: &str, pace: Option<Pace>) -> Candidate {
@@ -191,4 +195,188 @@ fn test_terms_sum_to_score() {
                 < 1e-9
         );
     }
+}
+
+/// Antigravity as its CLI reports itself: the effort in the model's name, and
+/// Claude models beside Gemini's.
+fn antigravity() -> Agent {
+    Agent {
+        name: "antigravity".into(),
+        installed: true,
+        read_only: true,
+        file_editing: true,
+        effort_mode: "model-suffix".into(),
+        discovered: [
+            "gemini-3.8-flash-high",
+            "claude-sonnet-5-5-low",
+            "claude-sonnet-5-5-high",
+            "claude-opus-5-5-high",
+        ]
+        .map(String::from)
+        .to_vec(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn antigravity_claude_model_routes_when_requested() {
+    let cat = Catalog::embedded().unwrap();
+    let r = router::route(
+        &Table::default(),
+        &Policy::default(),
+        &[antigravity()],
+        &RouteOptions {
+            filters: Filters {
+                agent: "antigravity".into(),
+                model: "claude-sonnet-5-5-high".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        &cat,
+    )
+    .unwrap();
+    let winner = r.winner.expect("winner");
+    assert_eq!(
+        (
+            winner.agent.as_str(),
+            winner.model.as_str(),
+            winner.provider.as_str()
+        ),
+        ("antigravity", "claude-sonnet-5-5-high", "anthropic"),
+        "{:?}",
+        r.eliminated
+    );
+}
+
+#[test]
+fn auto_weighs_antigravity_claude_models_on_the_claude_benchmarks() {
+    let cat = Catalog::embedded().unwrap();
+    let r = router::route(
+        &Table::default(),
+        &Policy::default(),
+        &[antigravity()],
+        &RouteOptions {
+            tier: "auto".into(),
+            difficulty: Some(0.0),
+            ..Default::default()
+        },
+        &cat,
+    )
+    .unwrap();
+    let got: Vec<&str> = r
+        .candidates
+        .iter()
+        .map(|c| c.filters.model.as_str())
+        .collect();
+    for want in [
+        "gemini-3.8-flash-high",
+        "claude-sonnet-5-5-high",
+        "claude-opus-5-5-high",
+    ] {
+        assert!(
+            got.contains(&want),
+            "auto lacks {want}: {got:?} {:?}",
+            r.eliminated
+        );
+    }
+    for c in &r.candidates {
+        if !c.filters.model.starts_with("claude-") {
+            continue;
+        }
+        let auto = c.auto.as_ref().expect("auto info");
+        let claude = cat.estimate(&c.filters.model, &c.filters.effort);
+        assert_eq!(c.filters.provider, "anthropic");
+        assert!(
+            !auto.theta_source.is_empty() && auto.theta_source != "unknown",
+            "{}: {}",
+            c.filters.model,
+            auto.theta_source
+        );
+        assert!(
+            (auto.theta - claude.theta).abs() < 1e-9,
+            "{}",
+            c.filters.model
+        );
+        assert!(auto.cost.is_some(), "{}: unpriced", c.filters.model);
+    }
+}
+
+#[test]
+fn deny_policy_is_the_only_guard_on_claude_in_other_clis() {
+    let cat = Catalog::embedded().unwrap();
+    let mut policy = Policy::default();
+    policy.deny.providers = vec!["anthropic".into()];
+    let r = router::route(
+        &Table::default(),
+        &policy,
+        &[antigravity()],
+        &RouteOptions {
+            tier: "auto".into(),
+            difficulty: Some(0.0),
+            ..Default::default()
+        },
+        &cat,
+    )
+    .unwrap();
+    assert!(
+        r.candidates
+            .iter()
+            .all(|c| !c.filters.model.starts_with("claude-")),
+        "{:?}",
+        r.candidates
+    );
+    assert!(
+        r.eliminated
+            .iter()
+            .any(|e| e.contains("claude-opus-5-5-high: policy deny.providers includes anthropic")),
+        "{:?}",
+        r.eliminated
+    );
+}
+
+#[test]
+fn max_effort_routes_where_the_agent_takes_it() {
+    let cat = Catalog::embedded().unwrap();
+    let config_agent = |name: &str, efforts: &[&str]| Agent {
+        name: name.into(),
+        installed: true,
+        read_only: true,
+        file_editing: true,
+        effort_mode: "config".into(),
+        efforts: efforts.iter().map(|e| (*e).to_owned()).collect(),
+        discovered: vec!["claude-opus-5-5".into()],
+        ..Default::default()
+    };
+    let agents = [
+        config_agent("claude", &["low", "medium", "high", "xhigh", "max"]),
+        config_agent("codex", &["low", "medium", "high", "xhigh"]),
+    ];
+    let r = router::route(
+        &Table::default(),
+        &Policy::default(),
+        &agents,
+        &RouteOptions {
+            filters: Filters {
+                model: "claude-opus-5-5".into(),
+                effort: "max".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        &cat,
+    )
+    .unwrap();
+    let winner = r.winner.expect("winner");
+    assert_eq!(
+        (winner.agent.as_str(), winner.effort.as_str()),
+        ("claude", "max")
+    );
+    assert!(
+        r.eliminated
+            .iter()
+            .any(|e| e.starts_with("codex/claude-opus-5-5: effort max unsupported")),
+        "{:?}",
+        r.eliminated
+    );
 }

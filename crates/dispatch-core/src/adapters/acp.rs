@@ -40,7 +40,6 @@ pub fn custom_agents() -> BTreeMap<String, Vec<String>> {
 use super::{
     Model, Request, RunResult, binaries, cli,
     livelog::LiveLog,
-    model::allowed_model,
     proc::RpcProcess,
     usage::{AcpUsage, Usage, usage_line},
 };
@@ -118,15 +117,6 @@ pub async fn run_outcome(
     model: &str,
     cancel: CancellationToken,
 ) -> (RunResult, Result<(), Error>) {
-    if !allowed_model(&spec.name, model) {
-        return (
-            RunResult::default(),
-            Err(Error::Message(format!(
-                "{}: claude models are not routed through this CLI",
-                spec.name
-            ))),
-        );
-    }
     let (result, status) = session_outcome(spec, req, model, cancel, false).await;
     (result, status.map(|_| ()))
 }
@@ -199,7 +189,6 @@ pub async fn models(name: &str, cancel: CancellationToken) -> Result<Vec<Model>,
         };
         return Ok(ids
             .into_iter()
-            .filter(|m| allowed_model(name, m))
             .map(|id| Model {
                 id,
                 tier: String::new(),
@@ -215,7 +204,6 @@ pub async fn models(name: &str, cancel: CancellationToken) -> Result<Vec<Model>,
     let models: Vec<Model> = session_models(&Spec::for_agent(name, true), cancel)
         .await?
         .into_iter()
-        .filter(|m| allowed_model(name, m))
         .map(|id| Model {
             id,
             tier: String::new(),

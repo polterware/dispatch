@@ -1,6 +1,6 @@
 use crate::{
     Error,
-    adapters::{Model, model::allowed_model},
+    adapters::Model,
     catalog::{Catalog, base_model},
     config::Policy,
     pass_model::difficulty_tier,
@@ -53,9 +53,6 @@ pub fn agent_pool(agent: &str, table: &Table, listed: &[Entry]) -> Vec<Entry> {
         }
     }
     unique_entries(&out)
-        .into_iter()
-        .filter(|e| allowed_model(&e.agent, &e.model))
-        .collect()
 }
 
 pub fn merge_agent(table: &Table, built: &Table, agent: &str) -> Table {

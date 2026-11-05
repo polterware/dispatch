@@ -3,7 +3,6 @@
 
 use super::{
     Capabilities, Model, RunResult, StartedHook, acp, binaries, claude_limits, cli, codex,
-    model::allowed_model,
     probe::{self, ProbeReport},
     quota::{self, Quota, QuotaSample},
 };
@@ -166,9 +165,8 @@ async fn command_output(bin: &str, args: &[&str], timeout: Duration) -> Result<V
     Ok(out.stdout)
 }
 
-fn to_models(agent: &str, ids: Vec<String>) -> Vec<Model> {
+fn to_models(ids: Vec<String>) -> Vec<Model> {
     ids.into_iter()
-        .filter(|id| allowed_model(agent, id))
         .map(|id| Model {
             id,
             tier: String::new(),
@@ -322,18 +320,13 @@ impl AgentAdapter for Agent {
                         tier: String::new(),
                     })
                     .collect()),
-                "cursor" => Ok(to_models(
-                    "cursor",
-                    cli::parse_cursor_models(&list(&["models"]).await?),
-                )),
-                "grok" => Ok(to_models(
-                    "grok",
-                    cli::parse_grok_models(&list(&["models"]).await?),
-                )),
-                "pi" => Ok(to_models(
-                    "pi",
-                    cli::parse_pi_models(&list(&["--list-models"]).await?),
-                )),
+                "cursor" => Ok(to_models(cli::parse_cursor_models(
+                    &list(&["models"]).await?,
+                ))),
+                "grok" => Ok(to_models(cli::parse_grok_models(&list(&["models"]).await?))),
+                "pi" => Ok(to_models(cli::parse_pi_models(
+                    &list(&["--list-models"]).await?,
+                ))),
                 name => {
                     let cancel = CancellationToken::new();
                     match tokio::time::timeout(

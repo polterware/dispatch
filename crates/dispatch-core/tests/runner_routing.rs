@@ -334,8 +334,8 @@ async fn test_outside_table_and_safety_constraints() {
         ))
         .await;
     assert!(
-        cs.is_empty() && why.join(";").contains("Claude"),
-        "{cs:?} {why:?}"
+        cs.len() == 1 && cs[0].agent() == "a" && cs[0].route.model == "claude-opus",
+        "a Claude model routes through any agent that offers it: {cs:?} {why:?}"
     );
     r.t.store
         .set_cooldown("b", &rfc(now() + TimeDelta::hours(1)))

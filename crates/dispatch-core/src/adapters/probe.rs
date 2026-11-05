@@ -88,6 +88,10 @@ pub fn capabilities(name: &str) -> Capabilities {
             .into_iter()
             .map(str::to_owned)
             .collect();
+        // Claude Code's `--effort` also takes max.
+        if name == "claude" {
+            c.efforts.push("max".into());
+        }
     } else if name == "antigravity" {
         c.effort_mode = "model-suffix".into();
     }

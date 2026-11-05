@@ -161,15 +161,14 @@ async fn test_opencode_auto_weighs_the_models_it_lists() {
     for want in [
         "opencode/zai/glm-5.3-flash",
         "opencode/openai/gpt-5.6-sol",
+        "opencode/anthropic/claude-sonnet-5-5",
         "opencode/opencode/glm-5.3",
     ] {
         assert!(got.iter().any(|m| m == want), "auto lacks {want}: {got:?}");
     }
     assert!(
-        !got.iter()
-            .any(|m| m == "opencode/anthropic/claude-sonnet-5-5")
-            && !got.iter().any(|m| m == "a/gpt-5.6-luna"),
-        "auto weighs a refused model or another agent: {got:?}"
+        !got.iter().any(|m| m == "a/gpt-5.6-luna"),
+        "auto weighs another agent: {got:?}"
     );
 }
 
@@ -189,6 +188,12 @@ async fn test_opencode_tier_without_entry_ranks_its_models_for_the_tier() {
             agent: OPEN_CODE_AGENT.into(),
             model: "openai/gpt-5.6-sol".into(),
             provider: "openai".into(),
+            ..Default::default()
+        },
+        Entry {
+            agent: OPEN_CODE_AGENT.into(),
+            model: "anthropic/claude-sonnet-5-5".into(),
+            provider: "anthropic".into(),
             ..Default::default()
         },
     ];
@@ -225,11 +230,8 @@ async fn test_opencode_tier_without_entry_ranks_its_models_for_the_tier() {
             "{tier}: got {got:?}, want {want:?}"
         );
         assert!(
-            !got.iter().any(|m| m == "opencode/opencode/glm-5.3")
-                && !got
-                    .iter()
-                    .any(|m| m == "opencode/anthropic/claude-sonnet-5-5"),
-            "{tier}: a denied or refused model was ranked: {got:?}"
+            !got.iter().any(|m| m == "opencode/opencode/glm-5.3"),
+            "{tier}: a denied model was ranked: {got:?}"
         );
         assert!(
             r.note.contains(OPEN_CODE_PICK_NOTE),
@@ -372,6 +374,7 @@ fn test_agent_pool_and_merge_agent() {
         vec![
             "zai/glm-5.3-flash",
             "openai/gpt-5.6-sol",
+            "anthropic/claude-opus-5-5",
             "opencode/glm-5.3"
         ]
     );

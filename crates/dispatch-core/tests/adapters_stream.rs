@@ -1,4 +1,4 @@
-use dispatch_core::adapters::{cli::*, model::allowed_model, stream::*, usage::*};
+use dispatch_core::adapters::{cli::*, stream::*, usage::*};
 
 #[test]
 fn parsers() {
@@ -10,9 +10,9 @@ fn parsers() {
     );
     assert_eq!(
         parse_agy_models(
-            "Fetching available models...\ngemini-3.8-flash-low\tGemini 3.8 Flash (Low)\n"
+            "Fetching available models...\ngemini-3.8-flash-low\tGemini 3.8 Flash (Low)\nclaude-sonnet-5-5-high\tClaude Sonnet 5.5 (High)\n"
         ),
-        ["gemini-3.8-flash-low"]
+        ["gemini-3.8-flash-low", "claude-sonnet-5-5-high"]
     );
     assert_eq!(
         parse_grok_models(
@@ -20,17 +20,6 @@ fn parsers() {
         ),
         ["grok-4.7", "grok-4.6"]
     );
-}
-#[test]
-fn claude_filter() {
-    for id in [
-        "claude-opus-5-5-low",
-        "claude-fable-5-thinking-high",
-        "x-Sonnet-y",
-    ] {
-        assert!(!allowed_model("cursor", id));
-    }
-    assert!(allowed_model("cursor", "grok-4.7-low"));
 }
 #[test]
 fn parse_cursor() {
@@ -178,6 +167,4 @@ fn claude_usage_of_a_cut_off_run() {
             ..Usage::default()
         })
     );
-    assert!(allowed_model("claude", "claude-opus-5-5"));
-    assert!(!allowed_model("codex", "claude-opus-5-5"));
 }
