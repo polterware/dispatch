@@ -15,7 +15,7 @@ use gpui::{
 use crate::avatar::agent_avatar;
 use crate::client::{
     ApplyAgentSetupRequest, ClassifyRequest, ConfigRequest, ConfigResponse, CoreClient, CoreError,
-    GetAgentSetupRequest, ListAgentsRequest, ListModelsRequest,
+    GetAgentSetupRequest, ListAgentsRequest, ListModelsRequest, at_once,
 };
 use crate::models::settings::{
     CLASSIFIERS, CliState, Dimension, InstallState, ListedModel, Policy, RuleSide, SAMPLE_TASK,
@@ -357,9 +357,10 @@ impl SettingsView {
         cx.spawn(async move |this, cx| {
             let listed = cx
                 .background_spawn(async move {
-                    let agents = client.list_agents(&ListAgentsRequest::default()).ok();
-                    let models = client.list_models(&ListModelsRequest::default()).ok();
-                    (agents, models)
+                    at_once(
+                        || client.list_agents(&ListAgentsRequest::default()).ok(),
+                        || client.list_models(&ListModelsRequest::default()).ok(),
+                    )
                 })
                 .await;
             let _ = this.update(cx, |view, cx| {

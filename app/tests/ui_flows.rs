@@ -207,6 +207,21 @@ fn every_page_opens_with_data(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn a_core_with_no_runs_refreshes_without_an_error(cx: &mut TestAppContext) {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let core = Core::new();
+    core.cli(&["workspace", "add", &core.repo.to_string_lossy()]);
+    let mut w = open(&core, cx);
+    w.go(Route::Stats);
+    let (runs, error) = w.state.read_with(w.cx, |s, _| {
+        (s.runs().len(), s.last_error().map(str::to_owned))
+    });
+    assert_eq!(runs, 0);
+    // The sidebar would say it could not refresh beside its empty state.
+    assert_eq!(error, None);
+}
+
+#[gpui::test]
 fn the_keyboard_opens_the_palette_settings_and_goes_back(cx: &mut TestAppContext) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let core = Core::new();

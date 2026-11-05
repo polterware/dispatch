@@ -1061,85 +1061,93 @@ impl Core {
         last.insert(agent.into(), std::time::Instant::now());
     }
 
+    /// Asks every agent's CLI for its quota at once: each answer can take seconds, and the
+    /// first list of agents waits for the slowest of them, not for their sum.
     async fn probe_agents(&self, filter: &str, now: DateTime<Utc>) {
-        let at = now.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
-        let time = |t: Option<DateTime<Utc>>| {
-            t.map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true))
-                .unwrap_or_default()
+        futures::future::join_all(
+            known::known()
+                .into_iter()
+                .filter(|a| filter.is_empty() || a.name() == filter)
+                .map(|a| self.probe_agent(a, now)),
+        )
+        .await;
+    }
+
+    async fn probe_agent(&self, a: Arc<dyn AgentAdapter>, now: DateTime<Utc>) {
+        let at = rfc3339(now);
+        let time = |t: Option<DateTime<Utc>>| t.map(rfc3339).unwrap_or_default();
+        let name = a.name();
+        let provider = provider_of(&name, "");
+        let emp = empirical_quota(Some(self.store.as_ref()), &name, Some(now));
+        let mut row = Agent {
+            name: name.clone(),
+            bin: a.binary(),
+            provider: provider.clone(),
+            cooldown_until: emp.reset_at.map(|t| time(Some(t))),
+            ..Agent::default()
         };
-        for a in known::known() {
-            let name = a.name();
-            if !filter.is_empty() && name != filter {
-                continue;
-            }
-            let provider = provider_of(&name, "");
-            let emp = empirical_quota(Some(self.store.as_ref()), &name, Some(now));
-            let mut row = Agent {
-                name: name.clone(),
-                bin: a.binary(),
-                provider: provider.clone(),
-                cooldown_until: emp.reset_at.map(|t| time(Some(t))),
-                ..Agent::default()
-            };
-            // source and confidence describe the quota snapshots this probe saves.
-            let mut source = emp.source.clone();
-            let is_installed = installed(a.as_ref());
-            if let Some(src) = a.usage_source() {
-                source = src.into();
-                if is_installed
-                    && let Ok(samples) = a.usage().await
-                    && !samples.is_empty()
-                {
-                    for s in samples {
-                        if row.used_percent.is_none() {
-                            row.used_percent = s.used;
-                        }
-                        let _ = self.store.save_quota(&QuotaSnapshot {
-                            agent: name.clone(),
-                            provider: provider.clone(),
-                            window: s.window.clone(),
-                            source: s.source.clone(),
-                            confidence: s.confidence.clone(),
-                            used_percent: s.used,
-                            window_minutes: i64::try_from(s.duration.as_secs() / 60).unwrap_or(0),
-                            resets_at: time(s.reset_at),
-                            sampled_at: s.sampled_at.map_or_else(|| at.clone(), |t| time(Some(t))),
-                        });
+        // source and confidence describe the quota snapshots this probe saves.
+        let mut source = emp.source.clone();
+        let is_installed = installed(a.as_ref());
+        if let Some(src) = a.usage_source() {
+            source = src.into();
+            if is_installed
+                && let Ok(samples) = a.usage().await
+                && !samples.is_empty()
+            {
+                for s in samples {
+                    if row.used_percent.is_none() {
+                        row.used_percent = s.used;
                     }
-                    let _ = self.store.upsert_agent(&row);
-                    continue;
+                    let _ = self.store.save_quota(&QuotaSnapshot {
+                        agent: name.clone(),
+                        provider: provider.clone(),
+                        window: s.window.clone(),
+                        source: s.source.clone(),
+                        confidence: s.confidence.clone(),
+                        used_percent: s.used,
+                        window_minutes: i64::try_from(s.duration.as_secs() / 60).unwrap_or(0),
+                        resets_at: time(s.reset_at),
+                        sampled_at: s.sampled_at.map_or_else(|| at.clone(), |t| time(Some(t))),
+                    });
                 }
-            }
-            if is_installed && let Ok(q) = a.quota().await {
-                row.used_percent = Some(q.used_percent);
-                let _ = self.store.save_quota(&QuotaSnapshot {
-                    agent: name.clone(),
-                    provider: provider.clone(),
-                    window: "default".into(),
-                    source: source.clone(),
-                    confidence: "official".into(),
-                    used_percent: Some(q.used_percent),
-                    window_minutes: q.window_minutes,
-                    resets_at: time(q.resets_at),
-                    sampled_at: at.clone(),
-                });
                 let _ = self.store.upsert_agent(&row);
-                continue;
+                return;
             }
+        }
+        if is_installed && let Ok(q) = a.quota().await {
+            row.used_percent = Some(q.used_percent);
             let _ = self.store.save_quota(&QuotaSnapshot {
                 agent: name.clone(),
-                provider,
-                window: emp.window.clone(),
-                source,
-                confidence: emp.confidence.clone(),
-                used_percent: None,
-                window_minutes: 0,
-                resets_at: time(emp.reset_at),
+                provider: provider.clone(),
+                window: "default".into(),
+                source: source.clone(),
+                confidence: "official".into(),
+                used_percent: Some(q.used_percent),
+                window_minutes: q.window_minutes,
+                resets_at: time(q.resets_at),
                 sampled_at: at.clone(),
             });
             let _ = self.store.upsert_agent(&row);
+            return;
         }
+        let _ = self.store.save_quota(&QuotaSnapshot {
+            agent: name.clone(),
+            provider,
+            window: emp.window.clone(),
+            source,
+            confidence: emp.confidence.clone(),
+            used_percent: None,
+            window_minutes: 0,
+            resets_at: time(emp.reset_at),
+            sampled_at: at,
+        });
+        let _ = self.store.upsert_agent(&row);
     }
+}
+
+fn rfc3339(t: DateTime<Utc>) -> String {
+    t.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
 }
 
 /// A stream over a channel's messages.

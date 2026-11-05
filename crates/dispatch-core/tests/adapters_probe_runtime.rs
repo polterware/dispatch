@@ -105,6 +105,37 @@ async fn probe_degraded_when_flag_removed() {
     assert!(!r.flags.iter().find(|f| f.name == "--json").unwrap().present);
 }
 
+/// A run waits for its CLI's probe, so the probe asks for the version and every help at once:
+/// with each answer taking a second, it ends near one second, not near three.
+#[tokio::test]
+async fn probe_asks_the_cli_everything_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, version, help) = fixture("codex");
+    let binary = install(dir.path(), "codex", &version, &help);
+    let body = fs::read_to_string(&binary).unwrap();
+    fs::write(
+        &binary,
+        body.replacen("#!/bin/sh\n", "#!/bin/sh\n/bin/sleep 1\n", 1),
+    )
+    .unwrap();
+    let started = std::time::Instant::now();
+    let r = probe::probe_binary(
+        "codex",
+        &binary,
+        probe::capabilities("codex"),
+        &probe::flags("codex"),
+    )
+    .await;
+    let took = started.elapsed();
+    assert_eq!(r.status, "OK", "{:?}", r.notes);
+    let log = fs::read_to_string(dir.path().join("codex.log")).unwrap();
+    assert_eq!(log.lines().count(), 3, "{log}");
+    assert!(
+        took < std::time::Duration::from_millis(2500),
+        "the probe took {took:?}"
+    );
+}
+
 #[tokio::test]
 async fn probe_unverified() {
     let dir = tempfile::tempdir().unwrap();

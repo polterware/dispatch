@@ -16,7 +16,7 @@ use serde::{Serialize, de::DeserializeOwned};
 
 use crate::client::{
     CoreClient, CoreError, DispatchRun, DispatchSection, ListRunsRequest, ListSectionsRequest,
-    ListWorkspacesRequest, Workspace, core_json_path, resolve_data_dir,
+    ListWorkspacesRequest, Workspace, at_once, core_json_path, each_at_once, resolve_data_dir,
 };
 pub use crate::ui::{Toast, ToastTone};
 
@@ -387,44 +387,54 @@ fn read_snapshot(data_dir: &Path, selected_run: Option<String>) -> Snapshot {
         Err(CoreError::Rpc(message)) => snapshot.last_error = Some(message),
     }
 
-    match client.list_sections(&ListSectionsRequest::default()) {
+    // The sections, each workspace's runs, and the open run's reply are asked for at once.
+    let ids: Vec<&str> = snapshot
+        .workspaces
+        .iter()
+        .map(|workspace| workspace.id.as_str())
+        .filter(|id| !id.trim().is_empty())
+        .collect();
+    let ((sections, reply), listed) = at_once(
+        || {
+            at_once(
+                || client.list_sections(&ListSectionsRequest::default()),
+                || selected_run.as_ref().map(|id| (id, client.run_reply(id))),
+            )
+        },
+        || {
+            each_at_once(&ids, |id| {
+                client.list_runs(&ListRunsRequest {
+                    project_id: (*id).to_owned(),
+                    limit: RUNS_LIMIT,
+                    ..ListRunsRequest::default()
+                })
+            })
+        },
+    );
+
+    match sections {
         Ok(response) => snapshot.sections = response.sections,
         Err(CoreError::NotRunning) => return offline(offline_path),
         Err(CoreError::Rpc(message)) => snapshot.last_error = Some(message),
     }
 
     let mut runs = Vec::new();
-    for workspace in &snapshot.workspaces {
-        if workspace.id.trim().is_empty() {
-            continue;
-        }
-        match client.list_runs(&ListRunsRequest {
-            project_id: workspace.id.clone(),
-            limit: RUNS_LIMIT,
-            ..ListRunsRequest::default()
-        }) {
+    for answer in listed {
+        match answer {
             Ok(response) => runs.extend(response.runs),
             Err(CoreError::NotRunning) => return offline(offline_path),
             Err(CoreError::Rpc(message)) => snapshot.last_error = Some(message),
         }
     }
-    if runs.is_empty() {
-        match client.list_runs(&ListRunsRequest {
-            limit: RUNS_LIMIT,
-            ..ListRunsRequest::default()
-        }) {
-            Ok(response) => runs = response.runs,
-            Err(CoreError::NotRunning) => return offline(offline_path),
-            Err(CoreError::Rpc(message)) => snapshot.last_error = Some(message),
-        }
-    }
+    // The core lists runs by workspace (or conversation), never all at once: with no runs in
+    // any workspace there is nothing more to ask, and the sidebar reads as empty, not failed.
     snapshot.runs = runs;
 
-    if let Some(id) = selected_run {
-        match client.run_reply(&id) {
-            Ok(text) => snapshot.reply = Some((id, text)),
+    if let Some((id, answer)) = reply {
+        match answer {
+            Ok(text) => snapshot.reply = Some((id.clone(), text)),
             Err(CoreError::NotRunning) => return offline(offline_path),
-            Err(CoreError::Rpc(_)) => snapshot.reply = Some((id, String::new())),
+            Err(CoreError::Rpc(_)) => snapshot.reply = Some((id.clone(), String::new())),
         }
     }
 

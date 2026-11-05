@@ -603,6 +603,23 @@ fn config_is_set_read_and_global() {
 }
 
 #[test]
+fn output_into_a_closed_pipe_ends_the_command_quietly() {
+    use std::os::unix::process::ExitStatusExt;
+    let env = Env::new();
+    // The reader is gone before the command writes, as `| head` leaves it once it has enough.
+    let (reader, writer) = std::io::pipe().expect("pipe");
+    drop(reader);
+    let out = env
+        .command(&["skill", "show"])
+        .stdout(writer)
+        .output()
+        .expect("spawn dispatch");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.signal(), Some(libc::SIGPIPE), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+}
+
+#[test]
 fn workspaces_are_added_listed_and_removed() {
     let env = Env::new();
     let other = env.root.join("other");

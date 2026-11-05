@@ -225,7 +225,22 @@ pub async fn probe_binary(
         status: "UNVERIFIED".into(),
         ..Default::default()
     };
-    let (version, version_err) = output(binary, &["--version"]).await;
+    // The CLI is asked for its version and each help it has at once: each answer is a process
+    // start, which for a Node CLI takes a few hundred milliseconds, and a run waits for them.
+    let mut subcommands: Vec<&str> = Vec::new();
+    for f in flags {
+        if !f.subcommand.is_empty() && !subcommands.contains(&f.subcommand) {
+            subcommands.push(f.subcommand);
+        }
+    }
+    let sub_args: Vec<[&str; 2]> = subcommands.iter().map(|s| [*s, "--help"]).collect();
+    let ((version, version_err), (help, help_err), sub_helps) = tokio::join!(
+        output(binary, &["--version"]),
+        output(binary, &["--help"]),
+        futures::future::join_all(sub_args.iter().map(|args| output(binary, args))),
+    );
+    let mut sub_helps: HashMap<&str, (String, Option<String>)> =
+        subcommands.into_iter().zip(sub_helps).collect();
     if version_err
         .as_deref()
         .is_some_and(|e| e.contains("No such file or directory"))
@@ -247,7 +262,6 @@ pub async fn probe_binary(
             version_err.unwrap_or_else(|| "version unknown".into())
         ));
     }
-    let (help, help_err) = output(binary, &["--help"]).await;
     let mut help_ok = help_err.is_none() && !help.trim().is_empty();
     if !help_ok {
         rep.notes.push(format!(
@@ -259,7 +273,7 @@ pub async fn probe_binary(
     let mut missing = Vec::new();
     for f in flags {
         if !helps.contains_key(f.subcommand) {
-            let (text, err) = output(binary, &[f.subcommand, "--help"]).await;
+            let (text, err) = sub_helps.remove(f.subcommand).unwrap_or_default();
             let ok = err.is_none() && !text.trim().is_empty();
             if !ok {
                 rep.notes
@@ -318,14 +332,14 @@ pub async fn probe(name: &str) -> ProbeReport {
     .await
 }
 
+/// Every agent CLI found, probed at once, in the order they were found.
 pub async fn doctor() -> Vec<ProbeReport> {
-    let mut reports = Vec::new();
-    for d in super::binaries::detect() {
-        if matches!(d.source.as_str(), "PATH" | "configured") {
-            reports.push(probe(&d.agent).await);
-        }
-    }
-    reports
+    let agents: Vec<String> = super::binaries::detect()
+        .into_iter()
+        .filter(|d| matches!(d.source.as_str(), "PATH" | "configured"))
+        .map(|d| d.agent)
+        .collect();
+    futures::future::join_all(agents.iter().map(|a| probe(a))).await
 }
 
 pub fn usage_source(name: &str) -> Option<&'static str> {

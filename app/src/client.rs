@@ -1157,10 +1157,93 @@ fn map_transport(err: ureq::Error) -> CoreError {
 }
 
 /// Blocking Connect-JSON client. Clone is cheap; call it from the background executor.
+/// How long a call that answers from the core's own data may take to come back: short, so a
+/// core that stopped answering does not hold a page.
+const QUICK_READ: Duration = Duration::from_secs(4);
+/// How long a call that waits on something outside the core may take: an agent CLI listing
+/// its models (20 s at most each), the CLI classifier (60 s), Jev or OpenAI, Polterware, or
+/// git. A core that has just started asks every CLI before the catalog's first answer.
+const SLOW_READ: Duration = Duration::from_secs(90);
+
+/// The calls that get [`SLOW_READ`].
+const SLOW_PROCEDURES: &[&str] = &[
+    "dispatch.v1.DispatchService/ApplyAgentSetup",
+    "dispatch.v1.DispatchService/BuildTiers",
+    "dispatch.v1.DispatchService/Capacity",
+    "dispatch.v1.DispatchService/CheckTiers",
+    "dispatch.v1.DispatchService/Classify",
+    "dispatch.v1.DispatchService/CleanRun",
+    "dispatch.v1.DispatchService/ListAgents",
+    "dispatch.v1.DispatchService/ListModelBenchmarks",
+    "dispatch.v1.DispatchService/ListModelCatalog",
+    "dispatch.v1.DispatchService/ListModels",
+    "dispatch.v1.DispatchService/ListQuota",
+    "dispatch.v1.DispatchService/MergeRun",
+    "dispatch.v1.DispatchService/RecoverRun",
+    "dispatch.v1.DispatchService/RefreshModelCatalog",
+    "dispatch.v1.DispatchService/ReplaceTiers",
+    "dispatch.v1.DispatchService/Route",
+    "dispatch.v1.DispatchService/StartRun",
+    "dispatch.v1.DispatchService/Subagents",
+    "dispatch.v1.WorkspaceService/AddWorkspace",
+    "dispatch.v1.WorkspaceService/ListWorkspaceCards",
+    "dispatch.v1.WorkspaceService/ResolveWorkspace",
+];
+
+/// The longest `procedure` may take to answer.
+pub(crate) fn read_timeout(procedure: &str) -> Duration {
+    if SLOW_PROCEDURES.contains(&procedure) {
+        SLOW_READ
+    } else {
+        QUICK_READ
+    }
+}
+
+/// How many calls [`each_at_once`] makes at the same time.
+const MAX_AT_ONCE: usize = 8;
+
+/// Makes two calls at once and returns both answers. A call blocks its thread until the core
+/// answers, so a page that needs two answers would otherwise wait for their sum.
+pub fn at_once<A: Send, B: Send>(
+    first: impl FnOnce() -> A + Send,
+    second: impl FnOnce() -> B + Send,
+) -> (A, B) {
+    std::thread::scope(|scope| {
+        let second = scope.spawn(second);
+        let first = first();
+        (first, joined(second))
+    })
+}
+
+/// Makes `call` for every item, [`MAX_AT_ONCE`] at a time, and returns the answers in the
+/// items' order.
+pub fn each_at_once<T: Sync, R: Send>(items: &[T], call: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let call = &call;
+    std::thread::scope(|scope| {
+        let mut answers = Vec::with_capacity(items.len());
+        for chunk in items.chunks(MAX_AT_ONCE) {
+            let calls: Vec<_> = chunk
+                .iter()
+                .map(|item| scope.spawn(move || call(item)))
+                .collect();
+            answers.extend(calls.into_iter().map(joined));
+        }
+        answers
+    })
+}
+
+/// A scoped thread's answer; a panic in it goes on in the caller, as it would have there.
+fn joined<R>(handle: std::thread::ScopedJoinHandle<'_, R>) -> R {
+    handle
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
 #[derive(Clone)]
 pub struct CoreClient {
     config: CoreConfig,
     agent: ureq::Agent,
+    slow_agent: ureq::Agent,
     stream_agent: ureq::Agent,
 }
 
@@ -1169,7 +1252,12 @@ impl CoreClient {
         let config = read_core_config(data_dir)?;
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(2))
-            .timeout_read(Duration::from_secs(4))
+            .timeout_read(QUICK_READ)
+            .timeout_write(Duration::from_secs(4))
+            .build();
+        let slow_agent = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(2))
+            .timeout_read(SLOW_READ)
             .timeout_write(Duration::from_secs(4))
             .build();
         let stream_agent = ureq::AgentBuilder::new()
@@ -1180,6 +1268,7 @@ impl CoreClient {
         Ok(Self {
             config,
             agent,
+            slow_agent,
             stream_agent,
         })
     }
@@ -1196,8 +1285,12 @@ impl CoreClient {
         let url = format!("{}/{}", self.config.endpoint, procedure);
         let payload =
             serde_json::to_string(request).map_err(|err| CoreError::Rpc(err.to_string()))?;
-        let response = self
-            .agent
+        let agent = if read_timeout(procedure) == SLOW_READ {
+            &self.slow_agent
+        } else {
+            &self.agent
+        };
+        let response = agent
             .post(&url)
             .set("Content-Type", "application/json")
             .set("Authorization", &format!("Bearer {}", self.config.token))
@@ -1622,10 +1715,78 @@ mod tests {
     use std::{fs, os::unix::fs::PermissionsExt};
 
     use super::{
-        CoreError, DispatchRun, EnvelopeDecoder, GetRunResponse, ListRunsResponse, ProtoI64,
-        ResultResponse, WatchRunResponse, encode_envelope, end_stream_error, interpret_frame,
-        read_core_config, strip_ansi, validate_loopback_endpoint,
+        CoreError, DispatchRun, EnvelopeDecoder, GetRunResponse, ListRunsResponse, MAX_AT_ONCE,
+        ProtoI64, QUICK_READ, ResultResponse, SLOW_PROCEDURES, SLOW_READ, WatchRunResponse,
+        at_once, each_at_once, encode_envelope, end_stream_error, interpret_frame,
+        read_core_config, read_timeout, strip_ansi, validate_loopback_endpoint,
     };
+
+    #[test]
+    fn two_calls_run_at_the_same_time() {
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+        // Each call waits for the other's word: in turn, the first would never hear it.
+        let (to_second, from_first) = channel();
+        let (to_first, from_second) = channel();
+        let (first, second) = at_once(
+            move || {
+                to_second.send(()).unwrap();
+                from_second.recv_timeout(Duration::from_secs(5)).is_ok()
+            },
+            move || {
+                to_first.send(()).unwrap();
+                from_first.recv_timeout(Duration::from_secs(5)).is_ok()
+            },
+        );
+        assert!(first && second);
+    }
+
+    #[test]
+    fn many_calls_run_a_few_at_a_time_and_answer_in_order() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        let (running, most) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let items: Vec<usize> = (0..20).collect();
+        let answers = each_at_once(&items, |item| {
+            let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+            most.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(30));
+            running.fetch_sub(1, Ordering::SeqCst);
+            item * 2
+        });
+        assert_eq!(
+            answers,
+            items.iter().map(|item| item * 2).collect::<Vec<_>>()
+        );
+        let most = most.load(Ordering::SeqCst);
+        assert!(most > 1 && most <= MAX_AT_ONCE, "{most} at once");
+    }
+
+    #[test]
+    fn calls_that_wait_on_the_agents_get_the_long_read() {
+        // A core that has just started asks every agent CLI before the catalog answers, which
+        // took 7 s once: past the quick read, so Intelligence showed no models.
+        assert_eq!(
+            read_timeout("dispatch.v1.DispatchService/ListModelCatalog"),
+            SLOW_READ
+        );
+        assert_eq!(
+            read_timeout("dispatch.v1.DispatchService/Classify"),
+            SLOW_READ
+        );
+        assert_eq!(
+            read_timeout("dispatch.v1.DispatchService/ListRuns"),
+            QUICK_READ
+        );
+        // Every slow call is one the client makes.
+        let source = include_str!("client.rs");
+        for procedure in SLOW_PROCEDURES {
+            assert!(
+                source.contains(&format!("self.rpc(\"{procedure}\"")),
+                "{procedure} is not called"
+            );
+        }
+    }
 
     #[test]
     fn validates_loopback_endpoints() {

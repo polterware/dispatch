@@ -610,6 +610,22 @@ pub fn matches_search(row: &ModelRow, query: &str) -> bool {
             .any(|offer| found(&offer.agent) || found(&offer.model) || found(&offer.tier))
 }
 
+/// How soon a catalog that could not load, or listed no model, is asked for again.
+pub const RETRY_GAP: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Whether the page asks the core for its catalog: on its first paint with a core, when the
+/// core it waited for answers, and again, at most every [`RETRY_GAP`], after a load that
+/// failed or listed no model (`incomplete`), as one does while a core that has just started
+/// still asks its agent CLIs. A catalog that listed models stays until the page reloads it.
+pub fn should_load(
+    loaded: bool,
+    awaiting_core: bool,
+    incomplete: bool,
+    since_last: Option<std::time::Duration>,
+) -> bool {
+    !loaded || awaiting_core || (incomplete && since_last.is_none_or(|gap| gap >= RETRY_GAP))
+}
+
 pub fn empty_title(filtered: bool, has_entries: bool, loaded: bool) -> &'static str {
     if filtered && has_entries {
         "No matches"
@@ -929,9 +945,23 @@ mod tests {
         BandPass, CatalogEntry, CatalogSource, ModelRow, SkillColumn, SortDirection,
         agent_task_price, best_effort_line, empty_catalog, group_models, map_dispatch_catalog,
         map_refresh, matches_model_filters, offer_name, offered_line, refresh_failure,
-        routing_note, row_digits, row_tiers, score_detail, skill_score, theta_source_label,
-        visible_rows,
+        routing_note, row_digits, row_tiers, score_detail, should_load, skill_score,
+        theta_source_label, visible_rows,
     };
+
+    #[test]
+    fn a_catalog_that_did_not_load_is_asked_for_again() {
+        use std::time::Duration;
+        let soon = Some(Duration::from_secs(1));
+        let later = Some(super::RETRY_GAP);
+        assert!(should_load(false, false, false, None));
+        assert!(should_load(true, true, false, soon));
+        // Failed, or no model listed: again once the gap has passed, not on every paint.
+        assert!(!should_load(true, false, true, soon));
+        assert!(should_load(true, false, true, later));
+        // A catalog with models stays.
+        assert!(!should_load(true, false, false, later));
+    }
 
     fn row(entry: CatalogEntry) -> ModelRow {
         group_models(&[entry]).remove(0)

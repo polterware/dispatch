@@ -18,6 +18,7 @@ use crate::avatar::agent_avatar;
 use crate::client::{
     BuildTiersRequest, CheckTiersRequest, CoreClient, CoreError, DispatchAgent, DispatchTier,
     ListAgentsRequest, ListModelsRequest, ListTiersRequest, ReplaceTiersRequest, SubagentsRequest,
+    at_once,
 };
 use crate::models::roles::{
     GENERAL_ROLE, PaletteModel, RoleDraft, RoleListRow, RoleProfile, RoleRow, RoleSource,
@@ -346,8 +347,12 @@ impl RolesView {
         self.loading = true;
         let generation = self.bump_fetch();
         cx.spawn(async move |this, cx| {
+            // Both loads start now; the extras, which wait on the agent CLIs, land after the
+            // roles and the tier table are drawn.
             let first = client.clone();
-            let bundle = cx.background_spawn(async move { load_all(&first) }).await;
+            let bundle = cx.background_spawn(async move { load_all(&first) });
+            let extras = cx.background_spawn(async move { load_extras(&client) });
+            let bundle = bundle.await;
             let current = this
                 .update(cx, |view, cx| {
                     if view.fetch_gen != generation {
@@ -362,9 +367,7 @@ impl RolesView {
             if !current {
                 return;
             }
-            let extras = cx
-                .background_spawn(async move { load_extras(&client) })
-                .await;
+            let extras = extras.await;
             let _ = this.update(cx, |view, cx| {
                 if view.fetch_gen == generation {
                     view.apply_extras(extras);
@@ -602,9 +605,11 @@ impl RolesView {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
-                    let tiers = client.list_tiers(&ListTiersRequest {})?;
-                    let problems = client.check_tiers(&CheckTiersRequest {})?;
-                    Ok::<_, CoreError>((tiers.tiers, problems.problems))
+                    let (tiers, problems) = at_once(
+                        || client.list_tiers(&ListTiersRequest {}),
+                        || client.check_tiers(&CheckTiersRequest {}),
+                    );
+                    Ok::<_, CoreError>((tiers?.tiers, problems?.problems))
                 })
                 .await;
             let _ = this.update(cx, |view, cx| {
@@ -2757,25 +2762,33 @@ fn core_message(err: CoreError, fallback: &str) -> String {
 }
 
 fn load_all(client: &CoreClient) -> LoadBundle {
-    let tiers = client
-        .list_tiers(&ListTiersRequest {})
-        .map(|response| response.tiers)
-        .map_err(|err| core_message(err, "Could not list the tiers."));
-    LoadBundle {
-        tiers,
-        roles: load_roles(client),
-    }
+    let (tiers, roles) = at_once(
+        || {
+            client
+                .list_tiers(&ListTiersRequest {})
+                .map(|response| response.tiers)
+                .map_err(|err| core_message(err, "Could not list the tiers."))
+        },
+        || load_roles(client),
+    );
+    LoadBundle { tiers, roles }
 }
 
 fn load_extras(client: &CoreClient) -> Extras {
-    let problems = client
-        .check_tiers(&CheckTiersRequest {})
-        .map(|response| response.problems)
-        .map_err(|err| core_message(err, "Could not check the tiers."));
-    let agents = client
-        .list_agents(&ListAgentsRequest {})
-        .map(|response| agent_names(response.agents))
-        .unwrap_or_default();
+    let (problems, agents) = at_once(
+        || {
+            client
+                .check_tiers(&CheckTiersRequest {})
+                .map(|response| response.problems)
+                .map_err(|err| core_message(err, "Could not check the tiers."))
+        },
+        || {
+            client
+                .list_agents(&ListAgentsRequest {})
+                .map(|response| agent_names(response.agents))
+                .unwrap_or_default()
+        },
+    );
     Extras { problems, agents }
 }
 

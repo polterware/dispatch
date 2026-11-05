@@ -9,6 +9,7 @@
 //! the shared `FilterPopover`, whose pills sit in the `ActiveFilterBar` under it.
 
 use std::rc::Rc;
+use std::time::Instant;
 
 use gpui::{
     AppContext as _, Context, DispatchPhase, Entity, FontWeight, IntoElement, KeyDownEvent, Render,
@@ -19,7 +20,7 @@ use crate::client::{CoreClient, CoreError, ListModelCatalogRequest};
 use crate::models::intelligence::{
     COLUMNS, Catalog, DEFAULT_SORT, ModelRow, SkillColumn, SkillSort, band_of, bar_note,
     empty_catalog, empty_title, group_models, map_dispatch_catalog, model_filter_fields,
-    percent_text, policy_bar, score_detail, skill_digits, visible_rows,
+    percent_text, policy_bar, score_detail, should_load, skill_digits, visible_rows,
 };
 use crate::motion::{Animator, SpringTier, SpringValue};
 use crate::state::{AppState, ConnectionState, ToastTone};
@@ -51,6 +52,10 @@ pub struct IntelligenceView {
     /// The last paint had no core client. A later client starts a real load.
     awaiting_core: bool,
     loading: bool,
+    /// The last load failed; the page tries again (see [`should_load`]) and says so once.
+    failed: bool,
+    /// When the last load started.
+    last_load: Option<Instant>,
     load_generation: u64,
     sort: SkillSort,
     empty_enter: SpringValue,
@@ -90,6 +95,8 @@ impl IntelligenceView {
             loaded: false,
             awaiting_core: false,
             loading: false,
+            failed: false,
+            last_load: None,
             load_generation: 0,
             sort: DEFAULT_SORT,
             empty_enter: SpringValue::new(0.0, SpringTier::Moderate),
@@ -119,7 +126,9 @@ impl IntelligenceView {
             }
             return;
         }
-        if self.loaded && !self.awaiting_core {
+        let incomplete = self.failed || self.rows.is_empty();
+        let since_last = self.last_load.map(|at| at.elapsed());
+        if !should_load(self.loaded, self.awaiting_core, incomplete, since_last) {
             return;
         }
         self.awaiting_core = false;
@@ -134,6 +143,7 @@ impl IntelligenceView {
         self.load_generation = self.load_generation.wrapping_add(1);
         let generation = self.load_generation;
         self.loading = true;
+        self.last_load = Some(Instant::now());
         cx.spawn(async move |this, cx| {
             let catalog = cx
                 .background_spawn(async move { fetch_catalog(client) })
@@ -146,14 +156,21 @@ impl IntelligenceView {
                 view.loaded = true;
                 match catalog {
                     Ok(json) => {
+                        view.failed = false;
                         view.catalog = map_dispatch_catalog(&json);
                         view.rows = group_models(&view.catalog.entries);
                     }
-                    Err(error) => view.toast(
-                        error_text(&error, "Could not load the model catalog."),
-                        ToastTone::Danger,
-                        cx,
-                    ),
+                    Err(error) => {
+                        // Said once: the tries after it, every few seconds, stay quiet.
+                        if !view.failed {
+                            view.toast(
+                                error_text(&error, "Could not load the model catalog."),
+                                ToastTone::Danger,
+                                cx,
+                            );
+                        }
+                        view.failed = true;
+                    }
                 }
                 cx.notify();
             });

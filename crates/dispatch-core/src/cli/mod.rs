@@ -124,6 +124,9 @@ pub fn main(args: Vec<String>) -> i32 {
         usage();
         return 2;
     };
+    if command != "serve" {
+        end_quietly_on_closed_pipe();
+    }
 
     let result = match command.as_str() {
         // The core sets up its environment before its runtime starts threads.
@@ -169,6 +172,19 @@ pub fn main(args: Vec<String>) -> i32 {
     match result {
         Ok(()) => 0,
         Err(f) => fail(f),
+    }
+}
+
+/// Lets a command whose output goes to a reader that stops early (`dispatch runs | head`)
+/// end quietly, as any Unix tool does. Rust ignores SIGPIPE, so the write fails instead, and
+/// `println!` panics on it, which a release build turns into an abort and a crash report.
+/// The core keeps ignoring it: it writes to its agents' pipes and reports a closed one. Every
+/// socket here is opened with SO_NOSIGPIPE, so only a pipe can raise it.
+#[allow(unsafe_code)]
+fn end_quietly_on_closed_pipe() {
+    // SAFETY: this sets one signal's disposition, before the runtime starts any thread.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
 }
 
