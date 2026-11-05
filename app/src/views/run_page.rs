@@ -307,7 +307,6 @@ impl RunPageView {
         if !run.resumable {
             return None;
         }
-        let theme = Theme::global(cx);
         let blocked = follow_up_blocker(run, self.state.read(cx).runs());
         let weak = cx.weak_entity();
         let input = self.message.clone();
@@ -317,13 +316,8 @@ impl RunPageView {
                 let text = input.read(cx).text().to_string();
                 let _ = weak.update(cx, |view, cx| view.send_message(text, cx));
             }));
-        if let Some(block) = blocked {
-            card = card.can_send(false).footer_start(
-                div()
-                    .text_size(px(12.0))
-                    .text_color(theme.color_text_muted)
-                    .child(block.note()),
-            );
+        if blocked.is_some() {
+            card = card.can_send(false);
         }
         Some(
             div()

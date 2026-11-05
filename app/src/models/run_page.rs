@@ -409,16 +409,6 @@ pub enum FollowUpBlock {
     FolderBusy,
 }
 
-impl FollowUpBlock {
-    pub fn note(self) -> &'static str {
-        match self {
-            Self::Working => "You can send a message once the run ends.",
-            Self::Answering => "The last message is still being answered.",
-            Self::FolderBusy => "Another run is working in this folder: you can send once it ends.",
-        }
-    }
-}
-
 pub fn is_run_active(status: &str) -> bool {
     matches!(
         status.to_ascii_lowercase().as_str(),
