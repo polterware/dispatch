@@ -44,6 +44,9 @@ message DispatchRun {
   string worktree_status = 38;
   string conversation_id = 39;
   string caller_agent = 40;
+  // The run kept its agent's session, so StartRunRequest.resume can send it a
+  // follow-up once it has ended.
+  bool resumable = 41;
 }
 
 // Tokens a run spent as its agent CLIs reported them, summed over attempts:
@@ -171,6 +174,10 @@ message StartRunRequest {
   // the card's component repository, else the project's only repository.
   string repo = 17;
   DispatchCaller caller = 18;
+  // resume names an ended run: the prompt goes to that run's agent session as a
+  // follow-up, in its worktree, as a new run whose resumed_of is that run. The
+  // project, directory, and routing fields come from that run.
+  string resume = 19;
 }
 
 // The conversation that called dispatch, separate from the worker's resume session.

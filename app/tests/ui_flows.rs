@@ -289,6 +289,51 @@ fn the_run_page_merges_then_deletes_the_worktree(cx: &mut TestAppContext) {
     );
 }
 
+#[gpui::test]
+fn the_run_page_sends_a_message_to_an_ended_run(cx: &mut TestAppContext) {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let core = Core::new();
+    let id = core.start("say hi", true);
+    core.wait_for(&id, "COMPLETED");
+    let mut w = open(&core, cx);
+    w.go(Route::Run(id.clone()));
+
+    assert!(w.shows("run-message"), "an ended run offers no composer");
+    // A press on the card writes in its field; Enter sends what it holds.
+    w.click("run-message");
+    w.cx.simulate_input("now say bye");
+    w.settle();
+    w.click("run-message-send");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let next = loop {
+        w.settle();
+        if let Route::Run(open) = w.route()
+            && open != id
+        {
+            break open;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the message never opened its run; the app said {:?}",
+            w.toasts()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let sent = core.wait_for(&next, "COMPLETED");
+    assert_eq!(sent.resumed_of, id);
+    assert_eq!(sent.prompt, "now say bye");
+    // The chat goes on in the same transcript: the first message stays over the new one.
+    w.settle();
+    assert!(
+        w.shows("transcript-prompt:say hi"),
+        "the chat lost its first message"
+    );
+    assert!(
+        w.shows("transcript-prompt:now say bye"),
+        "the chat never showed the message sent"
+    );
+}
+
 /// From the Runs page: a running run's own page follows its live output, which the test's
 /// one-thread executor would wait on until the run ends.
 #[gpui::test]

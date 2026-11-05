@@ -43,6 +43,7 @@ pub fn run(r: &Run) -> pb::DispatchRun {
     pb::DispatchRun {
         conversation_id: r.conversation_id.clone(),
         caller_agent: r.caller_agent.clone(),
+        resumable: !r.session_id.is_empty() && !r.agent.is_empty(),
         id: r.id.clone(),
         project_id: r.project_id.clone(),
         status: r.status.clone(),

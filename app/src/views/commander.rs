@@ -38,7 +38,10 @@ impl CommanderView {
             |this, _, event: &CommanderEvent, cx| match event {
                 CommanderEvent::Confirm(id) => this.run(id, cx),
                 CommanderEvent::Cancel => this.close(cx),
-                CommanderEvent::Query(_) | CommanderEvent::Select(_) => {}
+                CommanderEvent::Query(_)
+                | CommanderEvent::Select(_)
+                | CommanderEvent::Run { .. }
+                | CommanderEvent::Property { .. } => {}
             },
         )
         .detach();

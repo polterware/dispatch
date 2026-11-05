@@ -12,23 +12,23 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gpui::{
     AnyElement, AnyView, App, AppContext as _, Context, Entity, Font, FontWeight, Hsla,
-    IntoElement, MouseButton, SharedString, StyleRefinement, StyledText, TextRun, WeakEntity,
-    Window, div, prelude::*, px,
+    IntoElement, MouseButton, ScrollHandle, SharedString, StyleRefinement, StyledText, TextRun,
+    WeakEntity, Window, div, prelude::*, px,
 };
 
 use crate::avatar::{agent_avatar, agent_avatar_live};
 use crate::client::{
     CancelRunRequest, CleanRunRequest, CoreClient, CoreError, DispatchRun, DispatchWorktree,
     GetRouteDecisionRequest, ListWorktreesRequest, MergeRunRequest, RecoverRunRequest,
-    ResultRequest,
+    ResultRequest, StartRunRequest,
 };
 use crate::models::run_page::{
     AttemptCard, LinkedRow, MoreAction, ReviewAction, RouteDecision, TokenUsage,
     agent_attempt_cards, area_label, candidate_price, coalesce_text, context_usage,
-    decision_summary, duration_label, file_counts, format_tokens, has_worktree, is_run_active,
-    linked_rows, map_route_decision, policy_label, proto_ms, rail_tokens, role_summary,
-    route_label, run_cost, run_more_actions, run_review_action, stored_usage, timing_label,
-    token_breakdown, total_tokens, worktree_display_status,
+    decision_summary, duration_label, file_counts, follow_up_blocker, format_tokens, has_worktree,
+    is_run_active, linked_rows, map_route_decision, policy_label, proto_ms, rail_tokens,
+    role_summary, route_label, run_cost, run_more_actions, run_review_action, stored_usage,
+    timing_label, token_breakdown, total_tokens, worktree_display_status,
 };
 use crate::motion::{Animator, SpringTier, SpringValue};
 use crate::state::{AppState, ConnectionState, Route, observe};
@@ -36,12 +36,13 @@ use crate::theme::{Theme, status_tone, tw};
 use crate::ui::ellipsis;
 use crate::ui::parts::run_page::{context_meter, file_change_line};
 use crate::ui::patterns::trailing_toolbar;
+use crate::ui::patterns::{message_composer, message_input};
 use crate::ui::{
     Button, ButtonKind, ButtonSize, Icon, MascotMood, Menu, MenuEntry, PageWidth, RailGroup,
     RailPresence, ToastTone, chip, mono, page_empty_with, rail_page_body_under, rail_page_header,
     rail_properties, rail_property, rail_toggle_label, sans, tabular, toolbar, tooltip, wrap_text,
 };
-use crate::ui::{SkeletonLayout, page_skeleton};
+use crate::ui::{SkeletonLayout, TextInput, WIDE_MEASURE, page_skeleton};
 
 /// Where the rail's open state is remembered, as `railStorageKey` names it.
 const RAIL_PREFERENCE: &str = "polterware.run.rail";
@@ -105,7 +106,15 @@ pub struct RunPageView {
     drawer_open: bool,
     rail: RailPresence,
     page_width: PageWidth,
+    /// The message composer under the transcript: a follow-up to the run's agent session.
+    message: Entity<TextInput>,
+    message_scroll: ScrollHandle,
+    /// A follow-up is on its way to the core.
+    sending: bool,
 }
+
+/// The composer's placeholder.
+const MESSAGE_PLACEHOLDER: &str = "Send a message to the agent";
 
 impl RunPageView {
     /// Presses the transcript's jump-to-end button (the screenshot tour).
@@ -140,6 +149,15 @@ impl RunPageView {
             .flatten()
             .is_none_or(|value| value != "hidden");
         let menu = cx.new(Menu::new);
+        let weak = cx.weak_entity();
+        let message = message_input(
+            MESSAGE_PLACEHOLDER,
+            move |text, _, cx| {
+                let text = text.to_string();
+                let _ = weak.update(cx, |view, cx| view.send_message(text, cx));
+            },
+            cx,
+        );
         let mut view = Self {
             state,
             transcript,
@@ -176,6 +194,9 @@ impl RunPageView {
             drawer_open: false,
             rail: RailPresence::new(rail_open),
             page_width: PageWidth::default(),
+            message,
+            message_scroll: ScrollHandle::new(),
+            sending: false,
         };
         view.install_bodies(cx);
         view
@@ -220,6 +241,101 @@ impl RunPageView {
             cx.notify();
         });
         cx.notify();
+    }
+
+    /// Sends `text` to the open run's agent session: a new run that resumes it, which the
+    /// page opens once the core takes it.
+    fn send_message(&mut self, text: String, cx: &mut Context<Self>) {
+        let prompt = text.trim().to_string();
+        if prompt.is_empty() || self.sending {
+            return;
+        }
+        let Some(run) = self.snapshot_run.clone() else {
+            return;
+        };
+        if !run.resumable || follow_up_blocker(&run, self.state.read(cx).runs()).is_some() {
+            return;
+        }
+        let Some(client) = self.state.read(cx).client() else {
+            self.toast("Dispatch core is not running", ToastTone::Danger, cx);
+            return;
+        };
+        self.sending = true;
+        cx.notify();
+        let request = StartRunRequest {
+            project_id: run.project_id.clone(),
+            prompt,
+            resume: run.id.clone(),
+            ..StartRunRequest::default()
+        };
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { client.start_run(&request) })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                view.sending = false;
+                match result {
+                    Ok(response) => {
+                        view.message.update(cx, |input, cx| input.set_text("", cx));
+                        if response.run.id.is_empty() {
+                            cx.notify();
+                        } else {
+                            let id = response.run.id.clone();
+                            view.state
+                                .update(cx, |state, _| state.note_run(response.run));
+                            view.open_run(id, cx);
+                        }
+                    }
+                    Err(error) => {
+                        let message = match error {
+                            CoreError::Rpc(message) if !message.is_empty() => {
+                                format!("The message was not sent: {message}")
+                            }
+                            _ => "The message was not sent.".to_string(),
+                        };
+                        view.toast(message, ToastTone::Danger, cx);
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// The composer under the transcript, for a run whose agent kept its session.
+    fn composer(&self, run: &DispatchRun, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !run.resumable {
+            return None;
+        }
+        let theme = Theme::global(cx);
+        let blocked = follow_up_blocker(run, self.state.read(cx).runs());
+        let weak = cx.weak_entity();
+        let input = self.message.clone();
+        let mut card = message_composer("run-message", &self.message, &self.message_scroll)
+            .busy(self.sending)
+            .on_send(Rc::new(move |_, cx| {
+                let text = input.read(cx).text().to_string();
+                let _ = weak.update(cx, |view, cx| view.send_message(text, cx));
+            }));
+        if let Some(block) = blocked {
+            card = card.can_send(false).footer_start(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(theme.color_text_muted)
+                    .child(block.note()),
+            );
+        }
+        Some(
+            div()
+                .w_full()
+                .flex_none()
+                .flex()
+                .justify_center()
+                .px(px(16.0))
+                .pb(px(16.0))
+                .child(div().w_full().max_w(px(WIDE_MEASURE)).child(card))
+                .into_any_element(),
+        )
     }
 
     fn toast(&mut self, message: impl Into<SharedString>, tone: ToastTone, cx: &mut Context<Self>) {
@@ -471,10 +587,22 @@ impl RunPageView {
         if self.transcript_run == id {
             return;
         }
-        let state = self.state.clone();
-        let owned = id.to_string();
-        self.transcript =
-            cx.new(|cx| super::transcript::TranscriptView::new(state, owned, false, cx));
+        let follows = self
+            .state
+            .read(cx)
+            .run(id)
+            .is_some_and(|run| run.resumed_of == self.transcript_run);
+        if follows && !self.transcript_run.is_empty() {
+            // A message to the open run: the chat goes on in the same transcript.
+            let owned = id.to_string();
+            self.transcript
+                .update(cx, |transcript, cx| transcript.continue_with(owned, cx));
+        } else {
+            let state = self.state.clone();
+            let owned = id.to_string();
+            self.transcript =
+                cx.new(|cx| super::transcript::TranscriptView::new(state, owned, false, cx));
+        }
         self.transcript_run = id.to_string();
     }
 
@@ -847,6 +975,11 @@ impl Render for RunPageView {
                 .child(
                     AnyView::from(self.transcript.clone())
                         .cached(StyleRefinement::default().flex_1().min_h_0().w_full()),
+                )
+                .children(
+                    self.snapshot_run
+                        .clone()
+                        .and_then(|run| self.composer(&run, cx)),
                 );
             // The transcript runs up under the header, which fades it out on its trail.
             self.transcript

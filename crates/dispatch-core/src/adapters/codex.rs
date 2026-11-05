@@ -121,7 +121,7 @@ async fn run_session(
     log: &mut LiveLog,
     result: &mut RunResult,
 ) -> Result<(), Error> {
-    let mut process = RpcProcess::start(command, token, log.clone(), req.started.as_ref())?;
+    let mut process = RpcProcess::start(command, token, req.started.as_ref())?;
     result.exit_code = -1;
     let mut turn = String::new();
     let mut final_text = String::new();

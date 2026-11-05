@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 /// Maps each top-level command to the name `run_dispatch` knows it by.
 const COMMANDS: &[(&str, &str)] = &[
     ("run", "run"),
+    ("send", "send"),
     ("runs", "ls"),
     ("status", "status"),
     ("wait", "wait"),
@@ -286,6 +287,7 @@ async fn run_dispatch(db_path: &Path, args: &[String]) -> CliResult {
     };
     match sub.as_str() {
         "run" => runs::run(db_path, rest).await,
+        "send" => runs::send(db_path, rest).await,
         "ls" | "runs" => runs::list(db_path, rest).await,
         "status" => runs::status(db_path, rest).await,
         "result" => runs::result(db_path, rest).await,

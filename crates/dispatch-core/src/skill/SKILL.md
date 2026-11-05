@@ -35,6 +35,7 @@ BRIEF
    The brief carries **paths, never pasted code**.
 2. **Wait:** `dispatch wait <id> --timeout 9m`. Exit 3 means still running: call `wait` again. Do not end the turn with runs pending.
 3. **Read the summary** (compact JSON). The agent text is in `dispatch result <id> --section agent`. Check `git -C <worktree> diff --stat` and run the tests. Do not read the whole diff.
+   **Follow up** on a small miss (a failing test, a missed file) with `dispatch send <id> - <<< "<what to fix>"`: it goes to the same agent's session, in the same worktree, as a new run to `wait` on, and the agent keeps what it already read. When the run's model was not up to the task, start a new `run` with a higher `--tier` and the findings instead.
 4. **Integrate:** `dispatch merge <id>` (COMPLETED runs only) merges the run's branch and removes its worktree; you run the tests before it. A merge conflict is detected with `git merge-tree` before the working tree is touched, and the merge stops there. The result prints the `git revert` that undoes it. A failed run: `dispatch clean <id>`.
 
 ## Parallelism

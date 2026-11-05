@@ -346,6 +346,43 @@ fn a_write_run_lands_on_its_branch_and_merges() {
 }
 
 #[test]
+fn a_message_to_an_ended_run_continues_its_session_and_worktree() {
+    let env = Env::new();
+    let first = env.run("WRITE a file", &[]);
+    let s = env.wait_for(&first, "COMPLETED");
+    let worktree = s["worktree"].as_str().expect("worktree").to_owned();
+
+    let sent = env.json(&["send", &first[..8], "--json", "now fix the test"]);
+    assert_eq!(sent["status"], "PENDING", "{sent}");
+    let second = sent["id"].as_str().expect("run id").to_owned();
+    assert_ne!(second, first);
+    let s = env.wait_for(&second, "COMPLETED");
+    assert_eq!(s["agent"], "fake");
+    assert_eq!(s["model"], "fake-fast");
+    assert_eq!(s["worktree"], worktree.as_str());
+    assert_eq!(
+        s["conversation_id"],
+        format!("claude:{}", env.session).as_str()
+    );
+    let meta = env.json(&["result", &second, "--section", "meta", "--json"]);
+    assert_eq!(meta["ResumedOf"], first.as_str(), "{meta}");
+    let log = env.agent_log();
+    assert!(
+        log.contains("session/load") && log.contains("now fix the test"),
+        "the follow-up never reached the agent's session: {log}"
+    );
+
+    // Nothing to send to: a message needs a run that has ended and a message.
+    let err = env.fails(&["send", "0000000000", "hello"]);
+    assert!(err.contains("not found"), "{err}");
+    let slow = env.run("SLOW", &["--readonly"]);
+    env.wait_for(&slow, "RUNNING");
+    let err = env.fails(&["send", &slow, "hello"]);
+    assert!(err.contains("still"), "{err}");
+    env.ok(&["cancel", &slow]);
+}
+
+#[test]
 fn clean_keeps_unmerged_work_unless_forced() {
     let env = Env::new();
     let id = env.run("WRITE a file", &[]);

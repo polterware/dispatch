@@ -21,7 +21,7 @@ pub struct CommandOutput {
 
 async fn read_stream<R: AsyncRead + Unpin>(
     mut reader: R,
-    mut log: LiveLog,
+    mut log: Option<LiveLog>,
     mut watch: Option<FatalWatch>,
     filter_name: Option<String>,
 ) -> Vec<u8> {
@@ -42,13 +42,17 @@ async fn read_stream<R: AsyncRead + Unpin>(
             while let Some(i) = pending.iter().position(|b| *b == b'\n') {
                 let line: Vec<_> = pending.drain(..=i).collect();
                 let value = String::from_utf8_lossy(&line);
-                let _ = log.write_all(filter.line(value.trim_end_matches(['\r', '\n'])).as_bytes());
+                if let Some(log) = log.as_mut() {
+                    let _ =
+                        log.write_all(filter.line(value.trim_end_matches(['\r', '\n'])).as_bytes());
+                }
             }
-        } else {
+        } else if let Some(log) = log.as_mut() {
             let _ = log.write_all(&buf[..n]);
         }
     }
     if let Some(filter) = filter.as_mut()
+        && let Some(log) = log.as_mut()
         && !pending.is_empty()
     {
         let _ = log.write_all(filter.line(&String::from_utf8_lossy(&pending)).as_bytes());
@@ -102,11 +106,16 @@ pub async fn run_command(
     let watch = FatalWatch::new(fatal_cancel.clone());
     let mut out_task = tokio::spawn(read_stream(
         stdout,
-        log.clone(),
+        Some(log.clone()),
         None,
         filter_name.map(str::to_owned),
     ));
-    let mut err_task = tokio::spawn(read_stream(stderr, log.clone(), Some(watch.clone()), None));
+    let mut err_task = tokio::spawn(read_stream(
+        stderr,
+        Some(log.clone()),
+        Some(watch.clone()),
+        None,
+    ));
     let mut interrupted = false;
     let status = tokio::select! {
         status = child.wait() => status?,
@@ -185,7 +194,6 @@ impl RpcProcess {
     pub(crate) fn start(
         mut command: Command,
         cancel: CancellationToken,
-        log: LiveLog,
         started: Option<&StartedHook>,
     ) -> Result<Self, Error> {
         use tokio::io::AsyncBufReadExt;
@@ -215,7 +223,10 @@ impl RpcProcess {
             .ok_or_else(|| Error::Message("agent stderr unavailable".into()))?;
         let fatal_cancel = CancellationToken::new();
         let watch = FatalWatch::new(fatal_cancel.clone());
-        let stderr = tokio::spawn(read_stream(err, log, Some(watch.clone()), None));
+        // A protocol agent's stderr is its own logging (config warnings, tracing),
+        // not part of the conversation: it is kept for the error a failed run
+        // reports and for the fatal watch, and stays out of the run log.
+        let stderr = tokio::spawn(read_stream(err, None, Some(watch.clone()), None));
         Ok(Self {
             child,
             pid,

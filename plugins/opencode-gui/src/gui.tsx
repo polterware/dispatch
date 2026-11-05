@@ -7,7 +7,7 @@
 // dispatch binary embeds and `dispatch setup opencode` installs.
 import { Command, ComposerPill, MenuItem, Panel, Plugin, SettingsPage, Style } from "@opencode/plugin/gui";
 import { For, Show, createSignal } from "solid-js";
-import { createStore } from "solid-js/store";
+import { createStore, reconcile } from "solid-js/store";
 import { Dispatch } from "../../../crates/dispatch-core/src/setup/opencode/rpc.js";
 import { AgentBot, EmptyBot } from "./avatars";
 import { ACTIVE, FAILED, firstLine, formatDuration, formatTokens, runDetail, runLink, statusLabel, type RunView } from "./runs";
@@ -101,7 +101,9 @@ const definition = Plugin.define({
       if (!session || session.pending) return;
       try {
         const answer = await rpc().runs({ sessionID: session.id, directory: session.directory || "" });
-        setRuns(session.key, answer.runs || []);
+        // Reconciled by id: a poll that brings the same runs keeps their rows,
+        // so each bot stays mounted instead of being made again every poll.
+        setRuns(session.key, reconcile(answer.runs || [], { key: "id" }));
         setErrors(session.key, answer.error || "");
       } catch (error) {
         setErrors(session.key, String((error as Error)?.message || error));

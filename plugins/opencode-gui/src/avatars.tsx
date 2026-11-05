@@ -1,7 +1,9 @@
 import { BotAvatar, agentMarkFor, botAvatarTypes, type BotAvatarType } from "@polterware/bot-avatars";
 
 // The same bots the Dispatch app draws: the Polterware ghost for an empty
-// page, and each agent's own bot, which moves while its run works.
+// page, and each agent's own bot, which moves while its run works. A bot that
+// is not working is paused: it paints once and leaves the frame loop, as the
+// app's bots are still by default, so an idle panel draws nothing.
 
 function hash32(id: string) {
   let h = 2166136261;
@@ -20,6 +22,7 @@ export function EmptyBot(props: { mood: "sleeping" | "lost"; size?: number }) {
       state={props.mood === "sleeping" ? "sleeping" : "default"}
       size={props.size ?? 64}
       jumpEvery={0}
+      paused
       turn={props.mood === "lost" ? 1 : 0.35}
       aria-hidden="true"
     />
@@ -42,7 +45,7 @@ export function AgentBot(props: { agent?: string; seed: string; status: string; 
       size={props.size ?? 28}
       seed={(hash32(props.seed) % 1000) / 1000}
       aria-hidden="true"
-      {...(working() ? {} : { jumpEvery: 0, turn: 0.35 })}
+      {...(working() ? {} : { jumpEvery: 0, turn: 0.35, paused: true })}
     />
   );
 }

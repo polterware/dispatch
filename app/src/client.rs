@@ -146,6 +146,7 @@ pub struct DispatchRun {
     pub worktree_status: String,
     pub conversation_id: String,
     pub caller_agent: String,
+    pub resumable: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -287,6 +288,9 @@ pub struct StartRunRequest {
     pub profile: String,
     pub repo: String,
     pub caller: DispatchCaller,
+    /// An ended run to send `prompt` to as a follow-up.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub resume: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

@@ -378,6 +378,47 @@ pub fn run_more_actions(status: &str, merged_at: &str, has_worktree: bool) -> Ve
 }
 
 /// Header Cancel and the live duration clock. Matches `isRunActive` in the Electron page.
+/// What keeps a follow-up to `run` from starting now, as the core would refuse it: a
+/// message to it still on its way, or another run working in the folder it worked in.
+pub fn follow_up_blocker(run: &DispatchRun, runs: &[DispatchRun]) -> Option<FollowUpBlock> {
+    if is_run_active(&run.status) {
+        return Some(FollowUpBlock::Working);
+    }
+    let folder = run.worktree.trim();
+    runs.iter()
+        .filter(|other| other.id != run.id && is_run_active(&other.status))
+        .find_map(|other| {
+            if other.resumed_of == run.id {
+                Some(FollowUpBlock::Answering)
+            } else if !folder.is_empty() && other.worktree.trim() == folder {
+                Some(FollowUpBlock::FolderBusy)
+            } else {
+                None
+            }
+        })
+}
+
+/// Why the run page's composer cannot send yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FollowUpBlock {
+    /// The run itself is still working.
+    Working,
+    /// A message sent to it is still being answered.
+    Answering,
+    /// Another run is working in the same folder.
+    FolderBusy,
+}
+
+impl FollowUpBlock {
+    pub fn note(self) -> &'static str {
+        match self {
+            Self::Working => "You can send a message once the run ends.",
+            Self::Answering => "The last message is still being answered.",
+            Self::FolderBusy => "Another run is working in this folder: you can send once it ends.",
+        }
+    }
+}
+
 pub fn is_run_active(status: &str) -> bool {
     matches!(
         status.to_ascii_lowercase().as_str(),
@@ -1008,6 +1049,40 @@ mod tests {
     };
     use serde_json::{Value, json};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn a_follow_up_waits_for_the_run_its_answer_and_its_folder() {
+        use super::{FollowUpBlock, follow_up_blocker};
+        use crate::client::DispatchRun;
+        let run = |id: &str, status: &str, worktree: &str, resumed_of: &str| DispatchRun {
+            id: id.into(),
+            status: status.into(),
+            worktree: worktree.into(),
+            resumed_of: resumed_of.into(),
+            ..DispatchRun::default()
+        };
+        let mine = run("a", "COMPLETED", "/repo", "");
+        assert_eq!(follow_up_blocker(&mine, &[mine.clone()]), None);
+        let live = run("a", "RUNNING", "/repo", "");
+        assert_eq!(follow_up_blocker(&live, &[]), Some(FollowUpBlock::Working));
+        let answer = run("b", "RUNNING", "/repo", "a");
+        assert_eq!(
+            follow_up_blocker(&mine, &[answer]),
+            Some(FollowUpBlock::Answering)
+        );
+        let neighbor = run("c", "RUNNING", "/repo", "");
+        assert_eq!(
+            follow_up_blocker(&mine, &[neighbor.clone()]),
+            Some(FollowUpBlock::FolderBusy)
+        );
+        // A run in another folder, or one that ended, is no obstacle.
+        let elsewhere = run("d", "RUNNING", "/other", "");
+        let ended = run("e", "COMPLETED", "/repo", "");
+        assert_eq!(follow_up_blocker(&mine, &[elsewhere, ended]), None);
+        // A read-only run with no folder of its own waits only for itself and its answer.
+        let bare = run("f", "COMPLETED", "", "");
+        assert_eq!(follow_up_blocker(&bare, &[neighbor]), None);
+    }
 
     fn op(body: Value, ok: bool) -> (bool, String) {
         (ok, body.to_string())

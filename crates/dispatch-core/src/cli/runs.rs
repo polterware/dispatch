@@ -19,6 +19,7 @@ use std::path::Path;
 use std::time::Duration;
 
 const RUN_USAGE: &str = "usage: dispatch run [--tier <auto|easy|normal|hard>] [--role <name|none>] [--card <slug>] [--agent <name>] [--provider <p>] [--model <m>] [--effort <e>] [--priority <p>] [--relax] [--readonly] [--timeout <dur>] [--dir <repo>] [--worktree <dir>] [--json] [--compact] <prompt|->
+       dispatch send <id> [--json] [--compact] <message|->
        dispatch runs [--conversation <id>] [--project <id>] [--json] [--compact]
        dispatch status <id> [--json] [--compact]
        dispatch result <id> [--section summary|agent|files|attempts|meta|output] [--offset <n>] [--limit <n>] [--json] [--compact]
@@ -546,6 +547,46 @@ pub(super) async fn run(db_path: &Path, args: &[String]) -> CliResult {
             relax: f.flag("relax"),
             timeout_sec: i32::try_from(f.dur("timeout").as_secs()).unwrap_or(i32::MAX),
             profile: f.str("role").trim().into(),
+            caller: Some(pb::DispatchCaller {
+                agent: who.agent,
+                session_id: who.session_id,
+                conversation_id: who.conversation_id,
+                label: who.label,
+            }),
+            ..Default::default()
+        })
+        .await
+        .map_err(run_error)?;
+    write_proto_run(
+        &res.run.unwrap_or_default(),
+        f.flag("json"),
+        f.flag("compact"),
+    )
+}
+
+/// `dispatch send <id> <message|->`: a follow-up to an ended run, in its agent's session
+/// and worktree, as a new run.
+pub(super) async fn send(db_path: &Path, args: &[String]) -> CliResult {
+    let mut f = Flags::new("dispatch send");
+    common(&mut f);
+    let positional = f.parse_interspersed(args)?;
+    let Some((id, message)) = positional.split_first() else {
+        return Err(usage());
+    };
+    let id = id.trim().to_owned();
+    if id.is_empty() || id == "-" {
+        return Err(usage());
+    }
+    let prompt = read_prompt(message)?;
+    // The earlier run names its workspace: the cwd's is not looked up.
+    let c = super::dial(db_path).await?;
+    let who = caller::resolve(db_path);
+    let res = c
+        .dispatch
+        .start_run(&pb::StartRunRequest {
+            project_id: f.str("project").trim().into(),
+            prompt,
+            resume: id,
             caller: Some(pb::DispatchCaller {
                 agent: who.agent,
                 session_id: who.session_id,

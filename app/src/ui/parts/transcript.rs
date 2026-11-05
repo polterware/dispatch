@@ -224,6 +224,31 @@ pub fn terminal_font(cx: &App) -> Font {
     font
 }
 
+/// `rows` with every entry they point at moved `by`, so the rows of an earlier run of a chat
+/// keep their own entries (and their own Show more) apart from the open run's.
+pub fn offset_entries(rows: Vec<TranscriptRow>, by: usize) -> Vec<TranscriptRow> {
+    rows.into_iter()
+        .map(|mut row| {
+            match &mut row.body {
+                RowBody::Step { entry, .. }
+                | RowBody::Output { entry, .. }
+                | RowBody::More { entry, .. } => *entry += by,
+                _ => return row,
+            }
+            row.signature = body_signature(&row.body);
+            row
+        })
+        .collect()
+}
+
+/// The space between two messages of a chat.
+pub fn gap_row() -> TranscriptRow {
+    TranscriptRow {
+        signature: body_signature(&RowBody::Gap),
+        body: RowBody::Gap,
+    }
+}
+
 pub fn flatten_transcript(
     entries: &[TranscriptEntry],
     expanded: &HashSet<usize>,
@@ -853,8 +878,10 @@ fn prompt_row(
     if let Some(time) = time {
         bubble = bubble.time(time.to_string());
     }
+    let selector = format!("transcript-prompt:{text}");
     div()
         .w_full()
+        .debug_selector(move || selector)
         .pb(px(PROMPT_GAP_PX))
         .font(sans(&frame.theme, FontWeight::NORMAL))
         .child(bubble)

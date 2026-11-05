@@ -6000,6 +6000,7 @@ function EmptyBot(props) {
       return props.size ?? 64;
     },
     jumpEvery: 0,
+    paused: true,
     get turn() {
       return props.mood === "lost" ? 1 : 0.35;
     },
@@ -6031,7 +6032,8 @@ function AgentBot(props) {
     "aria-hidden": "true"
   }, () => working() ? {} : {
     jumpEvery: 0,
-    turn: 0.35
+    turn: 0.35,
+    paused: true
   }));
 }
 const ACTIVE = /* @__PURE__ */ new Set(["PENDING", "RUNNING"]);
@@ -6179,7 +6181,9 @@ const definition = gui.Plugin.define({
           sessionID: session.id,
           directory: session.directory || ""
         });
-        setRuns(session.key, answer.runs || []);
+        setRuns(session.key, store.reconcile(answer.runs || [], {
+          key: "id"
+        }));
         setErrors(session.key, answer.error || "");
       } catch (error) {
         setErrors(session.key, String(error?.message || error));

@@ -148,6 +148,9 @@ pub struct SidebarRun {
     pub worktree_status: String,
     pub conversation_id: String,
     pub caller_agent: String,
+    /// The earlier runs of the chat this row stands for, oldest first: the runs it followed
+    /// up on, which the sidebar folds into this one row.
+    pub earlier: Vec<String>,
 }
 
 /// What a run last changed to: its status, and when it ended and merged.
@@ -185,21 +188,47 @@ impl SidebarRun {
             worktree_status: run.worktree_status.clone(),
             conversation_id: run.conversation_id.clone(),
             caller_agent: run.caller_agent.clone(),
+            earlier: Vec::new(),
         }
     }
 }
 
 /// Joins each run to its workspace name. A missing workspace leaves the name empty
 /// so grouping can fall back to the project id.
+///
+/// A chat of follow-ups is one row: a run a message was sent to folds into the run that
+/// message started, which shows the latest status under the chat's first prompt and its
+/// first run's created time.
 pub fn sidebar_runs(workspaces: &[Workspace], runs: &[DispatchRun]) -> Vec<SidebarRun> {
     let mut names: HashMap<&str, &str> = HashMap::new();
     for workspace in workspaces {
         names.insert(workspace.id.as_str(), workspace.name.as_str());
     }
+    let by_id: HashMap<&str, &DispatchRun> =
+        runs.iter().map(|run| (run.id.as_str(), run)).collect();
+    let followed: std::collections::HashSet<&str> = runs
+        .iter()
+        .map(|run| run.resumed_of.trim())
+        .filter(|id| by_id.contains_key(id))
+        .collect();
     runs.iter()
+        .filter(|run| !followed.contains(run.id.as_str()))
         .map(|run| {
             let name = names.get(run.project_id.as_str()).copied().unwrap_or("");
-            SidebarRun::from_dispatch(run, name)
+            let mut row = SidebarRun::from_dispatch(run, name);
+            let mut at = run;
+            while let Some(prev) = by_id.get(at.resumed_of.trim()) {
+                if row.earlier.iter().any(|id| id == &prev.id) || prev.id == run.id {
+                    break;
+                }
+                row.earlier.insert(0, prev.id.clone());
+                at = prev;
+            }
+            if !row.earlier.is_empty() {
+                row.prompt.clone_from(&at.prompt);
+                row.created_at.clone_from(&at.created_at);
+            }
+            row
         })
         .collect()
 }
@@ -480,10 +509,9 @@ fn automatic_key(
 
 fn section_index(sections: &[&DispatchSection], run: &SidebarRun) -> Option<usize> {
     if let Some(index) = sections.iter().position(|section| {
-        section
-            .items
-            .iter()
-            .any(|item| item.kind == "run" && item.item_ref == run.id)
+        section.items.iter().any(|item| {
+            item.kind == "run" && (item.item_ref == run.id || run.earlier.contains(&item.item_ref))
+        })
     }) {
         return Some(index);
     }
@@ -819,9 +847,51 @@ mod tests {
             worktree_status: String::new(),
             conversation_id: String::new(),
             caller_agent: String::new(),
+            earlier: Vec::new(),
         };
         edit(&mut run);
         run
+    }
+
+    #[test]
+    fn a_chat_of_follow_ups_is_one_row_under_its_first_prompt() {
+        use super::sidebar_runs;
+        use crate::client::DispatchRun;
+        let at =
+            |id: &str, prompt: &str, created: &str, resumed_of: &str, status: &str| DispatchRun {
+                id: id.into(),
+                prompt: prompt.into(),
+                created_at: created.into(),
+                resumed_of: resumed_of.into(),
+                status: status.into(),
+                ..DispatchRun::default()
+            };
+        let runs = vec![
+            at("c", "and now?", "2026-11-05T12:00:00Z", "b", "RUNNING"),
+            at("b", "oi", "2026-11-05T11:00:00Z", "a", "COMPLETED"),
+            at(
+                "a",
+                "Read the views",
+                "2026-11-05T10:00:00Z",
+                "",
+                "COMPLETED",
+            ),
+            at(
+                "z",
+                "Something else",
+                "2026-11-05T09:00:00Z",
+                "",
+                "COMPLETED",
+            ),
+        ];
+        let rows = sidebar_runs(&[], &runs);
+        let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(ids, ["c", "z"]);
+        assert_eq!(rows[0].prompt, "Read the views");
+        assert_eq!(rows[0].created_at, "2026-11-05T10:00:00Z");
+        assert_eq!(rows[0].status, "RUNNING");
+        assert_eq!(rows[0].earlier, ["a", "b"]);
+        assert!(rows[1].earlier.is_empty());
     }
 
     fn display(edit: impl FnOnce(&mut SidebarDisplay)) -> SidebarDisplay {

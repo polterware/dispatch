@@ -82,6 +82,11 @@ pub(crate) fn same_dir(a: &str, b: &str) -> bool {
     absolute(a) == absolute(b)
 }
 
+/// A run id as `dispatch runs` prints it.
+fn short_run(id: &str) -> &str {
+    id.get(..12).unwrap_or(id)
+}
+
 pub(crate) fn absolute(p: &str) -> String {
     let joined = if p.starts_with('/') {
         p.to_owned()
@@ -253,6 +258,9 @@ impl Core {
         self: &Arc<Self>,
         m: pb::StartRunRequest,
     ) -> RpcResult<pb::StartRunResponse> {
+        if !m.resume.trim().is_empty() {
+            return self.start_follow_up(m).await;
+        }
         let project_id = required(&m.project_id, "project id")?;
         let tier = m.tier.trim().to_owned();
         if !tier.is_empty() && tier != runner::TIER_AUTO && !crate::adapters::valid_tier(&tier) {
@@ -336,12 +344,115 @@ impl Core {
         }
         let begun = deps.begin(opts).await;
         drop(start);
-        let mut run = begun.map_err(|e| RpcError::invalid(e.to_string()))?;
+        let run = begun.map_err(|e| RpcError::invalid(e.to_string()))?;
+        self.launch_run(&ws, deps, run, &prompt, &req_worktree, &dir)
+            .await
+    }
 
+    /// A follow-up: `m.prompt` goes to the session of the ended run `m.resume`, as a new
+    /// run in that run's workspace, directory, and worktree, with its agent and model. The
+    /// calling conversation is the request's, else the earlier run's.
+    async fn start_follow_up(
+        self: &Arc<Self>,
+        m: pb::StartRunRequest,
+    ) -> RpcResult<pb::StartRunResponse> {
+        let prompt = m.prompt.trim().to_owned();
+        if prompt.is_empty() {
+            return Err(RpcError::invalid("prompt is required"));
+        }
+        let id = self.full_run_id(&m.resume)?;
+        let prev = self.store.get_run(&id).map_err(store_error)?;
+        if !is_terminal(&prev.status) {
+            return Err(RpcError::invalid(format!(
+                "run {} is still {}: wait for it to end before sending it a message",
+                short_run(&prev.id),
+                prev.status
+            )));
+        }
+        if prev.session_id.is_empty() || prev.agent.is_empty() {
+            return Err(RpcError::invalid(format!(
+                "run {} has no agent session to send a message to",
+                short_run(&prev.id)
+            )));
+        }
+        let project_id = if m.project_id.trim().is_empty() {
+            prev.project_id.clone()
+        } else {
+            m.project_id.trim().to_owned()
+        };
+        let ws = self
+            .workspace(&project_id)
+            .await
+            .map_err(|e| RpcError::invalid(e.to_string()))?;
+        let dir = absolute(&prev.dir);
+        let deps = self.deps_in(&dir).map_err(RpcError::internal)?;
+        let start = self.start_mu.lock().await;
+        let active = self
+            .store
+            .list_runs(&project_id, 0, 0, "")
+            .map_err(RpcError::internal)?
+            .into_iter()
+            .find(|r| {
+                (r.status == STATUS_PENDING || r.status == STATUS_RUNNING)
+                    && (r.resumed_of == prev.id
+                        || (!prev.worktree.is_empty() && same_dir(&r.worktree, &prev.worktree)))
+            });
+        if let Some(active) = active {
+            let reason = if active.resumed_of == prev.id {
+                "on a message to this run".to_owned()
+            } else {
+                format!("in {}", prev.worktree)
+            };
+            return Err(RpcError::invalid(format!(
+                "run {} is still working {reason}: send the message once it ends",
+                short_run(&active.id)
+            )));
+        }
+        let caller = m.caller.unwrap_or_default();
+        let (conversation_id, agent) = if caller.conversation_id.trim().is_empty() {
+            (prev.conversation_id.clone(), prev.caller_agent.clone())
+        } else {
+            (caller.conversation_id, caller.agent)
+        };
+        let opts = Options {
+            caller: Caller {
+                agent,
+                session_id: caller.session_id,
+                conversation_id,
+                label: caller.label,
+            },
+            project_id,
+            card_slug: prev.card_slug.clone(),
+            prompt: prompt.clone(),
+            dir: dir.clone(),
+            read_only: prev.read_only,
+            no_worktree: prev.no_worktree,
+            timeout: Duration::from_secs(u64::try_from(prev.timeout_sec).unwrap_or(0)),
+            resume: prev.id.clone(),
+            profile: prev.profile.clone(),
+            ..Options::default()
+        };
+        let begun = deps.begin(opts).await;
+        drop(start);
+        let run = begun.map_err(|e| RpcError::invalid(e.to_string()))?;
+        self.launch_run(&ws, deps, run, &prompt, "", &dir).await
+    }
+
+    /// Records a begun run's start and runs it in the background.
+    async fn launch_run(
+        self: &Arc<Self>,
+        ws: &crate::store::Workspace,
+        deps: runner::Deps,
+        run: Run,
+        prompt: &str,
+        req_worktree: &str,
+        dir: &str,
+    ) -> RpcResult<pb::StartRunResponse> {
+        let mut run = run;
         // A delegation is also an audited Run: the agent it launches writes
         // under this AgentRun, so Activity shows one history for both.
         if !ws.polterware_project_id.is_empty() {
-            let task = dispatch_run_task(&prompt);
+            let task = dispatch_run_task(prompt);
             let started = tokio::time::timeout(
                 HOST_TIMEOUT,
                 self.host
@@ -357,16 +468,16 @@ impl Core {
         }
 
         if !req_worktree.is_empty() {
-            run.worktree.clone_from(&dir);
-            let root = worktree::root(&dir);
+            dir.clone_into(&mut run.worktree);
+            let root = worktree::root(dir);
             if !root.is_empty() {
                 run.repo = root;
-                if let Ok(br) = worktree::current_branch(&dir)
+                if let Ok(br) = worktree::current_branch(dir)
                     && br != "HEAD"
                 {
                     run.branch = br;
                 }
-                if let Ok(head) = worktree::head(&dir) {
+                if let Ok(head) = worktree::head(dir) {
                     run.base_sha = head;
                 }
             }

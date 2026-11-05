@@ -27,7 +27,7 @@ dispatch merge <id>
 
 | Command | Does |
 | --- | --- |
-| `run`, `wait`, `status`, `result`, `cancel`, `runs` | Start and follow runs |
+| `run`, `send`, `wait`, `status`, `result`, `cancel`, `runs` | Start and follow runs; `send` follows up on an ended run in its agent's session |
 | `merge`, `clean`, `recover` | Bring a run's worktree back, discard it, or save an interrupted one |
 | `route`, `classify`, `models [refresh\|bench]` | Show how a prompt would route, the classifier's answer, and the model catalog |
 | `tiers [--check\|build]`, `roles`, `config`, `agents` | Tune the tier table, roles, the routing policy, and the agent list |

@@ -664,6 +664,17 @@ impl AppState {
         workspace_groups(&self.workspaces, &self.runs)
     }
 
+    /// A run the app just started, listed until the next refresh brings it: its page opens
+    /// with its message at once.
+    pub fn note_run(&mut self, run: DispatchRun) {
+        if run.id.is_empty() || self.run(&run.id).is_some() {
+            return;
+        }
+        let mut runs = self.runs.clone();
+        runs.insert(0, run);
+        self.set_runs(runs);
+    }
+
     pub fn run(&self, id: &str) -> Option<&DispatchRun> {
         self.runs.iter().find(|run| run.id == id)
     }
