@@ -7,6 +7,8 @@ use std::collections::HashSet;
 
 pub const PREFER_BIAS: f64 = -50.0;
 pub const AVOID_BIAS: f64 = 1500.0;
+/// Bounds this close are within benchmark noise, so prefer the cheaper candidate.
+pub const NEAR_BEST_BOUND: f64 = 0.02;
 #[derive(Clone, Debug, Default)]
 pub struct Pace {
     pub actual: f64,
@@ -20,11 +22,6 @@ pub struct History {
     pub risk: f64,
 }
 #[derive(Clone, Debug, Default)]
-pub struct Evidence {
-    pub duration_n: usize,
-    pub p50_ms: Option<i64>,
-}
-#[derive(Clone, Debug, Default)]
 pub struct Candidate {
     pub agent: String,
     pub provider: String,
@@ -36,9 +33,6 @@ pub struct Candidate {
     pub cooled_down: bool,
     pub bias: f64,
     pub priority: String,
-    pub speed: i32,
-    pub strength: i32,
-    pub evidence: Evidence,
     pub auto: Option<AutoInfo>,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -122,44 +116,13 @@ fn pace_base(c: &Candidate) -> f64 {
     let (a, b) = pace_parts(c);
     a + b
 }
-fn attr(v: i32) -> f64 {
-    if v <= 0 {
-        0.0
-    } else {
-        f64::from(3 - v) * 100.0
-    }
-}
-fn duration(c: &Candidate) -> f64 {
-    let prior = attr(c.speed);
-    let n = c.evidence.duration_n;
-    if let Some(p50) = c.evidence.p50_ms.filter(|v| *v > 0 && n >= 5) {
-        let measured = (200.0 * (p50 as f64 / 60_000.0).log2()).clamp(-800.0, 800.0);
-        (5.0 * prior + n as f64 * measured) / (5.0 + n as f64)
-    } else {
-        prior
-    }
-}
-fn duration_note(c: &Candidate) -> String {
-    if c.evidence.duration_n < 5 || c.evidence.p50_ms.is_none_or(|v| v <= 0) {
-        if c.speed == 0 {
-            "neutral"
-        } else {
-            "static prior"
-        }
-        .into()
-    } else {
-        format!("blended n/(n+5) samples={}", c.evidence.duration_n)
-    }
-}
+/// Quota pace, cooldown, and prefer/avoid bias; the speed priority weighs
+/// pace twice.
 pub fn score(c: &Candidate) -> f64 {
     let base = pace_base(c);
     base + if c.cooled_down { 10000.0 } else { 0.0 }
         + c.bias
-        + match c.priority.as_str() {
-            "speed" => base + duration(c),
-            "quality" => attr(c.strength),
-            _ => 0.0,
-        }
+        + if c.priority == "speed" { base } else { 0.0 }
 }
 pub fn rank(cs: &[Candidate]) -> Vec<Candidate> {
     let mut out = cs.to_vec();
@@ -189,22 +152,8 @@ pub fn terms(c: &Candidate) -> Vec<Term> {
     if c.bias != 0.0 {
         add("bias", c.bias, String::new());
     }
-    match c.priority.as_str() {
-        "speed" => {
-            add("paceSlack", pace_base(c), String::new());
-            add("duration", duration(c), duration_note(c));
-        }
-        "quality" => add(
-            "quality",
-            attr(c.strength),
-            if c.strength == 0 {
-                "neutral"
-            } else {
-                "static prior"
-            }
-            .into(),
-        ),
-        _ => (),
+    if c.priority == "speed" {
+        add("paceSlack", pace_base(c), String::new());
     }
     out
 }
@@ -235,7 +184,7 @@ pub fn price_auto(cs: &[Candidate], d: f64, priority: &str, cat: &Catalog) -> Ve
     let threshold = pass_threshold(priority);
     let mut known = Vec::new();
     for c in &mut out {
-        let e = cat.estimate(&c.model, &c.effort, c.strength);
+        let e = cat.estimate(&c.model, &c.effort);
         let (p, low) = pass_probability(
             e.theta,
             d,
@@ -279,9 +228,24 @@ pub fn price_auto(cs: &[Candidate], d: f64, priority: &str, cat: &Catalog) -> Ve
 }
 pub fn rank_auto(cs: &[Candidate], d: f64, priority: &str, cat: &Catalog) -> Vec<Candidate> {
     let mut out = price_auto(cs, d, priority, cat);
+    let best_bound = if out
+        .iter()
+        .any(|c| c.auto.as_ref().is_some_and(|a| a.qualified))
+    {
+        None
+    } else {
+        out.iter()
+            .filter_map(|c| c.auto.as_ref().map(|a| a.p_pass_low))
+            .max_by(f64::total_cmp)
+    };
     out.sort_by(|x, y| match (&x.auto, &y.auto) {
         (Some(a), Some(b)) => b.qualified.cmp(&a.qualified).then_with(|| {
-            if a.qualified && a.effective_cost != b.effective_cost {
+            let near_a = best_bound.is_some_and(|best| a.p_pass_low >= best - NEAR_BEST_BOUND);
+            let near_b = best_bound.is_some_and(|best| b.p_pass_low >= best - NEAR_BEST_BOUND);
+            if near_a != near_b {
+                return near_b.cmp(&near_a);
+            }
+            if (a.qualified || near_a) && a.effective_cost != b.effective_cost {
                 a.effective_cost
                     .partial_cmp(&b.effective_cost)
                     .unwrap_or(std::cmp::Ordering::Equal)
@@ -321,7 +285,7 @@ pub fn auto_note(cs: &[Candidate]) -> String {
     let why = if a.qualified {
         "cheapest likely to pass"
     } else {
-        "none reaches the bound; most likely to pass"
+        "none reaches the bound; the cheapest within 0.02 of the best bound"
     };
     format!(
         "auto: d={:.2} ({}), picked {} (P={:.2}, ${:.2}): {}",
@@ -346,23 +310,8 @@ pub fn reason(c: &Candidate) -> String {
         basis.push_str(&format!(" historyRisk={:.2}", h.risk));
     }
     let mut msg = format!("score={:.2} ({}; bias={:.2})", score(c), basis, c.bias);
-    match c.priority.as_str() {
-        "speed" => msg.push_str(&format!(
-            "; speed paceSlack={:.2} duration={:.2} ({})",
-            pace_base(c),
-            duration(c),
-            duration_note(c)
-        )),
-        "quality" => msg.push_str(&format!(
-            "; quality={:.2} ({})",
-            attr(c.strength),
-            if c.strength == 0 {
-                "neutral"
-            } else {
-                "static prior"
-            }
-        )),
-        _ => (),
+    if c.priority == "speed" {
+        msg.push_str(&format!("; speed paceSlack={:.2}", pace_base(c)));
     }
     msg
 }
@@ -390,19 +339,17 @@ pub fn priority_effect(priority: &str, chosen: &[Candidate], balanced: &[Candida
             label(w)
         );
     }
-    let why = if priority == "speed" {
+    let why = if w.auto.is_some() {
         format!(
-            "duration {:.2} vs {:.2}, paceSlack {:.2} vs {:.2} (lower wins)",
-            duration(w),
-            duration(b),
-            pace_base(w),
-            pace_base(b)
+            "P(pass) bar {:.2} instead of {:.2}",
+            pass_threshold(priority),
+            pass_threshold("balanced")
         )
     } else {
         format!(
-            "quality {:.2} vs {:.2} from strength (lower wins)",
-            attr(w.strength),
-            attr(b.strength)
+            "paceSlack {:.2} vs {:.2} (lower wins)",
+            pace_base(w),
+            pace_base(b)
         )
     };
     format!(
@@ -762,8 +709,6 @@ pub fn select_candidates(
                 cooled_down: a.cooled_down,
                 bias,
                 priority: f.priority.clone(),
-                speed: e.speed,
-                strength: e.strength,
                 ..Default::default()
             });
         }
@@ -1007,7 +952,7 @@ pub fn route(
     if planned.candidates[0].auto.is_some() {
         join_note(&mut report.note, &auto_note(&planned.candidates));
         report.reason = format!(
-            "auto: the cheapest candidate whose pass bound meets the threshold wins, else the most likely to pass; cached quota only: {}",
+            "auto: the cheapest candidate whose pass bound meets the threshold wins, else the cheapest within 0.02 of the best bound; cached quota only: {}",
             first.reason
         );
     }

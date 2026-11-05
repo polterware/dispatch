@@ -649,8 +649,6 @@ pub(super) async fn doctor(db_path: &Path, args: &[String]) -> CliResult {
                         provider: t.provider.clone(),
                         agent: t.agent.clone(),
                         model: t.model.clone(),
-                        speed: i64::from(t.speed),
-                        strength: i64::from(t.strength),
                         position: i64::from(t.position),
                     })
                     .collect();

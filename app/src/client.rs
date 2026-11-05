@@ -224,8 +224,6 @@ pub struct DispatchTier {
     pub provider: String,
     pub agent: String,
     pub model: String,
-    pub speed: i32,
-    pub strength: i32,
     pub position: i32,
 }
 

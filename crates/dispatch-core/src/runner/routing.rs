@@ -1,6 +1,6 @@
 use super::{
     Candidate, Deps, LOW_QUOTA_PERCENT, Options, PRIORITY_BALANCED, TIER_AUTO, fmt_time, join_note,
-    msg, observed_ms, parse_time,
+    msg, parse_time,
 };
 use crate::{
     Error,
@@ -13,9 +13,7 @@ use crate::{
     pass_model::difficulty_tier,
     router::{self, AutoInfo, Pace, Term},
     tiers::Table,
-    types::{
-        Filters, QuotaSnapshot, RolePick, STATUS_COMPLETED, STATUS_PENDING, STATUS_RUNNING, Store,
-    },
+    types::{Filters, QuotaSnapshot, RolePick, Store},
 };
 use chrono::{DateTime, Utc};
 use serde::{Serialize, Serializer};
@@ -222,46 +220,6 @@ fn evaluate_pace(c: &mut Candidate, now: DateTime<Utc>) {
         let window = Duration::from_secs(u64::try_from(q.window_minutes).unwrap_or(0) * 60);
         c.route.pace = Some(linear(q.used_percent, window, q.resets_at, now));
     }
-}
-
-fn pctile(xs: &[i64], p: f64) -> Option<i64> {
-    if xs.is_empty() {
-        return None;
-    }
-    let mut s = xs.to_vec();
-    s.sort_unstable();
-    let idx = ((p * s.len() as f64).ceil() as i64 - 1).clamp(0, s.len() as i64 - 1);
-    Some(s[idx as usize])
-}
-
-/// Measured evidence per tier and model: completed runs time the model.
-fn evidence_by_tier_model(
-    recs: &[crate::types::Run],
-) -> HashMap<(String, String), router::Evidence> {
-    let mut groups: HashMap<(String, String), Vec<i64>> = HashMap::new();
-    for r in recs {
-        if r.status == STATUS_PENDING || r.status == STATUS_RUNNING || r.model.is_empty() {
-            continue;
-        }
-        let durs = groups.entry((r.tier.clone(), r.model.clone())).or_default();
-        if r.status == STATUS_COMPLETED
-            && let Some(ms) = observed_ms(r)
-        {
-            durs.push(ms);
-        }
-    }
-    groups
-        .into_iter()
-        .map(|(k, durs)| {
-            (
-                k,
-                router::Evidence {
-                    duration_n: durs.len(),
-                    p50_ms: pctile(&durs, 0.5),
-                },
-            )
-        })
-        .collect()
 }
 
 /// A route that names only a tier: no model, agent, or provider filter. It
@@ -488,8 +446,7 @@ impl Deps {
         table
     }
 
-    /// The tier a candidate came from, so measured evidence is not pooled
-    /// across difficulties.
+    /// The tier a candidate came from, recorded as the run's execution tier.
     fn tier_of(&self, o: &Options, c: &router::Candidate) -> String {
         match c.note.as_str() {
             "explicit model outside tier table" => return o.tier.clone(),
@@ -750,28 +707,7 @@ impl Deps {
                 });
             }
         }
-        self.attach_evidence(&mut cs);
         cs
-    }
-
-    /// Copies tier-segmented measurements onto candidates. A read error
-    /// leaves the static prior in place.
-    fn attach_evidence(&self, cs: &mut [Candidate]) {
-        let Some(st) = self.store.as_deref() else {
-            return;
-        };
-        let Ok(recs) = st.list_runs("", 0, 0, "") else {
-            return;
-        };
-        if recs.is_empty() {
-            return;
-        }
-        let ev = evidence_by_tier_model(&recs);
-        for c in cs {
-            if let Some(e) = ev.get(&(c.tier.clone(), c.route.model.clone())) {
-                c.route.evidence = e.clone();
-            }
-        }
     }
 
     /// Reads cached quota and cooldown state. It never records a snapshot or
@@ -846,7 +782,7 @@ impl Deps {
         if ranked[0].auto.is_some() {
             r.note = join_note(&r.note, &router::auto_note(&ranked));
             r.reason = format!(
-                "auto: the cheapest candidate whose pass bound meets the threshold wins, else the most likely to pass; cached quota only: {first_reason}"
+                "auto: the cheapest candidate whose pass bound meets the threshold wins, else the cheapest within 0.02 of the best bound; cached quota only: {first_reason}"
             );
         }
         if !r.priority_note.is_empty() {

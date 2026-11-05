@@ -1,33 +1,10 @@
-//! Run-page visuals: the prompt, the context meter, and file counts.
+//! Run-page visuals: the context meter and file counts.
 
 use gpui::{AnyElement, App, FontWeight, Rgba, div, prelude::*, px};
 
 use crate::models::run_page::{ContextMeter, FileCounts};
 use crate::theme::{Theme, tw};
 use crate::ui::{Icon, icon_colored, progress_bar_sm, sans, tabular};
-
-/// The Prompt group: `whitespace-pre-wrap px-1 text-[13px] leading-5` in the secondary color.
-pub fn prompt_text(text: &str, theme: Theme) -> AnyElement {
-    // GPUI text has no pre-wrap, so each source line is its own block.
-    let line_height = tw(5.0);
-    let mut column = div()
-        .px(px(tw(1.0)))
-        .flex()
-        .flex_col()
-        .text_size(px(13.0))
-        .line_height(px(line_height))
-        .text_color(theme.color_text_secondary);
-    for line in text.split('\n') {
-        column = column.child(div().whitespace_normal().min_h(px(line_height)).child(
-            if line.is_empty() {
-                " ".to_string()
-            } else {
-                line.to_string()
-            },
-        ));
-    }
-    column.into_any_element()
-}
 
 /// `FileChangeLine`: the 14px diff icon, `N files`, `+ins` in success, and `−del` in danger,
 /// 12px figures in the secondary color, `gap-1.5`. In the rail it keeps the value's weight.

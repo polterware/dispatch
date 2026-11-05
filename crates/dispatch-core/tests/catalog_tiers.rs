@@ -15,39 +15,20 @@ fn test_default_covers_all_tiers() {
     }
     let e = &d.tiers["hard"][0];
     assert_eq!(
-        (&*e.provider, &*e.agent, &*e.model, e.speed, e.strength),
-        ("google", "antigravity", "gemini-4-argon-high", 3, 5)
+        (&*e.provider, &*e.agent, &*e.model),
+        ("google", "antigravity", "gemini-4-argon-high")
     );
 }
 #[test]
-fn test_speed_and_strength() {
+fn test_legacy_speed_and_strength_are_ignored() {
     let table = Table::parse(
-        r#"{"tiers":{"easy":[{"agent":"codex","model":"gpt-small","speed":5,"strength":1}]}}"#,
+        r#"{"tiers":{"easy":[{"agent":"codex","model":"gpt-small","speed":9,"strength":-1}]}}"#,
     )
     .unwrap();
-    assert_eq!(
-        (
-            table.tiers["easy"][0].speed,
-            table.tiers["easy"][0].strength
-        ),
-        (5, 1)
-    );
-    for body in [
-        r#"{"tiers":{"easy":[{"agent":"codex","model":"gpt-small","speed":6}]}}"#,
-        r#"{"tiers":{"easy":[{"agent":"codex","model":"gpt-small","strength":-1}]}}"#,
-    ] {
-        assert!(
-            Table::parse(body)
-                .unwrap_err()
-                .to_string()
-                .contains("out of range")
-        );
-    }
-    let e = Table::parse(r#"{"tiers":{"easy":[{"agent":"codex","model":"gpt-small"}]}}"#).unwrap();
-    assert_eq!(
-        (e.tiers["easy"][0].speed, e.tiers["easy"][0].strength),
-        (0, 0)
-    );
+    let plain =
+        Table::parse(r#"{"tiers":{"easy":[{"agent":"codex","model":"gpt-small"}]}}"#).unwrap();
+    assert_eq!(table, plain);
+    assert!(!serde_json::to_string(&table).unwrap().contains("speed"));
 }
 #[test]
 fn test_tier_effort_validation() {
@@ -65,7 +46,7 @@ fn test_embedded_catalog_resolves_the_default_table() {
     assert!(!c.models.is_empty() && !c.scores.is_empty() && c.eci_fit.is_some());
     for entries in Table::embedded().unwrap().tiers.values() {
         for e in entries {
-            let est = c.estimate(&e.model, "", e.strength);
+            let est = c.estimate(&e.model, "");
             assert_ne!(est.theta_source, "unknown");
             assert!(est.cost_per_task.is_some());
         }
@@ -103,29 +84,29 @@ fn test_estimate_uses_the_level_then_the_nearest_one() {
         }],
         ..Default::default()
     };
-    let high = c.estimate("m-high", "", 0);
+    let high = c.estimate("m-high", "");
     assert_eq!(high.extrapolated_levels, 0);
     assert_eq!(high.theta_source, "cursorbench high");
     assert_eq!(high.cost_per_task, Some(3.));
     assert!(near(high.theta, (0.6f64 / 0.4).ln()));
-    let xhigh = c.estimate("m", "xhigh", 0);
+    let xhigh = c.estimate("m", "xhigh");
     assert_eq!(xhigh.extrapolated_levels, 1);
     assert!(xhigh.theta_source.contains("nearest to xhigh"));
     assert!(near(xhigh.theta, (0.6f64 / 0.4).ln() + 0.15));
     assert!(near(xhigh.cost_per_task.unwrap(), 3. * 2.5 / 1.6));
-    let f = c.estimate("openai/flat", "low", 0);
+    let f = c.estimate("openai/flat", "low");
     assert_eq!(f.theta_source, "cursorbench");
     assert!(near(f.theta, (0.3f64 / 0.7).ln()));
     assert_eq!(
-        c.estimate("m-build-fast", "medium", 0).theta_source,
+        c.estimate("m-build-fast", "medium").theta_source,
         "cursorbench medium (as m)"
     );
-    let p = c.estimate("priced", "medium", 5);
-    assert_eq!(p.theta_source, "tiers.json strength");
-    assert!(near(p.theta, 0.));
+    let p = c.estimate("priced", "medium");
+    assert_eq!(p.theta_source, "unknown");
+    assert!(near(p.theta, -0.7));
     assert_eq!(p.cost_source, "models.dev price");
     assert!(near(p.cost_per_task.unwrap(), 0.2));
-    let u = c.estimate("nothing", "", 0);
+    let u = c.estimate("nothing", "");
     assert_eq!(u.theta_source, "unknown");
     assert_eq!(u.cost_per_task, None);
 }
@@ -139,12 +120,8 @@ fn test_estimate_shifts_unmeasured_efforts_from_medium() {
         eci_fit: Some((0.01, 0.)),
         ..Default::default()
     };
-    for (model, strength, source) in [
-        ("eci-only", 0, "eci"),
-        ("prior", 5, "tiers.json strength"),
-        ("unknown", 0, "unknown"),
-    ] {
-        let medium = cat.estimate(model, "medium", strength);
+    for (model, source) in [("eci-only", "eci"), ("unknown", "unknown")] {
+        let medium = cat.estimate(model, "medium");
         for (effort, levels) in [
             ("low", -1i32),
             ("medium", 0),
@@ -152,7 +129,7 @@ fn test_estimate_shifts_unmeasured_efforts_from_medium() {
             ("xhigh", 2),
             ("max", 3),
         ] {
-            let e = cat.estimate(model, effort, strength);
+            let e = cat.estimate(model, effort);
             assert_eq!(e.theta_source, source);
             assert!(near(e.theta, medium.theta + f64::from(levels) * 0.15));
             assert_eq!(e.extrapolated_levels, levels.unsigned_abs() as usize);

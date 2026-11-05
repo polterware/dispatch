@@ -17,9 +17,9 @@ use crate::client::{CoreError, DeleteSectionRequest, MoveToSectionRequest, SaveS
 use crate::format::agent_display_name;
 use crate::models::sidebar::{
     COLLAPSED_PREFERENCE, DISPLAY_PREFERENCE, Direction, GroupBy, GroupKind, HOVER_CLOSE_MS,
-    HOVER_OPEN_MS, RunsNotice, Show, SidebarDisplay, SidebarGroup, SidebarRun, SortBy,
-    conversation_ref, group_sidebar_runs, now_unix_ms, parse_sidebar_display, runs_notice,
-    section_ref, sidebar_run_title, sidebar_runs,
+    HOVER_OPEN_MS, RunsNotice, SEEN_PREFERENCE, Show, SidebarDisplay, SidebarGroup, SidebarRun,
+    SortBy, conversation_ref, group_sidebar_runs, has_unseen_update, now_unix_ms,
+    parse_sidebar_display, run_mark, runs_notice, section_ref, sidebar_run_title, sidebar_runs,
 };
 use crate::motion::{Animator, SpringTier, SpringValue};
 use crate::state::{AppState, ConnectionState, Route, SettingsPage, observe};
@@ -68,6 +68,9 @@ pub struct SidebarView {
     state: Entity<AppState>,
     display: SidebarDisplay,
     collapsed: Vec<String>,
+    /// Each run's mark as its page last showed it (`run_mark`); `None` until the first list,
+    /// which marks every run then listed as seen, so an update means one since this app ran.
+    seen: Option<HashMap<String, String>>,
     /// The run rows' bounds as last laid out, which place the hover preview beside its row.
     row_bounds: Rc<RefCell<HashMap<String, Bounds<Pixels>>>>,
     hover_run: Option<String>,
@@ -106,6 +109,11 @@ impl SidebarView {
             .ok()
             .flatten()
             .unwrap_or_default();
+        let seen = state
+            .read(cx)
+            .read_preference::<HashMap<String, String>>(SEEN_PREFERENCE)
+            .ok()
+            .flatten();
         let view = cx.entity();
         let section_name = cx.new({
             let view = view.clone();
@@ -137,6 +145,7 @@ impl SidebarView {
             state,
             display,
             collapsed,
+            seen,
             row_bounds: Rc::new(RefCell::new(HashMap::new())),
             hover_run: None,
             preview_run: None,
@@ -224,6 +233,32 @@ impl SidebarView {
             .state
             .read(cx)
             .write_preference(DISPLAY_PREFERENCE, &self.display);
+    }
+
+    /// Marks the open run as seen, and on the first list every run then listed.
+    fn sync_seen(&mut self, snapshot: &Snapshot, cx: &gpui::App) {
+        if snapshot.connecting || snapshot.show_error {
+            return;
+        }
+        let runs = || snapshot.groups.iter().flat_map(|group| group.runs.iter());
+        let mut changed = false;
+        let seen = self.seen.get_or_insert_with(|| {
+            changed = true;
+            runs().map(|run| (run.id.clone(), run_mark(run))).collect()
+        });
+        if let Route::Run(id) = &snapshot.route
+            && let Some(run) = runs().find(|run| &run.id == id)
+            && has_unseen_update(run, seen)
+        {
+            seen.insert(run.id.clone(), run_mark(run));
+            changed = true;
+        }
+        if changed {
+            let _ = self
+                .state
+                .read(cx)
+                .write_preference(SEEN_PREFERENCE, &*seen);
+        }
     }
 
     fn persist_collapsed(&self, cx: &gpui::App) {
@@ -1117,7 +1152,12 @@ impl SidebarView {
             .active(active)
             .leading(agent_avatar(&run.agent, &run.status, 40.0), 36.0)
             .content(content)
-            .trailing(run_dot(&run.status, &theme))
+            .when(
+                self.seen
+                    .as_ref()
+                    .is_some_and(|seen| has_unseen_update(run, seen)),
+                |item| item.trailing(run_dot(&run.status, &theme)),
+            )
             .on_hover({
                 let view = view.clone();
                 let run_id = run_id.clone();
@@ -1363,6 +1403,7 @@ impl Render for SidebarView {
         let theme = *Theme::global(cx);
         let snapshot = self.read_snapshot(cx);
         self.sync(&snapshot);
+        self.sync_seen(&snapshot, cx);
         self.advance(window);
         if self.editor_focus {
             self.section_name.read(cx).focus_handle(cx).focus(window);

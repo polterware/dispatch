@@ -763,6 +763,14 @@ pub fn policy_options(
     }
 }
 
+/// The agent that offers `model`: the first listed model with that name.
+pub fn model_agent<'a>(models: &'a [ListedModel], model: &str) -> Option<&'a str> {
+    models
+        .iter()
+        .find(|item| item.model == model)
+        .map(|item| item.agent.as_str())
+}
+
 pub fn token_delta(previous: &[String], next: &[String]) -> (Vec<String>, Vec<String>) {
     let added = next
         .iter()
@@ -942,12 +950,30 @@ fn number_or(value: Option<&Value>, default: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentSetup, CliModel, CliState, HookSetup, InstallState, OpenCodeSetup,
+        AgentSetup, CliModel, CliState, HookSetup, InstallState, ListedModel, OpenCodeSetup,
         classifier_trailing, fixed2, folder_agents_label, hook_note, hook_points_elsewhere,
-        key_chip, parse_agent_setup, parse_classify, parse_key_status_value, parse_policy,
-        parse_role_answer, role_answer_line, skill_readers, skills_need_install, token_delta,
+        key_chip, model_agent, parse_agent_setup, parse_classify, parse_key_status_value,
+        parse_policy, parse_role_answer, role_answer_line, skill_readers, skills_need_install,
+        token_delta,
     };
     use serde_json::json;
+
+    #[test]
+    fn a_model_leads_with_the_first_agent_that_offers_it() {
+        let listed = |agent: &str, model: &str| ListedModel {
+            agent: agent.to_string(),
+            model: model.to_string(),
+            provider: String::new(),
+        };
+        let models = [
+            listed("cursor", "grok-4.5"),
+            listed("codex", "gpt-6"),
+            listed("opencode", "gpt-6"),
+        ];
+        assert_eq!(model_agent(&models, "gpt-6"), Some("codex"));
+        assert_eq!(model_agent(&models, "grok-4.5"), Some("cursor"));
+        assert_eq!(model_agent(&models, "missing"), None);
+    }
 
     #[test]
     fn says_when_no_classifier_can_pick_a_role() {

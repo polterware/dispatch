@@ -21,11 +21,11 @@ use crate::models::settings::{
     CLASSIFIERS, CliState, Dimension, InstallState, ListedModel, Policy, RuleSide, SAMPLE_TASK,
     agent_label, bool_wire, classifier_trailing, classify_meta, cli_description, draft_ready,
     env_key_sentence, fixed2, folder_agents_label, hook_note, hook_points_elsewhere, key_chip,
-    key_placeholder, key_test_enabled, key_uses_replace, keyed_classifier, opencode_description,
-    parse_agent_setup, parse_classify, parse_cli_model, parse_key_map, parse_key_status_value,
-    parse_policy, policy_options, priority_label, priority_value, prob_line, radio_value,
-    role_answer_line, skill_readers, skills_need_install, token_delta, trimmed_draft, with_token,
-    without_token,
+    key_placeholder, key_test_enabled, key_uses_replace, keyed_classifier, model_agent,
+    opencode_description, parse_agent_setup, parse_classify, parse_cli_model, parse_key_map,
+    parse_key_status_value, parse_policy, policy_options, priority_label, priority_value,
+    prob_line, radio_value, role_answer_line, skill_readers, skills_need_install, token_delta,
+    trimmed_draft, with_token, without_token,
 };
 use crate::motion::{Animator, Spring, SpringTier, SpringValue};
 use crate::state::{AppState, Route, SettingsPage, ToastTone};
@@ -35,11 +35,15 @@ use crate::ui::patterns::{
     AnchorSlot, SETTINGS_SECTION_GAP, SettingsNavItem, settings_dialog, window_anchor,
 };
 use crate::ui::{
-    ButtonKind, Icon, Menu, MenuItem, Popover, Switch, TextInput, TileTone, button, chip, icon,
-    icon_button,
+    ButtonKind, Icon, IconTile, Menu, MenuItem, Popover, Switch, TextInput, TileTone, button, chip,
+    icon, icon_button,
 };
 use crate::ui::{SkeletonLayout, page_skeleton};
 
+/// A token option's leading mark: an agent's bot or a provider's tile.
+const TOKEN_MARK: f32 = 20.0;
+/// Wide enough for `cursor-grok-4.5-high-fast` beside its mark.
+const TOKEN_PANEL_WIDTH: f32 = 280.0;
 const RAIL_ROW: f32 = 32.0;
 const RAIL_GAP: f32 = 2.0;
 /// The editor's height before a frame has measured it: one row of controls.
@@ -2386,7 +2390,7 @@ fn token_panel(view: &WeakEntity<SettingsView>, cx: &mut App) -> gpui::AnyElemen
         return div().into_any_element();
     };
     let theme = *Theme::global(cx);
-    let (options, draft) = {
+    let (options, dimension, models, draft) = {
         let settings = view.read(cx);
         let Some(slot) = settings.token_slot else {
             return div().into_any_element();
@@ -2402,7 +2406,12 @@ fn token_panel(view: &WeakEntity<SettingsView>, cx: &mut App) -> gpui::AnyElemen
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        (options, settings.token_draft.clone())
+        (
+            options,
+            slot.dimension,
+            settings.models.clone(),
+            settings.token_draft.clone(),
+        )
     };
     let mut list = div()
         .id("settings-token-options")
@@ -2414,13 +2423,25 @@ fn token_panel(view: &WeakEntity<SettingsView>, cx: &mut App) -> gpui::AnyElemen
         let view = view.downgrade();
         let option = option.clone();
         let label = option.clone();
+        let mark = match dimension {
+            Dimension::Agents => Some(agent_avatar(&option, "", TOKEN_MARK).into_any_element()),
+            Dimension::Models => model_agent(&models, &option)
+                .map(|agent| agent_avatar(agent, "", TOKEN_MARK).into_any_element()),
+            Dimension::Providers => Some(
+                IconTile::new(Icon::Cloud)
+                    .size(TOKEN_MARK, 12.0)
+                    .into_any_element(),
+            ),
+        };
         list = list.child(
             div()
                 .id(("settings-token-option", index))
+                .flex_shrink_0()
                 .h(px(theme.control_height_md))
                 .px(px(theme.space_2))
                 .flex()
                 .items_center()
+                .gap(px(theme.space_2))
                 .rounded(px(theme.radius_sm))
                 .cursor_pointer()
                 .hover(|style| style.bg(theme.color_surface_hover))
@@ -2434,12 +2455,13 @@ fn token_panel(view: &WeakEntity<SettingsView>, cx: &mut App) -> gpui::AnyElemen
                         }
                     });
                 })
-                .child(label),
+                .children(mark.map(|mark| div().flex_none().child(mark)))
+                .child(div().min_w(px(0.0)).truncate().child(label)),
         );
     }
     div()
         .debug_selector(|| "settings-token-panel".to_string())
-        .w(px(220.0))
+        .w(px(TOKEN_PANEL_WIDTH))
         .flex()
         .flex_col()
         .gap(px(theme.space_2))

@@ -156,8 +156,6 @@ pub fn tier(t: &Tier) -> pb::DispatchTier {
         provider: t.provider.clone(),
         agent: t.agent.clone(),
         model: t.model.clone(),
-        speed: i32_of(t.speed),
-        strength: i32_of(t.strength),
         position: i32_of(t.position),
     }
 }

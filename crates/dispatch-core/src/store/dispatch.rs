@@ -274,7 +274,7 @@ fn scan_decision(r: &Row<'_>) -> Result<RouteDecision, Error> {
 pub(super) fn list_tiers_on(conn: &Connection) -> Result<Vec<Tier>, Error> {
     let mut stmt = conn
         .prepare(
-            "SELECT name, provider, agent, model, speed, strength, position
+            "SELECT name, provider, agent, model, position
 			 FROM dispatch_tiers
 			 ORDER BY position ASC, id ASC",
         )
@@ -286,9 +286,7 @@ pub(super) fn list_tiers_on(conn: &Connection) -> Result<Vec<Tier>, Error> {
                 provider: r.get(1)?,
                 agent: r.get(2)?,
                 model: r.get(3)?,
-                speed: r.get(4)?,
-                strength: r.get(5)?,
-                position: r.get(6)?,
+                position: r.get(4)?,
             })
         })
         .map_err(db)?;
@@ -873,9 +871,9 @@ impl types::Store for Store {
         tx.execute("DELETE FROM dispatch_tiers", []).map_err(db)?;
         for t in tiers {
             tx.execute(
-                "INSERT INTO dispatch_tiers (name, provider, agent, model, speed, strength, position)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)",
-                params![t.name, t.provider, t.agent, t.model, t.speed, t.strength, t.position],
+                "INSERT INTO dispatch_tiers (name, provider, agent, model, position)
+		 VALUES (?, ?, ?, ?, ?)",
+                params![t.name, t.provider, t.agent, t.model, t.position],
             )
             .map_err(db)?;
         }

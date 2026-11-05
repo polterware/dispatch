@@ -24,14 +24,15 @@ use gpui::{
 use crate::client::{CoreClient, ProtoI64, ReadRunEventsRequest, ResultRequest, WatchRunRequest};
 use crate::format::is_active_status;
 use crate::models::transcript::{
-    LogEvent, PagedEvent, StreamedLog, TranscriptBuilder, TranscriptEntry,
+    LogEvent, PagedEvent, PromptBubble, StreamedLog, TranscriptBuilder, TranscriptEntry,
+    prompt_bubble,
 };
 use crate::motion::{Animator, SpringTier, SpringValue};
 use crate::state::{AppState, observe};
 use crate::theme::{Theme, tw};
 use crate::ui::parts::transcript::{
-    HighlightCache, PREVIEW_ENTRIES, RowFrame, TranscriptRow, flatten_transcript, render_row,
-    terminal_font,
+    HighlightCache, PREVIEW_ENTRIES, PromptToggle, RowFrame, TranscriptRow, flatten_transcript,
+    prompt_transcript_row, render_row, terminal_font,
 };
 use crate::ui::patterns::{JUMP_TO_END_REST, SCROLL_FADE, jump_to_end};
 use crate::ui::text_skeleton;
@@ -108,6 +109,10 @@ pub struct TranscriptView {
     rows: Rc<RefCell<Vec<TranscriptRow>>>,
     entries: Vec<TranscriptEntry>,
     expanded: HashSet<usize>,
+    /// The prompt bubble is open past its folded lines.
+    prompt_expanded: bool,
+    /// The rows open with the prompt bubble.
+    prompt_shown: bool,
     reveal_entry: Option<usize>,
     builder: TranscriptBuilder,
     processed: String,
@@ -196,6 +201,8 @@ impl TranscriptView {
             rows: Rc::new(RefCell::new(Vec::new())),
             entries: Vec::new(),
             expanded: HashSet::new(),
+            prompt_expanded: false,
+            prompt_shown: false,
             reveal_entry: None,
             builder: TranscriptBuilder::new(),
             processed: String::new(),
@@ -423,6 +430,11 @@ impl TranscriptView {
                 body: crate::ui::parts::transcript::RowBody::Live,
             });
         }
+        let bubble = self.prompt_bubble(cx);
+        self.prompt_shown = bubble.is_some();
+        if let Some(bubble) = bubble {
+            rows.insert(0, prompt_transcript_row(&bubble, self.prompt_expanded));
+        }
         let rows_now = rows.len();
         self.install_rows(rows);
         if let Some(before) = self.rows_before_page.take() {
@@ -595,6 +607,36 @@ impl TranscriptView {
         self.rebuild_rows(cx);
     }
 
+    /// The prompt's bubble, which opens the run page's transcript once the text holds the
+    /// run's start: a log read from its end gets it when the earlier pages are in.
+    fn prompt_bubble(&self, cx: &App) -> Option<PromptBubble> {
+        if self.compact || self.earlier_more {
+            return None;
+        }
+        let state = self.state.read(cx);
+        let run = state.run(&self.run_id)?;
+        prompt_bubble(&run.prompt, &run.caller_agent, &run.created_at)
+    }
+
+    /// Whether [`Self::prompt_bubble`] has one, without building it.
+    fn prompt_visible(&self, cx: &App) -> bool {
+        !self.compact
+            && !self.earlier_more
+            && self
+                .state
+                .read(cx)
+                .run(&self.run_id)
+                .is_some_and(|run| !run.prompt.trim().is_empty())
+    }
+
+    fn set_prompt_expanded(&mut self, open: bool, cx: &mut Context<Self>) {
+        if self.prompt_expanded == open {
+            return;
+        }
+        self.prompt_expanded = open;
+        self.rebuild_rows(cx);
+    }
+
     fn live_now(&self, cx: &App) -> bool {
         self.state
             .read(cx)
@@ -750,7 +792,7 @@ impl Render for TranscriptView {
         let top_inset = self.top_inset;
         self.ensure_stream(cx);
         let live = self.live_now(cx);
-        if live != self.shown_live {
+        if live != self.shown_live || self.prompt_visible(cx) != self.prompt_shown {
             self.shown_live = live;
             self.rebuild_rows(cx);
         }
@@ -767,6 +809,12 @@ impl Render for TranscriptView {
             let entity = entity.clone();
             move |entry, _, cx| {
                 entity.update(cx, |view, cx| view.expand(entry, cx));
+            }
+        });
+        let on_prompt_toggle: PromptToggle = Rc::new({
+            let entity = entity.clone();
+            move |open, _, cx| {
+                entity.update(cx, |view, cx| view.set_prompt_expanded(open, cx));
             }
         });
         let count = rows.borrow().len();
@@ -789,6 +837,7 @@ impl Render for TranscriptView {
                 cursor,
                 cache: cache.clone(),
                 on_expand: on_expand.clone(),
+                on_prompt_toggle: on_prompt_toggle.clone(),
             };
             let row = render_row(&frame, &row, window, cx);
             if compact {

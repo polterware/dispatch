@@ -9,6 +9,8 @@ use std::collections::HashMap;
 
 use serde_json::{Map, Value};
 
+use crate::models::sidebar::local_clock;
+
 /// One line of a run's transcript, in the shape `buildTranscript` returns.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TranscriptEntry {
@@ -1076,6 +1078,45 @@ impl TranscriptBuilder {
     }
 }
 
+/// The run's prompt as the user's own chat bubble over its transcript.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PromptBubble {
+    pub text: String,
+    /// "You", and "· via <caller agent>" after it when the run has one.
+    pub meta_label: String,
+    /// When the run was created, as `HH:MM` on this computer's clock.
+    pub time: Option<String>,
+}
+
+/// The bubble for a run's prompt, or `None` when the prompt is empty.
+pub fn prompt_bubble(prompt: &str, caller_agent: &str, created_at: &str) -> Option<PromptBubble> {
+    let text = prompt.trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(PromptBubble {
+        text: text.to_string(),
+        meta_label: prompt_meta_label(caller_agent),
+        time: local_clock(created_at),
+    })
+}
+
+/// "You", plus " · via Claude Code" for a run called from `claude`.
+pub fn prompt_meta_label(caller_agent: &str) -> String {
+    let caller = caller_agent.trim();
+    if caller.is_empty() {
+        return "You".to_string();
+    }
+    let label = match caller {
+        "claude" => "Claude Code",
+        "codex" => "Codex",
+        "cursor" => "Cursor",
+        "opencode" => "OpenCode",
+        other => other,
+    };
+    format!("You \u{b7} via {label}")
+}
+
 /// Reads `log` the way the agent's CLI would show it.
 /// `answer`, the stored final reply, closes a transcript whose stream holds none.
 pub fn build_transcript(log: &str, answer: &str) -> Vec<TranscriptEntry> {
@@ -1135,7 +1176,16 @@ pub struct StreamedLog {
     partial: bool,
 }
 
+/// The core's event that repeats the run's prompt, which the transcript shows once, as a chat
+/// bubble, instead of as a row.
+const EVENT_STARTED: &str = "started";
+
 fn write_event(text: &mut String, has_output: &mut bool, event: &LogEvent) {
+    if event.kind == EVENT_STARTED {
+        // Left out whole: a prompt of several lines would otherwise leave its later lines
+        // behind as plain output.
+        return;
+    }
     if event.kind == "output" || event.kind == "agent" {
         text.push_str(&event.text);
         *has_output = true;
@@ -1153,7 +1203,7 @@ fn write_event(text: &mut String, has_output: &mut bool, event: &LogEvent) {
 
 impl StreamedLog {
     /// Writes `events` after the ones already in: output as it is, any other kind as one
-    /// `[kind] text` line.
+    /// `[kind] text` line, and the `started` event not at all.
     pub fn extend<'a>(&mut self, events: impl IntoIterator<Item = &'a LogEvent>) {
         for event in events {
             write_event(&mut self.text, &mut self.has_output, event);
@@ -1667,8 +1717,9 @@ fn first_tool_call_key(line: &str, call: &Map<String, Value>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        LiveUsage, LogEvent, PagedEvent, StreamedLog, TranscriptBuilder, TranscriptEntry,
-        build_transcript, live_usage, looks_like_diff, run_log, strip_ansi, unwrap_shell,
+        LiveUsage, LogEvent, PagedEvent, PromptBubble, StreamedLog, TranscriptBuilder,
+        TranscriptEntry, build_transcript, live_usage, looks_like_diff, prompt_bubble,
+        prompt_meta_label, run_log, strip_ansi, unwrap_shell,
     };
 
     fn message(text: &str) -> TranscriptEntry {
@@ -2100,6 +2151,86 @@ mod tests {
         assert!(!paged.may_have_earlier());
         assert_eq!(paged.join(""), whole.join(""));
         assert_eq!(paged.join("stored"), whole.join("stored"));
+    }
+
+    #[test]
+    fn the_started_event_is_not_a_row_because_the_prompt_bubble_shows_it() {
+        let events = |prompt: &str| {
+            [
+                LogEvent {
+                    kind: "started".into(),
+                    text: prompt.into(),
+                },
+                LogEvent {
+                    kind: "routed".into(),
+                    text: "codex / gpt".into(),
+                },
+                LogEvent {
+                    kind: "output".into(),
+                    text: "hello\n".into(),
+                },
+                LogEvent {
+                    kind: "merged".into(),
+                    text: "into main".into(),
+                },
+            ]
+        };
+        // A prompt of several lines leaves nothing behind either, and the other core lines stay.
+        for prompt in ["Fix the bug", "Fix the bug\nin the store\n\nand test it"] {
+            let log = run_log("", &events(prompt));
+            assert_eq!(log, "[routed] codex / gpt\nhello\n[merged] into main\n");
+            assert_eq!(
+                build_transcript(&log, ""),
+                vec![
+                    event("routed", "codex / gpt"),
+                    message("hello"),
+                    event("merged", "into main"),
+                ]
+            );
+        }
+        // Paged the same way, as the run page streams them.
+        let mut streamed = StreamedLog::default();
+        streamed.extend_paged(&[PagedEvent {
+            event: events("Fix the bug")[0].clone(),
+            seq: 1,
+            offset: 0,
+        }]);
+        assert_eq!(streamed.join(""), "");
+        assert!(!streamed.may_have_earlier());
+    }
+
+    #[test]
+    fn the_prompt_bubble_says_who_asked_and_when() {
+        assert_eq!(prompt_meta_label(""), "You");
+        assert_eq!(prompt_meta_label("  "), "You");
+        assert_eq!(prompt_meta_label("claude"), "You \u{b7} via Claude Code");
+        assert_eq!(prompt_meta_label("codex"), "You \u{b7} via Codex");
+        assert_eq!(prompt_meta_label("cursor"), "You \u{b7} via Cursor");
+        assert_eq!(prompt_meta_label("opencode"), "You \u{b7} via OpenCode");
+        assert_eq!(prompt_meta_label("my-agent"), "You \u{b7} via my-agent");
+
+        let created = "2026-11-02T09:30:00Z";
+        let bubble = prompt_bubble("  Fix the bug\nin the store  ", "claude", created)
+            .expect("a prompt makes a bubble");
+        assert_eq!(bubble.text, "Fix the bug\nin the store");
+        assert_eq!(bubble.meta_label, "You \u{b7} via Claude Code");
+        // The clock is this computer's, so only its shape is fixed here (`local_clock` has
+        // its own test).
+        let time = bubble.time.expect("the created time parses");
+        assert_eq!(time.len(), 5);
+        assert!(time[..2].parse::<u32>().is_ok() && time[3..].parse::<u32>().is_ok());
+        assert_eq!(&time[2..3], ":");
+
+        // No caller and no readable time: just "You", with no clock.
+        assert_eq!(
+            prompt_bubble("Fix it", "", ""),
+            Some(PromptBubble {
+                text: "Fix it".into(),
+                meta_label: "You".into(),
+                time: None,
+            })
+        );
+        assert_eq!(prompt_bubble(" \n ", "claude", created), None);
     }
 
     #[test]

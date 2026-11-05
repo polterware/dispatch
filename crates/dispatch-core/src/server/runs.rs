@@ -818,8 +818,6 @@ impl Core {
                 provider: row.provider.trim().into(),
                 agent: row.agent.trim().into(),
                 model: row.model.trim().into(),
-                speed: row.speed,
-                strength: row.strength,
                 ..Entry::default()
             });
         }
@@ -950,8 +948,7 @@ impl Core {
         let adapters = known::known();
         let by_name: HashMap<String, Arc<dyn AgentAdapter>> =
             adapters.iter().map(|a| (a.name(), a.clone())).collect();
-        let mut problems = table.field_problems();
-        problems.extend(table.capability_problems(&crate::tiers::known_adapters()));
+        let mut problems = table.capability_problems(&crate::tiers::known_adapters());
 
         // Ask the table's installed agents for their models at once, through the shared cache.
         let mut asked: Vec<String> = Vec::new();

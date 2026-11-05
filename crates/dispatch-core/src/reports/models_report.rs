@@ -111,7 +111,7 @@ pub fn report_catalog(cat: &Catalog, table: &Table, discovered: &[Entry]) -> Cat
 }
 
 fn build_catalog_entry(cat: &Catalog, e: &Entry, tier: &str, effort: &str) -> CatalogEntry {
-    let est = cat.estimate(&e.model, effort, e.strength);
+    let est = cat.estimate(&e.model, effort);
     let sigma = theta_uncertainty(&est.theta_source, est.extrapolated_levels);
     let mut bands = Vec::with_capacity(3);
     for band in ["easy", "normal", "hard"] {

@@ -192,11 +192,11 @@ pub fn start_tour(
                     }
                 }
                 if name == "13-run" {
-                    // The rail's properties, with the groups above them folded away.
+                    // The rail's properties, with the Agent group above them folded away.
                     let _ = cx.update(|_, app| {
                         views
                             .run_page
-                            .update(app, |page, cx| page.fold_rail_heads(cx));
+                            .update(app, |page, cx| page.fold_agent_group(cx));
                     });
                     settle(cx, 800).await;
                     capture(cx, &dir.join("13-run-properties.png"));

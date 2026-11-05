@@ -13,17 +13,22 @@ use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
 use gpui::{
-    App, Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, HighlightStyle, Hsla,
-    IntoElement, SharedString, StyledText, Window, div, font, prelude::*, px,
+    App, ClipboardItem, Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, HighlightStyle,
+    Hsla, IntoElement, SharedString, StyledText, Window, div, font, prelude::*, px,
 };
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use syntect::easy::ScopeRegionIterator;
 use syntect::parsing::{ParseState, ScopeStack, SyntaxSet};
 
-use crate::models::transcript::{TranscriptEntry, looks_like_diff, looks_like_json};
+use crate::models::transcript::{PromptBubble, TranscriptEntry, looks_like_diff, looks_like_json};
 use crate::theme::{StatusTone, Theme, status_tone};
+use crate::ui::{ChatBubble, sans};
 
 pub const OUTPUT_LINES: usize = 6;
+/// How many lines of the prompt its bubble shows before it folds.
+pub const PROMPT_COLLAPSE_LINES: usize = 6;
+/// The room under the prompt bubble, before the transcript's first row.
+const PROMPT_GAP_PX: f32 = 16.0;
 pub const PREVIEW_ENTRIES: usize = 60;
 const TERM_FONT_PX: f32 = 12.5;
 const TERM_LINE_PX: f32 = 20.0;
@@ -117,6 +122,13 @@ pub enum RowBody {
         text: String,
         tone: StatusTone,
     },
+    /// The run's prompt as the user's own chat bubble, first in the transcript.
+    Prompt {
+        text: String,
+        meta_label: String,
+        time: Option<String>,
+        expanded: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -164,6 +176,9 @@ impl Default for HighlightCache {
     }
 }
 
+/// Opens (`true`) or folds the prompt's bubble.
+pub type PromptToggle = Rc<dyn Fn(bool, &mut Window, &mut App)>;
+
 pub struct RowFrame {
     pub theme: Theme,
     pub index: usize,
@@ -173,6 +188,8 @@ pub struct RowFrame {
     pub cursor: f32,
     pub cache: Rc<RefCell<HighlightCache>>,
     pub on_expand: Rc<dyn Fn(usize, &mut Window, &mut App)>,
+    /// The prompt bubble's fold: called with whether it is now open.
+    pub on_prompt_toggle: PromptToggle,
 }
 
 /// JetBrains Mono when the machine or the asset source has it, else Menlo.
@@ -255,6 +272,20 @@ pub fn flatten_transcript(
         }
     }
     rows
+}
+
+/// The row that opens a run's transcript: the prompt's bubble, open or folded.
+pub fn prompt_transcript_row(bubble: &PromptBubble, expanded: bool) -> TranscriptRow {
+    let body = RowBody::Prompt {
+        text: bubble.text.clone(),
+        meta_label: bubble.meta_label.clone(),
+        time: bubble.time.clone(),
+        expanded,
+    };
+    TranscriptRow {
+        signature: body_signature(&body),
+        body,
+    }
 }
 
 pub fn render_row(
@@ -350,6 +381,12 @@ pub fn render_row(
             text,
             tone,
         } => event_row(theme, *glyph, kind, text, *tone).into_any_element(),
+        RowBody::Prompt {
+            text,
+            meta_label,
+            time,
+            expanded,
+        } => prompt_row(frame, text, meta_label, time.as_deref(), *expanded),
     };
     let _ = cx;
     let mut wrap = div().w_full();
@@ -794,6 +831,36 @@ fn event_row(theme: Theme, glyph: char, kind: &str, text: &str, tone: StatusTone
         .child(text.to_string())
 }
 
+/// The prompt, in the user's own bubble: UI type rather than the terminal's, folded after
+/// [`PROMPT_COLLAPSE_LINES`] lines, with a copy button that writes the whole prompt.
+fn prompt_row(
+    frame: &RowFrame,
+    text: &str,
+    meta_label: &str,
+    time: Option<&str>,
+    expanded: bool,
+) -> gpui::AnyElement {
+    let on_toggle = frame.on_prompt_toggle.clone();
+    let copied = text.to_string();
+    let mut bubble = ChatBubble::new("transcript-prompt", text.to_string())
+        .meta_label(meta_label.to_string())
+        .on_copy(move |_, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(copied.clone()));
+        })
+        .collapse_after(PROMPT_COLLAPSE_LINES)
+        .expanded(expanded)
+        .on_toggle(move |open, window, cx| on_toggle(open, window, cx));
+    if let Some(time) = time {
+        bubble = bubble.time(time.to_string());
+    }
+    div()
+        .w_full()
+        .pb(px(PROMPT_GAP_PX))
+        .font(sans(&frame.theme, FontWeight::NORMAL))
+        .child(bubble)
+        .into_any_element()
+}
+
 /// One `ch` of the terminal face (JetBrains Mono advances 0.6em).
 const TERM_CH_PX: f32 = TERM_FONT_PX * 0.6;
 
@@ -1145,6 +1212,18 @@ fn body_signature(body: &RowBody) -> u64 {
             kind.hash(&mut hasher);
             text.hash(&mut hasher);
             tone_tag(*tone).hash(&mut hasher);
+        }
+        RowBody::Prompt {
+            text,
+            meta_label,
+            time,
+            expanded,
+        } => {
+            16u8.hash(&mut hasher);
+            text.hash(&mut hasher);
+            meta_label.hash(&mut hasher);
+            time.hash(&mut hasher);
+            expanded.hash(&mut hasher);
         }
     }
     hasher.finish()

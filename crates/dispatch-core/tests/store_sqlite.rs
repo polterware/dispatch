@@ -197,7 +197,7 @@ fn conversation_migration_from_0005() {
     assert_eq!(old.session_id, "worker-session");
     assert_eq!(old.conversation_id, "");
     assert_eq!(old.caller_agent, "");
-    assert_eq!(count(&s, "PRAGMA user_version"), 6);
+    assert_eq!(count(&s, "PRAGMA user_version"), 7);
     assert_eq!(
         count(
             &s,
@@ -208,6 +208,63 @@ fn conversation_migration_from_0005() {
     drop(s);
     // Opening the database again must not rerun ALTER TABLE.
     Store::new(path.to_str().unwrap()).unwrap();
+}
+
+#[test]
+fn tier_speed_strength_migration_keeps_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dispatch.db");
+    let migrations = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/store/migrations");
+    {
+        let db = Connection::open(&path).unwrap();
+        for name in [
+            "0001_baseline.sql",
+            "0002_drop_verify.sql",
+            "0003_run_usage.sql",
+            "0004_run_subagent.sql",
+            "0005_run_role.sql",
+            "0006_conversations_sections.sql",
+        ] {
+            let body = std::fs::read_to_string(migrations.join(name)).unwrap();
+            db.execute_batch(&body).unwrap();
+        }
+        db.execute_batch(
+            "PRAGMA user_version=6;
+             INSERT INTO dispatch_tiers(name, provider, agent, model, speed, strength, position)
+             VALUES ('easy','openai','codex','gpt-5.4-mini',5,1,0),
+                    ('hard','anthropic','claude','opus',2,5,1)",
+        )
+        .unwrap();
+    }
+    let s = Store::new(path.to_str().unwrap()).unwrap();
+    assert_eq!(count(&s, "PRAGMA user_version"), 7);
+    assert_eq!(
+        count(
+            &s,
+            "SELECT COUNT(*) FROM pragma_table_info('dispatch_tiers') WHERE name IN ('speed','strength')"
+        ),
+        0
+    );
+    let tiers = s.list_tiers().unwrap();
+    assert_eq!(
+        tiers,
+        vec![
+            types::Tier {
+                name: "easy".into(),
+                provider: "openai".into(),
+                agent: "codex".into(),
+                model: "gpt-5.4-mini".into(),
+                position: 0,
+            },
+            types::Tier {
+                name: "hard".into(),
+                provider: "anthropic".into(),
+                agent: "claude".into(),
+                model: "opus".into(),
+                position: 1,
+            },
+        ]
+    );
 }
 
 #[test]

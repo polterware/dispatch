@@ -113,8 +113,8 @@ message DispatchTier {
   string provider = 2;
   string agent = 3;
   string model = 4;
-  int32 speed = 5;
-  int32 strength = 6;
+  reserved 5, 6;
+  reserved "speed", "strength";
   int32 position = 7;
 }
 

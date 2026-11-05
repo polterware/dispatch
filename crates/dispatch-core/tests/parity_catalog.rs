@@ -9,7 +9,6 @@ use std::path::Path;
 
 const EFFORT_THETA_STEP: f64 = 0.15;
 const UNKNOWN_THETA: f64 = -0.7;
-const STRENGTH_THETA_STEP: f64 = 0.35;
 const DEFAULT_TOKENS_PER_TASK: f64 = 40_000.0;
 
 fn near(a: f64, b: f64) -> bool {
@@ -31,7 +30,7 @@ fn test_embedded_catalog_resolves_the_default_table() {
     let table = default_tiers().expect("default_tiers");
     for entries in table.tiers.values() {
         for e in entries {
-            let est = c.estimate(&e.model, "", e.strength);
+            let est = c.estimate(&e.model, "");
             assert_ne!(
                 est.theta_source, "unknown",
                 "{}/{}: {est:?}",
@@ -80,13 +79,13 @@ fn test_estimate_uses_the_level_then_the_nearest_one() {
         ..Default::default()
     };
 
-    let high = c.estimate("m-high", "", 0);
+    let high = c.estimate("m-high", "");
     assert_eq!(high.extrapolated_levels, 0);
     assert_eq!(high.theta_source, "cursorbench high");
     assert_eq!(high.cost_per_task, Some(3.0));
     assert!(near(high.theta, logit(0.6)));
 
-    let xhigh = c.estimate("m", "xhigh", 0);
+    let xhigh = c.estimate("m", "xhigh");
     assert_eq!(xhigh.extrapolated_levels, 1);
     assert!(xhigh.theta_source.contains("nearest to xhigh"));
     assert!(near(xhigh.theta, logit(0.6) + EFFORT_THETA_STEP));
@@ -96,23 +95,23 @@ fn test_estimate_uses_the_level_then_the_nearest_one() {
             .is_some_and(|cost| near(cost, 3.0 * 2.5 / 1.6))
     );
 
-    let f = c.estimate("openai/flat", "low", 0);
+    let f = c.estimate("openai/flat", "low");
     assert_eq!(f.theta_source, "cursorbench");
     assert!(near(f.theta, logit(0.3)));
 
-    let s = c.estimate("m-build-fast", "medium", 0);
+    let s = c.estimate("m-build-fast", "medium");
     assert_eq!(s.theta_source, "cursorbench medium (as m)");
 
-    let s = c.estimate("priced", "medium", 5);
-    assert_eq!(s.theta_source, "tiers.json strength");
-    assert!(near(s.theta, UNKNOWN_THETA + 2.0 * STRENGTH_THETA_STEP));
+    let s = c.estimate("priced", "medium");
+    assert_eq!(s.theta_source, "unknown");
+    assert!(near(s.theta, UNKNOWN_THETA));
     assert_eq!(s.cost_source, "models.dev price");
     assert!(s.cost_per_task.is_some_and(|cost| near(
         cost,
         (3.0 * 4.0 + 8.0) / 4.0 * DEFAULT_TOKENS_PER_TASK / 1e6
     )));
 
-    let u = c.estimate("nothing", "", 0);
+    let u = c.estimate("nothing", "");
     assert_eq!(u.theta_source, "unknown");
     assert_eq!(u.cost_per_task, None);
 }
@@ -152,12 +151,8 @@ fn test_estimate_shifts_unmeasured_efforts_from_medium() {
         ..Default::default()
     };
 
-    for (model, strength, source) in [
-        ("eci-only", 0, "eci"),
-        ("prior", 5, "tiers.json strength"),
-        ("unknown", 0, "unknown"),
-    ] {
-        let medium = cat.estimate(model, "medium", strength);
+    for (model, source) in [("eci-only", "eci"), ("unknown", "unknown")] {
+        let medium = cat.estimate(model, "medium");
         for (effort, levels) in [
             ("low", -1i32),
             ("medium", 0),
@@ -165,7 +160,7 @@ fn test_estimate_shifts_unmeasured_efforts_from_medium() {
             ("xhigh", 2),
             ("max", 3),
         ] {
-            let est = cat.estimate(model, effort, strength);
+            let est = cat.estimate(model, effort);
             assert_eq!(est.theta_source, source, "{source}/{effort}: {est:?}");
             assert!(
                 near(

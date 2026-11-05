@@ -377,9 +377,6 @@ pub fn score_detail(row: &ModelRow, catalog: &Catalog) -> ScoreDetail {
         }
     } else if source.starts_with("eci") {
         "No CursorBench run: its Epoch Capabilities Index, put on CursorBench's scale by a line fitted on the models that have both.".to_string()
-    } else if source == "tiers.json strength" {
-        "No benchmark knows it: the tier table's strength, \u{2212}0.7 and 0.35 a step from 3."
-            .to_string()
     } else {
         "No benchmark knows it: the field's middle, \u{03b8} \u{2212}0.7.".to_string()
     };
@@ -496,8 +493,6 @@ pub fn theta_source_label(source: &str, score: Option<f64>) -> String {
             None => "ECI".to_string(),
         };
         join_head(&head, rest.trim())
-    } else if source == "tiers.json strength" {
-        "Tier strength".to_string()
     } else {
         "Unknown (median)".to_string()
     }
@@ -518,8 +513,6 @@ pub fn theta_family(source: &str) -> String {
         "CursorBench".to_string()
     } else if source.starts_with("eci") {
         "ECI".to_string()
-    } else if source == "tiers.json strength" {
-        "Tier strength".to_string()
     } else {
         "Unknown".to_string()
     }
@@ -820,7 +813,7 @@ pub fn model_filter_fields(rows: &[ModelRow], discover: bool) -> [FilterSpec; 4]
             "Skill source",
             distinct(
                 rows.iter().map(|row| theta_family(&row.entry.theta_source)),
-                &["CursorBench", "ECI", "Tier strength", "Unknown"],
+                &["CursorBench", "ECI", "Unknown"],
             ),
         ),
         FilterSpec::multi(
@@ -1015,10 +1008,6 @@ mod tests {
         assert_eq!(
             theta_source_label("eci (as gpt-5.6)", Some(141.2)),
             "ECI 141 (as gpt-5.6)"
-        );
-        assert_eq!(
-            theta_source_label("tiers.json strength", None),
-            "Tier strength"
         );
         assert_eq!(theta_source_label("unknown", None), "Unknown (median)");
     }

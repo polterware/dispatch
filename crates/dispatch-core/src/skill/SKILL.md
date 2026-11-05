@@ -6,7 +6,7 @@ description: Delegate a task to another coding agent (Codex, Claude Code, Cursor
 # dispatch
 
 `dispatch run` routes a task to an installed agent CLI and returns a compact result.
-With no `--tier` and a classifier on (`dispatch config set classifier jev|openai|cli`), **Auto** asks the classifier how hard the task is, then weighs each model's chance to do it (from public benchmarks: CursorBench, else the Epoch Capabilities Index), its cost, and the account's quota, and picks the cheapest model likely to succeed. `--tier` routes that tier's table instead: its first model, or the next one when that account's quota is low (90% used, or running out before it resets) or rate limited. The core falls back when an agent fails.
+With no `--tier` and a classifier on (`dispatch config set classifier jev|openai|cli`), **Auto** asks the classifier how hard the task is, then weighs each model's chance to do it (from public benchmarks: CursorBench, else the Epoch Capabilities Index), its cost, and the account's quota, and picks the cheapest model likely to succeed. If none meets the priority's bound, it picks the cheapest within 0.02 of the best bound. `--tier` routes that tier's table instead: its first model, or the next one when that account's quota is low (90% used, or running out before it resets) or rate limited. The core falls back when an agent fails. Routing reads only the model catalog's benchmarks (CursorBench, ECI, and models.dev prices), the classifier, and the CLIs' quota; a model no benchmark rates counts as mid-field.
 You are the conductor: delegate, read short summaries, integrate.
 
 ## When to delegate

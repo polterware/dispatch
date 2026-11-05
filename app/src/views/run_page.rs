@@ -31,7 +31,7 @@ use crate::motion::{Animator, SpringTier, SpringValue};
 use crate::state::{AppState, ConnectionState, Route, observe};
 use crate::theme::{Theme, status_tone, tw};
 use crate::ui::ellipsis;
-use crate::ui::parts::run_page::{context_meter, file_change_line, prompt_text};
+use crate::ui::parts::run_page::{context_meter, file_change_line};
 use crate::ui::patterns::trailing_toolbar;
 use crate::ui::{
     Button, ButtonKind, ButtonSize, Icon, MascotMood, Menu, MenuEntry, PageWidth, RailGroup,
@@ -70,7 +70,6 @@ pub struct RunPageView {
     transcript: Entity<super::transcript::TranscriptView>,
     transcript_run: String,
     agent: Entity<RailGroup>,
-    prompt: Entity<RailGroup>,
     run_section: Entity<RailGroup>,
     routing: Entity<RailGroup>,
     changes: Entity<RailGroup>,
@@ -119,11 +118,10 @@ impl RunPageView {
             .update(cx, |transcript, cx| transcript.scroll_by(y, cx));
     }
 
-    /// Folds the Agent and Prompt groups, so the run's properties show (the screenshot tour).
-    pub(crate) fn fold_rail_heads(&mut self, cx: &mut Context<Self>) {
-        for group in [&self.agent, &self.prompt] {
-            group.update(cx, |group, cx| group.set_open(false, cx));
-        }
+    /// Folds the Agent group, so the run's properties show (the screenshot tour).
+    pub(crate) fn fold_agent_group(&mut self, cx: &mut Context<Self>) {
+        self.agent
+            .update(cx, |section, cx| section.set_open(false, cx));
         cx.notify();
     }
 
@@ -137,7 +135,6 @@ impl RunPageView {
             super::transcript::TranscriptView::new(state.clone(), run_id.clone(), false, cx)
         });
         let agent = cx.new(|cx| RailGroup::new("Agent", Icon::Bot, cx));
-        let prompt = cx.new(|cx| RailGroup::new("Prompt", Icon::FileText, cx));
         let run_section = cx.new(|cx| RailGroup::new("Run", Icon::InformationCircle, cx));
         let routing = cx.new(|cx| RailGroup::new("Routing", Icon::Route, cx));
         let changes = cx.new(|cx| RailGroup::new("Changes", Icon::FileDiff, cx));
@@ -154,7 +151,6 @@ impl RunPageView {
             transcript,
             transcript_run: run_id,
             agent,
-            prompt,
             run_section,
             routing,
             changes,
@@ -195,7 +191,6 @@ impl RunPageView {
     fn install_bodies(&mut self, cx: &mut Context<Self>) {
         let weak = cx.weak_entity();
         bind_body(&self.agent, weak.clone(), paint_agent, cx);
-        bind_body(&self.prompt, weak.clone(), paint_prompt, cx);
         bind_body(&self.run_section, weak.clone(), paint_run, cx);
         bind_body(&self.routing, weak.clone(), paint_routing, cx);
         bind_body(&self.changes, weak.clone(), paint_changes, cx);
@@ -588,7 +583,7 @@ impl RunPageView {
             let open = weak.clone();
             let id = run.id.clone();
             row = row.child(
-                Button::new("run-cancel", ButtonKind::Ghost)
+                Button::new("run-cancel", ButtonKind::Danger)
                     .size(ButtonSize::Sm)
                     .icon(Icon::Stop)
                     .icon_size(12.0)
@@ -791,12 +786,6 @@ impl Render for RunPageView {
         }
         self.step_motion(window);
 
-        let prompt = self
-            .snapshot_run
-            .as_ref()
-            .map(|run| run.prompt.trim().to_string())
-            .unwrap_or_default();
-        let show_prompt = !prompt.is_empty();
         let show_routing = self.decision.is_some();
         let show_linked = !self.snapshot_links.is_empty();
         if let Some(run) = self.snapshot_run.clone() {
@@ -840,7 +829,6 @@ impl Render for RunPageView {
         let mut drawer = None;
         let body = if self.snapshot_run.is_some() {
             let agent = self.agent.clone();
-            let prompt_section = self.prompt.clone();
             let run_section = self.run_section.clone();
             let routing = self.routing.clone();
             let changes = self.changes.clone();
@@ -850,7 +838,6 @@ impl Render for RunPageView {
                 .flex()
                 .flex_col()
                 .child(agent)
-                .when(show_prompt, |rail| rail.child(prompt_section))
                 .child(run_section)
                 .when(show_routing, |rail| rail.child(routing))
                 .child(changes)
@@ -1122,14 +1109,6 @@ fn current_title(run: &DispatchRun, card: &AttemptCard) -> String {
     } else {
         format!("{} / {provider}", card.title)
     }
-}
-
-fn paint_prompt(view: &WeakEntity<RunPageView>, window: &mut Window, cx: &mut App) -> AnyElement {
-    let _ = window;
-    let Some(pack) = read_pack(view, cx) else {
-        return div().into_any_element();
-    };
-    prompt_text(pack.run.prompt.trim(), *Theme::global(cx))
 }
 
 /// The Run group's properties: the run, its route, how long it took and how, its tokens,

@@ -11,7 +11,6 @@ use dispatch_core::{
     tiers_build::build_tiers,
     types::Store,
 };
-use std::collections::BTreeMap;
 
 fn auto_catalog() -> Catalog {
     Catalog {
@@ -82,8 +81,6 @@ fn test_default_covers_all_tiers() {
     assert_eq!(first_hard.provider, "google");
     assert_eq!(first_hard.agent, "antigravity");
     assert_eq!(first_hard.model, "gemini-4-argon-high");
-    assert_eq!(first_hard.speed, 3);
-    assert_eq!(first_hard.strength, 5);
 }
 
 #[test]
@@ -122,46 +119,6 @@ fn test_provider_efforts_compatibility() {
         !table.capability_problems(&known_adapters()).is_empty(),
         "effort accepted for CLI without control"
     );
-}
-
-#[test]
-fn test_speed_and_strength() {
-    let table = Table::parse(
-        r#"{"tiers":{"easy":[{"agent":"codex","model":"gpt-small","speed":5,"strength":1}]}}"#,
-    )
-    .expect("parse speed and strength");
-    assert_eq!(table.tiers["easy"][0].speed, 5);
-    assert_eq!(table.tiers["easy"][0].strength, 1);
-    assert!(table.field_problems().is_empty());
-
-    for body in [
-        r#"{"tiers":{"easy":[{"agent":"codex","model":"gpt-small","speed":6}]}}"#,
-        r#"{"tiers":{"easy":[{"agent":"codex","model":"gpt-small","strength":-1}]}}"#,
-    ] {
-        let err = Table::parse(body)
-            .expect_err("expected out of range error")
-            .to_string();
-        assert!(err.contains("out of range"), "accepted {body}: {err}");
-    }
-
-    let omitted =
-        Table::parse(r#"{"tiers":{"easy":[{"agent":"codex","model":"gpt-small"}]}}"#).expect("ok");
-    assert_eq!(omitted.tiers["easy"][0].speed, 0);
-    assert_eq!(omitted.tiers["easy"][0].strength, 0);
-
-    let hand = Table {
-        tiers: BTreeMap::from([(
-            "hard".into(),
-            vec![Entry {
-                agent: "a".into(),
-                model: "m".into(),
-                speed: 9,
-                strength: 0,
-                ..Default::default()
-            }],
-        )]),
-    };
-    assert_eq!(hand.field_problems().len(), 1);
 }
 
 #[test]

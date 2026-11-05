@@ -265,8 +265,6 @@ pub struct Tier {
     pub provider: String,
     pub agent: String,
     pub model: String,
-    pub speed: i64,
-    pub strength: i64,
     pub position: i64,
 }
 

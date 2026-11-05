@@ -865,7 +865,7 @@ pub(super) async fn tiers(db_path: &Path, args: &[String]) -> CliResult {
             .map(|t| {
                 json!({
                     "Name": t.name, "Provider": t.provider, "Agent": t.agent, "Model": t.model,
-                    "Speed": t.speed, "Strength": t.strength, "Position": t.position,
+                    "Position": t.position,
                 })
             })
             .collect();
@@ -878,13 +878,11 @@ pub(super) async fn tiers(db_path: &Path, args: &[String]) -> CliResult {
     }
     for t in &res.tiers {
         println!(
-            "{:<6}  {:<12}  {:<24}  provider={}  speed={}  strength={}",
+            "{:<6}  {:<12}  {:<24}  provider={}",
             t.name,
             t.agent,
             t.model,
-            or_unknown(&t.provider),
-            t.speed,
-            t.strength
+            or_unknown(&t.provider)
         );
     }
     Ok(())

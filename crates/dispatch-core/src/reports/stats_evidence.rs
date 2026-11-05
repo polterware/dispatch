@@ -15,21 +15,6 @@ pub struct ModelEvidence {
     pub p50_ms: Option<i64>,
 }
 
-impl From<&ModelEvidence> for crate::router::Evidence {
-    fn from(e: &ModelEvidence) -> Self {
-        Self {
-            duration_n: e.duration_n,
-            p50_ms: e.p50_ms,
-        }
-    }
-}
-
-impl From<ModelEvidence> for crate::router::Evidence {
-    fn from(e: ModelEvidence) -> Self {
-        Self::from(&e)
-    }
-}
-
 pub fn evidence_key(tier: &str, model: &str) -> String {
     format!("{tier}\0{model}")
 }

@@ -10,6 +10,8 @@ use crate::format::prompt_first_line;
 
 pub const DISPLAY_PREFERENCE: &str = "pwdispatch.sidebar.display";
 pub const COLLAPSED_PREFERENCE: &str = "pwdispatch.sidebar.collapsed";
+/// Each run's mark as its page last showed it, so a row says when it changed since.
+pub const SEEN_PREFERENCE: &str = "pwdispatch.sidebar.seen";
 
 /// How long a pointer must rest on a run before its transcript card opens: long enough that
 /// passing down the list opens nothing, short enough that a pause still does.
@@ -146,6 +148,22 @@ pub struct SidebarRun {
     pub worktree_status: String,
     pub conversation_id: String,
     pub caller_agent: String,
+}
+
+/// What a run last changed to: its status, and when it ended and merged.
+pub fn run_mark(run: &SidebarRun) -> String {
+    format!(
+        "{}|{}|{}",
+        run.status.trim().to_ascii_lowercase(),
+        run.finished_at.trim(),
+        run.merged_at.trim()
+    )
+}
+
+/// Whether a run has an update its page has not shown: it is no longer working, and it ended,
+/// failed, or merged since its page was last open. A working run has nothing to read yet.
+pub fn has_unseen_update(run: &SidebarRun, seen: &HashMap<String, String>) -> bool {
+    !crate::models::runs::is_run_active(&run.status) && seen.get(&run.id) != Some(&run_mark(run))
 }
 
 impl SidebarRun {
@@ -689,6 +707,21 @@ fn local_ymd(ms: i64) -> (i32, i32, i32) {
     }
 }
 
+/// `HH:MM` on this computer's clock for an ISO timestamp, or `None` when it does not parse.
+pub fn local_clock(value: &str) -> Option<String> {
+    let ms = timestamp_ms(value);
+    if ms == 0 {
+        return None;
+    }
+    let secs = ms.div_euclid(1000) as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let parsed = unsafe { libc::localtime_r(&secs, &mut tm) };
+    if parsed.is_null() {
+        return None;
+    }
+    Some(format!("{:02}:{:02}", tm.tm_hour, tm.tm_min))
+}
+
 fn format_utc_iso(ms: i64) -> String {
     let secs = ms.div_euclid(1000);
     let millis = ms.rem_euclid(1000);
@@ -726,8 +759,34 @@ fn civil_from_days(days: i64) -> (i32, i32, i32) {
 mod tests {
     use super::{
         Direction, GroupBy, RunsNotice, Show, SidebarDisplay, SidebarRun, SortBy, format_utc_iso,
-        group_sidebar_runs, local_unix_ms, parse_sidebar_display, runs_notice, timestamp_ms,
+        group_sidebar_runs, has_unseen_update, local_clock, local_unix_ms, parse_sidebar_display,
+        run_mark, runs_notice, timestamp_ms,
     };
+
+    #[test]
+    fn a_run_shows_an_update_until_its_page_shows_it() {
+        let mut seen = std::collections::HashMap::new();
+        let working = run("r1", |r| r.status = "running".into());
+        assert!(
+            !has_unseen_update(&working, &seen),
+            "nothing to read while it works"
+        );
+        let done = run("r1", |r| r.finished_at = "2026-11-04T10:00:00Z".into());
+        assert!(
+            has_unseen_update(&done, &seen),
+            "it ended and its page was not open"
+        );
+        seen.insert(done.id.clone(), run_mark(&done));
+        assert!(!has_unseen_update(&done, &seen), "its page showed the end");
+        let merged = run("r1", |r| {
+            r.finished_at = "2026-11-04T10:00:00Z".into();
+            r.merged_at = "2026-11-04T10:05:00Z".into();
+        });
+        assert!(
+            has_unseen_update(&merged, &seen),
+            "a merge after that is news"
+        );
+    }
 
     #[test]
     fn an_empty_list_says_one_thing() {
@@ -1126,5 +1185,15 @@ mod tests {
             timestamp_ms("2026-11-02T11:00:00+02:00"),
             timestamp_ms("2026-11-02T09:00:00Z")
         );
+    }
+
+    #[test]
+    fn local_clock_reads_the_time_on_this_computers_clock() {
+        let ms = local_unix_ms(2026, 11, 2, 9, 30, 0);
+        assert_eq!(local_clock(&format_utc_iso(ms)).as_deref(), Some("09:30"));
+        let ms = local_unix_ms(2026, 11, 2, 0, 5, 0);
+        assert_eq!(local_clock(&format_utc_iso(ms)).as_deref(), Some("00:05"));
+        assert_eq!(local_clock(""), None);
+        assert_eq!(local_clock("broken"), None);
     }
 }

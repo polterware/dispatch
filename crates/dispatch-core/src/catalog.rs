@@ -431,7 +431,7 @@ impl Catalog {
         };
     }
 
-    pub fn estimate(&self, model: &str, effort: &str, strength: i32) -> ModelEstimate {
+    pub fn estimate(&self, model: &str, effort: &str) -> ModelEstimate {
         let effort = if effort.is_empty() {
             effort_of(model)
         } else {
@@ -484,12 +484,7 @@ impl Catalog {
         }
         if est.theta_source.is_empty() {
             est.theta = -0.7;
-            est.theta_source = if strength > 0 {
-                est.theta += f64::from(strength - 3) * 0.35;
-                "tiers.json strength".into()
-            } else {
-                "unknown".into()
-            };
+            est.theta_source = "unknown".into();
         }
         if !est.theta_source.starts_with("cursorbench")
             && let Some(r) = rank(effort)

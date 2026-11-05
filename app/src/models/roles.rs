@@ -30,8 +30,6 @@ pub struct TierCardInput {
     pub agent: String,
     pub model: String,
     pub provider: String,
-    pub speed: i32,
-    pub strength: i32,
 }
 
 impl TierCardInput {
@@ -40,8 +38,6 @@ impl TierCardInput {
             agent: tier.agent.clone(),
             model: tier.model.clone(),
             provider: tier.provider.clone(),
-            speed: tier.speed,
-            strength: tier.strength,
         }
     }
 }
@@ -138,8 +134,6 @@ pub fn place_tier_card(
             agent: card.agent.clone(),
             model: card.model.clone(),
             provider: card.provider.clone(),
-            speed: card.speed,
-            strength: card.strength,
         },
     );
     flatten(&columns)
@@ -355,8 +349,6 @@ pub fn role_board_tiers(profile: &RoleProfile) -> Vec<DispatchTier> {
                 agent: entry.agent.clone(),
                 model: entry.model.clone(),
                 provider: entry.provider.clone(),
-                speed: 0,
-                strength: 0,
                 position: next,
             }
         })
@@ -831,8 +823,6 @@ pub fn palette_card(model: &PaletteModel) -> TierCardInput {
         agent: model.agent.clone(),
         model: model.model.clone(),
         provider: model.provider.clone(),
-        speed: 0,
-        strength: 0,
     }
 }
 
@@ -981,8 +971,6 @@ mod tests {
             agent: agent.to_string(),
             model: model.to_string(),
             provider: String::new(),
-            speed: 0,
-            strength: 0,
         }
     }
 
@@ -1048,8 +1036,6 @@ mod tests {
                 agent: "codex".into(),
                 model: "z".into(),
                 provider: "openai".into(),
-                speed: 0,
-                strength: 0,
             },
             &TierSlot {
                 tier: "normal".into(),

@@ -37,7 +37,7 @@ pub fn pass_probability(theta: f64, d: f64, uncertainty: f64) -> (f64, f64) {
     (sigmoid(theta - d), sigmoid(theta - d - uncertainty))
 }
 pub fn theta_uncertainty(source: &str, extrapolated_levels: usize) -> f64 {
-    let base = if source == "unknown" || source == "tiers.json strength" {
+    let base = if source == "unknown" {
         0.8
     } else if source.starts_with("eci") {
         0.5

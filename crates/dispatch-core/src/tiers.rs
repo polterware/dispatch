@@ -8,10 +8,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
 
-fn is_zero_i32(v: &i32) -> bool {
-    *v == 0
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Entry {
@@ -23,10 +19,6 @@ pub struct Entry {
     pub effort: String,
     pub agent: String,
     pub model: String,
-    #[serde(skip_serializing_if = "is_zero_i32")]
-    pub speed: i32,
-    #[serde(skip_serializing_if = "is_zero_i32")]
-    pub strength: i32,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -210,8 +202,6 @@ pub fn table_from_rows(rows: &[Tier]) -> Table {
             agent: r.agent,
             model,
             effort,
-            speed: r.speed as i32,
-            strength: r.strength as i32,
             efforts: Vec::new(),
         });
     }
@@ -259,8 +249,6 @@ impl Table {
                         provider,
                         agent: e.agent.clone(),
                         model: stored_model(e),
-                        speed: i64::from(e.speed),
-                        strength: i64::from(e.strength),
                         position: i as i64,
                     });
                 }
@@ -271,22 +259,6 @@ impl Table {
 
     pub fn from_rows(rows: &[Tier]) -> Self {
         table_from_rows(rows)
-    }
-
-    pub fn field_problems(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        for (tier, entries) in &self.tiers {
-            for e in entries {
-                if e.speed != 0 && !(1..=5).contains(&e.speed) {
-                    out.push(format!("{tier}: speed {} out of range 1-5", e.speed));
-                }
-                if e.strength != 0 && !(1..=5).contains(&e.strength) {
-                    out.push(format!("{tier}: strength {} out of range 1-5", e.strength));
-                }
-            }
-        }
-        out.sort();
-        out
     }
 
     pub fn capability_problems<A: CapabilityAdapter>(&self, adapters: &[A]) -> Vec<String> {
@@ -364,10 +336,6 @@ impl Table {
                     )));
                 }
             }
-        }
-        let problems = self.field_problems();
-        if !problems.is_empty() {
-            return Err(Error::Message(problems.join("; ")));
         }
         Ok(self)
     }

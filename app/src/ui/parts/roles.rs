@@ -9,45 +9,7 @@ use crate::models::roles::{
     instructions_preview, role_tier, tier_column_label, when_display,
 };
 use crate::theme::{StatusTone, Theme};
-use crate::ui::{chip, progress_bar_sm, sans, segment_display, tabular};
-
-/// `TierMeter`: speed or strength, 1–5, as label, a small `ProgressBar`, and `n/5` on the
-/// `56px minmax(0, 1fr) 28px` grid. Zero means the table does not say.
-pub fn tier_meter(label: &'static str, value: i32, fill: gpui::Rgba, cx: &App) -> impl IntoElement {
-    let theme = Theme::global(cx);
-    let shown = value.clamp(0, 5);
-    let fraction = shown as f32 / 5.0;
-    let readout = if value > 0 {
-        format!("{shown}/5")
-    } else {
-        "—".to_string()
-    };
-    let text = |el: gpui::Div| {
-        el.flex_none()
-            .text_size(px(11.0))
-            .line_height(px(11.0 * 1.5))
-            .text_color(theme.color_text_secondary)
-    };
-    div()
-        .flex()
-        .items_center()
-        .gap(px(8.0))
-        .child(text(div()).w(px(56.0)).child(label))
-        .child(
-            div()
-                .flex_1()
-                .min_w(px(0.0))
-                .child(progress_bar_sm(fraction, fill, cx)),
-        )
-        .child(
-            text(div())
-                .w(px(28.0))
-                .flex()
-                .justify_end()
-                .font(tabular(sans(theme, gpui::FontWeight::NORMAL)))
-                .child(readout),
-        )
-}
+use crate::ui::{chip, segment_display};
 
 pub fn order_mark(row: usize, theme: &Theme, cx: &App) -> impl IntoElement {
     div()

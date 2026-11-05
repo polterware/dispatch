@@ -123,7 +123,6 @@ pub fn build_tiers_n(
             .map(|e| Candidate {
                 model: e.model.clone(),
                 effort: e.effort.clone(),
-                strength: e.strength,
                 ..Default::default()
             })
             .collect();
@@ -144,7 +143,7 @@ pub fn build_tiers_n(
         let mut bases = HashSet::new();
         for i in order {
             let e = &expanded[i];
-            let estimate = cat.estimate(&e.model, &priced[i].effort, e.strength);
+            let estimate = cat.estimate(&e.model, &priced[i].effort);
             let base = if estimate.matched.is_empty() {
                 catalog_key(&e.model)
             } else {

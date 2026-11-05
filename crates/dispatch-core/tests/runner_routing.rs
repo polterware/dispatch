@@ -419,14 +419,10 @@ fn priority_deps() -> Routing {
         vec![
             Entry {
                 provider: "openai".into(),
-                speed: 5,
-                strength: 1,
                 ..entry("a", "fast")
             },
             Entry {
                 provider: "google".into(),
-                speed: 1,
-                strength: 5,
                 ..entry("b", "strong")
             },
         ],
@@ -434,8 +430,8 @@ fn priority_deps() -> Routing {
     r
 }
 
-/// Ranks the normal tier by score, as a filtered route does, so the priority
-/// weights stay measurable apart from the tier's table order.
+/// Ranks the normal tier by score, as a filtered route does, apart from the
+/// tier's table order.
 async fn ranked_for_priority(r: &Routing, priority: &str) -> Vec<Candidate> {
     let (cs, _) = r
         .select(Options {
@@ -450,7 +446,7 @@ async fn ranked_for_priority(r: &Routing, priority: &str) -> Vec<Candidate> {
 }
 
 #[tokio::test]
-async fn test_priority_routes_different_models() {
+async fn test_priority_reads_no_hand_set_prior() {
     let r = priority_deps();
     let route = |priority: &'static str| {
         let deps = r.t.deps.clone();
@@ -478,20 +474,20 @@ async fn test_priority_routes_different_models() {
             "{priority}: tier route left the table order: {w:?}"
         );
     }
+    // With equal quota a ranked route keeps the table order under every
+    // priority: nothing but quota, cooldowns, and bias reorders it.
+    for priority in [PRIORITY_SPEED, PRIORITY_QUALITY, PRIORITY_BALANCED] {
+        let ranked = ranked_for_priority(&r, priority).await;
+        assert!(
+            ranked[0].agent() == "a" && ranked[0].model() == "fast",
+            "{priority}: {ranked:?}"
+        );
+    }
     let speed = ranked_for_priority(&r, PRIORITY_SPEED).await;
-    assert!(
-        speed[0].agent() == "a" && speed[0].model() == "fast",
-        "{speed:?}"
-    );
     let reason = router::reason(&speed[0].route);
     assert!(
-        reason.contains("paceSlack=") && reason.contains("duration="),
+        reason.contains("paceSlack=") && !reason.contains("duration"),
         "{reason}"
-    );
-    let quality = ranked_for_priority(&r, PRIORITY_QUALITY).await;
-    assert!(
-        quality[0].agent() == "b" && quality[0].model() == "strong",
-        "{quality:?}"
     );
     let o = |p: &str| Options {
         tier: "normal".into(),
@@ -520,87 +516,6 @@ async fn test_priority_routes_different_models() {
         sum.requested.unwrap().priority == PRIORITY_QUALITY
             && sum.resolved.unwrap().priority == PRIORITY_QUALITY
     );
-}
-
-#[tokio::test]
-async fn test_measured_evidence_overrides_prior_after_min_samples() {
-    let mut r = priority_deps();
-    let row = r.t.deps.table.tiers.get_mut("normal").unwrap();
-    row[0].speed = 1;
-    row[1].speed = 5;
-    let mut n = 0;
-    let mut seed = |tier: &str, model: &str, count: usize, ms: i64| {
-        for _ in 0..count {
-            n += 1;
-            r.t.store
-                .save_run(&Run {
-                    id: format!("e-{n}"),
-                    status: STATUS_COMPLETED.into(),
-                    tier: tier.into(),
-                    model: model.into(),
-                    run_ms: Some(ms),
-                    created_at: rfc(now()),
-                    finished_at: rfc(now()),
-                    ..Run::default()
-                })
-                .unwrap();
-        }
-    };
-    seed("hard", "fast", 8, 1000);
-    assert_eq!(
-        ranked_for_priority(&r, PRIORITY_SPEED).await[0].model(),
-        "strong",
-        "hard-tier samples changed the easy/normal prior"
-    );
-    let mut seed = |tier: &str, model: &str, count: usize, ms: i64| {
-        for _ in 0..count {
-            n += 1;
-            r.t.store
-                .save_run(&Run {
-                    id: format!("e-{n}"),
-                    status: STATUS_COMPLETED.into(),
-                    tier: tier.into(),
-                    model: model.into(),
-                    run_ms: Some(ms),
-                    created_at: rfc(now()),
-                    finished_at: rfc(now()),
-                    ..Run::default()
-                })
-                .unwrap();
-        }
-    };
-    seed("normal", "fast", 4, 1000);
-    seed("normal", "strong", 4, 600_000);
-    assert_eq!(
-        ranked_for_priority(&r, PRIORITY_SPEED).await[0].model(),
-        "strong",
-        "prior overridden before min samples"
-    );
-    let mut seed = |tier: &str, model: &str, ms: i64| {
-        n += 1;
-        r.t.store
-            .save_run(&Run {
-                id: format!("e-{n}"),
-                status: STATUS_COMPLETED.into(),
-                tier: tier.into(),
-                model: model.into(),
-                run_ms: Some(ms),
-                created_at: rfc(now()),
-                finished_at: rfc(now()),
-                ..Run::default()
-            })
-            .unwrap();
-    };
-    seed("normal", "fast", 1000);
-    seed("normal", "strong", 600_000);
-    let top = ranked_for_priority(&r, PRIORITY_SPEED).await.remove(0);
-    let reason = router::reason(&top.route);
-    assert!(
-        top.model() == "fast" && reason.contains("blended"),
-        "{} {reason}",
-        top.model()
-    );
-    r.fakes.clear();
 }
 
 #[tokio::test]
@@ -642,9 +557,6 @@ async fn test_priority_does_not_bypass_constraints() {
         ..Capabilities::default()
     });
     r.set(fakes);
-    let row = r.t.deps.table.tiers.get_mut("normal").unwrap();
-    row[0].strength = 5;
-    row[1].strength = 1;
     let (cs, why) = r
         .select(o(filters(|f| f.priority = PRIORITY_QUALITY.into()), true))
         .await;

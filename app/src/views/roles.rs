@@ -34,7 +34,7 @@ use crate::theme::{StatusTone, Theme, mix, tw};
 use crate::ui::ellipsis;
 use crate::ui::hang::hang;
 use crate::ui::parts::roles::{
-    build_sections, muted_note, order_mark, role_board_note, role_summary, tier_meter,
+    build_sections, muted_note, order_mark, role_board_note, role_summary,
 };
 use crate::ui::patterns::{
     Property, PropertyOption, PropertyPills, PropertyPillsEvent, composer_card, composer_field,
@@ -191,6 +191,7 @@ impl RolesView {
                 TextInput::new(cx)
                     .bare()
                     .title()
+                    .wrap()
                     .placeholder("Name, such as reviewer")
                     .on_submit(move |_, _, cx| {
                         submit.update(cx, |this, cx| this.submit_composer(cx));
@@ -206,6 +207,7 @@ impl RolesView {
             cx.new(move |cx| {
                 TextInput::new(cx)
                     .description()
+                    .wrap()
                     .placeholder("Instructions put before every task it takes")
                     .on_submit(move |_, _, cx| {
                         submit.update(cx, |this, cx| this.submit_composer(cx));
@@ -220,6 +222,7 @@ impl RolesView {
             cx.new(move |cx| {
                 TextInput::new(cx)
                     .inline()
+                    .wrap()
                     .placeholder("The tasks it fits, for the classifier that picks it")
                     .on_cancel(move |_, cx| {
                         cancel.update(cx, |this, cx| this.close_composer(cx));
@@ -231,6 +234,7 @@ impl RolesView {
             cx.new(move |cx| {
                 TextInput::new(cx)
                     .inline()
+                    .wrap()
                     .placeholder("Such as 15m; empty uses the default")
                     .on_cancel(move |_, cx| {
                         cancel.update(cx, |this, cx| this.close_composer(cx));
@@ -1178,8 +1182,6 @@ impl RolesView {
                 agent,
                 model,
                 provider: String::new(),
-                speed: 0,
-                strength: 0,
             },
             cx,
         );
@@ -2068,7 +2070,7 @@ impl RolesView {
     }
 
     /// `TierCard`: the shared `Card` with the model leading (two lines at most), the agent and
-    /// provider under it, Remove when editable, and the speed and strength meters at its foot.
+    /// provider under it, and Remove when editable.
     fn tier_card(
         &self,
         tier: &DispatchTier,
@@ -2142,29 +2144,7 @@ impl RolesView {
                     ),
             )
             .children(remove);
-        let meters = div()
-            .flex()
-            .flex_col()
-            .gap(px(6.0))
-            .pt(px(10.0))
-            .border_t_1()
-            .border_color(theme.color_border_subtle)
-            .child(tier_meter("Speed", tier.speed, theme.chart_blue, cx))
-            .child(tier_meter(
-                "Strength",
-                tier.strength,
-                theme.chart_violet,
-                cx,
-            ));
-        let mut body = div()
-            .flex_1()
-            .min_w(px(0.0))
-            .flex()
-            .flex_col()
-            .justify_between()
-            .gap(px(10.0))
-            .child(head)
-            .child(meters);
+        let mut body = div().flex_1().min_w(px(0.0)).flex().flex_col().child(head);
         if editable {
             let view = cx.entity().clone();
             body = body.cursor(CursorStyle::OpenHand).on_mouse_down(
