@@ -443,8 +443,7 @@ pub fn most_failed_detail(rank: &DispatchStatRank) -> String {
 }
 
 /// What each comparison ranking reads, for its card's tooltip.
-pub const SLOWEST_ABOUT: &str = "The median time of each model's completed runs, among models with at least 5. A model handed bigger tasks takes longer, so this reads your runs, not the model's speed.";
-pub const MOST_FAILED_ABOUT: &str = "Failed or timed-out runs, over the runs each model ended itself: cancels, orphans, and rate-limited ends are left out. Ranked by the failure rate's 95% lower bound, so a rate from few runs weighs less.";
+pub const SLOWEST_ABOUT: &str = "The median duration of completed runs for each model, among models with at least 5 completed runs. Failed, cancelled, timed-out, and still-running runs are excluded. Larger tasks take longer, so this describes your runs, not the model's speed.";
 
 /// The breakdown table's columns, in order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

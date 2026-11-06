@@ -1,6 +1,9 @@
 //! Spend: what Dispatch's runs used over the Spend window. The window's totals sit on top,
 //! then one card per agent that ran, dearest first, with its tokens and its API-equivalent
-//! cost. Account limits are the tiers' business, not this page's. The toolbar holds the search
+//! cost. Account limits are the tiers' business, not this page's. The page reloads on entry,
+//! filter changes, and observed app-state updates, with a two-second minimum between routine
+//! reloads (a changed window can reload sooner); stats arrive before agent CLI quota probes.
+//! Running runs are excluded by the stats report. The toolbar holds the search
 //! and the shared `FilterPopover` (Provider and the Spend window), whose pills sit in the
 //! `ActiveFilterBar`.
 

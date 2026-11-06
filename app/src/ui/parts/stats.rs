@@ -10,8 +10,8 @@ use gpui::{
 use crate::client::{DispatchStatRank, DispatchStatsRankings, DispatchStatsRow};
 use crate::models::sort::SortDirection;
 use crate::models::stats::{
-    MOST_FAILED_ABOUT, SLOWEST_ABOUT, STATS_COLUMNS, StatsColumn, compact_lines,
-    most_failed_detail, most_used_detail, plural, rank_is_known, rank_reason, slowest_detail,
+    SLOWEST_ABOUT, STATS_COLUMNS, StatsColumn, compact_lines, most_used_detail, plural,
+    rank_is_known, rank_reason, slowest_detail,
 };
 use crate::theme::{Theme, mix_oklab, tw};
 use crate::ui::data_table::{Column, DataTable, sans, tabular, text_width};
@@ -52,11 +52,11 @@ pub fn chart_color(theme: &Theme, index: usize) -> Rgba {
     }
 }
 
-/// The rankings' grid: four columns from a 1024px viewport, two from 640px, else one.
+/// The rankings' grid: three columns from a 1024px viewport, two from 640px, else one.
 pub fn ranking_grid(rankings: &DispatchStatsRankings, window: &Window, cx: &App) -> AnyElement {
     let viewport = f32::from(window.viewport_size().width);
     let columns = if viewport >= 1024.0 {
-        4
+        3
     } else if viewport >= 640.0 {
         2
     } else {
@@ -85,21 +85,12 @@ pub fn ranking_grid(rankings: &DispatchStatsRankings, window: &Window, cx: &App)
             cx,
         ))
         .child(ranking_card(
-            "Slowest model",
+            "Longest median run",
             Icon::Clock,
             TileTone::Observability,
             &rankings.slowest_model,
             slowest_detail,
             Some(SLOWEST_ABOUT),
-            cx,
-        ))
-        .child(ranking_card(
-            "Most failed model",
-            Icon::ThumbsDownIcon,
-            TileTone::Security,
-            &rankings.most_failed_model,
-            most_failed_detail,
-            Some(MOST_FAILED_ABOUT),
             cx,
         ))
         .into_any_element()
