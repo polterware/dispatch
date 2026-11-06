@@ -61,7 +61,7 @@ dispatch clean <id> [--force]  # discard the worktree
 dispatch worktrees [--prune]   # list leftover worktrees; --prune removes the ones with nothing to merge
 dispatch delete <id>... | --conversation <id>  # delete ended runs and the worktrees Dispatch cut for them
 dispatch rename <conversation-id> <name>  # name a conversation as the app shows it
-dispatch repo ls|add|rm        # the repositories Dispatch knows (same as dispatch workspace)
+dispatch repo ls|add|rm        # the repositories Dispatch knows (same as dispatch workspace); rm deletes their runs
 ```
 
 ## Roles

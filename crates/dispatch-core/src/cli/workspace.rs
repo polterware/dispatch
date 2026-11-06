@@ -13,7 +13,7 @@ const WORKSPACE_USAGE: &str = "usage: dispatch workspace ls [--json]
 
 const REPO_USAGE: &str = "usage: dispatch repo ls [--json]
        dispatch repo add <folder> [--name <name>]   (the git repository holding it)
-       dispatch repo rm <id>   (its runs stay, out of the app's list until it is added again)";
+       dispatch repo rm <id>   (deletes its runs and the worktrees Dispatch cut for them)";
 
 /// The word the command was called by: `workspace`, which agents and Polterware parse, keeps
 /// the Go binary's text; `repo` says the same in the app's words. The JSON is the same.
@@ -136,10 +136,21 @@ pub(super) async fn run_workspace(db_path: &Path, args: &[String], noun: Noun) -
             let [id] = positional.as_slice() else {
                 return Err(usage_err(noun.usage()));
             };
-            c.workspaces
+            let res = c
+                .workspaces
                 .remove_workspace(&pb::RemoveWorkspaceRequest { id: id.clone() })
                 .await?;
-            println!("removed {id}");
+            let runs = match res.deleted_runs {
+                0 => String::new(),
+                1 => " and its run".to_string(),
+                n => format!(" and its {n} runs"),
+            };
+            let worktrees = match res.removed_worktrees {
+                0 => String::new(),
+                1 => " (1 worktree)".to_string(),
+                n => format!(" ({n} worktrees)"),
+            };
+            println!("removed {id}{runs}{worktrees}");
             Ok(())
         }
         _ => Err(usage_err(noun.usage())),

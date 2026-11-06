@@ -994,7 +994,10 @@ pub struct RemoveWorkspaceRequest {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
-pub struct RemoveWorkspaceResponse {}
+pub struct RemoveWorkspaceResponse {
+    pub deleted_runs: i32,
+    pub removed_worktrees: i32,
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]

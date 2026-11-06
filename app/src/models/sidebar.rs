@@ -238,37 +238,11 @@ pub fn main_checkout(path: &str) -> String {
     if let Some(found) = seen.lock().ok().and_then(|seen| seen.get(path).cloned()) {
         return found;
     }
-    let found = read_main_checkout(path);
+    let found = dispatch_core::worktree::main_checkout(path);
     if let Ok(mut seen) = seen.lock() {
         seen.insert(path.to_string(), found.clone());
     }
     found
-}
-
-fn read_main_checkout(path: &str) -> String {
-    let dot_git = std::path::Path::new(path).join(".git");
-    if let Ok(text) = std::fs::read_to_string(&dot_git)
-        && let Some(gitdir) = text.trim().strip_prefix("gitdir:")
-    {
-        // `<main>/.git/worktrees/<name>`.
-        let gitdir = std::path::Path::new(gitdir.trim());
-        let gitdir = if gitdir.is_relative() {
-            std::path::Path::new(path).join(gitdir)
-        } else {
-            gitdir.to_path_buf()
-        };
-        if let Some(main_git) = gitdir.parent().and_then(|worktrees| {
-            (worktrees.file_name()? == "worktrees").then(|| worktrees.parent())?
-        }) && main_git.file_name().is_some_and(|name| name == ".git")
-            && let Some(main) = main_git.parent()
-        {
-            return main.to_string_lossy().into_owned();
-        }
-    }
-    if let Some((repo, _)) = path.split_once("/.dispatch/worktrees/") {
-        return repo.to_string();
-    }
-    path.to_string()
 }
 
 /// Joins each run to its workspace name. A missing workspace leaves the name empty

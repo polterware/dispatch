@@ -8,7 +8,7 @@ use crate::{
     pass_model::Area,
     proto as pb,
     store::{self, Workspace},
-    types::Section,
+    types::{Section, Store as _},
 };
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -280,7 +280,9 @@ impl Core {
         })
     }
 
-    /// Forgets a standalone folder; its runs stay in the store.
+    /// Forgets a standalone repository and deletes every run in it: the runs started in
+    /// it and the ones whose checkout, or worktree, belongs to it, with the worktrees
+    /// Dispatch cut. Nothing is removed while one of them is still working.
     pub(crate) async fn remove_workspace(
         &self,
         m: pb::RemoveWorkspaceRequest,
@@ -294,10 +296,36 @@ impl Core {
                 "a Polterware project's workspace follows the project",
             ));
         }
+        let ids: Vec<String> = self
+            .store
+            .list_runs("", 0, 0, "")
+            .map_err(RpcError::internal)?
+            .into_iter()
+            .filter(|run| run_in_repository(run, &ws))
+            .map(|run| run.id)
+            .collect();
+        let (mut deleted_runs, mut removed_worktrees) = (0, 0);
+        if !ids.is_empty() {
+            let res = self
+                .delete_runs(pb::DeleteRunsRequest {
+                    ids,
+                    ..Default::default()
+                })
+                .await?;
+            deleted_runs = res.deleted;
+            removed_worktrees = serde_json::from_str::<serde_json::Value>(&res.json)
+                .ok()
+                .and_then(|body| Some(body.get("worktrees")?.as_array()?.len()))
+                .and_then(|n| i32::try_from(n).ok())
+                .unwrap_or(0);
+        }
         self.store
             .delete_workspace(&ws.id)
             .map_err(RpcError::internal)?;
-        Ok(pb::RemoveWorkspaceResponse {})
+        Ok(pb::RemoveWorkspaceResponse {
+            deleted_runs,
+            removed_worktrees,
+        })
     }
 
     pub(crate) async fn resolve_workspace(
@@ -430,4 +458,17 @@ impl Core {
 fn clean_dir(dir: &str) -> &str {
     let trimmed = dir.trim_end_matches('/');
     if trimmed.is_empty() { "/" } else { trimmed }
+}
+
+/// Whether `run` belongs to the repository `ws`: started in it, or in a checkout or
+/// worktree of it (read from its folder or path, so a worktree that is gone still counts).
+fn run_in_repository(run: &crate::types::Run, ws: &Workspace) -> bool {
+    if run.project_id == ws.id {
+        return true;
+    }
+    let home = clean_dir(&ws.path);
+    [run.repo.as_str(), run.dir.as_str()]
+        .into_iter()
+        .find(|path| !path.trim().is_empty())
+        .is_some_and(|path| clean_dir(&crate::worktree::main_checkout(path)) == home)
 }

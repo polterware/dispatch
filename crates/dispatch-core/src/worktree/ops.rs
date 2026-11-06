@@ -63,6 +63,35 @@ pub fn main_root(dir: impl AsRef<Path>) -> String {
     root(dir)
 }
 
+/// The main checkout `path` belongs to, read from the files alone so a worktree that is
+/// gone still names its repository: a linked worktree's `.git` file points at
+/// `<main>/.git/worktrees/<name>`, and a Dispatch worktree lives under
+/// `<main>/.dispatch/worktrees/`. Anything else is its own checkout.
+pub fn main_checkout(path: &str) -> String {
+    let dot_git = Path::new(path).join(".git");
+    if let Ok(text) = std::fs::read_to_string(&dot_git)
+        && let Some(gitdir) = text.trim().strip_prefix("gitdir:")
+    {
+        let gitdir = Path::new(gitdir.trim());
+        let gitdir = if gitdir.is_relative() {
+            Path::new(path).join(gitdir)
+        } else {
+            gitdir.to_path_buf()
+        };
+        if let Some(main_git) = gitdir.parent().and_then(|worktrees| {
+            (worktrees.file_name()? == "worktrees").then(|| worktrees.parent())?
+        }) && main_git.file_name().is_some_and(|name| name == ".git")
+            && let Some(main) = main_git.parent()
+        {
+            return main.to_string_lossy().into_owned();
+        }
+    }
+    if let Some((repo, _)) = path.split_once("/.dispatch/worktrees/") {
+        return repo.to_string();
+    }
+    path.to_string()
+}
+
 /// Reports whether `HEAD` resolves (a worktree needs a commit).
 pub fn has_commits(root: impl AsRef<Path>) -> bool {
     git(root.as_ref(), &["rev-parse", "--verify", "HEAD"]).is_ok()

@@ -849,6 +849,39 @@ fn repo_is_workspace_in_repository_words_and_names_the_main_checkout() {
 }
 
 #[test]
+fn removing_a_repository_deletes_its_runs_and_their_worktrees() {
+    let env = Env::new();
+    let cut_run = env.run("WRITE a file", &[]);
+    let s = env.wait_for(&cut_run, "COMPLETED");
+    let cut = PathBuf::from(s["worktree"].as_str().expect("worktree"));
+    let read_run = env.run("say hi", &["--readonly"]);
+    env.wait_for(&read_run, "COMPLETED");
+    let repo = std::fs::canonicalize(&env.repo).unwrap();
+    let id_of_repo = || {
+        items(&env.json(&["repo", "ls", "--json"])["workspaces"])
+            .iter()
+            .find(|w| {
+                w["path"]
+                    .as_str()
+                    .and_then(|path| std::fs::canonicalize(path).ok())
+                    .is_some_and(|path| path == repo)
+            })
+            .and_then(|w| w["id"].as_str().map(str::to_owned))
+    };
+    let id = id_of_repo().expect("the repository is listed");
+    let removed = env.ok(&["repo", "rm", &id]);
+    assert!(removed.contains("and its 2 runs (1 worktree)"), "{removed}");
+    assert!(id_of_repo().is_none(), "the repository is still listed");
+    assert!(!cut.exists(), "the run's worktree stayed");
+    for run in [&cut_run, &read_run] {
+        assert!(
+            !env.output(&["status", run]).status.success(),
+            "run {run} stayed"
+        );
+    }
+}
+
+#[test]
 fn delete_takes_the_worktrees_dispatch_cut_and_keeps_the_users() {
     let env = Env::new();
     let ours = env.run("WRITE a file", &[]);

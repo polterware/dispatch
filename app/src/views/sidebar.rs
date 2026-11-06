@@ -812,6 +812,7 @@ impl SidebarView {
         &self,
         id: String,
         name: String,
+        runs: Vec<String>,
         cx: &mut Context<Self>,
     ) -> MenuEntry {
         let view = cx.entity();
@@ -820,13 +821,21 @@ impl SidebarView {
             icon: None,
             danger: true,
             on_select: Rc::new(move |_, cx| {
-                let (id, name) = (id.clone(), name.clone());
-                let _ = view.update(cx, |this, cx| this.remove_repository(id, name, cx));
+                let (id, name, runs) = (id.clone(), name.clone(), runs.clone());
+                let _ = view.update(cx, |this, cx| this.remove_repository(id, name, runs, cx));
             }),
         }
     }
 
-    fn remove_repository(&mut self, id: String, name: String, cx: &mut Context<Self>) {
+    /// Removes a repository with all its runs and their worktrees (the core refuses while
+    /// one is still working).
+    fn remove_repository(
+        &mut self,
+        id: String,
+        name: String,
+        runs: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(client) = self.state.read(cx).client() else {
             self.toast("Dispatch core is not running", cx);
             return;
@@ -837,10 +846,16 @@ impl SidebarView {
                 .background_spawn(async move { client.remove_workspace(&request) })
                 .await;
             let _ = this.update(async_cx, |this, cx| match result {
-                Ok(_) => {
+                Ok(response) => {
+                    let deleted = match response.deleted_runs {
+                        0 => String::new(),
+                        1 => " and its run".to_string(),
+                        n => format!(" and its {n} runs"),
+                    };
                     this.state.update(cx, |app, cx| {
                         app.forget_workspace(&id);
-                        app.push_toast(format!("Removed {name}"), ToastTone::Success);
+                        app.forget_runs(&runs);
+                        app.push_toast(format!("Removed {name}{deleted}"), ToastTone::Success);
                         app.request_refresh(cx);
                         cx.notify();
                     });
@@ -931,13 +946,20 @@ impl SidebarView {
             self.section_entries(id, group.title.clone(), cx)
         } else if let Some(repository) = repository_ref(&group.id) {
             let mut items = Vec::new();
-            if let Some(id) = removable_repository(repository, self.state.read(cx).workspaces()) {
-                items.push(self.remove_repository_entry(id, group.title.clone(), cx));
+            let removable = removable_repository(repository, self.state.read(cx).workspaces());
+            if let Some(id) = removable.clone() {
+                let runs: Vec<String> = group
+                    .runs
+                    .iter()
+                    .flat_map(|run| run.earlier.iter().chain(std::iter::once(&run.id)).cloned())
+                    .collect();
+                items.push(self.remove_repository_entry(id, group.title.clone(), runs, cx));
             }
-            // A repository no workspace was added as (a worktree's, one that is gone) can
-            // still be cleared: its ended runs go, a working one stays.
+            // Removing a repository takes its runs with it. One no workspace was added as
+            // (a worktree's, one that is gone) can still be cleared: its ended runs go, a
+            // working one stays.
             let ids = ended_run_ids(&group.runs);
-            if !ids.is_empty() {
+            if removable.is_none() && !ids.is_empty() {
                 items.push(self.delete_entry(
                     "Delete runs",
                     DeleteRunsRequest {

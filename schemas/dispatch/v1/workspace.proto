@@ -29,8 +29,13 @@ message AddWorkspaceRequest {
 }
 message AddWorkspaceResponse { Workspace workspace = 1; }
 
+// RemoveWorkspace forgets a repository and deletes every run in it, with the
+// worktrees Dispatch cut for them. A run still working refuses it.
 message RemoveWorkspaceRequest { string id = 1; }
-message RemoveWorkspaceResponse {}
+message RemoveWorkspaceResponse {
+  int32 deleted_runs = 1;
+  int32 removed_worktrees = 2;
+}
 
 // ResolveWorkspace returns the workspace with id, else the one that holds dir.
 message ResolveWorkspaceRequest {
