@@ -391,6 +391,7 @@ fn the_report_pages_read_the_core() {
             project_id: String::new(),
             by: "model".into(),
             since: String::new(),
+            dir: String::new(),
         })
         .expect("stats");
     let row = stats

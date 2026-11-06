@@ -120,6 +120,9 @@ pub struct Usage {
     pub cost_usd: Option<f64>,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub cost_source: String,
+    /// Some attempt could not be priced, so `cost_usd` covers only the ones that could.
+    #[serde(rename = "costPartial", skip_serializing_if = "std::ops::Not::not")]
+    pub cost_partial: bool,
     #[serde(skip_serializing_if = "is_zero")]
     pub context_tokens: i64,
     #[serde(skip_serializing_if = "is_zero")]
@@ -210,6 +213,38 @@ pub struct Run {
     pub merge_sha: String,
     /// Read from the stored worktree, not persisted on the run.
     pub worktree_status: String,
+    /// The other repositories the task spans, each with a worktree of its own on a branch
+    /// named for the run: merged, cleaned, and reverted with the run's own as one.
+    pub linked: Vec<LinkedRepo>,
+}
+
+impl LinkedRepo {
+    /// The worktree's top folder, which `worktree` may sit below.
+    pub fn worktree_top(&self) -> String {
+        let root = crate::worktree::root(&self.worktree);
+        if root.is_empty() {
+            self.worktree.clone()
+        } else {
+            root
+        }
+    }
+}
+
+/// One more repository a run works in besides its own.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct LinkedRepo {
+    /// The folder asked for, inside the repository.
+    pub dir: String,
+    /// The repository's top folder.
+    pub repo: String,
+    /// The run's worktree of it, and the folder there the agent works in.
+    pub worktree: String,
+    pub branch: String,
+    pub base_sha: String,
+    /// Set once merged.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub merge_sha: String,
 }
 
 /// An append-only fact about a run. `seq` is assigned by the store when zero.
@@ -321,6 +356,22 @@ pub trait Store: Send + Sync {
         offset: i64,
         conversation_id: &str,
     ) -> Result<Vec<Run>, Error>;
+    /// Every run ever saved, newest first, as Spend and Stats count them: a deleted run stays
+    /// here with what it used, but no prompt, output, or worktree. An empty `project_id` or
+    /// `dir` does not filter; a `dir` keeps runs in that folder or below it.
+    fn list_run_history(&self, project_id: &str, dir: &str) -> Result<Vec<Run>, Error> {
+        let dir = dir.trim_end_matches('/');
+        Ok(self
+            .list_runs(project_id, 0, 0, "")?
+            .into_iter()
+            .filter(|r| {
+                dir.is_empty()
+                    || r.repo == dir
+                    || r.dir == dir
+                    || r.dir.starts_with(&format!("{dir}/"))
+            })
+            .collect())
+    }
     fn append_event(&self, event: &RunEvent) -> Result<(), Error>;
     fn list_events(&self, run_id: &str, after_seq: i64, limit: i64)
     -> Result<Vec<RunEvent>, Error>;

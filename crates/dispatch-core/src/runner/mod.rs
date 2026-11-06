@@ -6,6 +6,7 @@ mod empirical;
 mod execute;
 mod host;
 mod lifecycle;
+pub mod linked;
 mod ops;
 mod routing;
 mod summary;
@@ -29,7 +30,7 @@ pub use summary::{
     RunSummary, SUMMARY_SCHEMA, class_of, classify_run, go_duration, limit_notice, observed_ms,
     page, resets_in, summarize, summary,
 };
-pub use usage::{add_usage, load_catalog, usage_cost};
+pub use usage::{add_usage, attempt_usage_from_log, load_catalog, usage_cost, usage_with_log};
 pub use worktrees::{WORKTREES_DIR, WorktreeFolder};
 
 use crate::{
@@ -245,6 +246,8 @@ pub struct Deps {
 /// A request. For resumes, `resume` names the earlier run.
 #[derive(Clone, Debug, Default)]
 pub struct Options {
+    /// The other repositories' folders the task spans, each cut a worktree of its own.
+    pub with: Vec<String>,
     pub caller: Caller,
     pub project_id: String,
     pub agent_run_id: String,

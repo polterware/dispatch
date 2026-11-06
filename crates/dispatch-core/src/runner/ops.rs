@@ -74,6 +74,41 @@ impl Deps {
                 rec.id, rec.status
             )));
         }
+        // Every other repository the run spans merges with it, so each is checked first: one
+        // that would conflict stops them all before any merges.
+        let mut linked_locks = Vec::with_capacity(rec.linked.len());
+        for l in rec.linked.iter().filter(|l| l.merge_sha.is_empty()) {
+            let target = worktree::current_branch(&l.repo).unwrap_or_default();
+            linked_locks.push(worktree::lock_merge(&l.repo, &target).map_err(redact_err)?);
+            let overlapping =
+                worktree::uncommitted_overlaps(&l.repo, &l.branch).map_err(redact_err)?;
+            if !overlapping.is_empty() {
+                return Err(msg(format!(
+                    "{} has uncommitted changes in files touched by {}: {}; commit or stash them before merging",
+                    l.repo,
+                    l.branch,
+                    overlapping.join(", ")
+                )));
+            }
+            if worktree::supports_merge_tree(&l.repo) {
+                let tree = worktree::merge_tree(&l.repo, "HEAD", &l.branch).map_err(redact_err)?;
+                if !tree.clean {
+                    rec.exit_class = "merge_conflict".into();
+                    st.save_run(&rec)?;
+                    res.status = "merge_conflict".into();
+                    res.conflicts = tree
+                        .conflicts
+                        .iter()
+                        .map(|c| format!("{}: {c}", l.repo))
+                        .collect();
+                    res.hint = format!(
+                        "ask the agent to rebase branch {} in {}, or resolve the conflicts by hand",
+                        l.branch, l.repo
+                    );
+                    return Ok(res);
+                }
+            }
+        }
         let target = worktree::current_branch(&rec.repo).unwrap_or_default();
         let _lock = worktree::lock_merge(&rec.repo, &target).map_err(redact_err)?;
         let overlapping =
@@ -108,9 +143,20 @@ impl Deps {
         if !keep {
             res.cleaned = worktree::remove(&rec.repo, &rec.worktree, &rec.branch, false).is_ok();
         }
+        let mut reverts = vec![format!("git revert -m 1 {merge_sha}")];
+        for l in rec.linked.iter_mut().filter(|l| l.merge_sha.is_empty()) {
+            let out = worktree::merge(&l.repo, &l.branch, &rec.id).map_err(redact_err)?;
+            l.merge_sha = worktree::head(&l.repo).unwrap_or_default();
+            res.git = format!("{}\n{}: {out}", res.git, l.repo);
+            reverts.push(format!("git -C {} revert -m 1 {}", l.repo, l.merge_sha));
+            if !keep {
+                let _ = worktree::remove(&l.repo, l.worktree_top(), &l.branch, false);
+            }
+        }
+        drop(linked_locks);
         res.ok = true;
         res.status = "merged".into();
-        res.revert = format!("git revert -m 1 {merge_sha}");
+        res.revert = reverts.join(" && ");
         let now = fmt_time(self.now());
         rec.merged_at = Some(now.clone());
         rec.merge_sha = merge_sha;
@@ -147,6 +193,15 @@ impl Deps {
         } else {
             // `dispatch merge` removes the worktree it merges, so its folder may be gone.
             worktree::forget(&rec.repo, &rec.branch, force).map_err(redact_err)?;
+        }
+        for l in &rec.linked {
+            let top = l.worktree_top();
+            let gone = if std::path::Path::new(&top).exists() {
+                worktree::remove(&l.repo, &top, &l.branch, force)
+            } else {
+                worktree::forget(&l.repo, &l.branch, force)
+            };
+            gone.map_err(|e| msg(format!("{}: {}", l.repo, redact_err(e))))?;
         }
         let status = if rec.merged_at.is_some() {
             WORKTREE_REMOVED

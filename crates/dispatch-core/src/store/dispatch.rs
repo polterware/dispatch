@@ -19,7 +19,22 @@ const SELECT_RUN_COLUMNS: &str = "
 	classifier, difficulty, difficulty_probs_json,
 	files_changed, insertions, deletions, queued_ms, run_ms, usage_json, role_json,
 	created_at, started_at, finished_at, merged_at, merge_sha,
-	COALESCE((SELECT status FROM dispatch_worktrees WHERE run_id = dispatch_runs.id ORDER BY rowid DESC LIMIT 1), '')";
+	COALESCE((SELECT status FROM dispatch_worktrees WHERE run_id = dispatch_runs.id ORDER BY rowid DESC LIMIT 1), ''),
+	linked_json";
+
+/// [`SELECT_RUN_COLUMNS`]' shape over `dispatch_run_history`, which keeps no prompt, output,
+/// or worktree: those read empty.
+const SELECT_HISTORY_COLUMNS: &str = "
+	id, project_id, status, tier, requested_tier, execution_tier,
+	agent, model, provider, effort, '', dir, repo, '', '', '',
+	read_only, 0, '', '',
+	'', error, '', exit_code, exit_class,
+	0, '', conversation_id, '', '', '', 0, 0, '', profile,
+	'', '', COALESCE(requested_json, ''), COALESCE(resolved_json, ''), COALESCE(attempts_json, ''),
+	classifier, difficulty, '',
+	NULL, NULL, NULL, queued_ms, run_ms, COALESCE(usage_json, ''), '',
+	created_at, COALESCE(started_at, ''), COALESCE(finished_at, ''), NULL, '',
+	'', ''";
 
 const ROUTE_DECISION_COLUMNS: &str =
     "run_id, project_id, policy_version, route, priority, classifier,
@@ -193,6 +208,10 @@ fn scan_run(r: &Row<'_>) -> rusqlite::Result<Run> {
     let merged: Option<String> = r.get(next())?;
     run.merge_sha = r.get(next())?;
     run.worktree_status = r.get(next())?;
+    let linked: String = r.get(next())?;
+    if !linked.is_empty() {
+        run.linked = serde_json::from_str(&linked).unwrap_or_default();
+    }
 
     if !prefer.is_empty() {
         run.prefer = serde_json::from_str(&prefer).unwrap_or_default();
@@ -342,6 +361,11 @@ impl types::Store for Store {
         let probs = slice_json(&run.difficulty_probs)?;
         let usage = optional_json(run.usage.as_ref())?;
         let role = optional_json(run.role_pick.as_ref())?;
+        let linked = if run.linked.is_empty() {
+            String::new()
+        } else {
+            slice_json(&run.linked)?
+        };
         let merged = run
             .merged_at
             .as_deref()
@@ -360,7 +384,7 @@ impl types::Store for Store {
 			prefer_json, avoid_json, requested_json, resolved_json, attempts_json,
 			classifier, difficulty, difficulty_probs_json,
 			files_changed, insertions, deletions, queued_ms, run_ms, usage_json, role_json,
-			created_at, started_at, finished_at, merged_at, merge_sha
+			created_at, started_at, finished_at, merged_at, merge_sha, linked_json
 		) VALUES (
 			?, ?, ?, ?, ?, ?,
 			?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
@@ -370,7 +394,7 @@ impl types::Store for Store {
 			?, ?, ?, ?, ?,
 			?, ?, ?,
 			?, ?, ?, ?, ?, ?, ?,
-			?, ?, ?, ?, ?
+			?, ?, ?, ?, ?, ?
 		)
 		ON CONFLICT(id) DO UPDATE SET
 			project_id = excluded.project_id,
@@ -426,7 +450,8 @@ impl types::Store for Store {
 			started_at = excluded.started_at,
 			finished_at = excluded.finished_at,
 			merged_at = excluded.merged_at,
-			merge_sha = excluded.merge_sha",
+			merge_sha = excluded.merge_sha,
+			linked_json = excluded.linked_json",
                 params![
                     id,
                     run.project_id,
@@ -483,6 +508,7 @@ impl types::Store for Store {
                     format_time(&run.finished_at),
                     merged,
                     run.merge_sha,
+                    linked,
                 ],
             )
             .map_err(db)?;
@@ -531,6 +557,23 @@ impl types::Store for Store {
         let mut stmt = conn.prepare(&query).map_err(db)?;
         let rows = stmt
             .query_map(params_from_iter(args), scan_run)
+            .map_err(db)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db)
+    }
+
+    fn list_run_history(&self, project_id: &str, dir: &str) -> Result<Vec<Run>, Error> {
+        let dir = dir.trim_end_matches('/');
+        let query = format!(
+            "SELECT {SELECT_HISTORY_COLUMNS}
+		 FROM dispatch_run_history
+		 WHERE (?1 = '' OR project_id = ?1)
+		   AND (?2 = '' OR dir = ?2 OR dir LIKE ?2 || '/%' OR repo = ?2)
+		 ORDER BY created_at DESC, rowid DESC"
+        );
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&query).map_err(db)?;
+        let rows = stmt
+            .query_map(params![project_id, dir], scan_run)
             .map_err(db)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(db)
     }

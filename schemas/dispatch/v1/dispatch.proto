@@ -50,6 +50,7 @@ message DispatchRun {
   // in_place: a writable run that edits its folder itself, with no worktree of
   // its own (worktree_mode in_place, --worktree, or a folder outside git).
   bool in_place = 42;
+  repeated DispatchLinkedRepo linked = 43;
 }
 
 // Tokens a run spent as its agent CLIs reported them, summed over attempts:
@@ -68,6 +69,8 @@ message DispatchUsage {
   string cost_source = 7;
   int64 context_tokens = 8;
   int64 context_window = 9;
+  // Some attempt could not be priced: cost_usd covers only the ones that could.
+  bool cost_partial = 10;
 }
 
 message DispatchAttempt {
@@ -188,6 +191,19 @@ message StartRunRequest {
   // for callers that predate it, a worktree wherever the folder is a git
   // checkout with commits. A read-only run never gets one.
   string worktree_mode = 20;
+  // Other repositories' folders the task spans. Each gets a worktree of its own on the
+  // run's branch name, committed, merged, and cleaned with the run's.
+  repeated string with = 21;
+}
+
+// One more repository a run works in, with its worktree of it.
+message DispatchLinkedRepo {
+  string dir = 1;
+  string repo = 2;
+  string worktree = 3;
+  string branch = 4;
+  string base_sha = 5;
+  string merge_sha = 6;
 }
 
 // The conversation that called dispatch, separate from the worker's resume session.
@@ -386,6 +402,8 @@ message StatsRequest {
   string project_id = 1;
   string by = 2;
   string since = 3;
+  // A repository's folder: only runs in it or below it. Empty keeps every one.
+  string dir = 4;
 }
 
 message DispatchStatsRow {
@@ -408,6 +426,10 @@ message DispatchStatsRow {
   int64 reasoning_tokens = 15;
   double cost_usd = 16;
   int32 cost_runs = 17;
+  // Runs still working, whose usage so far the spend counts.
+  int32 live_runs = 18;
+  // Priced runs with an attempt no price covered: their cost is a floor.
+  int32 partial_cost_runs = 19;
 }
 
 message DispatchStatRank {

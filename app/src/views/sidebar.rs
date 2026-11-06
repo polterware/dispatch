@@ -12,18 +12,19 @@ use gpui::{
 };
 
 use super::TranscriptView;
+use super::repository_actions;
 use crate::avatar::agent_avatar_live;
 use crate::client::{
-    CoreError, DeleteRunsRequest, DeleteSectionRequest, MoveToSectionRequest,
-    RemoveWorkspaceRequest, RenameConversationRequest, SaveSectionRequest,
+    DeleteRunsRequest, DeleteSectionRequest, MoveToSectionRequest, RenameConversationRequest,
+    SaveSectionRequest,
 };
 use crate::format::agent_display_name;
 use crate::models::sidebar::{
     COLLAPSED_PREFERENCE, DISPLAY_PREFERENCE, Direction, GroupBy, GroupKind, HOVER_CLOSE_MS,
     HOVER_OPEN_MS, RunsNotice, SEEN_PREFERENCE, Show, SidebarDisplay, SidebarGroup, SidebarRun,
     SortBy, conversation_ref, ended_run_ids, group_sidebar_runs, has_unseen_update,
-    holding_section, now_unix_ms, parse_sidebar_display, removable_repository, repository_ref,
-    run_mark, runs_notice, section_ref, sidebar_run_title, sidebar_runs,
+    holding_section, now_unix_ms, parse_sidebar_display, repository_ref, run_mark, runs_notice,
+    section_ref, sidebar_run_title, sidebar_runs,
 };
 use crate::motion::{Animator, SpringTier, SpringValue};
 use crate::state::{AppState, ConnectionState, Route, SettingsPage, observe};
@@ -683,6 +684,18 @@ impl SidebarView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.place_menu_items(x, y, actions_of(items), window, cx);
+    }
+
+    /// Opens the context menu at `x`, `y` with any rows, separators among them.
+    fn place_menu_items(
+        &mut self,
+        x: f32,
+        y: f32,
+        items: Vec<MenuItem>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let theme = *Theme::global(cx);
         let viewport = window.viewport_size();
         let width = theme.sidebar_width * 0.8;
@@ -692,7 +705,7 @@ impl SidebarView {
         self.context_y = (y - theme.control_height_md).clamp(0.0, max_y);
         self.display_open = false;
         self.context_menu.update(cx, |menu, cx| {
-            menu.set_items(items);
+            menu.set_menu(items);
             menu.set_width(0.0);
             menu.set_open(true);
             cx.notify();
@@ -805,68 +818,6 @@ impl SidebarView {
         ]
     }
 
-    /// Remove repository: the core forgets the workspace the repository was added as. Its
-    /// runs stay in the store, and the sidebar no longer lists them; adding the repository
-    /// again brings them back.
-    fn remove_repository_entry(
-        &self,
-        id: String,
-        name: String,
-        runs: Vec<String>,
-        cx: &mut Context<Self>,
-    ) -> MenuEntry {
-        let view = cx.entity();
-        MenuEntry {
-            label: "Remove repository".into(),
-            icon: None,
-            danger: true,
-            on_select: Rc::new(move |_, cx| {
-                let (id, name, runs) = (id.clone(), name.clone(), runs.clone());
-                let _ = view.update(cx, |this, cx| this.remove_repository(id, name, runs, cx));
-            }),
-        }
-    }
-
-    /// Removes a repository with all its runs and their worktrees (the core refuses while
-    /// one is still working).
-    fn remove_repository(
-        &mut self,
-        id: String,
-        name: String,
-        runs: Vec<String>,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(client) = self.state.read(cx).client() else {
-            self.toast("Dispatch core is not running", cx);
-            return;
-        };
-        let request = RemoveWorkspaceRequest { id: id.clone() };
-        cx.spawn(async move |this, async_cx| {
-            let result = async_cx
-                .background_spawn(async move { client.remove_workspace(&request) })
-                .await;
-            let _ = this.update(async_cx, |this, cx| match result {
-                Ok(response) => {
-                    let deleted = match response.deleted_runs {
-                        0 => String::new(),
-                        1 => " and its run".to_string(),
-                        n => format!(" and its {n} runs"),
-                    };
-                    this.state.update(cx, |app, cx| {
-                        app.forget_workspace(&id);
-                        app.forget_runs(&runs);
-                        app.push_toast(format!("Removed {name}{deleted}"), ToastTone::Success);
-                        app.request_refresh(cx);
-                        cx.notify();
-                    });
-                    cx.notify();
-                }
-                Err(error) => this.toast(core_message(error), cx),
-            });
-        })
-        .detach();
-    }
-
     /// A danger entry that deletes runs for good: their records, transcripts, and worktrees.
     fn delete_entry(
         &self,
@@ -943,31 +894,26 @@ impl SidebarView {
             let Some(id) = section_ref(&group.id).map(str::to_string) else {
                 return;
             };
-            self.section_entries(id, group.title.clone(), cx)
+            actions_of(self.section_entries(id, group.title.clone(), cx))
         } else if let Some(repository) = repository_ref(&group.id) {
-            let mut items = Vec::new();
-            let removable = removable_repository(repository, self.state.read(cx).workspaces());
-            if let Some(id) = removable.clone() {
-                let runs: Vec<String> = group
-                    .runs
-                    .iter()
-                    .flat_map(|run| run.earlier.iter().chain(std::iter::once(&run.id)).cloned())
-                    .collect();
-                items.push(self.remove_repository_entry(id, group.title.clone(), runs, cx));
-            }
+            let target =
+                repository_actions::Repository::at(repository, &group.title, self.state.read(cx));
+            let removable = target.workspace_id.clone();
+            let mut items = repository_actions::menu_items(&target, &self.state);
             // Removing a repository takes its runs with it. One no workspace was added as
             // (a worktree's, one that is gone) can still be cleared: its ended runs go, a
             // working one stays.
             let ids = ended_run_ids(&group.runs);
             if removable.is_none() && !ids.is_empty() {
-                items.push(self.delete_entry(
+                items.push(MenuItem::Separator);
+                items.push(MenuItem::Action(self.delete_entry(
                     "Delete runs",
                     DeleteRunsRequest {
                         ids,
                         ..Default::default()
                     },
                     cx,
-                ));
+                )));
             }
             if items.is_empty() {
                 return;
@@ -984,11 +930,11 @@ impl SidebarView {
                 },
                 cx,
             ));
-            items
+            actions_of(items)
         } else {
             return;
         };
-        self.place_menu(x, y, items, window, cx);
+        self.place_menu_items(x, y, items, window, cx);
     }
 
     /// Rename…: opens the rename dialog on the conversation's name as it shows.
@@ -1903,11 +1849,11 @@ fn nav_height(theme: Theme) -> f32 {
     6.0 * theme.sidebar_row_height + 5.0 * theme.sidebar_row_gap
 }
 
-fn core_message(error: CoreError) -> String {
-    match error {
-        CoreError::NotRunning => "Dispatch core is not running".to_string(),
-        CoreError::Rpc(message) => message,
-    }
+use super::core_message;
+
+/// Plain entries as menu rows.
+fn actions_of(entries: Vec<MenuEntry>) -> Vec<MenuItem> {
+    entries.into_iter().map(MenuItem::Action).collect()
 }
 
 fn px_of(value: impl Into<f32>) -> f32 {

@@ -82,6 +82,8 @@ struct RunView {
     branch: String,
     #[serde(rename = "Worktree")]
     worktree: String,
+    #[serde(rename = "Linked", skip_serializing_if = "Vec::is_empty")]
+    linked: Vec<crate::types::LinkedRepo>,
     #[serde(rename = "ExitClass")]
     exit_class: String,
     #[serde(rename = "QueuedMs")]
@@ -121,6 +123,7 @@ impl From<&Run> for RunView {
             agent_run_id: r.agent_run_id.clone(),
             branch: r.branch.clone(),
             worktree: r.worktree.clone(),
+            linked: r.linked.clone(),
             exit_class: r.exit_class.clone(),
             queued_ms: r.queued_ms,
             run_ms: r.run_ms,
@@ -155,6 +158,18 @@ pub(super) fn run_from_proto(p: &pb::DispatchRun) -> Run {
         dir: p.dir.clone(),
         repo: p.repo.clone(),
         worktree: p.worktree.clone(),
+        linked: p
+            .linked
+            .iter()
+            .map(|l| crate::types::LinkedRepo {
+                dir: l.dir.clone(),
+                repo: l.repo.clone(),
+                worktree: l.worktree.clone(),
+                branch: l.branch.clone(),
+                base_sha: l.base_sha.clone(),
+                merge_sha: l.merge_sha.clone(),
+            })
+            .collect(),
         branch: p.branch.clone(),
         base_sha: p.base_sha.clone(),
         read_only: p.read_only,
@@ -181,6 +196,7 @@ pub(super) fn run_from_proto(p: &pb::DispatchRun) -> Run {
             cost_source: u.cost_source.clone(),
             context_tokens: u.context_tokens,
             context_window: u.context_window,
+            cost_partial: u.cost_partial,
         }),
         merged_at: (!p.merged_at.trim().is_empty()
             && chrono::DateTime::parse_from_rfc3339(p.merged_at.trim()).is_ok())
@@ -228,6 +244,8 @@ struct Summary {
     branch: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     worktree: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    linked: Vec<crate::types::LinkedRepo>,
     attempts: usize,
     #[serde(skip_serializing_if = "String::is_empty")]
     exit_class: String,
@@ -303,6 +321,7 @@ fn summarize(run: &RunView) -> Summary {
         agent_run_id: run.agent_run_id.clone(),
         branch: run.branch.clone(),
         worktree: run.worktree.clone(),
+        linked: run.linked.clone(),
         attempts,
         exit_class: run.exit_class.clone(),
         queued_ms: run.queued_ms,
@@ -524,6 +543,11 @@ pub(super) async fn run(db_path: &Path, args: &[String]) -> CliResult {
     )
     .string("dir", "", "repository (default: current directory)")
     .string(
+        "with",
+        "",
+        "other repositories the task spans, comma-separated: each gets a worktree on the run's branch, merged and cleaned with it",
+    )
+    .string(
         "worktree-mode",
         "",
         "worktree: a git worktree of its own, so runs go in parallel (the default in a git checkout with commits); in-place: edit the folder itself",
@@ -542,6 +566,13 @@ pub(super) async fn run(db_path: &Path, args: &[String]) -> CliResult {
     };
     let prompt = read_prompt(&positional)?;
     let wd = working_dir(&f.str("dir"))?;
+    let with = f
+        .str("with")
+        .split(',')
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .map(working_dir)
+        .collect::<Result<Vec<_>, _>>()?;
     let (c, project) = dial_workspace(db_path, &f.str("project")).await?;
     let who = caller::resolve(db_path);
     let res = c
@@ -563,6 +594,7 @@ pub(super) async fn run(db_path: &Path, args: &[String]) -> CliResult {
             timeout_sec: i32::try_from(f.dur("timeout").as_secs()).unwrap_or(i32::MAX),
             profile: f.str("role").trim().into(),
             worktree_mode,
+            with,
             caller: Some(pb::DispatchCaller {
                 agent: who.agent,
                 session_id: who.session_id,
@@ -1069,6 +1101,7 @@ pub(super) async fn stats(db_path: &Path, args: &[String]) -> CliResult {
     let res = c
         .dispatch
         .stats(&pb::StatsRequest {
+            dir: String::new(),
             project_id: project,
             by: f.str("by"),
             since: f.str("since"),

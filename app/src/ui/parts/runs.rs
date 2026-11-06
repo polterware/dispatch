@@ -1,5 +1,5 @@
-//! `DispatchRunRow`'s cells: the run's bot and prompt (with Cancel while it runs), its
-//! `StatusChip`, `agent / model` in 12px mono, `FileChangeLine`, and when it started.
+//! `DispatchRunRow`'s cells: the run's bot and prompt (with Cancel while it runs), the
+//! repository it came from, its `StatusChip`, `agent / model` in 12px mono, `FileChangeLine`, and when it started.
 
 use std::rc::Rc;
 
@@ -67,6 +67,23 @@ fn status_label(row: &RunRow) -> String {
     } else {
         row.status.clone()
     }
+}
+
+/// The repository the run came from, in 12px secondary, with its full path as the tooltip.
+pub fn source_cell(index: usize, row: &RunRow, cx: &App) -> AnyElement {
+    let theme = Theme::global(cx);
+    div()
+        .id(("run-source", index))
+        .min_w(px(0.0))
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .text_ellipsis()
+        .font(sans(theme, FontWeight::NORMAL))
+        .text_size(px(12.0))
+        .text_color(theme.color_text_secondary)
+        .tooltip(tooltip(row.source_title.clone()))
+        .child(SharedString::from(row.source.clone()))
+        .into_any_element()
 }
 
 /// `agent / model` in 12px mono secondary, `agent / model / provider` as its tooltip.
@@ -141,7 +158,8 @@ pub fn content_widths(rows: &[RunRow], now_ms: i64, window: &Window, cx: &App) -
         + CANCEL_ICON
         + tw(1.5)
         + text_width("Cancel", title.clone(), tw(3.0), window);
-    let mut widths = vec![0.0_f32; 5];
+    let plain = sans(theme, FontWeight::NORMAL);
+    let mut widths = vec![0.0_f32; 6];
     for row in rows {
         let changes = if row.has_changes() {
             let (files, insertions, deletions) = row.change_parts();
@@ -163,6 +181,7 @@ pub fn content_widths(rows: &[RunRow], now_ms: i64, window: &Window, cx: &App) -
                 } else {
                     0.0
                 },
+            text_width(&row.source, plain.clone(), 12.0, window),
             text_width(&status_label(row), title.clone(), 11.0, window) + CHIP_CHROME,
             text_width(&row.agent_label, code.clone(), 12.0, window),
             changes,

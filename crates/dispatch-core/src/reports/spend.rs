@@ -71,22 +71,16 @@ impl CatalogSpendExt for Catalog {
     }
 }
 
+/// Adds one attempt's reported usage, run on `model`, to the run: tokens always, and its cost
+/// when a price covers it.
 pub fn add_usage(run: &mut Run, model: &str, u: Option<&AdapterUsage>, cat: &Catalog) {
     let Some(u) = u else {
         return;
     };
     let priced = usage_cost(cat, model, u);
-    if run.usage.is_none() {
-        let mut init = Usage::default();
-        if let Some((_, ref source)) = priced {
-            init.cost_usd = Some(0.0);
-            init.cost_source = source.clone();
-        }
-        run.usage = Some(init);
-    }
-    let Some(s) = &mut run.usage else {
-        return;
-    };
+    let s = run.usage.get_or_insert_with(Usage::default);
+    // Tokens counted before this attempt that no price covered.
+    let unpriced_before = s.cost_usd.is_none() && total_tokens(s) > 0;
     s.input_tokens += u.input_tokens;
     s.cache_read_tokens += u.cache_read_tokens;
     s.cache_write_tokens += u.cache_write_tokens;
@@ -97,18 +91,21 @@ pub fn add_usage(run: &mut Run, model: &str, u: Option<&AdapterUsage>, cat: &Cat
         s.context_window = context_window(cat, model, u);
     }
     match priced {
-        None => {
-            s.cost_usd = None;
-            s.cost_source.clear();
-        }
-        Some((cost, source)) => {
-            if let Some(ref mut total) = s.cost_usd {
+        // An attempt no price covers leaves what the others cost, marked partial.
+        None => s.cost_partial |= s.cost_usd.is_some(),
+        Some((cost, source)) => match &mut s.cost_usd {
+            Some(total) => {
                 *total += cost;
                 if s.cost_source != source {
                     s.cost_source = COST_MIXED.into();
                 }
             }
-        }
+            None => {
+                s.cost_usd = Some(cost);
+                s.cost_source = source;
+                s.cost_partial |= unpriced_before;
+            }
+        },
     }
 }
 

@@ -2,6 +2,7 @@
 
 mod commander;
 mod intelligence;
+pub mod repository_actions;
 mod roles;
 mod run_page;
 mod runs;
@@ -12,6 +13,14 @@ mod stats;
 mod transcript;
 
 pub use commander::CommanderView;
+
+/// What the core said when a call failed, in words for a toast.
+pub(crate) fn core_message(error: crate::client::CoreError) -> String {
+    match error {
+        crate::client::CoreError::NotRunning => "Dispatch core is not running".to_string(),
+        crate::client::CoreError::Rpc(message) => message,
+    }
+}
 pub use intelligence::IntelligenceView;
 pub use roles::RolesView;
 pub use run_page::RunPageView;

@@ -1,5 +1,6 @@
-//! Runs, the sidebar's View all ([`Route::Runs`]): the current workspace's runs in the shared
-//! `DataTable`, searched from the toolbar and filtered by Status, Agent, and Tier through the
+//! Runs, the sidebar's View all ([`Route::Runs`]): every workspace's runs in the shared
+//! `DataTable`, whichever workspace is selected, each with the repository it came from,
+//! searched from the toolbar and filtered by Repository, Status, Agent, and Tier through the
 //! shared `FilterPopover`, whose pills sit in the `ActiveFilterBar` under the toolbar.
 
 use std::rc::Rc;
@@ -11,12 +12,13 @@ use gpui::{
 
 use crate::client::{CancelRunRequest, CoreError};
 use crate::models::filter::Filters;
-use crate::models::runs::{COLUMNS, RunRow, SORTABLE, filter_specs, visible_rows, workspace_rows};
+use crate::models::runs::{COLUMNS, RunRow, SORTABLE, all_rows, filter_specs, visible_rows};
 use crate::models::sort::{SortDirection, next_sort};
 use crate::state::{AppState, ConnectionState, Route};
 use crate::theme::Theme;
 use crate::ui::parts::runs::{
-    self as parts, AVATAR, RunAction, agent_cell, changes_cell, run_cell, started_cell, status_cell,
+    self as parts, AVATAR, RunAction, agent_cell, changes_cell, run_cell, source_cell,
+    started_cell, status_cell,
 };
 use crate::ui::{
     Column, DataTable, FilterField, FilterPopover, FiltersChanged, Icon, MascotMood, TextInput,
@@ -38,17 +40,17 @@ pub struct RunsView {
     fields_key: String,
     cancelling: Option<String>,
     now_ms: i64,
-    /// The workspace's rows, built once per runs revision and workspace: a scroll or a hover
-    /// redraws the page every frame, and rebuilding every run's row each time made it stutter.
+    /// Every workspace's rows, built once per runs revision: a scroll or a hover redraws the
+    /// page every frame, and rebuilding every run's row each time made it stutter.
     rows: Rc<Vec<RunRow>>,
-    rows_key: Option<(u64, String)>,
+    rows_key: Option<u64>,
     /// The rows the filters, the search, and the sort keep, for the inputs that kept them.
     visible: Rc<Vec<RunRow>>,
     visible_key: Option<VisibleKey>,
 }
 
 /// What the visible rows depend on: the rows, the filters, the search, and the sort.
-type VisibleKey = (u64, String, Filters, String, Option<(usize, SortDirection)>);
+type VisibleKey = (u64, Filters, String, Option<(usize, SortDirection)>);
 
 impl RunsView {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
@@ -102,34 +104,26 @@ impl RunsView {
         &self.filters
     }
 
-    /// The workspace's rows and the ones on show, rebuilt only when what they come from moved,
-    /// and the filter fields with them.
+    /// Every workspace's rows and the ones on show, rebuilt only when what they come from
+    /// moved, and the filter fields with them. A workspace's name or path only changes with a
+    /// refresh, which moves the runs revision too.
     fn refresh_rows(&mut self, cx: &mut Context<Self>) {
-        let (revision, workspace) = {
-            let state = self.state.read(cx);
-            let workspace = state
-                .current_workspace()
-                .map(|workspace| workspace.id.clone())
-                .unwrap_or_default();
-            (state.runs_revision(), workspace)
-        };
-        let rows_key = (revision, workspace.clone());
-        if self.rows_key.as_ref() != Some(&rows_key) {
-            let rows = if workspace.is_empty() {
-                Vec::new()
-            } else {
-                workspace_rows(self.state.read(cx).runs(), &workspace)
+        let revision = self.state.read(cx).runs_revision();
+        if self.rows_key != Some(revision) {
+            let rows = {
+                let state = self.state.read(cx);
+                all_rows(state.workspaces(), state.runs())
             };
             self.sync_fields(&rows, cx);
             self.rows = Rc::new(rows);
-            self.rows_key = Some(rows_key);
+            self.rows_key = Some(revision);
         }
         let filters = self.filters.read(cx).filters().clone();
-        let visible_key = (revision, workspace, filters, self.query.clone(), self.sort);
+        let visible_key = (revision, filters, self.query.clone(), self.sort);
         if self.visible_key.as_ref() != Some(&visible_key) {
             self.visible = Rc::new(visible_rows(
                 &self.rows,
-                &visible_key.2,
+                &visible_key.1,
                 &self.query,
                 self.sort,
             ));
@@ -139,13 +133,13 @@ impl RunsView {
 
     /// The fields follow the runs' distinct values, rebuilt only when those change.
     fn sync_fields(&mut self, rows: &[RunRow], cx: &mut Context<Self>) {
-        let [status, agent, tier] = filter_specs(rows);
-        let key = [&status, &agent, &tier]
+        let [repository, status, agent, tier] = filter_specs(rows);
+        let key = [&repository, &status, &agent, &tier]
             .iter()
             .map(|spec| {
                 spec.options
                     .iter()
-                    .map(|option| option.id.as_str())
+                    .map(|option| format!("{}\u{1d}{}", option.id, option.label))
                     .collect::<Vec<_>>()
                     .join("\u{1f}")
             })
@@ -157,6 +151,7 @@ impl RunsView {
         self.fields_key = key;
         self.filters.update(cx, |popover, _| {
             popover.set_fields(vec![
+                FilterField::new(repository, Some(Icon::Folder)),
                 FilterField::new(status, None),
                 FilterField::new(agent, Some(Icon::Bot)),
                 FilterField::new(tier, Some(Icon::Gauge)),
@@ -280,7 +275,8 @@ impl Render for RunsView {
 }
 
 /// The runs `DataTable`: Run at its content's width (`44%` does not count when the browser
-/// measures), Status, Agent, Changes, and Started on the right; Changes does not sort.
+/// measures), Repository, Status, Agent, Changes, and Started on the right; Changes does not
+/// sort.
 fn runs_table(rows: Rc<Vec<RunRow>>, view: &RunsView, cx: &mut Context<RunsView>) -> DataTable {
     let columns = COLUMNS
         .iter()
@@ -290,11 +286,11 @@ fn runs_table(rows: Rc<Vec<RunRow>>, view: &RunsView, cx: &mut Context<RunsView>
             if index == 0 {
                 column = column.fixed();
             }
-            // Run's title and Agent's `agent / model` fade, so they narrow to fit the page.
-            if index == 0 || index == 2 {
+            // Run's title, Repository, and Agent's `agent / model` fade, so they narrow to fit.
+            if index == 0 || index == 1 || index == 3 {
                 column = column.shrinks();
             }
-            if index == 4 {
+            if index == 5 {
                 column = column.end();
             }
             if SORTABLE[index] {
@@ -322,6 +318,7 @@ fn runs_table(rows: Rc<Vec<RunRow>>, view: &RunsView, cx: &mut Context<RunsView>
         let busy = cancelling.as_deref() == Some(entry.id.as_str());
         vec![
             run_cell(entry, busy, on_cancel.clone(), cx),
+            source_cell(row.index, entry, cx),
             status_cell(entry, cx),
             agent_cell(row.index, entry, cx),
             changes_cell(entry, cx),

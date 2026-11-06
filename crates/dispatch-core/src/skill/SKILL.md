@@ -80,8 +80,9 @@ Explicit flags win over the role. `prefer` and `avoid` are weights in the rankin
 
 ## Filters and routing (optional; Auto is the default with a classifier, else normal)
 
+`run --with <dir>,<dir>` spans other repositories: each gets a worktree on the run's branch, and `merge`/`clean` take them all as one (a repository's own `.dispatch/hooks/link` can point its build at the others; `DISPATCH_LINKED_WORKTREES` names them).
 `run` accepts `--provider`, `--model`, `--effort low|medium|high|xhigh|max` (an agent that lacks one is passed over), `--agent`, `--priority speed|balanced|quality`, `--relax`.
-A filter narrows candidates and fallback; with none left the run fails (`--relax` returns to tier routing, with a note). `--model` or `--provider` replaces Auto. `--priority` sets how sure Auto must be: speed 0.70, balanced 0.80, quality 0.90.
+A filter narrows candidates and fallback; with none left the run fails (`--relax` returns to tier routing, with a note). `--model` or `--provider` replaces Auto. A `--model` with no `--agent` runs on every agent that serves that model, the one with the most quota to spare first, and falls back among them on a limit; with `--agent` too it runs only there, and a limit ends the run. An `--agent` with no `--model` lets routing pick that agent's model. `--priority` sets how sure Auto must be: speed 0.70, balanced 0.80, quality 0.90.
 `dispatch route [same filters] [--json] "<prompt>"` shows candidates, eliminations, and the winner without running anything; on Auto, with each one's pass probability and cost. `dispatch models` lists how Auto prices each model.
 `dispatch config get|set|allow|deny` keeps the persistent policy, one for every repository (allow/deny of providers, models, agents; deny wins). Every model an installed agent CLI lists is a candidate, from any provider (`antigravity/claude-sonnet-5-5-high` as much as `claude/claude-sonnet-5-5`); the policy is the only thing that narrows them.
 `dispatch agents` lists the installed agents; `dispatch agents add <name> -- <command>` adds any agent CLI that speaks ACP (the Agent Client Protocol), and `dispatch agents remove <name>` drops it.
@@ -90,7 +91,7 @@ A filter narrows candidates and fallback; with none left the run fails (`--relax
 
 - **The verbose agent log is for the user** (Desktop Runs, TUI). Do not read it; use the summary.
 - **No recursive delegation** from inside a dispatch run.
-- **One writer per directory**, and no push, deploy, or secrets in the brief.
+- **One writer per folder**: a run that would edit a folder another run is editing in place waits in line (PENDING, its note names the run in front) and starts by itself once the folder is free. No push, deploy, or secrets in the brief.
 - Claude Code's quota is the rate limits its last run printed, unknown before its first run and once they reset. Cursor, Grok, Pi, and the ACP agents have no quota source: their usage stays unknown until a rate limit puts them on cooldown.
 - A `DEGRADED` CLI still runs, with a note. A required capability that is missing is refused with a clear error.
 - `FAILED` with exhausted candidates means improve the brief or set a higher tier; do not resend it unchanged.

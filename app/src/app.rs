@@ -58,6 +58,8 @@ pub struct AppView {
     resizing: Option<(f32, f32)>,
     /// The toasts whose lifetime is already counting down.
     timed_toasts: Vec<u64>,
+    /// Holds Enter and Escape while the app asks before removing a repository.
+    confirm_focus: gpui::FocusHandle,
 }
 
 /// `ResizableSidebar`'s handle: 12px wide, centered on the sidebar's edge.
@@ -123,6 +125,7 @@ impl AppView {
             state,
             resizing: None,
             timed_toasts: Vec::new(),
+            confirm_focus: cx.focus_handle(),
         };
         let width = view.state.read(cx).sidebar_width();
         cx.update_global::<Theme, _>(|theme, _| theme.sidebar_width = width);
@@ -173,9 +176,54 @@ impl AppView {
     }
 }
 
-impl Render for AppView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+impl AppView {
+    /// Asks before removing a repository: what goes with it, Cancel, and Remove.
+    fn removal_dialog(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let repository = self.state.read(cx).removing()?.clone();
+        if !self.confirm_focus.is_focused(window) {
+            self.confirm_focus.focus(window);
+        }
         let theme = *Theme::global(cx);
+        let cancel_state = self.state.clone();
+        let cancel: crate::ui::Handler = Rc::new(move |_, cx: &mut App| {
+            cancel_state.update(cx, |state, cx| {
+                state.take_removing();
+                cx.notify();
+            });
+        });
+        let confirm_state = self.state.clone();
+        let confirm: crate::ui::Handler = Rc::new(move |_, cx: &mut App| {
+            let taken = confirm_state.update(cx, |state, cx| {
+                cx.notify();
+                state.take_removing()
+            });
+            if let Some(repository) = taken {
+                crate::views::repository_actions::remove(repository, confirm_state.clone(), cx);
+            }
+        });
+        let dialog = crate::ui::patterns::ConfirmDialog::new(
+            "remove-repository",
+            format!("Remove \u{201c}{}\u{201d}?", repository.name),
+            "Dispatch forgets the repository and deletes its runs, their transcripts, and the worktrees it cut for them.",
+        )
+        .recovery("The folder itself and its git history stay on disk. Spend keeps what the runs used.")
+        .confirm_label("Remove")
+        .danger()
+        .focus(&self.confirm_focus)
+        .on_cancel(cancel.clone())
+        .on_confirm(confirm);
+        Some(modal_layer(1.0, true, cancel, dialog, &theme))
+    }
+}
+
+impl Render for AppView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *Theme::global(cx);
+        let removing = self.removal_dialog(window, cx);
         // Settings opens as a dialog over the page it was opened from.
         let route = self.state.read(cx).backdrop();
         let settings_shown = self.settings.read(cx).is_presented(cx);
@@ -369,6 +417,7 @@ impl Render for AppView {
                     &theme,
                 ))
             })
+            .children(removing)
             .child(toast_stack(&toasts, dismiss, cx))
     }
 }

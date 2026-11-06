@@ -1,17 +1,22 @@
-//! Pure logic for the Runs page (the sidebar's View all): the current workspace's runs as
-//! `DispatchRunRow` draws them, their filter fields, search, and sort. Nothing here performs IO.
+//! Pure logic for the Runs page (the sidebar's View all): every workspace's runs as
+//! `DispatchRunRow` draws them, each with the repository it came from (named as the sidebar
+//! names its repository groups), their filter fields, search, and sort. Nothing here performs
+//! IO beyond the sidebar's cached look-up of a worktree's main checkout.
 
-use crate::client::DispatchRun;
+use std::collections::HashMap;
 
-use super::filter::{FilterSpec, Filters};
+use crate::client::{DispatchRun, Workspace};
+
+use super::filter::{FilterOption, FilterSpec, Filters};
+use super::sidebar::main_checkout;
 use super::sort::{SortDirection, SortValue, sort_rows};
 
 pub const EM_DASH: &str = "\u{2014}";
 
-/// The Runs table's columns: Run, Status, Agent, Changes, and Started.
-pub const COLUMNS: [&str; 5] = ["Run", "Status", "Agent", "Changes", "Started"];
+/// The Runs table's columns: Run, Repository, Status, Agent, Changes, and Started.
+pub const COLUMNS: [&str; 6] = ["Run", "Repository", "Status", "Agent", "Changes", "Started"];
 /// Changes is the one column that does not sort.
-pub const SORTABLE: [bool; 5] = [true, true, true, false, true];
+pub const SORTABLE: [bool; 6] = [true, true, true, true, false, true];
 
 /// One run in the Runs table.
 #[derive(Clone, Debug, PartialEq)]
@@ -26,6 +31,13 @@ pub struct RunRow {
     pub tier: String,
     pub branch: String,
     pub card_slug: String,
+    /// Where the run came from: its repository's main checkout, or, when the run names no
+    /// folder, its workspace id. The Repository filter matches on it.
+    pub source_key: String,
+    /// The repository's folder name, else the workspace's name, else its id.
+    pub source: String,
+    /// The repository's full path (and the workspace, when it is named apart), for a tooltip.
+    pub source_title: String,
     /// `agent / model`, and with the provider as its tooltip.
     pub agent_label: String,
     pub agent_title: String,
@@ -38,7 +50,38 @@ pub struct RunRow {
 }
 
 impl RunRow {
+    /// A run whose workspace is unknown.
     pub fn new(run: &DispatchRun) -> Self {
+        Self::of(run, "", "")
+    }
+
+    /// `run`, from the workspace named `workspace_name` at `workspace_path`. The repository is
+    /// the first of the run's repo, its folder, and the workspace's path, at its main checkout,
+    /// as `SidebarRun::from_dispatch` finds it.
+    pub fn of(run: &DispatchRun, workspace_name: &str, workspace_path: &str) -> Self {
+        let repo = [run.repo.as_str(), run.dir.as_str(), workspace_path]
+            .into_iter()
+            .map(|path| path.trim().trim_end_matches('/'))
+            .find(|path| !path.is_empty())
+            .map(main_checkout)
+            .unwrap_or_default();
+        let folder = repo.rsplit('/').next().unwrap_or_default();
+        let workspace_name = workspace_name.trim();
+        let source = [folder, workspace_name, run.project_id.as_str()]
+            .into_iter()
+            .find(|name| !name.is_empty())
+            .unwrap_or(EM_DASH)
+            .to_string();
+        let source_title = match (repo.is_empty(), workspace_name.is_empty()) {
+            (false, false) if workspace_name != folder => format!("{repo} · {workspace_name}"),
+            (false, _) => repo.clone(),
+            (true, _) => source.clone(),
+        };
+        let source_key = if repo.is_empty() {
+            run.project_id.clone()
+        } else {
+            repo
+        };
         let title = run.prompt.split_whitespace().collect::<Vec<_>>().join(" ");
         Self {
             id: run.id.clone(),
@@ -54,6 +97,9 @@ impl RunRow {
             tier: run.tier.clone(),
             branch: run.branch.clone(),
             card_slug: run.card_slug.clone(),
+            source_key,
+            source,
+            source_title,
             agent_label: dotted(&[&run.agent, &run.model]),
             agent_title: dotted(&[&run.agent, &run.model, &run.provider]),
             files_changed: run.files_changed,
@@ -92,6 +138,7 @@ impl RunRow {
             "status" => Some(&self.status),
             "agent" => Some(&self.agent),
             "tier" => Some(&self.tier),
+            "repository" => Some(&self.source_key),
             _ => None,
         }
     }
@@ -102,17 +149,45 @@ pub fn short_run_id(id: &str) -> &str {
     id.char_indices().nth(12).map_or(id, |(end, _)| &id[..end])
 }
 
-/// The current workspace's runs, as the core lists them for it.
-pub fn workspace_rows(runs: &[DispatchRun], workspace_id: &str) -> Vec<RunRow> {
+/// Every workspace's runs, each joined to its workspace's name and path (empty when the
+/// workspace is gone), whichever workspace the app has selected.
+pub fn all_rows(workspaces: &[Workspace], runs: &[DispatchRun]) -> Vec<RunRow> {
+    let places: HashMap<&str, (&str, &str)> = workspaces
+        .iter()
+        .map(|workspace| {
+            (
+                workspace.id.as_str(),
+                (workspace.name.as_str(), workspace.path.as_str()),
+            )
+        })
+        .collect();
     runs.iter()
-        .filter(|run| run.project_id == workspace_id)
-        .map(RunRow::new)
+        .map(|run| {
+            let (name, path) = places
+                .get(run.project_id.as_str())
+                .copied()
+                .unwrap_or(("", ""));
+            RunRow::of(run, name, path)
+        })
         .collect()
 }
 
-/// `valueFilterField` for Status, Agent, and Tier: each field's distinct values.
-pub fn filter_specs(rows: &[RunRow]) -> [FilterSpec; 3] {
+/// The Repository field: each repository the rows came from, labeled by its folder's name,
+/// in the order they first appear. Empty until a filter is added, which keeps every run.
+pub fn repository_spec(rows: &[RunRow]) -> FilterSpec {
+    let mut seen = std::collections::HashSet::new();
+    let options = rows
+        .iter()
+        .filter(|row| !row.source_key.is_empty() && seen.insert(row.source_key.as_str()))
+        .map(|row| FilterOption::new(row.source_key.as_str(), row.source.as_str()))
+        .collect();
+    FilterSpec::multi("repository", "Repository", options).plural("repositories")
+}
+
+/// `valueFilterField` for Repository, Status, Agent, and Tier: each field's distinct values.
+pub fn filter_specs(rows: &[RunRow]) -> [FilterSpec; 4] {
     [
+        repository_spec(rows),
         FilterSpec::values(
             "status",
             "Status",
@@ -143,6 +218,8 @@ pub fn visible_rows(
                         &row.tier,
                         &row.branch,
                         &row.card_slug,
+                        &row.source,
+                        &row.source_key,
                         &row.id,
                         &row.status,
                     ],
@@ -161,9 +238,10 @@ pub fn visible_rows(
 fn sort_value(row: &RunRow, column: usize) -> SortValue {
     let text = match column {
         0 => &row.prompt,
-        1 => &row.status,
-        2 => &row.agent_label,
-        4 => &row.started,
+        1 => &row.source,
+        2 => &row.status,
+        3 => &row.agent_label,
+        5 => &row.started,
         _ => return SortValue::Missing,
     };
     if text.is_empty() {
@@ -402,23 +480,88 @@ mod tests {
         assert!(parse_time("2000-02-29T00:00:00Z").is_some());
     }
 
+    fn workspace(id: &str, name: &str, path: &str) -> Workspace {
+        Workspace {
+            id: id.into(),
+            name: name.into(),
+            path: path.into(),
+            ..Workspace::default()
+        }
+    }
+
     #[test]
-    fn rows_keep_the_workspace_and_title_the_prompt_on_one_line() {
+    fn rows_cover_every_workspace_and_title_the_prompt_on_one_line() {
         let mut other = run("b", "x", "completed", "codex", "");
         other.project_id = "other".into();
-        let rows = workspace_rows(
+        let mut gone = run("d", "y", "completed", "codex", "");
+        gone.project_id = "gone".into();
+        let rows = all_rows(
+            &[
+                workspace("ws", "App", "/nowhere/app"),
+                workspace("other", "Library", "/nowhere/lib"),
+            ],
             &[
                 run("abcdefghijklmnop", "", "running", "claude", ""),
                 other,
                 run("c", "Line one\n  line two", "completed", "codex", ""),
+                gone,
             ],
-            "ws",
         );
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 4);
         assert_eq!(rows[0].title, "abcdefghijkl");
         assert!(rows[0].active);
-        assert_eq!(rows[1].title, "Line one line two");
-        assert_eq!(rows[1].agent_label, "codex / m");
+        assert_eq!(rows[2].title, "Line one line two");
+        assert_eq!(rows[2].agent_label, "codex / m");
+        // Each row says where it came from: the repository's folder, else the workspace.
+        assert_eq!(rows[0].source, "app");
+        assert_eq!(rows[0].source_key, "/nowhere/app");
+        assert_eq!(rows[0].source_title, "/nowhere/app · App");
+        assert_eq!(rows[1].source, "lib");
+        assert_eq!(rows[3].source, "gone");
+        assert_eq!(rows[3].source_key, "gone");
+    }
+
+    #[test]
+    fn a_run_names_its_own_folder_over_its_workspace() {
+        let mut own = run("a", "p", "completed", "codex", "");
+        own.dir = "/nowhere/tools/".into();
+        let row = RunRow::of(&own, "App", "/nowhere/app");
+        assert_eq!(row.source, "tools");
+        assert_eq!(row.source_key, "/nowhere/tools");
+    }
+
+    #[test]
+    fn the_repository_filter_lists_each_repository_once_and_keeps_its_runs() {
+        let mut lib = run("b", "x", "completed", "codex", "");
+        lib.project_id = "other".into();
+        let rows = all_rows(
+            &[
+                workspace("ws", "App", "/nowhere/app"),
+                workspace("other", "Library", "/nowhere/lib"),
+            ],
+            &[
+                run("a", "p", "completed", "codex", ""),
+                lib,
+                run("c", "q", "failed", "claude", ""),
+            ],
+        );
+        let [repository, ..] = filter_specs(&rows);
+        let options: Vec<(&str, &str)> = repository
+            .options
+            .iter()
+            .map(|option| (option.id.as_str(), option.label.as_str()))
+            .collect();
+        assert_eq!(options, [("/nowhere/app", "app"), ("/nowhere/lib", "lib")]);
+        let ids = |rows: Vec<RunRow>| rows.into_iter().map(|row| row.id).collect::<Vec<_>>();
+        let mut filters = Filters::default();
+        assert_eq!(
+            ids(visible_rows(&rows, &filters, "", None)),
+            ["a", "b", "c"]
+        );
+        let clause = filters.add(&repository, &["/nowhere/lib".into()]);
+        assert_eq!(ids(visible_rows(&rows, &filters, "", None)), ["b"]);
+        filters.set_operator(&clause, FILTER_IS_NOT);
+        assert_eq!(ids(visible_rows(&rows, &filters, "", None)), ["a", "c"]);
     }
 
     #[test]
@@ -435,7 +578,8 @@ mod tests {
 
     #[test]
     fn filters_search_and_sort_compose() {
-        let rows = workspace_rows(
+        let rows = all_rows(
+            &[],
             &[
                 run(
                     "a",
@@ -459,12 +603,12 @@ mod tests {
                     "2026-01-01T00:00:00Z",
                 ),
             ],
-            "ws",
         );
         let specs = filter_specs(&rows);
-        assert_eq!(specs[0].options.len(), 2);
+        assert_eq!(specs[0].options.len(), 1);
+        assert_eq!(specs[1].options.len(), 2);
         let mut filters = Filters::default();
-        let agent = filters.add(&specs[1], &["claude".into()]);
+        let agent = filters.add(&specs[2], &["claude".into()]);
         let ids = |rows: Vec<RunRow>| rows.into_iter().map(|row| row.id).collect::<Vec<_>>();
         assert_eq!(ids(visible_rows(&rows, &filters, "", None)), ["b", "c"]);
         assert_eq!(ids(visible_rows(&rows, &filters, "FIX", None)), ["c"]);
@@ -476,7 +620,7 @@ mod tests {
                 &rows,
                 &filters,
                 "",
-                Some((4, SortDirection::Ascending))
+                Some((5, SortDirection::Ascending))
             )),
             ["c", "a", "b"]
         );
@@ -485,7 +629,7 @@ mod tests {
                 &rows,
                 &filters,
                 "",
-                Some((3, SortDirection::Ascending))
+                Some((4, SortDirection::Ascending))
             )),
             ["a", "b", "c"]
         );

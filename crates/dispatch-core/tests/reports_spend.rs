@@ -129,10 +129,10 @@ fn test_usage_cost_and_run_totals() {
     );
     let u = r.usage.as_ref().expect("usage retained");
     assert!(
-        u.cost_usd.is_none(),
-        "an unpriced attempt must leave the run's cost unknown: {u:?}"
+        u.cost_usd.is_some_and(|c| near(c, 4.0)) && u.cost_partial,
+        "an unpriced attempt keeps what the others cost, marked partial: {u:?}"
     );
-    assert!(u.cost_source.is_empty());
+    assert_eq!(u.cost_source, COST_MIXED);
     assert_eq!(u.output_tokens, 100_007);
     assert_eq!(u.total_tokens(), 1_000_010 + 100_007);
 }

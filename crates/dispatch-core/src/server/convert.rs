@@ -89,12 +89,25 @@ pub fn run(r: &Run) -> pb::DispatchRun {
             cost_source: u.cost_source.clone(),
             context_tokens: u.context_tokens,
             context_window: u.context_window,
+            cost_partial: u.cost_partial,
         }),
         worktree_status: r.worktree_status.clone(),
         // A pending run has not cut its worktree yet.
         in_place: !r.read_only
             && (r.no_worktree
                 || (r.worktree.is_empty() && r.status != crate::types::STATUS_PENDING)),
+        linked: r
+            .linked
+            .iter()
+            .map(|l| pb::DispatchLinkedRepo {
+                dir: l.dir.clone(),
+                repo: l.repo.clone(),
+                worktree: l.worktree.clone(),
+                branch: l.branch.clone(),
+                base_sha: l.base_sha.clone(),
+                merge_sha: l.merge_sha.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -257,6 +270,8 @@ pub fn stats(report: &Report) -> pb::StatsResponse {
                 reasoning_tokens: r.spend.reasoning_tokens,
                 cost_usd: r.spend.cost_usd,
                 cost_runs: i32_of_usize(r.spend.cost_runs),
+                live_runs: i32_of_usize(r.spend.live_runs),
+                partial_cost_runs: i32_of_usize(r.spend.partial_cost_runs),
             })
             .collect(),
         rankings: Some(pb::DispatchStatsRankings {

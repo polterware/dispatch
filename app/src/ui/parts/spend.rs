@@ -46,10 +46,23 @@ pub fn totals_row(totals: &SpendTotals) -> AnyElement {
             StatTile::new("spend-total-tokens", "Tokens", format_tokens(totals.tokens))
                 .leading(mark(Icon::Layers, TileTone::Data)),
         )
-        .child(
-            StatTile::new("spend-total-runs", "Runs", totals.runs.to_string())
-                .leading(mark(Icon::Play, TileTone::Execution)),
-        )
+        .child({
+            let mut tile = StatTile::new("spend-total-runs", "Runs", totals.runs.to_string())
+                .leading(mark(Icon::Play, TileTone::Execution));
+            let mut notes = Vec::new();
+            if totals.live_runs > 0 {
+                notes.push(format!("{} working", totals.live_runs));
+            }
+            if totals.unreported_runs > 0 {
+                notes.push(format!("{} without usage", totals.unreported_runs));
+            }
+            if !notes.is_empty() {
+                tile = tile.caption(notes.join(" \u{00b7} ")).tooltip(
+                    "A run without usage ended before its agent reported any, so its tokens and cost are unknown rather than zero. A working run counts what it has used so far.",
+                );
+            }
+            tile
+        })
         .child(
             StatTile::new(
                 "spend-total-per-run",
@@ -71,10 +84,13 @@ pub fn agent_card(row: &SpendRow, cx: &App) -> AnyElement {
     } else {
         format!("{} runs", row.runs)
     };
-    let caption = match row.tokens.as_ref() {
-        Some(tokens) => format!("{} tokens · {runs}", tokens.label),
-        None => format!("No usage reported · {runs}"),
+    let mut caption = match row.tokens.as_ref() {
+        Some(tokens) => format!("{} tokens \u{00b7} {runs}", tokens.label),
+        None => format!("No usage reported \u{00b7} {runs}"),
     };
+    if row.live_runs > 0 {
+        caption.push_str(&format!(" \u{00b7} {} working", row.live_runs));
+    }
     let (figure, figure_tip) = match row.cost.as_ref() {
         Some(cost) => (cost.label.clone(), cost.title.clone()),
         None => (

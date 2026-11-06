@@ -89,6 +89,12 @@ impl Deps {
                 tree.stop(cancel, STOP_GRACE).await?;
             }
             let now = self.now();
+            // What the attempt used before the core went away is in its log; keep it.
+            if let Some(usage) =
+                super::usage::usage_with_log(&rec, &self.state_dir(), &self.catalog())
+            {
+                rec.usage = Some(usage);
+            }
             rec.status = STATUS_ORPHANED.into();
             rec.note = join_note(&rec.note, note);
             rec.finished_at = fmt_time(now);

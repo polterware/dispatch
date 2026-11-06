@@ -62,6 +62,8 @@ fn is_zero_usize(v: &usize) -> bool {
 #[derive(Clone, Debug, Default)]
 pub struct StatsOptions {
     pub project_id: String,
+    /// A repository's folder: only runs in it or below it.
+    pub dir: String,
     pub by: String,
     pub since: Option<DateTime<Utc>>,
     pub now: Option<DateTime<Utc>>,
@@ -116,6 +118,10 @@ pub struct Spend {
     #[serde(rename = "costUsd")]
     pub cost_usd: f64,
     pub cost_runs: usize,
+    /// Runs still working, whose usage so far is counted.
+    pub live_runs: usize,
+    /// Priced runs with an attempt no price covered.
+    pub partial_cost_runs: usize,
 }
 
 impl Spend {
@@ -132,6 +138,9 @@ impl Spend {
         if let Some(cost) = u.cost_usd {
             self.cost_usd += cost;
             self.cost_runs += 1;
+            if u.cost_partial {
+                self.partial_cost_runs += 1;
+            }
         }
     }
 }
@@ -209,10 +218,20 @@ pub fn parse_since(s: &str, now: DateTime<Utc>) -> Result<Option<DateTime<Utc>>,
 }
 
 pub fn from_store(store: Option<&dyn Store>, opt: StatsOptions) -> Result<Report, Error> {
+    from_store_live(store, opt, &|_| None)
+}
+
+/// [`from_store`], with `live` giving a run still working its usage so far, which the spend
+/// counts as live.
+pub fn from_store_live(
+    store: Option<&dyn Store>,
+    opt: StatsOptions,
+    live: &dyn Fn(&Run) -> Option<Usage>,
+) -> Result<Report, Error> {
     let Some(s) = store else {
         return compute(&[], opt);
     };
-    let mut recs = s.list_runs(&opt.project_id, 0, 0, "")?;
+    let mut recs = s.list_run_history(&opt.project_id, &opt.dir)?;
     if opt.by == "area" {
         let decs = s.list_route_decisions(&opt.project_id)?;
         let mut areas: HashMap<String, Area> = HashMap::with_capacity(decs.len());
@@ -221,6 +240,13 @@ pub fn from_store(store: Option<&dyn Store>, opt: StatsOptions) -> Result<Report
         }
         for r in &mut recs {
             r.area = areas.get(&r.id).cloned().unwrap_or_default();
+        }
+    }
+    for r in &mut recs {
+        if (r.status == STATUS_PENDING || r.status == STATUS_RUNNING)
+            && let Some(usage) = live(r)
+        {
+            r.usage = Some(usage);
         }
     }
     compute(&recs, opt)
@@ -250,6 +276,7 @@ pub fn compute(recs: &[Run], mut opt: StatsOptions) -> Result<Report, Error> {
                 .into(),
     };
     let mut kept: Vec<&Run> = Vec::new();
+    let mut working: Vec<&Run> = Vec::new();
     for r in recs {
         if let Some(since) = opt.since {
             let created = parse_time_or_zero(&r.created_at);
@@ -259,11 +286,33 @@ pub fn compute(recs: &[Run], mut opt: StatsOptions) -> Result<Report, Error> {
         }
         if r.status == STATUS_PENDING || r.status == STATUS_RUNNING {
             rep.in_flight += 1;
+            working.push(r);
             continue;
         }
         kept.push(r);
     }
-    rep.rows = rows_of(&stats_buckets(&kept, &opt.by), &opt.by);
+    let mut buckets = stats_buckets(&kept, &opt.by);
+    // A run still working counts toward spend only, as live: it has no outcome yet.
+    for r in working {
+        if r.usage.is_none() {
+            continue;
+        }
+        let a = buckets.entry(stats_group_key(r, &opt.by)).or_default();
+        let (usage_runs, cost_runs, partial) = (
+            a.spend.usage_runs,
+            a.spend.cost_runs,
+            a.spend.partial_cost_runs,
+        );
+        a.spend.add(r.usage.as_ref());
+        // Its tokens and cost count; the run counts once it ends.
+        (
+            a.spend.usage_runs,
+            a.spend.cost_runs,
+            a.spend.partial_cost_runs,
+        ) = (usage_runs, cost_runs, partial);
+        a.spend.live_runs += 1;
+    }
+    rep.rows = rows_of(&buckets, &opt.by);
     rep.rankings = rank_all_stats(&kept);
     Ok(rep)
 }

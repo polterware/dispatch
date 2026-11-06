@@ -149,6 +149,20 @@ pub struct DispatchRun {
     pub resumable: bool,
     /// A writable run that edits its folder itself, with no worktree of its own.
     pub in_place: bool,
+    /// The other repositories the run spans, each with a worktree of its own.
+    pub linked: Vec<DispatchLinkedRepo>,
+}
+
+/// One more repository a run works in, with its worktree of it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DispatchLinkedRepo {
+    pub dir: String,
+    pub repo: String,
+    pub worktree: String,
+    pub branch: String,
+    pub base_sha: String,
+    pub merge_sha: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -164,6 +178,7 @@ pub struct DispatchUsage {
     pub cost_source: String,
     pub context_tokens: ProtoI64,
     pub context_window: ProtoI64,
+    pub cost_partial: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -617,6 +632,8 @@ pub struct StatsRequest {
     pub project_id: String,
     pub by: String,
     pub since: String,
+    /// A repository's folder: only runs in it or below it.
+    pub dir: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -641,6 +658,8 @@ pub struct DispatchStatsRow {
     pub reasoning_tokens: ProtoI64,
     pub cost_usd: f64,
     pub cost_runs: i32,
+    pub live_runs: i32,
+    pub partial_cost_runs: i32,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

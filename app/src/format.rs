@@ -36,6 +36,11 @@ pub fn agent_display_name(agent: &str) -> String {
     }
 }
 
+/// Whether a run is waiting in line for a folder another run is editing, as its note says.
+pub fn is_waiting_in_line(status: &str, note: &str) -> bool {
+    status.trim().eq_ignore_ascii_case("pending") && note.contains("waiting for run ")
+}
+
 pub fn is_active_status(status: &str) -> bool {
     matches!(
         status.trim().to_ascii_lowercase().as_str(),

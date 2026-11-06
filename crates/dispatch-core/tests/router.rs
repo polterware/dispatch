@@ -380,3 +380,61 @@ fn max_effort_routes_where_the_agent_takes_it() {
         r.eliminated
     );
 }
+
+/// A model with no agent runs on every agent that serves it, so a limit on one falls back to
+/// the next; a model with an agent runs only there, so nothing else takes it.
+#[test]
+fn a_model_alone_routes_to_every_agent_that_serves_it() {
+    let cat = Catalog::embedded().unwrap();
+    let agent = |name: &str, effort_mode: &str, models: &[&str]| Agent {
+        name: name.into(),
+        installed: true,
+        read_only: true,
+        file_editing: true,
+        effort_mode: effort_mode.into(),
+        efforts: vec!["low".into(), "medium".into(), "high".into()],
+        discovered: models.iter().map(|m| (*m).to_owned()).collect(),
+        ..Default::default()
+    };
+    let agents = [
+        agent("antigravity", "model-suffix", &["claude-opus-5-5-high"]),
+        agent("claude", "config", &["claude-opus-5-5"]),
+    ];
+    let route = |agent: &str| {
+        router::route(
+            &Table::default(),
+            &Policy {
+                discover: true,
+                ..Default::default()
+            },
+            &agents,
+            &RouteOptions {
+                filters: Filters {
+                    model: "claude-opus-5-5-high".into(),
+                    agent: agent.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            &cat,
+        )
+        .unwrap()
+    };
+    let mut both: Vec<String> = route("")
+        .candidates
+        .iter()
+        .map(|c| c.filters.agent.clone())
+        .collect();
+    both.sort();
+    both.dedup();
+    assert_eq!(both, ["antigravity", "claude"]);
+    let pinned = route("antigravity");
+    assert!(
+        pinned
+            .candidates
+            .iter()
+            .all(|c| c.filters.agent == "antigravity"),
+        "{:?}",
+        pinned.candidates
+    );
+}

@@ -7,8 +7,10 @@
 //! a value: a removed pill comes back at its default. The rankings follow the chart's Since.
 //! Runs still in flight are left out: the core's report counts only runs that ended.
 //!
-//! It reads the app's current workspace (the one of the last run opened), as the Electron
-//! page does, and has no workspace picker.
+//! Its toolbar holds the page's own filter, Repository (shared with Spend): every repository
+//! while none is picked, else the runs in that repository's folder or below it, whatever
+//! workspace they were recorded under. Its figures come from the runs' history, so a deleted
+//! run still counts.
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -21,6 +23,7 @@ use gpui::{
 use crate::client::{CoreError, DispatchStatsRow, StatsRequest, StatsResponse};
 use crate::models::filter::{FilterOption, FilterSpec};
 use crate::models::sort::{SortDirection, next_sort, sort_rows};
+use crate::models::spend::{repository_spec, repository_value};
 use crate::models::stats::{
     BY_OPTIONS, STATS_COLUMNS, StatsColumn, by_label, chart_bars, column_ticks, column_title,
     default_since, empty_stats, fitting_since, is_time_series, since_options, utc_now_ms,
@@ -121,7 +124,9 @@ fn fields(by: &str) -> Vec<FilterField> {
 
 pub struct StatsView {
     state: Entity<AppState>,
-    project_id: String,
+    /// The page's filter: Repository.
+    filters: Entity<FilterPopover>,
+    fields_key: String,
     chart: Query,
     breakdown: Query,
     /// Answers by project, grouping, and window, shared by both cards.
@@ -158,9 +163,18 @@ impl StatsView {
         };
         let chart = Query::new(Pane::Chart, cx);
         let breakdown = Query::new(Pane::Table, cx);
+        let filters = cx.new(|cx| FilterPopover::new("stats-filters", "Stats filters", true, cx));
+        cx.subscribe(&filters, |this, _, _: &FiltersChanged, cx| {
+            this.chart.stale = true;
+            this.breakdown.stale = true;
+            cx.notify();
+        })
+        .detach();
+        cx.observe(&filters, |_, _, cx| cx.notify()).detach();
         Self {
             state,
-            project_id: String::new(),
+            filters,
+            fields_key: String::new(),
             chart,
             breakdown,
             cache: HashMap::new(),
@@ -191,27 +205,33 @@ impl StatsView {
         }
     }
 
-    fn resolved_project(&self, state: &AppState) -> String {
-        state
-            .current_workspace()
-            .map(|workspace| workspace.id.clone())
-            .unwrap_or_default()
+    /// The Repository field follows the repositories added, rebuilt only when they change.
+    fn sync_fields(&mut self, cx: &mut Context<Self>) {
+        let spec = repository_spec(self.state.read(cx).workspaces());
+        let key = spec
+            .options
+            .iter()
+            .map(|option| option.id.as_str())
+            .collect::<Vec<_>>()
+            .join("\u{1f}");
+        if key == self.fields_key && !self.filters.read(cx).fields().is_empty() {
+            return;
+        }
+        self.fields_key = key;
+        self.filters.update(cx, |popover, _| {
+            popover.set_fields(vec![FilterField::new(spec, Some(Icon::Folder))]);
+        });
     }
 
     fn ensure_loaded(&mut self, pane: Pane, cx: &mut Context<Self>) {
-        let (resolved, client, stamp) = {
+        let (client, stamp) = {
             let state = self.state.read(cx);
-            (
-                self.resolved_project(state),
-                state.client(),
-                snapshot_stamp(state),
-            )
+            (state.client(), snapshot_stamp(state))
         };
-        self.project_id = resolved;
-        let project = self.project_id.clone();
+        let dir = repository_value(self.filters.read(cx).filters()).to_string();
         let cached = {
             let query = self.query(pane);
-            let key = format!("{}|{}|{}", project.trim(), query.by, query.since);
+            let key = format!("{}|{}|{}", dir, query.by, query.since);
             if query.loaded_key == key && query.loaded_stamp == stamp && !query.stale {
                 return;
             }
@@ -227,10 +247,6 @@ impl StatsView {
             finish_empty(query, &key, stamp);
             return;
         };
-        if project.trim().is_empty() {
-            finish_empty(query, &key, stamp);
-            return;
-        }
         if let Some(cached) = cached {
             query.stats = cached;
         }
@@ -238,9 +254,10 @@ impl StatsView {
         query.generation = query.generation.wrapping_add(1);
         let generation = query.generation;
         let request = StatsRequest {
-            project_id: project.trim().to_string(),
+            project_id: String::new(),
             by: query.by.clone(),
             since: query.since.clone(),
+            dir,
         };
         cx.spawn(async move |this, async_cx| {
             let result = async_cx
@@ -535,6 +552,7 @@ impl StatsView {
 
 impl Render for StatsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_fields(cx);
         self.ensure_loaded(Pane::Chart, cx);
         self.ensure_loaded(Pane::Table, cx);
         self.sync_compact();
@@ -572,7 +590,16 @@ impl Render for StatsView {
         } else {
             self.content(padding, chart, window, cx)
         };
-        let bar = toolbar(div(), div(), cx);
+        let bar = toolbar(div(), self.filters.clone(), cx);
+        let content = match FilterPopover::bar(&self.filters, window, cx) {
+            Some(pills) => div()
+                .flex()
+                .flex_col()
+                .gap(px(padding))
+                .child(pills)
+                .child(content),
+            None => content,
+        };
         div()
             .size_full()
             .relative()

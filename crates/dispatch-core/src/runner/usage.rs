@@ -1,7 +1,7 @@
 use crate::{
     adapters::usage::Usage as AgentUsage,
     catalog::{Catalog, CatalogModel, PriceTier, catalog_key},
-    types::{Run, Usage},
+    types::Run,
 };
 use serde::Deserialize;
 
@@ -91,20 +91,17 @@ fn context_window(c: &Catalog, model: &str, u: &AgentUsage) -> i64 {
     price(c, &catalog_key(model)).map_or(0, |m| m.context)
 }
 
-/// Adds one attempt's reported usage, run on `model`, to the run.
+/// Adds one attempt's reported usage, run on `model`, to the run: its tokens always, and its
+/// cost when a price covers it. An attempt no price covers leaves what the others cost and
+/// marks the cost partial, rather than dropping it.
 pub fn add_usage(r: &mut Run, model: &str, u: Option<&AgentUsage>, cat: &Catalog) {
     let Some(u) = u else {
         return;
     };
     let priced = usage_cost(cat, model, u);
-    let s = r.usage.get_or_insert_with(|| {
-        let mut s = Usage::default();
-        if let Some((_, source)) = priced {
-            s.cost_usd = Some(0.0);
-            s.cost_source = source.into();
-        }
-        s
-    });
+    let s = r.usage.get_or_insert_with(Default::default);
+    let unpriced_before = s.cost_usd.is_none()
+        && s.input_tokens + s.cache_read_tokens + s.cache_write_tokens + s.output_tokens > 0;
     s.input_tokens += u.input_tokens;
     s.cache_read_tokens += u.cache_read_tokens;
     s.cache_write_tokens += u.cache_write_tokens;
@@ -115,17 +112,95 @@ pub fn add_usage(r: &mut Run, model: &str, u: Option<&AgentUsage>, cat: &Catalog
         s.context_window = context_window(cat, model, u);
     }
     match priced {
-        None => {
-            s.cost_usd = None;
-            s.cost_source.clear();
-        }
-        Some((cost, source)) => {
-            if let Some(total) = &mut s.cost_usd {
+        None => s.cost_partial |= s.cost_usd.is_some(),
+        Some((cost, source)) => match &mut s.cost_usd {
+            Some(total) => {
                 *total += cost;
                 if s.cost_source != source {
                     s.cost_source = COST_MIXED.into();
                 }
             }
+            None => {
+                s.cost_usd = Some(cost);
+                s.cost_source = source.into();
+                s.cost_partial |= unpriced_before;
+            }
+        },
+    }
+}
+
+/// The usage the run's current attempt reported so far in its agent log: the last
+/// `{"dispatch":"usage"}` line since the last attempt marker (written as the CLI streams it),
+/// else what the CLI's own output says, for the agents whose usage is read from it.
+pub fn attempt_usage_from_log(agent: &str, log: &str) -> Option<AgentUsage> {
+    let segment = log
+        .rsplit("\u{2500}\u{2500} dispatch: ")
+        .next()
+        .unwrap_or(log);
+    for line in segment.lines().rev() {
+        if !line.contains("\"dispatch\":\"usage\"") {
+            continue;
         }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        let n = |k: &str| v.get(k).and_then(serde_json::Value::as_i64).unwrap_or(0);
+        return Some(AgentUsage {
+            input_tokens: n("input"),
+            cache_read_tokens: n("cacheRead"),
+            cache_write_tokens: n("cacheWrite"),
+            output_tokens: n("output"),
+            reasoning_tokens: n("reasoning"),
+            cost_usd: v
+                .get("costUsd")
+                .and_then(serde_json::Value::as_f64)
+                .filter(|c| c.is_finite()),
+            context_tokens: n("context"),
+            context_window: n("window"),
+        });
+    }
+    use crate::adapters::usage::{usage_claude, usage_cursor, usage_grok, usage_pi};
+    match agent {
+        "claude" => usage_claude(segment),
+        "pi" => usage_pi(segment),
+        "cursor" => usage_cursor(segment),
+        "grok" => usage_grok(segment),
+        _ => None,
+    }
+}
+
+/// The run's usage counting its current attempt so far, read from its agent log under
+/// `state_dir`: what a run still working has used, or what an orphan used before the core
+/// went away. None when the log says nothing more than the run already holds.
+pub fn usage_with_log(run: &Run, state_dir: &str, cat: &Catalog) -> Option<crate::types::Usage> {
+    if state_dir.is_empty() || run.id.is_empty() {
+        return None;
+    }
+    let log = std::fs::read_to_string(super::agent_log_path(state_dir, &run.id)).ok()?;
+    let u = attempt_usage_from_log(&run.agent, &log)?;
+    let mut with = run.clone();
+    add_usage(&mut with, &run.model, Some(&u), cat);
+    with.usage
+}
+
+#[cfg(test)]
+mod log_tests {
+    use super::attempt_usage_from_log;
+
+    #[test]
+    fn the_current_attempt_reads_its_last_usage_line() {
+        let log = concat!(
+            "{\"dispatch\":\"usage\",\"input\":5,\"output\":1}\n",
+            "\n\u{2500}\u{2500} dispatch: a/m failed (rate_limit); trying b/n \u{2500}\u{2500}\n",
+            "{\"dispatch\":\"usage\",\"input\":10,\"output\":2,\"costUsd\":null}\n",
+            "{\"dispatch\":\"usage\",\"input\":30,\"output\":4,\"cacheRead\":7}\n",
+            "some agent text\n",
+        );
+        let u = attempt_usage_from_log("acp-agent", log).expect("usage");
+        assert_eq!(
+            (u.input_tokens, u.output_tokens, u.cache_read_tokens),
+            (30, 4, 7)
+        );
+        assert!(attempt_usage_from_log("acp-agent", "no usage here").is_none());
     }
 }

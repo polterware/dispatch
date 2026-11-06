@@ -77,7 +77,26 @@ pub(crate) fn which(bin: &str) -> bool {
 
 /// What the refusal of a second run editing a folder in place offers, word for word: the
 /// app finds it to offer New worktree in one click.
-pub const IN_PLACE_BUSY_HINT: &str = "--worktree-mode worktree";
+/// How often a run waiting for a folder looks whether it is free.
+const QUEUE_POLL: Duration = Duration::from_secs(1);
+
+/// The note a run waiting in line carries, naming the run in front of it.
+const WAITING_PREFIX: &str = "waiting for run ";
+
+fn waiting_note(ahead: &str, dir: &str) -> String {
+    format!(
+        "{WAITING_PREFIX}{} to finish editing {dir} itself",
+        short_run(ahead)
+    )
+}
+
+/// `note` without the waiting part, once the run leaves the line.
+fn drop_waiting(note: &str) -> String {
+    note.split("; ")
+        .filter(|part| !part.starts_with(WAITING_PREFIX))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
 
 /// `StartRunRequest.worktree_mode`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -376,6 +395,7 @@ impl Core {
             tier,
             prompt: prompt.clone(),
             dir: dir.clone(),
+            with: m.with.iter().map(|d| absolute(d.trim())).collect(),
             read_only: m.read_only,
             no_worktree,
             timeout: Duration::from_secs(u64::try_from(m.timeout_sec).unwrap_or(0)),
@@ -394,40 +414,104 @@ impl Core {
             self.apply_profile(&mut opts, profile)
                 .map_err(|e| RpcError::invalid(e.to_string()))?;
         }
-        // Runs share a folder freely; only two editing the same folder itself would clash.
-        if edits_in_place(opts.read_only, no_worktree, "", &dir) {
-            let busy = self
-                .store
-                .list_runs(&project_id, 0, 0, "")
-                .map_err(RpcError::internal)?
-                .into_iter()
-                .find(|r| {
-                    (r.status == STATUS_PENDING || r.status == STATUS_RUNNING)
-                        && edits_in_place(r.read_only, r.no_worktree, &r.worktree, &r.dir)
-                        && same_dir(&r.dir, &dir)
-                });
-            if let Some(busy) = busy {
-                let way_out = if can_branch(&dir) {
-                    format!(
-                        "start this one in a new worktree ({IN_PLACE_BUSY_HINT}), read-only, or once that run ends"
-                    )
-                } else {
-                    "start this one read-only, or once that run ends".to_owned()
-                };
-                return Err(RpcError::new(
-                    "failed_precondition",
-                    format!(
-                        "run {} is editing {dir} itself, with no worktree of its own: {way_out}",
-                        short_run(&busy.id)
-                    ),
-                ));
-            }
-        }
+        // Runs share a folder freely; only two editing the same folder itself would clash, so
+        // a run that would edit a folder another run is editing waits in line for it.
+        let busy = if edits_in_place(opts.read_only, no_worktree, "", &dir) {
+            self.folder_writer(&dir, None).map_err(RpcError::internal)?
+        } else {
+            None
+        };
         let begun = deps.begin(opts).await;
         drop(start);
         let run = begun.map_err(|e| RpcError::invalid(e.to_string()))?;
-        self.launch_run(&ws, deps, run, &prompt, &req_worktree, &dir)
-            .await
+        match busy {
+            Some(busy) => self.queue_run(ws, deps, run, prompt, req_worktree, dir, &busy),
+            None => {
+                self.launch_run(&ws, deps, run, &prompt, &req_worktree, &dir)
+                    .await
+            }
+        }
+    }
+
+    /// The run editing `dir` itself, with no worktree of its own, that `run` waits behind:
+    /// any such run still pending or working, in any workspace, started before `run` (every
+    /// one, with no `run`).
+    fn folder_writer(&self, dir: &str, run: Option<&Run>) -> Result<Option<Run>, Error> {
+        Ok(self.store.list_runs("", 0, 0, "")?.into_iter().find(|r| {
+            (r.status == STATUS_PENDING || r.status == STATUS_RUNNING)
+                && edits_in_place(r.read_only, r.no_worktree, &r.worktree, &r.dir)
+                && same_dir(&r.dir, dir)
+                && run.is_none_or(|run| {
+                    r.id != run.id
+                        && (r.created_at.as_str(), r.id.as_str())
+                            < (run.created_at.as_str(), run.id.as_str())
+                })
+        }))
+    }
+
+    /// Records `run` as waiting behind `busy` and starts it once no run started before it is
+    /// editing `dir` itself. Cancel ends the wait; a core that goes away leaves it orphaned.
+    #[allow(clippy::too_many_arguments)]
+    fn queue_run(
+        self: &Arc<Self>,
+        ws: crate::store::Workspace,
+        deps: runner::Deps,
+        run: Run,
+        prompt: String,
+        req_worktree: String,
+        dir: String,
+        busy: &Run,
+    ) -> RpcResult<pb::StartRunResponse> {
+        let mut run = run;
+        let waiting = waiting_note(&busy.id, &dir);
+        run.note = runner::join_note(&run.note, &waiting);
+        self.store.save_run(&run).map_err(RpcError::internal)?;
+        let wait = CancellationToken::new();
+        self.put_cancel(&run.id, wait.clone());
+        let core = self.clone();
+        let queued = run.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = wait.cancelled() => return,
+                    () = tokio::time::sleep(QUEUE_POLL) => {}
+                }
+                let Ok(current) = core.store.get_run(&queued.id) else {
+                    return;
+                };
+                if is_terminal(&current.status) {
+                    return;
+                }
+                match core.folder_writer(&dir, Some(&current)) {
+                    Ok(None) => break,
+                    Ok(Some(ahead)) => {
+                        // The run in front can change as the line moves; the note follows it.
+                        let note = waiting_note(&ahead.id, &dir);
+                        if !current.note.contains(&note) {
+                            let mut current = current;
+                            current.note = runner::join_note(&drop_waiting(&current.note), &note);
+                            let _ = core.store.save_run(&current);
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+            let Ok(mut current) = core.store.get_run(&queued.id) else {
+                return;
+            };
+            if is_terminal(&current.status) || wait.is_cancelled() {
+                return;
+            }
+            core.pop_cancel(&current.id);
+            current.note = drop_waiting(&current.note);
+            let _ = core.store.save_run(&current);
+            let _ = core
+                .launch_run(&ws, deps, current, &prompt, &req_worktree, &dir)
+                .await;
+        });
+        Ok(pb::StartRunResponse {
+            run: Some(convert::run(&run)),
+        })
     }
 
     /// A follow-up: `m.prompt` goes to the session of the ended run `m.resume`, as a new
@@ -1196,14 +1280,21 @@ impl Core {
         let now = Utc::now();
         let since = reports::stats::parse_since(&m.since, now)
             .map_err(|e| RpcError::invalid(e.to_string()))?;
-        let report = reports::stats::from_store(
+        let deps = self.deps().map_err(RpcError::internal)?;
+        let (state_dir, catalog) = (deps.state_dir(), deps.catalog());
+        let live = |run: &crate::types::Run| {
+            runner::usage_with_log(run, &state_dir, &catalog).or_else(|| run.usage.clone())
+        };
+        let report = reports::stats::from_store_live(
             Some(self.store.as_ref()),
             StatsOptions {
                 project_id: m.project_id.trim().into(),
+                dir: m.dir.trim().into(),
                 by: m.by.trim().into(),
                 since,
                 now: Some(now),
             },
+            &live,
         )
         .map_err(|e| RpcError::invalid(e.to_string()))?;
         Ok(convert::stats(&report))

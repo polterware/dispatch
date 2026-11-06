@@ -729,3 +729,36 @@ fn test_evidence_durations_only_from_completed_runs() {
     assert_eq!(e.duration_n, 1);
     assert_eq!(e.p50_ms, Some(1000));
 }
+
+/// Spend and Stats read the runs' history, which deleting a run leaves in place, and a
+/// repository's folder keeps the runs in it or below it.
+#[test]
+fn history_outlives_a_deleted_run_and_filters_by_folder() {
+    use dispatch_core::types::{Run, Store as _, Usage};
+    let store = dispatch_core::store::Store::new(":memory:").unwrap();
+    let run = |id: &str, dir: &str| Run {
+        id: id.into(),
+        project_id: "ws-home".into(),
+        status: "COMPLETED".into(),
+        agent: "codex".into(),
+        dir: dir.into(),
+        usage: Some(Usage {
+            input_tokens: 10,
+            cost_usd: Some(0.5),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    store.save_run(&run("a", "/code/repo")).unwrap();
+    store.save_run(&run("b", "/code/repo/sub")).unwrap();
+    store.save_run(&run("c", "/code/other")).unwrap();
+    store.delete_runs(&["a".to_string()], "").unwrap();
+    assert!(store.get_run("a").is_err(), "the run itself is gone");
+    let all = store.list_run_history("", "").unwrap();
+    assert_eq!(all.len(), 3);
+    let repo = store.list_run_history("", "/code/repo/").unwrap();
+    let mut ids: Vec<&str> = repo.iter().map(|r| r.id.as_str()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["a", "b"]);
+    assert_eq!(repo[0].usage.as_ref().and_then(|u| u.cost_usd), Some(0.5));
+}

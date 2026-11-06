@@ -233,44 +233,57 @@ pub fn policy_label(policy: &str) -> String {
     }
 }
 
-/// Difficulty, classifier band, and the priority bar the task had to clear.
-pub fn decision_summary(decision: &RouteDecision) -> String {
-    let mut parts = Vec::new();
-    if let Some(difficulty) = decision.difficulty {
-        let tier = if decision.tier.is_empty() {
-            String::new()
-        } else {
-            format!(" ({})", decision.tier)
-        };
-        parts.push(format!("d {}{tier}", fixed(difficulty, 2)));
+/// The task's difficulty and the tier it maps to, such as `-2.49 · easy`.
+pub fn difficulty_label(decision: &RouteDecision) -> Option<String> {
+    let difficulty = decision.difficulty?;
+    Some(if decision.tier.is_empty() {
+        fixed(difficulty, 2)
+    } else {
+        format!("{} \u{00b7} {}", fixed(difficulty, 2), decision.tier)
+    })
+}
+
+/// The classifier that judged the task and, when it gave them, its chances for easy,
+/// normal, and hard, drawn as bars.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClassifierBands {
+    pub name: String,
+    pub bands: Vec<(&'static str, f64)>,
+}
+
+pub fn classifier_bands(decision: &RouteDecision) -> Option<ClassifierBands> {
+    if decision.classifier.is_empty() {
+        return None;
     }
-    if !decision.classifier.is_empty() {
-        if decision.probs.len() == 3 {
-            parts.push(format!(
-                "{}: easy {}, normal {}, hard {}",
-                decision.classifier,
-                fixed(decision.probs[0], 2),
-                fixed(decision.probs[1], 2),
-                fixed(decision.probs[2], 2),
-            ));
-        } else {
-            parts.push(decision.classifier.clone());
-        }
-    }
+    let bands = if decision.probs.len() == 3 {
+        ["easy", "normal", "hard"]
+            .into_iter()
+            .zip(decision.probs.iter().map(|p| p.clamp(0.0, 1.0)))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Some(ClassifierBands {
+        name: decision.classifier.clone(),
+        bands,
+    })
+}
+
+/// The priority and the bar it sets, such as `balanced · bar 80%`.
+pub fn priority_label(decision: &RouteDecision) -> String {
     let priority = if decision.priority.is_empty() {
         "balanced"
     } else {
         decision.priority.as_str()
     };
-    let bar = PRIORITY_BARS
+    match PRIORITY_BARS
         .iter()
         .find(|(name, _)| *name == priority)
-        .map(|(_, bar)| *bar);
-    parts.push(match bar {
-        Some(bar) => format!("{priority}, bar {}", fixed(bar, 2)),
+        .map(|(_, bar)| *bar)
+    {
+        Some(bar) => format!("{priority} \u{00b7} bar {}", percent(bar)),
         None => priority.to_string(),
-    });
-    parts.join(" \u{00b7} ")
+    }
 }
 
 /// How the run got its role: picked with P, general, or named by the request.
@@ -317,7 +330,7 @@ fn priority_bar(decision: &RouteDecision) -> f64 {
         .map_or(0.8, |(_, bar)| *bar)
 }
 
-fn percent(value: f64) -> String {
+pub fn percent(value: f64) -> String {
     format!("{:.0}%", value * 100.0)
 }
 
@@ -1339,12 +1352,13 @@ fn json_i64(value: &Value, key: &str) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        CandidateOutcome, DecisionCandidate, MoreAction, ReviewAction, RolePick, RouteDecision,
-        TokenUsage, candidate_explain, candidate_line, candidate_outcomes, context_usage,
-        decision_summary, dispatch_op_body, file_counts, format_cost, format_duration,
-        format_files, format_tokens, live_usage, map_route_decision, pace_label, parse_time_ms,
-        role_summary, route_reason, run_cost, run_more_actions, run_review_action, token_breakdown,
-        total_tokens, unmatched_attempts, worktree_display_status,
+        CandidateOutcome, ClassifierBands, DecisionCandidate, MoreAction, ReviewAction, RolePick,
+        RouteDecision, TokenUsage, candidate_explain, candidate_line, candidate_outcomes,
+        classifier_bands, context_usage, difficulty_label, dispatch_op_body, file_counts,
+        format_cost, format_duration, format_files, format_tokens, live_usage, map_route_decision,
+        pace_label, parse_time_ms, priority_label, role_summary, route_reason, run_cost,
+        run_more_actions, run_review_action, token_breakdown, total_tokens, unmatched_attempts,
+        worktree_display_status,
     };
     use crate::client::{DispatchAttempt, DispatchRun as Run};
     use serde_json::{Value, json};
@@ -1419,9 +1433,17 @@ mod tests {
         assert_eq!(decision.area_kinds, vec!["service".to_string()]);
         assert_eq!(decision.area_tech, vec!["go".to_string()]);
         assert_eq!(
-            decision_summary(&decision),
-            "d -0.50 (hard) \u{00b7} jev: easy 0.10, normal 0.20, hard 0.70 \u{00b7} quality, bar 0.90"
+            difficulty_label(&decision).as_deref(),
+            Some("-0.50 \u{00b7} hard")
         );
+        assert_eq!(
+            classifier_bands(&decision),
+            Some(ClassifierBands {
+                name: "jev".into(),
+                bands: vec![("easy", 0.1), ("normal", 0.2), ("hard", 0.7)],
+            })
+        );
+        assert_eq!(priority_label(&decision), "quality \u{00b7} bar 90%");
         assert_eq!(
             candidate_line(&decision.candidates[0]),
             "91% to pass \u{00b7} $0.20"

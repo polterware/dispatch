@@ -96,6 +96,18 @@ fn fill_diff(rec: &mut Run) {
     }
 }
 
+/// A run that cuts no worktree of its own cuts none for the other repositories either.
+fn drop_linked(rec: &mut Run) {
+    if rec.linked.is_empty() {
+        return;
+    }
+    rec.linked.clear();
+    rec.note = join_note(
+        &rec.note,
+        "the other repositories need a worktree of the run's own; they were left out",
+    );
+}
+
 /// Where the live, redacted copy of an agent's output goes; empty without a
 /// state directory.
 pub fn agent_log_path(state_dir: &str, id: &str) -> String {
@@ -278,6 +290,16 @@ impl Deps {
             requested: Some(o.filters.clone()),
             parent_run_id: self.env(RUN_ID_ENV),
             note: route_note,
+            linked: o
+                .with
+                .iter()
+                .map(|d| d.trim())
+                .filter(|d| !d.is_empty())
+                .map(|d| crate::types::LinkedRepo {
+                    dir: d.to_owned(),
+                    ..Default::default()
+                })
+                .collect(),
             ..Run::default()
         };
         if !o.resume.is_empty() {
@@ -303,6 +325,7 @@ impl Deps {
             rec.provider.clone_from(&prev.provider);
             rec.effort.clone_from(&prev.effort);
             rec.resolved.clone_from(&prev.resolved);
+            rec.linked.clone_from(&prev.linked);
             let f = &o.filters;
             if (!f.agent.is_empty() && f.agent != prev.agent)
                 || (!f.model.is_empty() && !matches_model(&prev.model, &f.model))
@@ -568,10 +591,12 @@ impl Deps {
             rec.note = "the previous run's worktree had nothing to merge and was removed; this follow-up cut it again on a new branch".into();
         }
         if rec.read_only || rec.no_worktree {
+            drop_linked(rec);
             return Ok(dir);
         }
         let root = worktree::root(&dir);
         if root.is_empty() || !worktree::has_commits(&root) {
+            drop_linked(rec);
             return Ok(dir);
         }
         if self.worktree_dir.is_empty() {
@@ -609,6 +634,10 @@ impl Deps {
                 &rec.note,
                 "checkout has uncommitted changes; the worktree was cut from HEAD and does not include them",
             );
+        }
+        if !rec.linked.is_empty() {
+            self.cut_linked(rec)?;
+            self.run_link_hooks(rec);
         }
         Ok(dir)
     }
@@ -674,15 +703,23 @@ impl Deps {
                 None => Ok(()),
             }
         });
+        let mut env = child_env.to_vec();
+        if !rec.linked.is_empty() {
+            env.push(format!(
+                "{}={}",
+                super::linked::LINKED_ENV,
+                super::linked::linked_env(rec)
+            ));
+        }
         let request = Request {
             effort: rec.effort.clone(),
-            prompt: rec.prompt.clone(),
+            prompt: format!("{}{}", rec.prompt, super::linked::prompt_note(rec)),
             tier: rec.tier.clone(),
             dir: dir.into(),
             read_only: rec.read_only,
             timeout,
             resume_session: resume_session.into(),
-            env: child_env.to_vec(),
+            env,
             log_path: agent_log_path(&self.state_dir(), &rec.id),
             started: None,
         };
@@ -724,6 +761,49 @@ impl Deps {
             Ok(false) => "no file changes".into(),
         };
         rec.note = join_note(&rec.note, &note);
+        self.commit_linked(rec);
+        self.note_overlaps(rec);
+    }
+
+    /// Warns, before any merge, of files this run changed that another run working, or done
+    /// and not merged yet, changed too in the same repository.
+    fn note_overlaps(&self, rec: &mut Run) {
+        let Some(st) = self.store.as_deref() else {
+            return;
+        };
+        let mine = super::linked::branches(rec);
+        if mine.is_empty() {
+            return;
+        }
+        let Ok(others) = st.list_runs("", 0, 0, "") else {
+            return;
+        };
+        for other in others {
+            let open = matches!(other.status.as_str(), STATUS_PENDING | STATUS_RUNNING)
+                || (other.status == STATUS_COMPLETED && other.merged_at.is_none());
+            if other.id == rec.id || !open {
+                continue;
+            }
+            let shared = super::linked::overlap(rec, &other);
+            if shared.is_empty() {
+                continue;
+            }
+            let shown: Vec<&str> = shared.iter().take(5).map(String::as_str).collect();
+            let more = shared.len().saturating_sub(shown.len());
+            let more = if more > 0 {
+                format!(" and {more} more")
+            } else {
+                String::new()
+            };
+            rec.note = join_note(
+                &rec.note,
+                &format!(
+                    "run {} changed the same files: {}{more}; expect a conflict when both merge",
+                    &other.id[..other.id.len().min(8)],
+                    shown.join(", ")
+                ),
+            );
+        }
     }
 
     /// Sets cooldowns for quota errors and appends the failed attempt. It

@@ -53,6 +53,10 @@ pub struct Usage {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SpendGroup {
     pub usage_runs: i64,
+    /// Runs still working, counted in the tokens and cost so far.
+    pub live_runs: i64,
+    /// Priced runs whose cost leaves out an attempt no price covered.
+    pub partial_cost_runs: i64,
     pub tokens: TokenCounts,
     pub cost_usd: f64,
     pub cost_runs: i64,
@@ -92,6 +96,12 @@ pub struct SpendRow {
     pub cost_usd: Option<f64>,
     /// The runs whose cost is in `cost_usd`.
     pub cost_runs: i64,
+    /// Ended runs that reported usage.
+    pub usage_runs: i64,
+    /// Runs still working, whose usage so far is in the tokens and cost.
+    pub live_runs: i64,
+    /// Priced runs with an attempt no price covered: their cost is a floor.
+    pub partial_cost_runs: i64,
 }
 
 /// Every token sent or received, cache included. Reasoning is part of output.
@@ -218,7 +228,7 @@ pub fn run_cost(usage: &Usage) -> Cell {
 
 /// A group's spend: tokens and the cost of its priced runs, with tooltips.
 pub fn spend_cells(group: &SpendGroup, runs: i64) -> SpendCells {
-    if group.usage_runs == 0 {
+    if group.usage_runs == 0 && group.live_runs == 0 {
         return SpendCells {
             tokens: None,
             cost: None,
@@ -227,12 +237,13 @@ pub fn spend_cells(group: &SpendGroup, runs: i64) -> SpendCells {
     let tokens = Cell {
         label: format_tokens(total_tokens(&group.tokens)),
         title: format!(
-            "{}. {} of {runs} runs reported usage.",
+            "{}. {} of {runs} runs reported usage.{}",
             token_breakdown(&group.tokens),
-            group.usage_runs
+            group.usage_runs,
+            live_note(group.live_runs)
         ),
     };
-    if group.cost_runs == 0 {
+    if group.cost_runs == 0 && group.live_runs == 0 {
         return SpendCells {
             tokens: Some(tokens),
             cost: None,
@@ -246,12 +257,29 @@ pub fn spend_cells(group: &SpendGroup, runs: i64) -> SpendCells {
     } else {
         String::new()
     };
+    let partial = match group.partial_cost_runs {
+        0 => String::new(),
+        1 => " One run had an attempt no price covered, so its cost is a floor.".to_string(),
+        n => format!(" {n} runs had an attempt no price covered, so their cost is a floor."),
+    };
     SpendCells {
         tokens: Some(tokens),
         cost: Some(Cell {
             label: format_cost(group.cost_usd),
-            title: format!("{API_EQUIVALENT}{priced}"),
+            title: format!(
+                "{API_EQUIVALENT}{priced}{partial}{}",
+                live_note(group.live_runs)
+            ),
         }),
+    }
+}
+
+/// What a figure says about runs still working: their usage so far is in it.
+pub fn live_note(live_runs: i64) -> String {
+    match live_runs {
+        0 => String::new(),
+        1 => " Includes 1 run still working, so far.".to_string(),
+        n => format!(" Includes {n} runs still working, so far."),
     }
 }
 
@@ -264,10 +292,42 @@ pub fn known_text(value: &str) -> Option<String> {
     }
 }
 
-/// `agentFilters`: Provider over the rows' providers, then the Spend window (one at a time,
-/// Last 7 days without one).
-pub fn filter_specs(rows: &[SpendRow]) -> [FilterSpec; 2] {
+/// The Repository filter Spend and Stats share: one repository at a time, by its folder,
+/// every one while none is picked. It offers each repository added with a folder, by name.
+pub fn repository_spec(workspaces: &[crate::client::Workspace]) -> FilterSpec {
+    let mut seen = HashSet::new();
+    let options = workspaces
+        .iter()
+        .filter(|workspace| !workspace.path.trim().is_empty())
+        .filter(|workspace| seen.insert(workspace.path.trim_end_matches('/').to_string()))
+        .map(|workspace| {
+            let label = if workspace.name.trim().is_empty() {
+                workspace.path.rsplit('/').next().unwrap_or(&workspace.path)
+            } else {
+                workspace.name.as_str()
+            };
+            FilterOption::new(workspace.path.trim_end_matches('/'), label)
+        })
+        .collect();
+    FilterSpec::multi("repository", "Repository", options)
+        .single()
+        .plural("repositories")
+}
+
+/// The repository's folder a page reads, or empty for every repository.
+pub fn repository_value(filters: &Filters) -> &str {
+    filters
+        .values_of("repository")
+        .first()
+        .map(String::as_str)
+        .unwrap_or("")
+}
+
+/// `agentFilters`: Repository, Provider over the rows' providers, then the Spend window (one
+/// at a time, Last 7 days without one).
+pub fn filter_specs(rows: &[SpendRow], workspaces: &[crate::client::Workspace]) -> [FilterSpec; 3] {
     [
+        repository_spec(workspaces),
         FilterSpec::values(
             "provider",
             "Provider",
@@ -325,6 +385,10 @@ pub fn spent_rows(rows: &[SpendRow]) -> Vec<SpendRow> {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SpendTotals {
     pub runs: i64,
+    /// Ended runs with no usage recorded: their tokens and cost are unknown.
+    pub unreported_runs: i64,
+    pub live_runs: i64,
+    pub partial_cost_runs: i64,
     pub tokens: i64,
     /// The API-equivalent cost of the priced runs, when any was priced.
     pub cost_usd: Option<f64>,
@@ -341,6 +405,9 @@ impl SpendTotals {
 
 pub fn spend_totals(rows: &[SpendRow]) -> SpendTotals {
     let mut totals = SpendTotals {
+        unreported_runs: 0,
+        live_runs: 0,
+        partial_cost_runs: 0,
         runs: 0,
         tokens: 0,
         cost_usd: None,
@@ -348,6 +415,9 @@ pub fn spend_totals(rows: &[SpendRow]) -> SpendTotals {
     };
     for row in rows {
         totals.runs += row.runs;
+        totals.unreported_runs += (row.runs - row.usage_runs).max(0);
+        totals.live_runs += row.live_runs;
+        totals.partial_cost_runs += row.partial_cost_runs;
         totals.tokens += row.counts.as_ref().map(total_tokens).unwrap_or(0);
         if let Some(cost) = row.cost_usd {
             totals.cost_usd = Some(totals.cost_usd.unwrap_or(0.0) + cost);
@@ -392,8 +462,10 @@ fn build_row(agent: &DispatchAgent, stats: &[DispatchStatsRow]) -> SpendRow {
         Some(row) => {
             let group = group_from_row(row);
             let cells = spend_cells(&group, runs);
-            let counts = (row.usage_runs > 0).then(|| group.tokens.clone());
-            let cost_usd = (row.cost_runs > 0).then_some(row.cost_usd);
+            let used = row.usage_runs > 0 || row.live_runs > 0;
+            let counts = used.then(|| group.tokens.clone());
+            let cost_usd = (row.cost_runs > 0 || (row.live_runs > 0 && row.cost_usd > 0.0))
+                .then_some(row.cost_usd);
             (
                 cells.tokens,
                 cells.cost,
@@ -413,11 +485,16 @@ fn build_row(agent: &DispatchAgent, stats: &[DispatchStatsRow]) -> SpendRow {
         counts,
         cost_usd,
         cost_runs,
+        usage_runs: stat.map_or(0, |row| i64::from(row.usage_runs)),
+        live_runs: stat.map_or(0, |row| i64::from(row.live_runs)),
+        partial_cost_runs: stat.map_or(0, |row| i64::from(row.partial_cost_runs)),
     }
 }
 
 fn group_from_row(row: &DispatchStatsRow) -> SpendGroup {
     SpendGroup {
+        live_runs: i64::from(row.live_runs),
+        partial_cost_runs: i64::from(row.partial_cost_runs),
         usage_runs: i64::from(row.usage_runs),
         tokens: TokenCounts {
             input: row.input_tokens.0,
@@ -554,6 +631,8 @@ mod tests {
     fn shows_tokens_and_a_cost_only_for_priced_runs() {
         let group = SpendGroup {
             usage_runs: 3,
+            live_runs: 0,
+            partial_cost_runs: 0,
             tokens: tokens(1000, 0, 0, 500, 0),
             cost_usd: 2.5,
             cost_runs: 2,
@@ -682,18 +761,31 @@ mod tests {
         assert_eq!(rows[1].runs, 0);
         assert!(rows[1].tokens.is_none());
 
-        let specs = filter_specs(&rows);
+        let workspaces = [crate::client::Workspace {
+            id: "ws-1".into(),
+            name: "api".into(),
+            path: "/code/api/".into(),
+            ..Default::default()
+        }];
+        let specs = filter_specs(&rows, &workspaces);
         let mut filters = Filters::default();
         assert!(row_matches(&rows[0], "Open", &filters));
         assert!(!row_matches(&rows[0], "xai", &filters));
-        filters.add(&specs[0], &["openai".into()]);
+        filters.add(&specs[1], &["openai".into()]);
         assert!(row_matches(&rows[0], "", &filters));
         assert!(!row_matches(&rows[1], "", &filters));
 
         assert_eq!(since_value(&filters), "7d");
-        filters.add(&specs[1], &["24h".into()]);
-        filters.add(&specs[1], &["30d".into()]);
+        filters.add(&specs[2], &["24h".into()]);
+        filters.add(&specs[2], &["30d".into()]);
         assert_eq!(since_value(&filters), "30d");
+        assert!(row_matches(&rows[0], "", &filters));
+
+        // The repository picks the figures, not the rows: every row still matches.
+        assert_eq!(repository_value(&filters), "");
+        assert_eq!(specs[0].options[0].label, "api");
+        filters.add(&specs[0], &["/code/api".into()]);
+        assert_eq!(repository_value(&filters), "/code/api");
         assert!(row_matches(&rows[0], "", &filters));
     }
 }

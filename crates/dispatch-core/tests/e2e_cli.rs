@@ -345,6 +345,52 @@ fn a_write_run_lands_on_its_branch_and_merges() {
     env.ok(&["clean", &id]);
 }
 
+/// A run that spans another repository cuts a worktree there on its branch name, runs that
+/// repository's link hook with every worktree named, and merges and cleans both as one.
+#[test]
+fn a_run_with_another_repository_cuts_merges_and_cleans_both() {
+    let env = Env::new();
+    let lib = env.root.join("lib");
+    std::fs::create_dir_all(lib.join(".dispatch/hooks")).expect("mkdir");
+    git(&lib, &["init", "-q", "-b", "main"]);
+    std::fs::write(lib.join("lib.txt"), "library\n").expect("write");
+    let hook = lib.join(".dispatch/hooks/link");
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\nprintf '%s' \"$DISPATCH_LINKED_WORKTREES\" > linked.txt\n",
+    )
+    .expect("write hook");
+    std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .expect("chmod");
+    git(&lib, &["add", "-A"]);
+    git(&lib, &["commit", "-qm", "init"]);
+    let lib_dir = lib.to_string_lossy().into_owned();
+
+    let id = env.run("WRITE a file", &["--with", &lib_dir]);
+    let s = env.wait_for(&id, "COMPLETED");
+    let linked = s["linked"].as_array().expect("linked repos");
+    assert_eq!(linked.len(), 1, "{s}");
+    let lib_tree = PathBuf::from(linked[0]["worktree"].as_str().expect("worktree"));
+    assert_eq!(linked[0]["branch"], format!("dispatch/{id}").as_str());
+    // The hook ran in the library's worktree and saw both worktrees.
+    let seen = read(lib_tree.join("linked.txt"));
+    assert!(seen.contains("lib=") && seen.contains("repo="), "{seen}");
+
+    env.ok(&["merge", &id[..8]]);
+    assert!(read(env.repo.join("e2e.txt")).starts_with("written by the fake agent"));
+    assert!(
+        read(lib.join("linked.txt")).contains("lib="),
+        "the library merged too"
+    );
+    assert!(!lib_tree.exists(), "merge left the library's worktree");
+    assert_eq!(
+        git(&lib, &["worktree", "list", "--porcelain"])
+            .matches("worktree ")
+            .count(),
+        1
+    );
+}
+
 #[test]
 fn a_message_to_an_ended_run_continues_its_session_and_worktree() {
     let env = Env::new();
@@ -448,25 +494,29 @@ fn a_cancelled_run_ends_with_its_agent() {
 }
 
 #[test]
-fn two_runs_editing_one_folder_itself_are_refused() {
+fn a_second_run_editing_one_folder_itself_waits_in_line() {
     let env = Env::new();
     let folder = env.repo.to_string_lossy().into_owned();
     let id = env.run("SLOW answer", &["--worktree", &folder]);
     env.wait_for(&id, "RUNNING");
-    // Both would write in the folder itself, with no worktree of their own.
-    let err = env.fails(&[
-        "run",
-        "--agent",
-        "fake",
-        "--json",
-        "--worktree",
-        &folder,
-        "another",
-    ]);
-    assert!(err.contains("is editing"), "{err}");
+    // Both would write in the folder itself, with no worktree of their own: the second waits.
+    let queued = env.run("SLOW another", &["--worktree", &folder]);
+    std::thread::sleep(Duration::from_millis(1500));
+    let waiting = env.status(&queued);
+    assert_eq!(waiting["status"], "PENDING", "{waiting}");
+    assert!(
+        waiting["note"]
+            .as_str()
+            .unwrap_or("")
+            .contains("waiting for run"),
+        "{waiting}"
+    );
     // A read-only run there is fine.
     let reader = env.run("say hi", &["--readonly", "--worktree", &folder]);
     env.wait_for(&reader, "COMPLETED");
+    // Cancel ends the wait: the run in line never starts.
+    env.ok(&["cancel", &queued[..8]]);
+    env.wait_for(&queued, "CANCELLED");
     env.ok(&["cancel", &id[..8]]);
     env.wait_for(&id, "CANCELLED");
 }
@@ -500,25 +550,34 @@ fn a_new_worktree_needs_git_and_a_busy_folder_offers_one() {
     ]);
     assert!(err.contains("not a git checkout"), "{err}");
 
-    // In place, the checkout takes one writer at a time, and the refusal offers a worktree.
+    // In place, the checkout takes one writer at a time: another waits in line behind it,
+    // naming the run in front, while a run with a worktree of its own goes at once.
     let first = env.run("SLOW answer", &["--worktree-mode", "in-place"]);
     env.wait_for(&first, "RUNNING");
-    let err = env.fails(&[
-        "run",
-        "--agent",
-        "fake",
-        "--json",
-        "--worktree-mode",
-        "in-place",
-        "another",
-    ]);
-    assert!(err.contains("--worktree-mode worktree"), "{err}");
+    let queued = env.run("another", &["--worktree-mode", "in-place"]);
+    let waiting = env.status(&queued);
+    assert_eq!(waiting["status"], "PENDING", "{waiting}");
+    assert!(
+        waiting["note"]
+            .as_str()
+            .is_some_and(|n| n.contains(&format!("waiting for run {}", &first[..8]))),
+        "{waiting}"
+    );
     let second = env.run("WRITE a file", &["--worktree-mode", "worktree"]);
     let s = env.wait_for(&second, "COMPLETED");
     let worktree = PathBuf::from(s["worktree"].as_str().expect("worktree"));
     assert!(worktree.join("e2e.txt").exists(), "{s}");
     env.ok(&["cancel", &first[..8]]);
     env.wait_for(&first, "CANCELLED");
+    // The folder is free: the run in line starts by itself and leaves the line's note.
+    let done = env.wait_for(&queued, "COMPLETED");
+    assert!(
+        !done["note"]
+            .as_str()
+            .unwrap_or("")
+            .contains("waiting for run"),
+        "{done}"
+    );
 }
 
 #[test]

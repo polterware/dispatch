@@ -17,6 +17,7 @@ use gpui::{
     TextRun, WeakEntity, Window, canvas, div, prelude::*, px,
 };
 
+use super::repository_actions;
 use crate::avatar::{agent_avatar, route_avatar};
 use crate::client::{
     AddWorkspaceRequest, CancelRunRequest, CleanRunRequest, ConfigRequest, CoreClient, CoreError,
@@ -30,13 +31,14 @@ use crate::models::new_run::{
     run_label, start_request,
 };
 use crate::models::run_page::{
-    AttemptCard, CandidateExplain, CandidateOutcome, LinkedRow, MoreAction, ReviewAction,
-    RouteDecision, TokenUsage, area_label, candidate_explain, candidate_line, candidate_outcomes,
-    coalesce_text, context_usage, decision_summary, duration_label, file_counts, follow_up_blocker,
-    format_tokens, has_worktree, is_run_active, linked_rows, map_route_decision, policy_label,
-    proto_ms, rail_tokens, role_summary, route_label, route_reason, run_cost, run_more_actions,
-    run_review_action, stored_usage, timing_label, token_breakdown, total_tokens,
-    unmatched_attempts, worktree_display_status,
+    AttemptCard, CandidateExplain, CandidateOutcome, ClassifierBands, LinkedRow, MoreAction,
+    ReviewAction, RouteDecision, TokenUsage, area_label, candidate_explain, candidate_line,
+    candidate_outcomes, classifier_bands, coalesce_text, context_usage, difficulty_label,
+    duration_label, file_counts, follow_up_blocker, format_tokens, has_worktree, is_run_active,
+    linked_rows, map_route_decision, percent, policy_label, priority_label, proto_ms, rail_tokens,
+    role_summary, route_label, route_reason, run_cost, run_more_actions, run_review_action,
+    stored_usage, timing_label, token_breakdown, total_tokens, unmatched_attempts,
+    worktree_display_status,
 };
 use crate::models::settings::parse_policy;
 use crate::motion::{Animator, SpringTier, SpringValue};
@@ -102,7 +104,8 @@ pub struct RunPageView {
     rail_reveal: SpringValue,
     decision: Option<RouteDecision>,
     /// The Routing group lists every candidate, not just the first few.
-    all_candidates: bool,
+    /// How many pages of five the Routing group lists.
+    candidate_pages: usize,
     worktree: Option<DispatchWorktree>,
     output_log: String,
     meta_for: String,
@@ -243,6 +246,7 @@ impl RunPageView {
                     view.add_repository(cx)
                 }
                 PropertyPickerEvent::Pick(value) => view.pick_place(value, cx),
+                PropertyPickerEvent::Action(value, id) => view.repository_action(value, id, cx),
                 _ => {}
             },
         )
@@ -257,7 +261,7 @@ impl RunPageView {
             linked,
             menu,
             cancelling: false,
-            all_candidates: false,
+            candidate_pages: 1,
             reviewing: None,
             confirm_open: false,
             confirm_progress: SpringValue::new(0.0, SpringTier::Moderate),
@@ -515,16 +519,21 @@ impl RunPageView {
         });
     }
 
-    /// The repository picker's rows: each repository, then Add repository. A repository is
-    /// removed from its group's context menu in the sidebar.
+    /// The repository picker's rows: each repository by name, its folder in a tooltip and
+    /// the repository actions on its ⋯ (as its sidebar group's menu has them), then Add
+    /// repository.
     fn folder_options(&self, cx: &App) -> Vec<PropertyOption> {
+        let state = self.state.read(cx);
         let mut options: Vec<PropertyOption> = self
             .folders(cx)
             .iter()
             .map(|folder| {
-                PropertyOption::new(folder.value(), folder.label.clone())
-                    .hint(folder.dir.clone())
-                    .icon(Icon::Folder)
+                let repository =
+                    repository_actions::Repository::at(&folder.dir, &folder.label, state);
+                let option = PropertyOption::new(folder.value(), folder.label.clone())
+                    .tooltip(folder.dir.clone())
+                    .icon(Icon::Folder);
+                repository_actions::with_actions(option, &repository)
             })
             .collect();
         options.push(
@@ -533,6 +542,22 @@ impl RunPageView {
                 .action(),
         );
         options
+    }
+
+    /// A repository action picked from a row's menu in the folder picker.
+    fn repository_action(&mut self, value: &str, id: &str, cx: &mut Context<Self>) {
+        let Some(folder) = self.folders(cx).into_iter().find(|f| f.value() == value) else {
+            return;
+        };
+        let repository =
+            repository_actions::Repository::at(&folder.dir, &folder.label, self.state.read(cx));
+        if id == repository_actions::REMOVE {
+            self.draft
+                .place_picker
+                .update(cx, |picker, cx| picker.close(cx));
+        }
+        let state = self.state.clone();
+        repository_actions::perform(id, &repository, &state, cx);
     }
 
     /// Add repository in the folder picker: the folder chosen becomes a workspace, and the
@@ -1379,7 +1404,7 @@ impl RunPageView {
             self.log_for.clear();
             self.meta_for.clear();
             self.decision = None;
-            self.all_candidates = false;
+            self.candidate_pages = 1;
             self.worktree = None;
             self.side_gen = self.side_gen.wrapping_add(1);
             self.side_inflight = false;
@@ -2290,9 +2315,20 @@ fn paint_routing(view: &WeakEntity<RunPageView>, window: &mut Window, cx: &mut A
     if !policy.is_empty() {
         rows = rows.child(rail_property("Policy", wrapped(&policy), false, cx));
     }
+    if let Some(difficulty) = difficulty_label(&decision) {
+        rows = rows.child(rail_property("Difficulty", wrapped(&difficulty), false, cx));
+    }
+    if let Some(classifier) = classifier_bands(&decision) {
+        rows = rows.child(rail_property(
+            "Classifier",
+            classifier_chart(&classifier, &theme),
+            false,
+            cx,
+        ));
+    }
     rows = rows.child(rail_property(
-        "Task",
-        wrapped(&decision_summary(&decision)),
+        "Priority",
+        wrapped(&priority_label(&decision)),
         false,
         cx,
     ));
@@ -2312,7 +2348,7 @@ fn paint_routing(view: &WeakEntity<RunPageView>, window: &mut Window, cx: &mut A
         .flex_col()
         .gap(px(tw(0.5)))
         .px(px(tw(1.0)));
-    let all = view.upgrade().is_some_and(|v| v.read(cx).all_candidates);
+    let pages = view.upgrade().map_or(1, |v| v.read(cx).candidate_pages);
     let total = decision.candidates.len();
     let outcomes = candidate_outcomes(&decision, &pack.run);
     // The ones the run tried stay in view, however far down the list.
@@ -2326,7 +2362,7 @@ fn paint_routing(view: &WeakEntity<RunPageView>, window: &mut Window, cx: &mut A
         })
         .collect();
     for (index, candidate) in decision.candidates.iter().enumerate() {
-        if !shown_candidate(index, &pinned, all) {
+        if !shown_candidate(index, &pinned, pages) {
             continue;
         }
         let outcome = outcomes[index].clone();
@@ -2374,7 +2410,7 @@ fn paint_routing(view: &WeakEntity<RunPageView>, window: &mut Window, cx: &mut A
                 .id(("routing-candidate", index))
                 .flex()
                 .min_w(px(0.0))
-                .items_center()
+                .items_start()
                 .gap(px(tw(2.0)))
                 .p(px(tw(1.0)))
                 .tooltip(rich_tooltip(CANDIDATE_TIP_WIDTH, move |_, cx| {
@@ -2411,10 +2447,13 @@ fn paint_routing(view: &WeakEntity<RunPageView>, window: &mut Window, cx: &mut A
                                 .child(wrapped(&error))
                         })),
                 )
-                .children(marker.map(|(label, tone)| chip(label, tone, cx))),
+                .children(marker.map(|(label, tone)| {
+                    // Level with the model line when the error below it wraps.
+                    div().flex_none().child(chip(label, tone, cx))
+                })),
         );
     }
-    if let Some(label) = more_candidates_label(total, &pinned, all) {
+    if let Some((label, next)) = more_candidates(total, &pinned, pages) {
         let toggle = view.clone();
         candidates = candidates.child(
             div()
@@ -2427,7 +2466,7 @@ fn paint_routing(view: &WeakEntity<RunPageView>, window: &mut Window, cx: &mut A
                 .child(label)
                 .on_click(move |_, _, cx| {
                     let _ = toggle.update(cx, |page, cx| {
-                        page.all_candidates = !page.all_candidates;
+                        page.candidate_pages = next;
                         page.routing.update(cx, |_, cx| cx.notify());
                         cx.notify();
                     });
@@ -2477,27 +2516,89 @@ fn candidate_tip(title: &str, explain: &CandidateExplain, cx: &App) -> AnyElemen
 /// The rail toggle's room in the header: the 8px gap before it and the 28px icon button.
 const RAIL_TOGGLE_SLOT: f32 = 36.0;
 
-/// How many candidates the Routing group lists before Show more.
-const ROUTING_PREVIEW: usize = 5;
+/// How many candidates a page of the Routing group lists.
+const ROUTING_PAGE: usize = 5;
 
-/// Whether the Routing group lists this candidate: the first few, the one tried first, or
-/// every one once expanded.
-fn shown_candidate(index: usize, pinned: &[bool], all: bool) -> bool {
-    all || index < ROUTING_PREVIEW || pinned.get(index).copied().unwrap_or(false)
+/// The most ranked candidates the Routing group ever lists; the ones the run tried show
+/// beyond it.
+const ROUTING_MAX: usize = 10;
+
+/// Whether the Routing group lists this candidate: those within the pages shown (never past
+/// [`ROUTING_MAX`]), or one the run tried.
+fn shown_candidate(index: usize, pinned: &[bool], pages: usize) -> bool {
+    index < (pages.max(1) * ROUTING_PAGE).min(ROUTING_MAX)
+        || pinned.get(index).copied().unwrap_or(false)
 }
 
-/// The Show more / Show fewer line, when some candidates are hidden or shown.
-fn more_candidates_label(total: usize, pinned: &[bool], all: bool) -> Option<String> {
-    let shown = (0..total)
-        .filter(|&i| shown_candidate(i, pinned, false))
-        .count();
-    if total <= shown {
-        None
-    } else if all {
-        Some("Show fewer".into())
-    } else {
-        Some(format!("Show {} more", total - shown))
+/// The Show more / Show fewer line and the page count a click sets, when there is one.
+fn more_candidates(total: usize, pinned: &[bool], pages: usize) -> Option<(String, usize)> {
+    let pages = pages.max(1);
+    let limit = total.min(ROUTING_MAX);
+    let shown = (pages * ROUTING_PAGE).min(limit);
+    if shown < limit {
+        let more = (limit - shown).min(ROUTING_PAGE);
+        return Some((format!("Show {more} more"), pages + 1));
     }
+    let first = (0..total)
+        .filter(|&i| shown_candidate(i, pinned, 1))
+        .count();
+    let now = (0..total)
+        .filter(|&i| shown_candidate(i, pinned, pages))
+        .count();
+    (pages > 1 && now > first).then(|| ("Show fewer".to_string(), 1))
+}
+
+/// The classifier's name over one bar per band: the band, a thin track filled to its
+/// chance, and the chance in figures.
+fn classifier_chart(classifier: &ClassifierBands, theme: &Theme) -> AnyElement {
+    let mut chart = div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px(4.0))
+        .child(wrapped(&classifier.name));
+    for (band, p) in &classifier.bands {
+        chart = chart.child(
+            div()
+                .w_full()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .text_size(px(11.0))
+                .child(
+                    div()
+                        .w(px(44.0))
+                        .flex_none()
+                        .text_color(theme.color_text_muted)
+                        .child(SharedString::from(*band)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .h(px(4.0))
+                        .rounded_full()
+                        .bg(theme.color_surface_active)
+                        .child(
+                            div()
+                                .h_full()
+                                .rounded_full()
+                                .bg(theme.color_accent)
+                                .w(gpui::relative(*p as f32)),
+                        ),
+                )
+                .child(
+                    div()
+                        .w(px(32.0))
+                        .flex_none()
+                        .flex()
+                        .justify_end()
+                        .font(tabular(mono(theme, FontWeight::NORMAL)))
+                        .text_color(theme.color_text_secondary)
+                        .child(SharedString::from(percent(*p))),
+                ),
+        );
+    }
+    chart.into_any_element()
 }
 
 fn paint_changes(view: &WeakEntity<RunPageView>, window: &mut Window, cx: &mut App) -> AnyElement {
@@ -2518,6 +2619,25 @@ fn paint_changes(view: &WeakEntity<RunPageView>, window: &mut Window, cx: &mut A
     }
     if !pack.branch.is_empty() {
         rows = rows.child(rail_property("Branch", wrapped(&pack.branch), true, cx));
+    }
+    // The other repositories the run spans, each by name, with its worktree.
+    for linked in &run.linked {
+        let name = linked
+            .repo
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or(&linked.repo)
+            .to_string();
+        let place = if linked.merge_sha.is_empty() {
+            linked.worktree.clone()
+        } else {
+            format!(
+                "merged {}",
+                &linked.merge_sha[..linked.merge_sha.len().min(8)]
+            )
+        };
+        rows = rows.child(rail_property(&name, wrapped(&place), true, cx));
     }
     if !pack.chip_status.is_empty() {
         rows = rows.child(rail_property(
@@ -2689,4 +2809,38 @@ fn offline_body(path: &str, theme: Theme) -> AnyElement {
                 .child(path.to_string()),
         )
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{more_candidates, shown_candidate};
+
+    #[test]
+    fn routing_pages_by_five_up_to_ten() {
+        let pinned = vec![false; 71];
+        assert_eq!(
+            more_candidates(71, &pinned, 1),
+            Some(("Show 5 more".to_string(), 2))
+        );
+        assert!(shown_candidate(9, &pinned, 2));
+        assert!(!shown_candidate(10, &pinned, 2));
+        assert!(!shown_candidate(12, &pinned, 3));
+        assert_eq!(
+            more_candidates(71, &pinned, 2),
+            Some(("Show fewer".to_string(), 1))
+        );
+        assert_eq!(
+            more_candidates(8, &pinned[..8], 1),
+            Some(("Show 3 more".to_string(), 2))
+        );
+        assert_eq!(more_candidates(4, &pinned[..4], 1), None);
+    }
+
+    #[test]
+    fn a_tried_candidate_shows_past_the_limit() {
+        let mut pinned = vec![false; 30];
+        pinned[25] = true;
+        assert!(shown_candidate(25, &pinned, 1));
+        assert!(!shown_candidate(24, &pinned, 2));
+    }
 }

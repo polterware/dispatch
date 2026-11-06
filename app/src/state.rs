@@ -494,6 +494,8 @@ pub struct AppState {
     last_error: Option<String>,
     toasts: Vec<Toast>,
     next_toast: u64,
+    /// A repository the app asks about removing, until the person answers.
+    removing: Option<crate::views::repository_actions::Repository>,
     commander_open: bool,
     generation: u64,
     applied_generation: u64,
@@ -534,6 +536,7 @@ impl AppState {
             last_error: None,
             toasts: Vec::new(),
             next_toast: 0,
+            removing: None,
             commander_open: false,
             generation: 0,
             applied_generation: 0,
@@ -550,6 +553,39 @@ impl AppState {
     /// Drops a workspace the core just forgot, before the next load says so.
     pub fn forget_workspace(&mut self, id: &str) {
         self.workspaces.retain(|workspace| workspace.id != id);
+    }
+
+    /// Drops the runs the core deleted with a removed workspace: those it held, and those
+    /// working in its folder.
+    pub fn forget_workspace_runs(&mut self, id: &str, dir: &str) {
+        let dir = dir.trim_end_matches('/');
+        let ids: Vec<String> = self
+            .runs
+            .iter()
+            .filter(|run| {
+                run.project_id == id || (!dir.is_empty() && run.dir.trim_end_matches('/') == dir)
+            })
+            .map(|run| run.id.clone())
+            .collect();
+        self.forget_runs(&ids);
+    }
+
+    /// Asks before removing `repository`; asking again replaces the question.
+    pub fn ask_remove_repository(
+        &mut self,
+        repository: crate::views::repository_actions::Repository,
+    ) {
+        self.removing = Some(repository);
+    }
+
+    /// The repository the app is asking about removing.
+    pub fn removing(&self) -> Option<&crate::views::repository_actions::Repository> {
+        self.removing.as_ref()
+    }
+
+    /// Ends the question, returning what it asked about.
+    pub fn take_removing(&mut self) -> Option<crate::views::repository_actions::Repository> {
+        self.removing.take()
     }
 
     /// Asks for a repository's folder and adds it as a workspace, then makes it the current
@@ -771,6 +807,35 @@ impl AppState {
 
     fn set_runs(&mut self, runs: Vec<DispatchRun>) {
         if self.runs != runs {
+            // A run that waited in line for its folder says so once it starts.
+            let started: Vec<String> = runs
+                .iter()
+                .filter(|run| !crate::format::is_waiting_in_line(&run.status, &run.note))
+                .filter(|run| {
+                    !["cancelled", "orphaned"].contains(&run.status.to_ascii_lowercase().as_str())
+                })
+                .filter(|run| {
+                    self.runs.iter().any(|before| {
+                        before.id == run.id
+                            && crate::format::is_waiting_in_line(&before.status, &before.note)
+                    })
+                })
+                .map(|run| {
+                    let folder = run
+                        .dir
+                        .trim_end_matches('/')
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or("");
+                    format!(
+                        "Run {} started: {folder} is free",
+                        &run.id[..run.id.len().min(8)]
+                    )
+                })
+                .collect();
+            for message in started {
+                self.push_toast(message, ToastTone::Info);
+            }
             self.runs = runs;
             self.runs_revision = self.runs_revision.wrapping_add(1);
         }

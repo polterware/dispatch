@@ -16,7 +16,8 @@ use gpui::{
 
 use crate::client::{CoreClient, DispatchAgent, DispatchStatsRow, ListAgentsRequest, StatsRequest};
 use crate::models::spend::{
-    SpendRow, agent_rows, filter_specs, row_matches, since_value, spend_totals, spent_rows,
+    SpendRow, agent_rows, filter_specs, repository_value, row_matches, since_value, spend_totals,
+    spent_rows,
 };
 use crate::motion::{Animator, SpringTier, SpringValue};
 use crate::state::{AppState, ConnectionState, Route};
@@ -123,7 +124,10 @@ impl SpendView {
         let entered = !self.on_page;
         self.on_page = true;
         let since = since_value(self.filters.read(cx).filters()).to_string();
-        let since_changed = self.fetched_since.as_deref() != Some(since.as_str());
+        let dir = repository_value(self.filters.read(cx).filters()).to_string();
+        // The window and the repository pick the figures; either changing fetches again.
+        let fetch_key = format!("{since}\u{1f}{dir}");
+        let since_changed = self.fetched_since.as_deref() != Some(fetch_key.as_str());
         if self.in_flight {
             if entered || since_changed {
                 self.again = true;
@@ -146,7 +150,7 @@ impl SpendView {
         self.in_flight = true;
         self.again = false;
         self.last_kick = Instant::now();
-        self.fetched_since = Some(since.clone());
+        self.fetched_since = Some(fetch_key);
         self.ticket = self.ticket.wrapping_add(1);
         let ticket = self.ticket;
         cx.spawn(async move |this, cx| {
@@ -154,7 +158,7 @@ impl SpendView {
             // of every CLI, so the cards draw first and take their providers when it comes.
             let first = client.clone();
             let stats = cx
-                .background_spawn(async move { load_stats(&first, since) })
+                .background_spawn(async move { load_stats(&first, since, dir) })
                 .await;
             let current = this
                 .update(cx, |view, cx| {
@@ -241,18 +245,17 @@ impl SpendView {
 
     /// The fields follow the rows' providers, rebuilt only when those change.
     fn sync_fields(&mut self, rows: &[SpendRow], cx: &mut Context<Self>) {
-        let specs = filter_specs(rows);
-        let key = specs[0]
-            .options
+        let specs = filter_specs(rows, self.state.read(cx).workspaces());
+        let key = specs[..2]
             .iter()
-            .map(|option| option.id.as_str())
+            .flat_map(|spec| spec.options.iter().map(|option| option.id.as_str()))
             .collect::<Vec<_>>()
             .join("\u{1f}");
         if key == self.fields_key && !self.filters.read(cx).fields().is_empty() {
             return;
         }
         self.fields_key = key;
-        let icons = [Icon::Cpu, Icon::CalendarClock];
+        let icons = [Icon::Folder, Icon::Cpu, Icon::CalendarClock];
         self.filters.update(cx, |popover, _| {
             popover.set_fields(
                 specs
@@ -361,11 +364,12 @@ fn load_agents(client: &CoreClient) -> Slot<Vec<DispatchAgent>> {
     }
 }
 
-fn load_stats(client: &CoreClient, since: String) -> Slot<Vec<DispatchStatsRow>> {
+fn load_stats(client: &CoreClient, since: String, dir: String) -> Slot<Vec<DispatchStatsRow>> {
     match client.stats(&StatsRequest {
         project_id: String::new(),
         by: "agent".into(),
         since,
+        dir,
     }) {
         Ok(response) => Slot::Ready(response.rows),
         Err(_) => Slot::Clear,
