@@ -7,6 +7,8 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
 
+use crate::client::DispatchProviderModels;
+
 pub const SAMPLE_TASK: &str = "Add pagination to the runs list API and its table, with tests";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,48 +126,11 @@ pub struct AgentSetup {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RuleSet {
-    pub providers: Vec<String>,
-    pub models: Vec<String>,
-    pub agents: Vec<String>,
-}
-
-impl Default for RuleSet {
-    fn default() -> Self {
-        Self {
-            providers: Vec::new(),
-            models: Vec::new(),
-            agents: Vec::new(),
-        }
-    }
-}
-
-impl RuleSet {
-    pub fn get(&self, dimension: Dimension) -> &[String] {
-        match dimension {
-            Dimension::Providers => &self.providers,
-            Dimension::Models => &self.models,
-            Dimension::Agents => &self.agents,
-        }
-    }
-
-    pub fn get_mut(&mut self, dimension: Dimension) -> &mut Vec<String> {
-        match dimension {
-            Dimension::Providers => &mut self.providers,
-            Dimension::Models => &mut self.models,
-            Dimension::Agents => &mut self.agents,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Policy {
     pub priority: String,
     pub discover: bool,
     pub roles: bool,
     pub classifier: String,
-    pub allow: RuleSet,
-    pub deny: RuleSet,
 }
 
 impl Policy {
@@ -187,84 +152,39 @@ impl Policy {
             None
         }
     }
-
-    pub fn rules(&self, side: RuleSide) -> &RuleSet {
-        match side {
-            RuleSide::Allow => &self.allow,
-            RuleSide::Deny => &self.deny,
-        }
-    }
-
-    pub fn rules_mut(&mut self, side: RuleSide) -> &mut RuleSet {
-        match side {
-            RuleSide::Allow => &mut self.allow,
-            RuleSide::Deny => &mut self.deny,
-        }
-    }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RuleSide {
-    Allow,
-    Deny,
-}
-
-impl RuleSide {
-    pub fn title(self) -> &'static str {
-        match self {
-            Self::Allow => "Allow",
-            Self::Deny => "Deny",
-        }
+/// Filters provider groups and their models by a case-insensitive search query over provider
+/// and model names.
+pub fn filter_provider_models(
+    providers: &[DispatchProviderModels],
+    query: &str,
+) -> Vec<DispatchProviderModels> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return providers.to_vec();
     }
-
-    pub fn description(self) -> &'static str {
-        match self {
-            Self::Allow => "When a list has values, runs use only those. Empty allows any.",
-            Self::Deny => "Runs never use these, whatever the allow lists say.",
-        }
-    }
-
-    pub fn empty_label(self) -> &'static str {
-        match self {
-            Self::Allow => "Any",
-            Self::Deny => "None",
-        }
-    }
-
-    pub fn action(self, op: &str) -> String {
-        let side = match self {
-            Self::Allow => "allow",
-            Self::Deny => "deny",
-        };
-        format!("{side}-{op}")
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Dimension {
-    Providers,
-    Models,
-    Agents,
-}
-
-impl Dimension {
-    pub const ALL: [Self; 3] = [Self::Providers, Self::Models, Self::Agents];
-
-    pub fn key(self) -> &'static str {
-        match self {
-            Self::Providers => "providers",
-            Self::Models => "models",
-            Self::Agents => "agents",
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Providers => "Providers",
-            Self::Models => "Models",
-            Self::Agents => "Agents",
-        }
-    }
+    providers
+        .iter()
+        .filter_map(|group| {
+            let provider_match = group.provider.to_lowercase().contains(&q);
+            let models: Vec<_> = group
+                .models
+                .iter()
+                .filter(|model| provider_match || model.id.to_lowercase().contains(&q))
+                .cloned()
+                .collect();
+            if provider_match || !models.is_empty() {
+                Some(DispatchProviderModels {
+                    provider: group.provider.clone(),
+                    enabled: group.enabled,
+                    models,
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -528,8 +448,6 @@ pub fn parse_policy(json: &str) -> Policy {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string(),
-        allow: parse_rules(body.get("allow")),
-        deny: parse_rules(body.get("deny")),
     }
 }
 
@@ -747,58 +665,12 @@ pub fn parse_classify(json: &str) -> ClassifyView {
     }
 }
 
-pub fn policy_options(
-    dimension: Dimension,
-    agents: &[String],
-    models: &[ListedModel],
-) -> Vec<String> {
-    match dimension {
-        Dimension::Agents => agents
-            .iter()
-            .filter(|name| !name.is_empty())
-            .cloned()
-            .collect(),
-        Dimension::Models => unique_sorted(models.iter().map(|model| model.model.as_str())),
-        Dimension::Providers => unique_sorted(models.iter().map(|model| model.provider.as_str())),
-    }
-}
-
 /// The agent that offers `model`: the first listed model with that name.
 pub fn model_agent<'a>(models: &'a [ListedModel], model: &str) -> Option<&'a str> {
     models
         .iter()
         .find(|item| item.model == model)
         .map(|item| item.agent.as_str())
-}
-
-pub fn token_delta(previous: &[String], next: &[String]) -> (Vec<String>, Vec<String>) {
-    let added = next
-        .iter()
-        .filter(|value| !previous.iter().any(|item| item == *value))
-        .cloned()
-        .collect();
-    let removed = previous
-        .iter()
-        .filter(|value| !next.iter().any(|item| item == *value))
-        .cloned()
-        .collect();
-    (added, removed)
-}
-
-pub fn with_token(values: &[String], token: &str) -> Vec<String> {
-    let mut next = values.to_vec();
-    if !token.is_empty() && !next.iter().any(|item| item == token) {
-        next.push(token.to_string());
-    }
-    next
-}
-
-pub fn without_token(values: &[String], token: &str) -> Vec<String> {
-    values
-        .iter()
-        .filter(|item| item.as_str() != token)
-        .cloned()
-        .collect()
 }
 
 pub fn priority_label(value: &str) -> &'static str {
@@ -861,43 +733,6 @@ pub fn bool_wire(value: bool) -> String {
     if value { "true" } else { "false" }.to_string()
 }
 
-fn parse_rules(value: Option<&Value>) -> RuleSet {
-    let Some(value) = value else {
-        return RuleSet::default();
-    };
-    if !value.is_object() {
-        return RuleSet::default();
-    }
-    let map = record_of(value);
-    RuleSet {
-        providers: string_list(map.get("providers")),
-        models: string_list(map.get("models")),
-        agents: string_list(map.get("agents")),
-    }
-}
-
-fn string_list(value: Option<&Value>) -> Vec<String> {
-    value
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn unique_sorted<'a>(values: impl Iterator<Item = &'a str>) -> Vec<String> {
-    let mut items: Vec<String> = values
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .collect();
-    items.sort();
-    items.dedup();
-    items
-}
-
 fn json_value(json: &str) -> Value {
     serde_json::from_str(json).unwrap_or(Value::Null)
 }
@@ -951,11 +786,12 @@ fn number_or(value: Option<&Value>, default: f64) -> f64 {
 mod tests {
     use super::{
         AgentSetup, CliModel, CliState, HookSetup, InstallState, ListedModel, OpenCodeSetup,
-        classifier_trailing, fixed2, folder_agents_label, hook_note, hook_points_elsewhere,
-        key_chip, model_agent, parse_agent_setup, parse_classify, parse_key_status_value,
-        parse_policy, parse_role_answer, role_answer_line, skill_readers, skills_need_install,
-        token_delta,
+        classifier_trailing, filter_provider_models, fixed2, folder_agents_label, hook_note,
+        hook_points_elsewhere, key_chip, model_agent, parse_agent_setup, parse_classify,
+        parse_key_status_value, parse_policy, parse_role_answer, role_answer_line, skill_readers,
+        skills_need_install,
     };
+    use crate::client::{DispatchModelSetting, DispatchProviderModels};
     use serde_json::json;
 
     #[test]
@@ -1182,12 +1018,43 @@ mod tests {
     }
 
     #[test]
-    fn token_delta_splits_adds_and_removes() {
-        let (added, removed) = token_delta(
-            &["codex".into(), "claude".into()],
-            &["claude".into(), "grok".into()],
-        );
-        assert_eq!(added, vec!["grok".to_string()]);
-        assert_eq!(removed, vec!["codex".to_string()]);
+    fn filter_provider_models_matches_provider_and_model_names() {
+        let providers = vec![
+            DispatchProviderModels {
+                provider: "anthropic".into(),
+                enabled: true,
+                models: vec![
+                    DispatchModelSetting {
+                        id: "claude-opus-4-6".into(),
+                        enabled: true,
+                        agents: vec!["claude".into()],
+                    },
+                    DispatchModelSetting {
+                        id: "claude-sonnet-4-6".into(),
+                        enabled: false,
+                        agents: vec!["claude".into()],
+                    },
+                ],
+            },
+            DispatchProviderModels {
+                provider: "openai".into(),
+                enabled: false,
+                models: vec![DispatchModelSetting {
+                    id: "gpt-5.4".into(),
+                    enabled: true,
+                    agents: vec!["codex".into()],
+                }],
+            },
+        ];
+        let by_provider = filter_provider_models(&providers, "anthropic");
+        assert_eq!(by_provider.len(), 1);
+        assert_eq!(by_provider[0].provider, "anthropic");
+        assert_eq!(by_provider[0].models.len(), 2);
+
+        let by_model = filter_provider_models(&providers, "sonnet");
+        assert_eq!(by_model.len(), 1);
+        assert_eq!(by_model[0].provider, "anthropic");
+        assert_eq!(by_model[0].models.len(), 1);
+        assert_eq!(by_model[0].models[0].id, "claude-sonnet-4-6");
     }
 }

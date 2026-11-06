@@ -13,8 +13,8 @@ use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
 use gpui::{
-    App, ClipboardItem, Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, HighlightStyle,
-    Hsla, IntoElement, SharedString, StyledText, Window, div, font, prelude::*, px,
+    AnyElement, App, ClipboardItem, Font, FontFallbacks, FontFeatures, FontStyle, FontWeight,
+    HighlightStyle, Hsla, IntoElement, SharedString, StyledText, Window, div, font, prelude::*, px,
 };
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use syntect::easy::ScopeRegionIterator;
@@ -22,8 +22,8 @@ use syntect::parsing::{ParseState, ScopeStack, SyntaxSet};
 
 use crate::avatar::{BotAvatarState, agent_avatar_playing};
 use crate::models::transcript::{PromptBubble, TranscriptEntry, looks_like_diff, looks_like_json};
-use crate::theme::{StatusTone, Theme, status_tone};
-use crate::ui::{ChatBubble, sans};
+use crate::theme::{StatusTone, Theme, status_tone, tw};
+use crate::ui::{ChatBubble, Icon, icon_colored, mono, sans, wrap_text};
 
 pub const OUTPUT_LINES: usize = 6;
 /// How many lines of the prompt its bubble shows before it folds.
@@ -133,6 +133,13 @@ pub enum RowBody {
         time: Option<String>,
         expanded: bool,
     },
+    /// A model switch divider between attempts, with expandable hand-off text.
+    Switch {
+        entry: usize,
+        label: String,
+        handoff: Option<String>,
+        expanded: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -235,7 +242,8 @@ pub fn offset_entries(rows: Vec<TranscriptRow>, by: usize) -> Vec<TranscriptRow>
             match &mut row.body {
                 RowBody::Step { entry, .. }
                 | RowBody::Output { entry, .. }
-                | RowBody::More { entry, .. } => *entry += by,
+                | RowBody::More { entry, .. }
+                | RowBody::Switch { entry, .. } => *entry += by,
                 _ => return row,
             }
             row.signature = body_signature(&row.body);
@@ -302,6 +310,19 @@ pub fn flatten_transcript(
                         kind: event.clone(),
                         text: text.clone(),
                         tone,
+                    },
+                );
+            }
+            TranscriptEntry::Switch { label, handoff, .. } => {
+                let open = expanded.contains(&index);
+                let handoff = (!handoff.trim().is_empty()).then(|| handoff.clone());
+                push_row(
+                    &mut rows,
+                    RowBody::Switch {
+                        entry: index,
+                        label: label.clone(),
+                        handoff,
+                        expanded: open,
                     },
                 );
             }
@@ -471,6 +492,28 @@ pub fn render_row(
             time,
             expanded,
         } => prompt_row(frame, text, meta_label, time.as_deref(), *expanded),
+        RowBody::Switch {
+            entry,
+            label,
+            handoff,
+            expanded,
+        } => {
+            let entry_ix = *entry;
+            let on_expand = frame.on_expand.clone();
+            let toggle = handoff.as_ref().map(|_| {
+                Rc::new(move |window: &mut Window, cx: &mut App| {
+                    on_expand(entry_ix, window, cx);
+                }) as Rc<dyn Fn(&mut Window, &mut App)>
+            });
+            attempt_switch_divider(
+                entry_ix,
+                label,
+                handoff.as_deref(),
+                *expanded,
+                &theme,
+                toggle,
+            )
+        }
     };
     let _ = cx;
     let mut wrap = div().w_full();
@@ -1390,6 +1433,18 @@ fn body_signature(body: &RowBody) -> u64 {
             time.hash(&mut hasher);
             expanded.hash(&mut hasher);
         }
+        RowBody::Switch {
+            entry,
+            label,
+            handoff,
+            expanded,
+        } => {
+            17u8.hash(&mut hasher);
+            entry.hash(&mut hasher);
+            label.hash(&mut hasher);
+            handoff.hash(&mut hasher);
+            expanded.hash(&mut hasher);
+        }
     }
     hasher.finish()
 }
@@ -1909,4 +1964,96 @@ mod tests {
         assert_eq!(role_at("\"name"), Some(TokenRole::Attribute));
         assert_eq!(role_at("\"value"), Some(TokenRole::String));
     }
+}
+
+/// A divider between attempts in the same conversation, such as
+/// `"Switched claude/claude-opus-5-5-high → codex/gpt-6-luna-medium · usage limit · hand-off"`,
+/// with the hand-off text expandable under it.
+pub(crate) fn attempt_switch_divider(
+    entry: usize,
+    label: &str,
+    handoff: Option<&str>,
+    expanded: bool,
+    theme: &Theme,
+    on_toggle: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
+) -> AnyElement {
+    let handoff = handoff.map(str::trim).filter(|text| !text.is_empty());
+    let has_handoff = handoff.is_some();
+    let selector = format!("attempt-switch:{label}");
+    let mut header = div()
+        .id(("attempt-switch", entry))
+        .debug_selector(move || selector)
+        .w_full()
+        .min_w(px(0.0))
+        .py(px(tw(1.5)))
+        .flex()
+        .items_center()
+        .gap(px(tw(2.0)))
+        .font(mono(theme, FontWeight::NORMAL))
+        .text_size(px(12.0))
+        .text_color(theme.color_text_muted)
+        .child(div().flex_1().h(px(1.0)).bg(theme.color_border))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(tw(1.5)))
+                .child(icon_colored(Icon::Route, 12.0, theme.color_text_muted))
+                .child(SharedString::from(label.to_string()))
+                .when(has_handoff, |pill| {
+                    pill.child(icon_colored(
+                        Icon::ChevronDown,
+                        12.0,
+                        theme.color_text_muted,
+                    ))
+                }),
+        )
+        .child(div().flex_1().h(px(1.0)).bg(theme.color_border));
+    if has_handoff {
+        let hover_color = theme.color_text_primary;
+        header = header
+            .cursor_pointer()
+            .hover(move |style| style.text_color(hover_color));
+        if let Some(toggle) = on_toggle {
+            header = header.on_click(move |_, window, cx| toggle(window, cx));
+        }
+    }
+    let mut col = div()
+        .w_full()
+        .min_w(px(0.0))
+        .flex()
+        .flex_col()
+        .child(header);
+    if expanded && let Some(handoff_text) = handoff {
+        let mut body = div()
+            .id(("attempt-switch-handoff", entry))
+            .w_full()
+            .min_w(px(0.0))
+            .mt(px(tw(1.0)))
+            .p(px(tw(2.5)))
+            .rounded(px(theme.radius_control))
+            .bg(theme.color_surface_raised)
+            .border_1()
+            .border_color(theme.color_border)
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .font(mono(theme, FontWeight::NORMAL))
+            .text_size(px(12.0))
+            .text_color(theme.color_text_secondary);
+        for line in handoff_text.lines() {
+            if line.trim().is_empty() {
+                body = body.child(div().h(px(6.0)));
+            } else {
+                body = body.child(
+                    div()
+                        .min_w(px(0.0))
+                        .whitespace_normal()
+                        .child(wrap_text(line.to_string())),
+                );
+            }
+        }
+        col = col.child(body);
+    }
+    col.into_any_element()
 }

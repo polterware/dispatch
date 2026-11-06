@@ -23,7 +23,7 @@ use crate::{
 };
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -179,8 +179,12 @@ impl Core {
         &self,
         _: pb::ListModelCatalogRequest,
     ) -> RpcResult<pb::ListModelCatalogResponse> {
-        let table =
+        let mut table =
             Table::load_from_store(Some(self.store.as_ref())).map_err(RpcError::internal)?;
+        let disabled = self.disabled_models();
+        for rows in table.tiers.values_mut() {
+            rows.retain(|e| !config::is_model_disabled(&disabled, &e.provider, &e.agent, &e.model));
+        }
         let state = self.state_dir();
         // Every model the installed agent CLIs report is listed; Auto routes
         // to the ones outside the tier table only with discover on.
@@ -202,6 +206,109 @@ impl Core {
         Ok(pb::ListModelCatalogResponse {
             ok: true,
             json: body(&report)?,
+        })
+    }
+
+    pub(crate) async fn list_model_settings(
+        &self,
+        _: pb::ListModelSettingsRequest,
+    ) -> RpcResult<pb::ListModelSettingsResponse> {
+        let raw = self.raw_models_report().await;
+        let table =
+            Table::load_from_store(Some(self.store.as_ref())).map_err(RpcError::internal)?;
+        let disabled = self.disabled_models();
+        let mut by_provider: BTreeMap<String, BTreeMap<String, BTreeSet<String>>> = BTreeMap::new();
+        for m in &raw.models {
+            let (p, base) = config::normalize_model_key(&m.provider, &m.agent, &m.model);
+            if !p.is_empty() && !base.is_empty() {
+                by_provider
+                    .entry(p)
+                    .or_default()
+                    .entry(base)
+                    .or_default()
+                    .insert(m.agent.clone());
+            }
+        }
+        for tier in ["easy", "normal", "hard"] {
+            for e in table.tiers.get(tier).into_iter().flatten() {
+                let (p, base) = config::normalize_model_key(&e.provider, &e.agent, &e.model);
+                if !p.is_empty() && !base.is_empty() {
+                    by_provider
+                        .entry(p)
+                        .or_default()
+                        .entry(base)
+                        .or_default()
+                        .insert(e.agent.clone());
+                }
+            }
+        }
+        for d in &disabled {
+            if !d.provider.is_empty() {
+                let models = by_provider.entry(d.provider.clone()).or_default();
+                if !d.model.is_empty() {
+                    models.entry(d.model.clone()).or_default();
+                }
+            }
+        }
+        let providers = by_provider
+            .into_iter()
+            .map(|(provider, models_map)| {
+                let enabled = !config::is_provider_disabled(&disabled, &provider);
+                let models = models_map
+                    .into_iter()
+                    .map(|(id, agents)| {
+                        let model_enabled = !disabled.iter().any(|d| {
+                            d.model.eq_ignore_ascii_case(&id)
+                                && (d.provider.is_empty()
+                                    || d.provider.eq_ignore_ascii_case(&provider))
+                        });
+                        pb::DispatchModelSetting {
+                            id,
+                            enabled: model_enabled,
+                            agents: agents.into_iter().filter(|a| !a.is_empty()).collect(),
+                        }
+                    })
+                    .collect();
+                pb::DispatchProviderModels {
+                    provider,
+                    enabled,
+                    models,
+                }
+            })
+            .collect();
+        Ok(pb::ListModelSettingsResponse {
+            providers,
+            problems: raw.problems,
+        })
+    }
+
+    pub(crate) async fn set_model_enabled(
+        &self,
+        m: pb::SetModelEnabledRequest,
+    ) -> RpcResult<pb::SetModelEnabledResponse> {
+        config::migrate_legacy_deny(
+            &config::policy_config_path(&self.state_dir()),
+            self.store.as_ref(),
+        )
+        .map_err(RpcError::internal)?;
+        let (provider, model) = if m.model.trim().is_empty() {
+            match m.provider.trim().split_once('/') {
+                Some((p, rest)) => config::normalize_model_key(p, "", rest),
+                None => (m.provider.trim().to_ascii_lowercase(), String::new()),
+            }
+        } else {
+            config::normalize_model_key(&m.provider, "", &m.model)
+        };
+        if provider.is_empty() {
+            return Err(RpcError::invalid("provider is required"));
+        }
+        self.store
+            .set_model_enabled(&provider, &model, m.enabled)
+            .map_err(invalid)?;
+        Ok(pb::SetModelEnabledResponse {
+            provider,
+            model,
+            enabled: m.enabled,
         })
     }
 
@@ -452,7 +559,8 @@ impl Core {
             }
             // agent-add and agent-remove keep the ACP agents the user added.
             "agent-add" | "agent-remove" => {
-                let mut f = config::load(&global).map_err(invalid)?;
+                let mut f =
+                    config::load_with_store(&global, self.store.as_ref()).map_err(invalid)?;
                 let added = m.action == "agent-add";
                 let bin = values.first().cloned().unwrap_or_default();
                 if added {
@@ -481,14 +589,12 @@ impl Core {
                 )
             }
             "get" => {
-                let f = config::load(&global).map_err(invalid)?;
+                let f = config::load_with_store(&global, self.store.as_ref()).map_err(invalid)?;
                 let v = match key.as_str() {
                     "" => json!(f),
                     "priority" => json!(f.priority),
                     "discover" => json!(f.discover),
                     "roles" => json!(f.roles),
-                    "allow" => json!(f.allow),
-                    "deny" => json!(f.deny),
                     "classifier" => json!(f.classifier),
                     "classifier_model" => json!(f.classifier_model),
                     "classifier_agent" => json!(f.classifier_agent),
@@ -507,7 +613,8 @@ impl Core {
                 respond(v)
             }
             action => {
-                let mut f = config::load(&global).map_err(invalid)?;
+                let mut f =
+                    config::load_with_store(&global, self.store.as_ref()).map_err(invalid)?;
                 let (write_key, value) = set_config(&mut f, action, &key, &values)?;
                 config::validate_config(&f).map_err(invalid)?;
                 config::write_config_key(&global, &write_key, &value)
@@ -766,13 +873,18 @@ impl Core {
             return Err(RpcError::invalid(format!("unknown agent {agent}")));
         }
         let (models, problems) = self.installed_entries().await;
+        let disabled = self.disabled_models();
+        let mut filtered_table = table.clone();
+        for rows in filtered_table.tiers.values_mut() {
+            rows.retain(|e| !config::is_model_disabled(&disabled, &e.provider, &e.agent, &e.model));
+        }
         let mut entries: Vec<Entry> = ["easy", "normal", "hard"]
             .iter()
-            .flat_map(|t| table.tiers.get(*t).cloned().unwrap_or_default())
+            .flat_map(|t| filtered_table.tiers.get(*t).cloned().unwrap_or_default())
             .collect();
         entries.extend(models.iter().cloned());
         if !agent.is_empty() {
-            entries = reports::agent_pool(&agent, &table, &models);
+            entries = reports::agent_pool(&agent, &filtered_table, &models);
         }
         let priority = self
             .global_policy()
@@ -782,10 +894,15 @@ impl Core {
             .unwrap_or_else(|| PRIORITY_BALANCED.into());
         let role = m.role.trim().to_owned();
         let judge = m.judge.trim().to_owned();
-        if !judge.is_empty() && judge != JUDGE_JEV {
+        if !judge.is_empty() && judge != JUDGE_JEV && judge != JUDGE_CHEAPEST {
             return Err(RpcError::invalid(format!(
-                "unknown judge {judge} (want {JUDGE_JEV})"
+                "unknown judge {judge} (want {JUDGE_JEV} or {JUDGE_CHEAPEST})"
             )));
+        }
+        // The cheapest pick weighs only what this machine's agent CLIs report, never the
+        // stored table's models.
+        if judge == JUDGE_CHEAPEST && agent.is_empty() {
+            entries = models.clone();
         }
         if !role.is_empty() && m.apply {
             return Err(RpcError::invalid(
@@ -846,6 +963,8 @@ impl Core {
 
 /// The judge that asks TypeSafe's Jev which candidates fit a role.
 const JUDGE_JEV: &str = "jev";
+/// The judge that ranks only the installed agent CLIs' models, the cheapest that qualify first.
+const JUDGE_CHEAPEST: &str = "cheapest";
 /// How many candidates per tier Jev chooses among; it keeps the build's usual three.
 const JEV_POOL: usize = 8;
 
@@ -949,7 +1068,7 @@ async fn judge_with_jev(
     Ok(())
 }
 
-/// Applies a set, allow-, or deny- action to `f` and names the key it writes.
+/// Applies a set action to `f` and names the key it writes.
 fn set_config(
     f: &mut Policy,
     action: &str,
@@ -998,36 +1117,6 @@ fn set_config(
                 value
             };
             Ok(("classifier_agent".into(), json!(f.classifier_agent)))
-        }
-        _ if action.starts_with("allow-") || action.starts_with("deny-") => {
-            let (side, op) = action.split_once('-').unwrap_or_default();
-            let rules = if side == "deny" {
-                &mut f.deny
-            } else {
-                &mut f.allow
-            };
-            let dst = match key {
-                "providers" => &mut rules.providers,
-                "models" => &mut rules.models,
-                "agents" => &mut rules.agents,
-                _ => {
-                    return Err(RpcError::invalid(
-                        "rule dimension must be providers, models, or agents",
-                    ));
-                }
-            };
-            for v in values {
-                match op {
-                    "add" => {
-                        if !dst.contains(v) {
-                            dst.push(v.clone());
-                        }
-                    }
-                    "rm" => dst.retain(|x| x != v),
-                    _ => return Err(RpcError::invalid(format!("unknown config action {action}"))),
-                }
-            }
-            Ok((side.into(), json!(rules)))
         }
         _ => Err(RpcError::invalid("invalid config request")),
     }

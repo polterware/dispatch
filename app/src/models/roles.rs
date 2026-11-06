@@ -818,6 +818,51 @@ pub fn palette_groups(models: &[PaletteModel], query: &str) -> Vec<(String, Vec<
     by_agent.into_iter().collect()
 }
 
+/// The efforts an agent CLI takes beside its model, as the core's probe lists them; the board
+/// writes one into the model's name (`claude-opus-5-5-high`).
+pub fn palette_efforts(agent: &str) -> &'static [&'static str] {
+    match agent {
+        "claude" => &["low", "medium", "high", "xhigh", "max"],
+        "codex" | "pi" => &["low", "medium", "high", "xhigh"],
+        _ => &[],
+    }
+}
+
+/// `model`'s palette card at `effort`, or at the agent's default when `effort` is empty.
+pub fn palette_card_at(model: &PaletteModel, effort: &str) -> TierCardInput {
+    let mut card = palette_card(model);
+    if !effort.is_empty() {
+        card.model = format!("{}-{effort}", card.model);
+    }
+    card
+}
+
+/// `tiers` with the card at `slot` swapped for `card`, in place. A card already elsewhere in
+/// that tier leaves the board as it was.
+pub fn replace_tier_card(
+    tiers: &[DispatchTier],
+    card: &TierCardInput,
+    slot: &TierSlot,
+) -> Vec<DispatchTier> {
+    let mut columns = tier_columns(tiers);
+    let Some(at) = columns.columns.iter().position(|(id, _)| id == &slot.tier) else {
+        return tiers.to_vec();
+    };
+    let column = &mut columns.columns[at].1;
+    if slot.index >= column.len()
+        || column.iter().enumerate().any(|(index, item)| {
+            index != slot.index && item.agent == card.agent && item.model == card.model
+        })
+    {
+        return tiers.to_vec();
+    }
+    let item = &mut column[slot.index];
+    item.agent = card.agent.clone();
+    item.model = card.model.clone();
+    item.provider = card.provider.clone();
+    flatten(&columns)
+}
+
 pub fn palette_card(model: &PaletteModel) -> TierCardInput {
     TierCardInput {
         agent: model.agent.clone(),
@@ -863,6 +908,64 @@ pub fn placed_cards(tiers: &[DispatchTier]) -> Vec<PlacedCard> {
 
 #[cfg(test)]
 mod tests {
+    use crate::client::DispatchTier;
+
+    fn tier(name: &str, agent: &str, model: &str, position: i32) -> DispatchTier {
+        DispatchTier {
+            name: name.into(),
+            agent: agent.into(),
+            model: model.into(),
+            provider: String::new(),
+            position,
+        }
+    }
+
+    #[test]
+    fn a_swap_puts_the_new_model_in_the_same_slot() {
+        let tiers = vec![
+            tier("easy", "claude", "claude-haiku-5-5-low", 0),
+            tier("easy", "codex", "gpt-6-luna-medium", 1),
+        ];
+        let card = super::TierCardInput {
+            agent: "claude".into(),
+            model: "claude-sonnet-5-5-high".into(),
+            provider: "anthropic".into(),
+        };
+        let slot = super::TierSlot {
+            tier: "easy".into(),
+            index: 1,
+        };
+        let next = super::replace_tier_card(&tiers, &card, &slot);
+        assert_eq!(next.len(), 2);
+        assert_eq!(next[0].model, "claude-haiku-5-5-low");
+        assert_eq!(
+            (next[1].agent.as_str(), next[1].model.as_str()),
+            ("claude", "claude-sonnet-5-5-high")
+        );
+        // A model already elsewhere in the tier leaves the board alone.
+        let dup = super::TierCardInput {
+            agent: "claude".into(),
+            model: "claude-haiku-5-5-low".into(),
+            provider: String::new(),
+        };
+        assert_eq!(super::replace_tier_card(&tiers, &dup, &slot), tiers);
+    }
+
+    #[test]
+    fn a_palette_effort_goes_into_the_models_name() {
+        let model = super::PaletteModel {
+            agent: "claude".into(),
+            model: "claude-opus-5-5".into(),
+            provider: "anthropic".into(),
+            tier: String::new(),
+        };
+        assert_eq!(
+            super::palette_card_at(&model, "max").model,
+            "claude-opus-5-5-max"
+        );
+        assert_eq!(super::palette_card_at(&model, "").model, "claude-opus-5-5");
+        assert!(super::palette_efforts("antigravity").is_empty());
+    }
     #[test]
     fn a_built_board_names_each_model_at_its_effort_once() {
         let entry = |model: &str, effort: &str| super::BuiltEntry {

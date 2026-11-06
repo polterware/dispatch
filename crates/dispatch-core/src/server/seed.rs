@@ -25,6 +25,7 @@ impl Core {
         let name = config::policy_config_path(Path::new(""));
         copy_if_missing(&old.join(&name), &state.join(&name))?;
         let tiers = self.store.import_tiers(&polterware_db.to_string_lossy())?;
+        config::migrate_legacy_deny(&state.join(&name), self.store.as_ref())?;
         create_private_dir(&state)?;
         write_private(&marker, b"")?;
         Ok(tiers)

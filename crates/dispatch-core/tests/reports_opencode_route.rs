@@ -174,8 +174,7 @@ async fn test_opencode_auto_weighs_the_models_it_lists() {
 
 #[tokio::test]
 async fn test_opencode_tier_without_entry_ranks_its_models_for_the_tier() {
-    let mut h = opencode_harness();
-    h.policy.deny.models = vec!["opencode/glm-5.3".into()];
+    let h = opencode_harness();
     let cat = load_catalog(h.dir.path()).expect("load catalog");
     let pool = vec![
         Entry {
@@ -203,6 +202,10 @@ async fn test_opencode_tier_without_entry_ranks_its_models_for_the_tier() {
             &h.policy,
             &h.agents,
             &RouteOptions {
+                disabled: vec![dispatch_core::types::DisabledModel {
+                    provider: "opencode".into(),
+                    model: "glm-5.3".into(),
+                }],
                 tier: tier.into(),
                 filters: Filters {
                     agent: OPEN_CODE_AGENT.into(),

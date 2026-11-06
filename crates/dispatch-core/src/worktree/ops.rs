@@ -33,6 +33,14 @@ pub struct NumStat {
     pub lines_known: bool,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FileStat {
+    pub path: String,
+    pub insertions: i32,
+    pub deletions: i32,
+    pub binary: bool,
+}
+
 /// Returns the repo top-level containing `dir`, or `""` when `dir` is not in a git work tree.
 pub fn root(dir: impl AsRef<Path>) -> String {
     git(dir.as_ref(), &["rev-parse", "--show-toplevel"]).unwrap_or_default()
@@ -106,6 +114,29 @@ pub fn dirty(root: impl AsRef<Path>) -> bool {
 pub fn exclude(root: impl AsRef<Path>, pattern: &str) -> Result<(), Error> {
     let root = root.as_ref();
     with_repo_lock(root, || exclude_locked(root, pattern))
+}
+
+/// Reports whether `pattern` (such as `".dispatch/"`) is already excluded in `dir`.
+pub fn is_excluded(dir: impl AsRef<Path>, pattern: &str) -> bool {
+    let dir = dir.as_ref();
+    let trimmed = pattern.trim().trim_end_matches('/');
+    if let Ok(raw) = git(dir, &["rev-parse", "--git-path", "info/exclude"]) {
+        let p = Path::new(&raw);
+        let exclude_path = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            dir.join(p)
+        };
+        if let Ok(existing) = fs::read_to_string(&exclude_path)
+            && existing.lines().any(|l| {
+                let line = l.trim();
+                line == pattern || line.trim_end_matches('/') == trimmed
+            })
+        {
+            return true;
+        }
+    }
+    git(dir, &["check-ignore", "-q", pattern]).is_ok()
 }
 
 fn exclude_locked(root: &Path, pattern: &str) -> Result<(), Error> {
@@ -383,6 +414,85 @@ pub fn num_stat(dir: impl AsRef<Path>, base: &str) -> Result<NumStat, Error> {
         stat.deletions += sub;
     }
     Ok(stat)
+}
+
+/// Lists files changed from `base` to the working tree (committed, staged, unstaged, and
+/// untracked) with their `+/-` line counts.
+pub fn file_changes(dir: impl AsRef<Path>, base: &str) -> Result<Vec<FileStat>, Error> {
+    let dir = dir.as_ref();
+    if base.is_empty() {
+        return Err(Error::Message("no base".into()));
+    }
+    let out = git(dir, &["diff", "--numstat", base])?;
+    let mut files = Vec::new();
+    for raw_line in out.split('\n') {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(3, '\t');
+        let (Some(a), Some(b), Some(path)) = (parts.next(), parts.next(), parts.next()) else {
+            continue;
+        };
+        let path = path.trim();
+        if path.is_empty() || path == ".dispatch" || path.starts_with(".dispatch/") {
+            continue;
+        }
+        if a == "-" || b == "-" {
+            files.push(FileStat {
+                path: path.to_owned(),
+                insertions: 0,
+                deletions: 0,
+                binary: true,
+            });
+            continue;
+        }
+        let add = a.parse::<i32>().unwrap_or(0);
+        let sub = b.parse::<i32>().unwrap_or(0);
+        files.push(FileStat {
+            path: path.to_owned(),
+            insertions: add,
+            deletions: sub,
+            binary: false,
+        });
+    }
+    if let Ok(untracked) = git(dir, &["ls-files", "--others", "--exclude-standard"]) {
+        for raw_path in untracked.split('\n') {
+            let path = raw_path.trim();
+            if path.is_empty()
+                || path == ".dispatch"
+                || path.starts_with(".dispatch/")
+                || files.iter().any(|f| f.path == path)
+            {
+                continue;
+            }
+            let full = dir.join(path);
+            match fs::read(&full) {
+                Ok(bytes) if bytes.contains(&0) => files.push(FileStat {
+                    path: path.to_owned(),
+                    insertions: 0,
+                    deletions: 0,
+                    binary: true,
+                }),
+                Ok(bytes) => {
+                    let lines = if bytes.is_empty() {
+                        0
+                    } else {
+                        bytes.iter().filter(|&&b| b == b'\n').count()
+                            + usize::from(!bytes.ends_with(b"\n"))
+                    };
+                    files.push(FileStat {
+                        path: path.to_owned(),
+                        insertions: i32::try_from(lines).unwrap_or(i32::MAX),
+                        deletions: 0,
+                        binary: false,
+                    });
+                }
+                Err(_) => {}
+            }
+        }
+    }
+    Ok(files)
 }
 
 /// Checks the run branch before committing and reporting its diff.

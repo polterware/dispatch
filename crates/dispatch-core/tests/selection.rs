@@ -184,9 +184,13 @@ fn filters_relax_and_policy_protection() {
             .iter()
             .any(|s| s == "b/two: agent filter requires a")
     );
-    let mut denied = policy;
-    denied.deny.agents.push("a".into());
-    let result = router::plan(&table, &denied, &agents(), &opts, &catalog());
+    let mut opts = opts;
+    opts.filters.model = "one".into();
+    opts.disabled.push(dispatch_core::types::DisabledModel {
+        provider: "a".into(),
+        model: String::new(),
+    });
+    let result = router::plan(&table, &policy, &agents(), &opts, &catalog());
     assert!(result.candidates.is_empty());
     assert!(!result.relaxed);
 }

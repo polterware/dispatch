@@ -42,6 +42,7 @@ const RUNS_LIMIT: i32 = 50;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SettingsPage {
     Agents,
+    Models,
     Classifier,
     PickRole,
     RoutingPolicy,
@@ -502,6 +503,7 @@ pub struct AppState {
     /// Moves on whenever [`Self::runs`] changes, so views can keep what they build from the
     /// runs until it does.
     runs_revision: u64,
+    models_revision: u64,
 }
 
 impl AppState {
@@ -541,9 +543,19 @@ impl AppState {
             generation: 0,
             applied_generation: 0,
             runs_revision: 0,
+            models_revision: 0,
         };
         Self::spawn_poll(cx);
         state
+    }
+
+    pub fn models_revision(&self) -> u64 {
+        self.models_revision
+    }
+
+    pub fn models_changed(&mut self, cx: &mut Context<Self>) {
+        self.models_revision = self.models_revision.wrapping_add(1);
+        cx.notify();
     }
 
     pub fn reload_all(&mut self, cx: &mut Context<Self>) {

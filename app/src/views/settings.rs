@@ -14,19 +14,19 @@ use gpui::{
 
 use crate::avatar::agent_avatar;
 use crate::client::{
-    ApplyAgentSetupRequest, ClassifyRequest, ConfigRequest, ConfigResponse, CoreClient, CoreError,
-    GetAgentSetupRequest, ListAgentsRequest, ListModelsRequest, ListWorktreeFoldersRequest,
-    PruneWorktreeFoldersRequest, WorktreeFolder, at_once,
+    ApplyAgentSetupRequest, ClassifyRequest, ConfigRequest, CoreClient, CoreError,
+    DispatchProviderModels, GetAgentSetupRequest, ListAgentsRequest, ListModelSettingsRequest,
+    ListModelsRequest, ListWorktreeFoldersRequest, PruneWorktreeFoldersRequest,
+    SetModelEnabledRequest, WorktreeFolder, at_once,
 };
 use crate::models::settings::{
-    CLASSIFIERS, CliState, Dimension, InstallState, ListedModel, Policy, RuleSide, SAMPLE_TASK,
-    agent_label, bool_wire, classifier_trailing, classify_meta, cli_description, draft_ready,
-    env_key_sentence, fixed2, folder_agents_label, hook_note, hook_points_elsewhere, key_chip,
-    key_placeholder, key_test_enabled, key_uses_replace, keyed_classifier, model_agent,
+    CLASSIFIERS, CliState, InstallState, ListedModel, Policy, SAMPLE_TASK, agent_label, bool_wire,
+    classifier_trailing, classify_meta, cli_description, draft_ready, env_key_sentence,
+    filter_provider_models, fixed2, folder_agents_label, hook_note, hook_points_elsewhere,
+    key_chip, key_placeholder, key_test_enabled, key_uses_replace, keyed_classifier,
     opencode_description, parse_agent_setup, parse_classify, parse_cli_model, parse_key_map,
-    parse_key_status_value, parse_policy, policy_options, priority_label, priority_value,
-    prob_line, radio_value, role_answer_line, skill_readers, skills_need_install, token_delta,
-    trimmed_draft, with_token, without_token,
+    parse_key_status_value, parse_policy, priority_label, priority_value, prob_line, radio_value,
+    role_answer_line, skill_readers, skills_need_install, trimmed_draft,
 };
 use crate::motion::{Animator, Spring, SpringTier, SpringValue};
 use crate::state::{AppState, Route, SettingsPage, ToastTone};
@@ -36,35 +36,23 @@ use crate::ui::patterns::{
     AnchorSlot, SETTINGS_SECTION_GAP, SettingsNavItem, settings_dialog, window_anchor,
 };
 use crate::ui::{
-    ButtonKind, Icon, IconTile, Menu, MenuItem, Popover, Switch, TextInput, TileTone, button, chip,
-    icon, icon_button,
+    ButtonKind, Icon, Menu, MenuItem, Popover, Switch, TextInput, TileTone, button, chip, icon,
 };
 use crate::ui::{SkeletonLayout, page_skeleton};
 
-/// A token option's leading mark: an agent's bot or a provider's tile.
-const TOKEN_MARK: f32 = 20.0;
-/// Wide enough for `cursor-grok-4.5-high-fast` beside its mark.
-const TOKEN_PANEL_WIDTH: f32 = 280.0;
 const RAIL_ROW: f32 = 32.0;
 const RAIL_GAP: f32 = 2.0;
 /// The editor's height before a frame has measured it: one row of controls.
 const EDITOR_HEIGHT: f32 = 44.0;
-/// The token picker's trigger, the row's "+" icon button, which the picker lines up with.
-const TOKEN_TRIGGER: f32 = 28.0;
 
-const RAIL: [(SettingsPage, &str, Icon); 5] = [
+const RAIL: [(SettingsPage, &str, Icon); 6] = [
     (SettingsPage::Agents, "Agents", Icon::Settings),
+    (SettingsPage::Models, "Models", Icon::Cpu),
     (SettingsPage::Classifier, "Classifier", Icon::AiBrain01Icon),
     (SettingsPage::PickRole, "Pick a role", Icon::Route),
     (SettingsPage::RoutingPolicy, "Routing policy", Icon::Sliders),
     (SettingsPage::Worktrees, "Worktrees", Icon::GitBranch),
 ];
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct TokenSlot {
-    side: RuleSide,
-    dimension: Dimension,
-}
 
 pub struct SettingsView {
     state: Entity<AppState>,
@@ -72,6 +60,14 @@ pub struct SettingsView {
     epoch: u64,
     policy: Option<Policy>,
     policy_ticket: u64,
+    model_providers: Option<Vec<DispatchProviderModels>>,
+    models_ticket: u64,
+    models_search: Entity<TextInput>,
+    model_groups: BTreeMap<String, Entity<crate::ui::CollapsibleSection>>,
+    models_inflight: bool,
+    models_saving: bool,
+    provider_switches: BTreeMap<String, Entity<Switch>>,
+    model_switches: BTreeMap<(String, String), Entity<Switch>>,
     keys: BTreeMap<String, String>,
     keys_ready: bool,
     keys_inflight: bool,
@@ -90,7 +86,6 @@ pub struct SettingsView {
     openai_key: Entity<TextInput>,
     jev_placeholder: &'static str,
     openai_placeholder: &'static str,
-    token_draft: Entity<TextInput>,
     /// Each agent's session hook switch, made when the setup first lists the agent.
     hooks: BTreeMap<String, Entity<Switch>>,
     opencode: Entity<Switch>,
@@ -98,9 +93,6 @@ pub struct SettingsView {
     discover: Entity<Switch>,
     priority_menu: Entity<Menu>,
     priority_anchor: AnchorSlot,
-    token_popover: Entity<Popover>,
-    token_anchor: AnchorSlot,
-    token_slot: Option<TokenSlot>,
     /// The agent and model the CLI classifier asks, picked from what the CLIs list.
     cli_popover: Entity<Popover>,
     cli_anchor: AnchorSlot,
@@ -122,7 +114,8 @@ pub struct SettingsView {
 impl SettingsView {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let view = cx.entity().downgrade();
-        let token_draft = token_input(view.clone(), cx);
+        let models_search =
+            cx.new(|cx| TextInput::new(cx).placeholder("Search providers and models"));
         let jev_key = key_input("jev", "Paste a key", view.clone(), cx);
         let openai_key = key_input("openai", "Paste a key", view.clone(), cx);
         let opencode = switch(true, view.clone(), cx, |this, on, cx| {
@@ -133,13 +126,6 @@ impl SettingsView {
             this.on_discover(on, cx)
         });
         let priority_menu = cx.new(Menu::new);
-        let token_popover = cx.new(Popover::new);
-        let panel_view = view.clone();
-        token_popover.update(cx, |popover, _| {
-            popover.set_panel(Rc::new(move |_window, app| token_panel(&panel_view, app)));
-            // The "+" ends its row, so the picker grows back over the row.
-            popover.set_align_end(Some(TOKEN_TRIGGER));
-        });
         let cli_filter = cli_filter_input(view.clone(), cx);
         let cli_popover = cx.new(Popover::new);
         let cli_view = view.clone();
@@ -151,9 +137,9 @@ impl SettingsView {
             cx.notify();
         })
         .detach();
+        watch_input(&models_search, cx);
         watch_input(&jev_key, cx);
         watch_input(&openai_key, cx);
-        watch_input(&token_draft, cx);
         watch_input(&cli_filter, cx);
         let mut this = Self {
             state,
@@ -161,6 +147,14 @@ impl SettingsView {
             epoch: 0,
             policy: None,
             policy_ticket: 0,
+            model_providers: None,
+            models_ticket: 0,
+            models_search,
+            model_groups: BTreeMap::new(),
+            models_inflight: false,
+            models_saving: false,
+            provider_switches: BTreeMap::new(),
+            model_switches: BTreeMap::new(),
             worktrees: None,
             worktrees_inflight: false,
             keys: BTreeMap::new(),
@@ -178,16 +172,12 @@ impl SettingsView {
             openai_key,
             jev_placeholder: "Paste a key",
             openai_placeholder: "Paste a key",
-            token_draft,
             hooks: BTreeMap::new(),
             opencode,
             roles,
             discover,
             priority_menu,
             priority_anchor: AnchorSlot::default(),
-            token_popover,
-            token_anchor: AnchorSlot::default(),
-            token_slot: None,
             cli_popover,
             cli_anchor: AnchorSlot::default(),
             cli_filter,
@@ -214,6 +204,8 @@ impl SettingsView {
                 self.started = false;
                 self.keys_ready = false;
                 self.keys_inflight = false;
+                self.model_providers = None;
+                self.models_inflight = false;
                 self.epoch = self.epoch.wrapping_add(1);
             }
         } else if !self.started {
@@ -221,10 +213,17 @@ impl SettingsView {
             self.epoch = self.epoch.wrapping_add(1);
             self.load_lists(cx);
             self.load_setup(cx);
+            self.load_model_settings(cx);
             reload_policy = true;
         }
         if reload_policy && online {
             self.load_policy(cx);
+        }
+        if online
+            && matches!(self.page(cx), SettingsPage::Models)
+            && (self.model_providers.is_none() || self.shown != Some(SettingsPage::Models))
+        {
+            self.load_model_settings(cx);
         }
         if online
             && matches!(self.page(cx), SettingsPage::Classifier)
@@ -502,6 +501,225 @@ impl SettingsView {
         .detach();
     }
 
+    fn sync_model_switches(&mut self, cx: &mut Context<Self>) {
+        let view = cx.entity().downgrade();
+        for provider in self.model_providers.clone().unwrap_or_default() {
+            let name = provider.provider.clone();
+            let toggle = self
+                .provider_switches
+                .entry(name.clone())
+                .or_insert_with(|| {
+                    let name = name.clone();
+                    switch(provider.enabled, view.clone(), cx, move |this, on, cx| {
+                        this.set_model_enabled(&name, "", on, cx);
+                    })
+                });
+            toggle.update(cx, |toggle, _| toggle.set_on(provider.enabled));
+            for model in provider.models {
+                let name = name.clone();
+                let id = model.id.clone();
+                let toggle = self
+                    .model_switches
+                    .entry((name.clone(), id.clone()))
+                    .or_insert_with(|| {
+                        switch(model.enabled, view.clone(), cx, move |this, on, cx| {
+                            this.set_model_enabled(&name, &id, on, cx);
+                        })
+                    });
+                toggle.update(cx, |toggle, _| toggle.set_on(model.enabled));
+            }
+            self.model_groups.entry(name.clone()).or_insert_with(|| {
+                let body_view = view.clone();
+                let body_name = name.clone();
+                let switch_name = name.clone();
+                let toggle = self.provider_switches[&name].clone();
+                cx.new(|cx| {
+                    cx.observe(&self.models_search, |_, _, cx| cx.notify())
+                        .detach();
+                    let mut group = crate::ui::CollapsibleSection::new(name, cx);
+                    group.set_actions(Some(Rc::new(move |_, _| {
+                        let selector = format!("settings-provider-{}", switch_name);
+                        div()
+                            .debug_selector(move || selector)
+                            .child(toggle.clone())
+                            .into_any_element()
+                    })));
+                    group.set_body(Rc::new(move |_, app| {
+                        body_view
+                            .upgrade()
+                            .map(|view| view.read(app).provider_rows(&body_name, app))
+                            .unwrap_or_else(|| div().into_any_element())
+                    }));
+                    group
+                })
+            });
+        }
+    }
+
+    fn load_model_settings(&mut self, cx: &mut Context<Self>) {
+        if self.models_inflight || self.models_saving {
+            return;
+        }
+        let Some(client) = self.client(cx) else {
+            return;
+        };
+        self.models_inflight = true;
+        self.models_ticket = self.models_ticket.wrapping_add(1);
+        let ticket = self.models_ticket;
+        let epoch = self.epoch;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    client.list_model_settings(&ListModelSettingsRequest::default())
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if view.models_ticket != ticket {
+                    return;
+                }
+                view.models_inflight = false;
+                if view.epoch != epoch {
+                    return;
+                }
+                match result {
+                    Ok(response) => view.model_providers = Some(response.providers),
+                    Err(err) => {
+                        view.model_providers = Some(Vec::new());
+                        view.toast(
+                            core_message(&err, "Could not read models."),
+                            ToastTone::Danger,
+                            cx,
+                        );
+                    }
+                }
+                view.sync_model_switches(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn set_model_enabled(
+        &mut self,
+        provider: &str,
+        model: &str,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.models_saving {
+            self.sync_model_switches(cx);
+            return;
+        }
+        let Some(client) = self.client(cx) else {
+            self.sync_model_switches(cx);
+            return;
+        };
+        let previous = self.model_providers.clone();
+        if let Some(providers) = self.model_providers.as_mut() {
+            for group in providers
+                .iter_mut()
+                .filter(|group| group.provider == provider)
+            {
+                if model.is_empty() {
+                    group.enabled = enabled;
+                } else if let Some(row) = group.models.iter_mut().find(|row| row.id == model) {
+                    row.enabled = enabled;
+                }
+            }
+        }
+        self.models_saving = true;
+        self.models_ticket = self.models_ticket.wrapping_add(1);
+        self.models_inflight = false;
+        let request = SetModelEnabledRequest {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            enabled,
+        };
+        self.sync_model_switches(cx);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { client.set_model_enabled(&request) })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                view.models_saving = false;
+                if let Err(err) = result {
+                    view.model_providers = previous;
+                    view.toast(
+                        core_message(&err, "Could not save model settings."),
+                        ToastTone::Danger,
+                        cx,
+                    );
+                } else {
+                    view.load_lists(cx);
+                    view.state.update(cx, |state, cx| {
+                        state.models_changed(cx);
+                        state.reload_all(cx);
+                        cx.notify();
+                    });
+                }
+                view.sync_model_switches(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn provider_rows(&self, provider: &str, cx: &App) -> gpui::AnyElement {
+        let providers = filter_provider_models(
+            self.model_providers.as_deref().unwrap_or_default(),
+            self.models_search.read(cx).text().as_ref(),
+        );
+        let mut rows = div().flex().flex_col();
+        if let Some(group) = providers.iter().find(|group| group.provider == provider) {
+            for model in &group.models {
+                if let Some(toggle) = self
+                    .model_switches
+                    .get(&(provider.to_string(), model.id.clone()))
+                {
+                    let selector = format!("settings-model-{provider}-{}", model.id);
+                    rows = rows.child(settings_row(
+                        model.id.clone(),
+                        None,
+                        div().debug_selector(move || selector).child(toggle.clone()),
+                        cx,
+                    ));
+                }
+            }
+        }
+        rows.into_any_element()
+    }
+
+    fn models_page(&self, theme: Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let providers = filter_provider_models(
+            self.model_providers.as_deref().unwrap_or_default(),
+            self.models_search.read(cx).text().as_ref(),
+        );
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .gap(px(theme.space_3))
+            .child(self.models_search.clone());
+        if self.model_providers.is_none() {
+            body = body.child(settings_skeleton(4));
+        } else if providers.is_empty() {
+            body = body.child(note("No models to show.", theme));
+        }
+        for provider in providers {
+            if let Some(group) = self.model_groups.get(&provider.provider) {
+                body = body.child(group.clone());
+            }
+        }
+        settings_section(
+            Icon::Cpu,
+            TileTone::Architecture,
+            "Models",
+            "Choose which providers and models Dispatch shows and runs.",
+            None,
+            body,
+            cx,
+        )
+    }
+
     fn load_policy(&mut self, cx: &mut Context<Self>) {
         let Some(client) = self.client(cx) else {
             return;
@@ -720,121 +938,6 @@ impl SettingsView {
         .detach();
     }
 
-    fn write_rule_delta(
-        &mut self,
-        side: RuleSide,
-        dimension: Dimension,
-        added: Vec<String>,
-        removed: Vec<String>,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(client) = self.client(cx) else {
-            self.toast("This core does not support it yet.", ToastTone::Danger, cx);
-            return;
-        };
-        let previous = self.policy.clone();
-        self.policy_ticket = self.policy_ticket.wrapping_add(1);
-        let ticket = self.policy_ticket;
-        let epoch = self.epoch;
-        let key = dimension.key().to_string();
-        cx.spawn(async move |this, cx| {
-            let result: Result<ConfigResponse, CoreError> = cx
-                .background_spawn(async move {
-                    if !added.is_empty() {
-                        client.config(&ConfigRequest {
-                            action: side.action("add"),
-                            key: key.clone(),
-                            values: added,
-                        })?;
-                    }
-                    if !removed.is_empty() {
-                        client.config(&ConfigRequest {
-                            action: side.action("rm"),
-                            key: key.clone(),
-                            values: removed,
-                        })?;
-                    }
-                    client.config(&ConfigRequest {
-                        action: "get".to_string(),
-                        ..Default::default()
-                    })
-                })
-                .await;
-            let _ = this.update(cx, |view, cx| {
-                if view.epoch != epoch || view.policy_ticket != ticket {
-                    return;
-                }
-                match result {
-                    Ok(response) => view.apply_policy(parse_policy(&response.json), cx),
-                    Err(err) => {
-                        view.policy = previous;
-                        view.toast(
-                            core_message(&err, "Could not save the routing policy."),
-                            ToastTone::Danger,
-                            cx,
-                        );
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    fn change_tokens(
-        &mut self,
-        side: RuleSide,
-        dimension: Dimension,
-        next: Vec<String>,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(policy) = self.policy.clone() else {
-            return;
-        };
-        let previous = policy.rules(side).get(dimension).to_vec();
-        let (added, removed) = token_delta(&previous, &next);
-        if added.is_empty() && removed.is_empty() {
-            return;
-        }
-        if let Some(policy) = self.policy.as_mut() {
-            *policy.rules_mut(side).get_mut(dimension) = next;
-        }
-        self.write_rule_delta(side, dimension, added, removed, cx);
-    }
-
-    fn add_token(&mut self, token: String, cx: &mut Context<Self>) {
-        let token = trimmed_draft(&token);
-        if !draft_ready(&token) {
-            return;
-        }
-        let Some(slot) = self.token_slot else { return };
-        let Some(policy) = self.policy.clone() else {
-            return;
-        };
-        let next = with_token(policy.rules(slot.side).get(slot.dimension), &token);
-        self.change_tokens(slot.side, slot.dimension, next, cx);
-        self.token_draft
-            .update(cx, |input, cx| input.set_text("", cx));
-        self.token_popover.update(cx, |popover, cx| {
-            popover.set_open(false);
-            cx.notify();
-        });
-    }
-
-    fn remove_token(
-        &mut self,
-        side: RuleSide,
-        dimension: Dimension,
-        token: String,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(policy) = self.policy.clone() else {
-            return;
-        };
-        let next = without_token(policy.rules(side).get(dimension), &token);
-        self.change_tokens(side, dimension, next, cx);
-    }
-
     fn write_key(
         &mut self,
         name: &str,
@@ -1010,12 +1113,15 @@ impl SettingsView {
         self.write_values("discover", vec![bool_wire(on)], cx);
     }
 
-    /// For the screenshot tour: opens Priority (0), the Allow models picker (1), picks the
+    /// For the screenshot tour: opens Priority (0), Models (1), picks the
     /// agent CLI classifier (2), or opens its model picker (3).
     pub(crate) fn tour_open(&mut self, which: usize, cx: &mut Context<Self>) {
         match which {
             0 => self.open_priority(cx),
-            1 => self.open_tokens(RuleSide::Allow, Dimension::Models, cx),
+            1 => self.state.update(cx, |state, cx| {
+                state.navigate(Route::Settings(SettingsPage::Models));
+                cx.notify();
+            }),
             2 => self.choose_classifier("cli", cx),
             _ => self.open_cli_models(cx),
         }
@@ -1028,13 +1134,12 @@ impl SettingsView {
             menu.set_open(false);
             cx.notify();
         });
-        for popover in [&self.token_popover, &self.cli_popover] {
+        for popover in [&self.cli_popover] {
             popover.update(cx, |popover, cx| {
                 popover.set_open(false);
                 cx.notify();
             });
         }
-        self.token_slot = None;
         cx.notify();
     }
 
@@ -1181,20 +1286,6 @@ impl SettingsView {
         });
     }
 
-    fn open_tokens(&mut self, side: RuleSide, dimension: Dimension, cx: &mut Context<Self>) {
-        let slot = Some(TokenSlot { side, dimension });
-        if self.token_slot != slot {
-            self.token_anchor.clear();
-        }
-        self.token_slot = slot;
-        self.token_draft
-            .update(cx, |input, cx| input.set_text("", cx));
-        self.token_popover.update(cx, |popover, cx| {
-            popover.set_open(true);
-            cx.notify();
-        });
-    }
-
     fn moving(&self) -> bool {
         !self.open.settled()
             || !self.editor.is_settled()
@@ -1259,6 +1350,7 @@ impl SettingsView {
     ) -> gpui::AnyElement {
         match page {
             SettingsPage::Agents => self.agents_page(theme, cx),
+            SettingsPage::Models => self.models_page(theme, cx),
             SettingsPage::Classifier => self.classifier_page(theme, cx),
             SettingsPage::PickRole => self.roles_page(theme, cx),
             SettingsPage::RoutingPolicy => self.policy_page(theme, cx),
@@ -2077,7 +2169,7 @@ impl SettingsView {
         } else {
             body = body.child(settings_skeleton(4));
         }
-        let mut column = div()
+        let column = div()
             .w_full()
             .flex()
             .flex_col()
@@ -2091,100 +2183,7 @@ impl SettingsView {
                 body,
                 cx,
             ));
-        if self.policy.is_some() {
-            for side in [RuleSide::Allow, RuleSide::Deny] {
-                let mut rows = div().flex().flex_col();
-                for dimension in Dimension::ALL {
-                    let values = self
-                        .policy
-                        .as_ref()
-                        .map(|policy| policy.rules(side).get(dimension).to_vec())
-                        .unwrap_or_default();
-                    rows = rows.child(settings_row(
-                        dimension.label(),
-                        None,
-                        self.token_picker(side, dimension, values, theme, cx),
-                        cx,
-                    ));
-                }
-                column = column.child(settings_section(
-                    side_icon(side),
-                    TileTone::Security,
-                    side.title(),
-                    side.description(),
-                    None,
-                    rows,
-                    cx,
-                ));
-            }
-        }
         column.into_any_element()
-    }
-
-    fn token_picker(
-        &self,
-        side: RuleSide,
-        dimension: Dimension,
-        values: Vec<String>,
-        theme: Theme,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        let view = cx.entity().downgrade();
-        let active = self.token_slot == Some(TokenSlot { side, dimension });
-        let mut row = div()
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .justify_end()
-            .gap(px(theme.space_2));
-        if values.is_empty() {
-            row = row.child(
-                div()
-                    .text_size(px(theme.font_size_xs))
-                    .text_color(theme.color_text_muted)
-                    .child(side.empty_label()),
-            );
-        }
-        for token in &values {
-            let token_id = token.clone();
-            row = row.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(theme.space_1))
-                    .child(chip(token.clone(), StatusTone::Muted, cx))
-                    .child(icon_button(
-                        SharedString::from(format!(
-                            "settings-token-rm-{}-{}-{token_id}",
-                            side.title(),
-                            dimension.key()
-                        )),
-                        Icon::Close,
-                        "Remove",
-                        click(view.clone(), move |this, cx| {
-                            this.remove_token(side, dimension, token_id.clone(), cx);
-                        }),
-                        cx,
-                    )),
-            );
-        }
-        row.child(
-            div()
-                .relative()
-                .child(icon_button(
-                    SharedString::from(format!(
-                        "settings-token-add-{}-{}",
-                        side.title(),
-                        dimension.key()
-                    )),
-                    Icon::Plus,
-                    "Add",
-                    click(view, move |this, cx| this.open_tokens(side, dimension, cx)),
-                    cx,
-                ))
-                .when(active, |row| row.child(self.token_anchor.probe())),
-        )
-        .into_any_element()
     }
 }
 
@@ -2244,19 +2243,10 @@ impl SettingsView {
     /// outside the content's scroll and clip. A closed one draws nothing.
     fn overlays(&self, page: &SettingsPage) -> Vec<gpui::AnyElement> {
         let hung: Vec<(&AnchorSlot, gpui::AnyElement)> = match page {
-            SettingsPage::RoutingPolicy => {
-                let mut hung = vec![(
-                    &self.priority_anchor,
-                    self.priority_menu.clone().into_any_element(),
-                )];
-                if self.token_slot.is_some() {
-                    hung.push((
-                        &self.token_anchor,
-                        self.token_popover.clone().into_any_element(),
-                    ));
-                }
-                hung
-            }
+            SettingsPage::RoutingPolicy => vec![(
+                &self.priority_anchor,
+                self.priority_menu.clone().into_any_element(),
+            )],
             SettingsPage::Classifier => {
                 vec![(
                     &self.cli_anchor,
@@ -2369,14 +2359,6 @@ fn text_or_none(text: &str) -> Option<SharedString> {
     }
 }
 
-/// The allow list's shield, the deny list's wall.
-fn side_icon(side: RuleSide) -> Icon {
-    match side {
-        RuleSide::Allow => Icon::ShieldCheck,
-        RuleSide::Deny => Icon::FirewallIcon,
-    }
-}
-
 fn watch_input(input: &Entity<TextInput>, cx: &mut Context<SettingsView>) {
     cx.observe(input, |_, _, cx| cx.notify()).detach();
 }
@@ -2397,25 +2379,6 @@ fn key_input(
                 app.defer(move |app| {
                     if let Some(view) = view.upgrade() {
                         let _ = view.update(app, |this, cx| this.submit_key(name, draft, cx));
-                    }
-                });
-            })
-    })
-}
-
-fn token_input(
-    view: WeakEntity<SettingsView>,
-    cx: &mut Context<SettingsView>,
-) -> Entity<TextInput> {
-    cx.new(move |cx| {
-        TextInput::new(cx)
-            .placeholder("Type a value")
-            .on_submit(move |text, _, app| {
-                let token = trimmed_draft(text);
-                let view = view.clone();
-                app.defer(move |app| {
-                    if let Some(view) = view.upgrade() {
-                        let _ = view.update(app, |this, cx| this.add_token(token, cx));
                     }
                 });
             })
@@ -2526,91 +2489,6 @@ fn menu_trigger(
                 )
                 .child(icon(Icon::ChevronDown, 14.0, cx)),
         )
-        .into_any_element()
-}
-
-fn token_panel(view: &WeakEntity<SettingsView>, cx: &mut App) -> gpui::AnyElement {
-    let Some(view) = view.upgrade() else {
-        return div().into_any_element();
-    };
-    let theme = *Theme::global(cx);
-    let (options, dimension, models, draft) = {
-        let settings = view.read(cx);
-        let Some(slot) = settings.token_slot else {
-            return div().into_any_element();
-        };
-        let options = settings
-            .policy
-            .as_ref()
-            .map(|policy| {
-                let current = policy.rules(slot.side).get(slot.dimension);
-                policy_options(slot.dimension, &settings.agents, &settings.models)
-                    .into_iter()
-                    .filter(|item| !current.iter().any(|have| have == item))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        (
-            options,
-            slot.dimension,
-            settings.models.clone(),
-            settings.token_draft.clone(),
-        )
-    };
-    let mut list = div()
-        .id("settings-token-options")
-        .flex()
-        .flex_col()
-        .max_h(px(220.0))
-        .overflow_y_scroll();
-    for (index, option) in options.iter().enumerate() {
-        let view = view.downgrade();
-        let option = option.clone();
-        let label = option.clone();
-        let mark = match dimension {
-            Dimension::Agents => Some(agent_avatar(&option, "", TOKEN_MARK).into_any_element()),
-            Dimension::Models => model_agent(&models, &option)
-                .map(|agent| agent_avatar(agent, "", TOKEN_MARK).into_any_element()),
-            Dimension::Providers => Some(
-                IconTile::new(Icon::Cloud)
-                    .size(TOKEN_MARK, 12.0)
-                    .into_any_element(),
-            ),
-        };
-        list = list.child(
-            div()
-                .id(("settings-token-option", index))
-                .flex_shrink_0()
-                .h(px(theme.control_height_md))
-                .px(px(theme.space_2))
-                .flex()
-                .items_center()
-                .gap(px(theme.space_2))
-                .rounded(px(theme.radius_sm))
-                .cursor_pointer()
-                .hover(|style| style.bg(theme.color_surface_hover))
-                .text_size(px(theme.font_size_sm))
-                .on_click(move |_, _, app| {
-                    let view = view.clone();
-                    let option = option.clone();
-                    app.defer(move |app| {
-                        if let Some(view) = view.upgrade() {
-                            let _ = view.update(app, |this, cx| this.add_token(option, cx));
-                        }
-                    });
-                })
-                .children(mark.map(|mark| div().flex_none().child(mark)))
-                .child(div().min_w(px(0.0)).truncate().child(label)),
-        );
-    }
-    div()
-        .debug_selector(|| "settings-token-panel".to_string())
-        .w(px(TOKEN_PANEL_WIDTH))
-        .flex()
-        .flex_col()
-        .gap(px(theme.space_2))
-        .child(list)
-        .child(draft)
         .into_any_element()
 }
 

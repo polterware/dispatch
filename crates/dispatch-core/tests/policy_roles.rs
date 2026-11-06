@@ -15,8 +15,6 @@ fn test_discover_defaults_on_and_explicit_false_wins() {
 fn wrong_known_types_are_rejected() {
     for body in [
         r#"{"discover":"yes"}"#,
-        r#"{"allow":[]}"#,
-        r#"{"deny":{"agents":"codex"}}"#,
         r#"{"priority":null}"#,
         r#"{"roles":null}"#,
     ] {
@@ -215,4 +213,11 @@ fn test_load_all_profiles_project_wins() {
     let p = roles::merge_profiles(user, project);
     assert_eq!(p["a"].tier, "hard");
     assert_eq!(p["b"].tier, "easy");
+}
+
+#[test]
+fn retired_rule_shapes_are_ignored() {
+    for body in [r#"{"allow":[]}"#, r#"{"deny":{"agents":"codex"}}"#] {
+        assert_eq!(Policy::parse(body).unwrap(), Policy::default());
+    }
 }

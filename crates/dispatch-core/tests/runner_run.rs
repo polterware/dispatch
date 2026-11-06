@@ -618,3 +618,110 @@ async fn test_a_follow_up_cuts_an_emptied_worktree_again_where_it_was() {
     assert_eq!(second.files_changed, Some(1));
     assert!(!std::path::Path::new(&root).join("later.txt").exists());
 }
+
+#[tokio::test]
+async fn test_rate_limit_builds_handoff_and_continues_from_it() {
+    use dispatch_core::runner::{HANDOFF_FILE, HANDOFF_INSTRUCTION};
+    use serde_json::json;
+
+    let (_dir, root) = repo(&[("README", "hi\n")]);
+    let stream_log = [
+        json!({"type": "item.completed", "item": {"id": "c1", "type": "command_execution", "command": "cat README", "aggregated_output": "RAW_FIRST_TRANSCRIPT_TOOL_OUTPUT"}}).to_string(),
+        json!({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t1", "name": "TodoWrite", "input": {"todos": [
+            {"content": "Write extra.txt", "status": "completed"},
+            {"content": "Verify tests", "status": "in_progress"}
+        ]}}]}}).to_string(),
+        json!({"type": "assistant", "message": {"content": [{"type": "text", "text": "Wrote extra.txt; hitting limit before tests."}]}}).to_string(),
+        String::new(),
+    ]
+    .join("\n");
+
+    let r = ran();
+    let first = Fake::new("a", &r)
+        .edit(|dir| {
+            std::fs::write(std::path::Path::new(dir).join("extra.txt"), "hello\n").unwrap();
+        })
+        .log(&stream_log)
+        .fail("429 rate limit exceeded");
+    let second = Fake::new("b", &r).out("finished\n");
+    let second_reqs = second.requests.clone();
+
+    let mut t = test_deps(vec![first.arc(), second.arc()]);
+    // Use the default repo-local worktree path so `.dispatch/` is excluded in the repo.
+    t.deps.worktree_dir.clear();
+
+    let rec = run(
+        &t,
+        Options {
+            dir: root.clone(),
+            ..easy("implement extra.txt and verify")
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(rec.status, STATUS_COMPLETED, "{rec:?}");
+    assert_eq!(rec.agent, "b");
+    assert_eq!(rec.attempts.len(), 1);
+
+    let handoff = &rec.attempts[0].handoff;
+    assert!(!handoff.is_empty(), "attempt handoff should be recorded");
+    assert!(handoff.contains("implement extra.txt and verify"), "{handoff}");
+    assert!(handoff.contains("a/m1 (rate_limit)"), "{handoff}");
+    assert!(handoff.contains("429 rate limit exceeded"), "{handoff}");
+    assert!(handoff.contains("extra.txt (+1 -0)"), "{handoff}");
+    assert!(handoff.contains("- [x] Write extra.txt"), "{handoff}");
+    assert!(handoff.contains("- [~] Verify tests"), "{handoff}");
+    assert!(
+        handoff.contains("Wrote extra.txt; hitting limit before tests."),
+        "{handoff}"
+    );
+    assert!(
+        !handoff.contains("RAW_FIRST_TRANSCRIPT_TOOL_OUTPUT"),
+        "hand-off must not include raw tool transcript: {handoff}"
+    );
+
+    let stored = t.get(&rec.id);
+    assert_eq!(stored.attempts[0].handoff, *handoff);
+
+    let reqs = second_reqs.lock().unwrap();
+    assert_eq!(reqs.len(), 1);
+    let second_prompt = &reqs[0].prompt;
+    assert!(
+        second_prompt.starts_with(HANDOFF_INSTRUCTION),
+        "second prompt: {second_prompt}"
+    );
+    assert!(second_prompt.contains(handoff), "second prompt: {second_prompt}");
+    assert!(!second_prompt.contains("RAW_FIRST_TRANSCRIPT_TOOL_OUTPUT"));
+
+    let handoff_file = std::path::Path::new(&rec.worktree).join(HANDOFF_FILE);
+    assert!(
+        handoff_file.exists(),
+        ".dispatch/handoff.md should exist when .dispatch/ is excluded"
+    );
+    assert_eq!(std::fs::read_to_string(handoff_file).unwrap(), *handoff);
+
+    // When `.dispatch/` is not excluded in the worktree, `.dispatch/handoff.md` is not written,
+    // and non-limit failures (crash) keep the original bare prompt without a hand-off.
+    let (_dir2, root2) = repo(&[("README", "hi\n")]);
+    let r2 = ran();
+    let crash_first = Fake::new("a", &r2).fail("process crashed");
+    let crash_second = Fake::new("b", &r2).out("recovered\n");
+    let crash_second_reqs = crash_second.requests.clone();
+    let t2 = test_deps(vec![crash_first.arc(), crash_second.arc()]);
+    let rec2 = run(
+        &t2,
+        Options {
+            dir: root2,
+            ..easy("bare task prompt")
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(rec2.status, STATUS_COMPLETED);
+    assert!(rec2.attempts[0].handoff.is_empty());
+    assert_eq!(
+        crash_second_reqs.lock().unwrap()[0].prompt,
+        "bare task prompt"
+    );
+}

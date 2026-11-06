@@ -12,8 +12,8 @@ use dispatch_core::{
     },
     tiers::{Entry, Table},
     types::{
-        Agent, ERR_UNKNOWN_RUN, QuotaSnapshot, RouteDecision, Run, RunEvent, Store, Tier,
-        WorktreeInfo,
+        Agent, DisabledModel, ERR_UNKNOWN_RUN, QuotaSnapshot, RouteDecision, Run, RunEvent, Store,
+        Tier, WorktreeInfo,
     },
 };
 use futures::future::BoxFuture;
@@ -31,6 +31,7 @@ struct Inner {
     tiers: Vec<Tier>,
     agents: Vec<Agent>,
     decisions: Vec<RouteDecision>,
+    disabled_models: Vec<DisabledModel>,
 }
 
 /// An in-memory Store that keeps insertion order and counts run writes.
@@ -264,6 +265,47 @@ impl Store for FakeStore {
             .cloned()
             .collect())
     }
+
+    fn list_disabled_models(&self) -> Result<Vec<DisabledModel>, Error> {
+        Ok(self.lock().disabled_models.clone())
+    }
+
+    fn set_model_enabled(&self, provider: &str, model: &str, enabled: bool) -> Result<(), Error> {
+        let provider = provider.trim().to_ascii_lowercase();
+        let model = model.trim();
+        let model = if model.is_empty() {
+            String::new()
+        } else {
+            let base = dispatch_core::catalog::base_model(model);
+            match base.split_once('/') {
+                Some((head, rest))
+                    if !rest.is_empty()
+                        && (provider.is_empty() || head.eq_ignore_ascii_case(&provider)) =>
+                {
+                    rest.to_owned()
+                }
+                _ => base.to_owned(),
+            }
+        };
+        let mut g = self.lock();
+        if enabled {
+            if model.is_empty() {
+                g.disabled_models.retain(|d| {
+                    !(d.provider.eq_ignore_ascii_case(&provider) && d.model.is_empty())
+                });
+            } else {
+                g.disabled_models.retain(|d| {
+                    !(d.model.eq_ignore_ascii_case(&model)
+                        && (d.provider.is_empty() || d.provider.eq_ignore_ascii_case(&provider)))
+                });
+            }
+        } else if !g.disabled_models.iter().any(|d| {
+            d.provider.eq_ignore_ascii_case(&provider) && d.model.eq_ignore_ascii_case(&model)
+        }) {
+            g.disabled_models.push(DisabledModel { provider, model });
+        }
+        Ok(())
+    }
 }
 
 pub type Ran = Arc<Mutex<Vec<String>>>;
@@ -288,6 +330,7 @@ pub type EditFn = Arc<dyn Fn(&str) + Send + Sync>;
 pub struct Fake {
     pub name: String,
     pub out: String,
+    pub log: String,
     pub err: Option<AttemptError>,
     pub ran: Ran,
     pub caps: Arc<Mutex<Capabilities>>,
@@ -309,6 +352,7 @@ impl Fake {
         Self {
             name: name.into(),
             out: String::new(),
+            log: String::new(),
             err: None,
             ran: ran.clone(),
             caps: Arc::new(Mutex::new(Capabilities {
@@ -333,6 +377,11 @@ impl Fake {
 
     pub fn out(mut self, out: &str) -> Self {
         self.out = out.into();
+        self
+    }
+
+    pub fn log(mut self, log: &str) -> Self {
+        self.log = log.into();
         self
     }
 
@@ -440,6 +489,20 @@ impl AgentAdapter for Fake {
             }
             if let Some(edit) = &self.edit {
                 edit(&call.request.dir);
+            }
+            if !self.log.is_empty() && !call.request.log_path.is_empty() {
+                use std::io::Write;
+                let path = std::path::Path::new(&call.request.log_path);
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                {
+                    let _ = f.write_all(self.log.as_bytes());
+                }
             }
             if !self.delay.is_zero() {
                 tokio::time::sleep(self.delay).await;

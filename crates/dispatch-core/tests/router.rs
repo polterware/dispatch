@@ -303,15 +303,18 @@ fn auto_weighs_antigravity_claude_models_on_the_claude_benchmarks() {
 }
 
 #[test]
-fn deny_policy_is_the_only_guard_on_claude_in_other_clis() {
+fn disabled_provider_hides_claude_in_other_clis() {
     let cat = Catalog::embedded().unwrap();
-    let mut policy = Policy::default();
-    policy.deny.providers = vec!["anthropic".into()];
+    let policy = Policy::default();
     let r = router::route(
         &Table::default(),
         &policy,
         &[antigravity()],
         &RouteOptions {
+            disabled: vec![dispatch_core::types::DisabledModel {
+                provider: "anthropic".into(),
+                model: String::new(),
+            }],
             tier: "auto".into(),
             difficulty: Some(0.0),
             ..Default::default()
@@ -329,7 +332,7 @@ fn deny_policy_is_the_only_guard_on_claude_in_other_clis() {
     assert!(
         r.eliminated
             .iter()
-            .any(|e| e.contains("claude-opus-5-5-high: policy deny.providers includes anthropic")),
+            .any(|e| e.contains("claude-opus-5-5-high: provider anthropic is disabled")),
         "{:?}",
         r.eliminated
     );
@@ -437,4 +440,47 @@ fn a_model_alone_routes_to_every_agent_that_serves_it() {
         "{:?}",
         pinned.candidates
     );
+}
+
+#[test]
+fn disabled_base_model_is_never_routed_on_any_agent_or_effort() {
+    let disabled = vec![dispatch_core::types::DisabledModel {
+        provider: "anthropic".into(),
+        model: "claude-opus-5-5".into(),
+    }];
+    let agents = ["claude", "antigravity"]
+        .into_iter()
+        .map(|name| dispatch_core::router::Agent {
+            name: name.into(),
+            installed: true,
+            file_editing: true,
+            read_only: true,
+            discovered: vec![
+                "claude-opus-5-5".into(),
+                "claude-opus-5-5-high".into(),
+                "gemini-4-argon-high".into(),
+            ],
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+    for tier in ["auto", "normal"] {
+        let opts = RouteOptions {
+            tier: tier.into(),
+            difficulty: Some(-1.8),
+            disabled: disabled.clone(),
+            ..Default::default()
+        };
+        let (candidates, notes) = dispatch_core::router::select_candidates(
+            &Table::default(),
+            &Policy::default(),
+            &agents,
+            &opts,
+        );
+        assert!(
+            candidates
+                .iter()
+                .all(|c| !c.model.starts_with("claude-opus-5-5"))
+        );
+        assert!(notes.iter().any(|n| n.contains("disabled")), "{notes:?}");
+    }
 }

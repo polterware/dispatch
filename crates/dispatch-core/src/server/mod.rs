@@ -192,7 +192,18 @@ impl Core {
 
     /// The routing policy: one for every repository.
     pub(crate) fn global_policy(&self) -> Result<Policy, Error> {
-        config::load(&config::policy_config_path(&self.state_dir()))
+        config::load_with_store(
+            &config::policy_config_path(&self.state_dir()),
+            self.store.as_ref(),
+        )
+    }
+
+    pub(crate) fn disabled_models(&self) -> Vec<types::DisabledModel> {
+        let _ = config::migrate_legacy_deny(
+            &config::policy_config_path(&self.state_dir()),
+            self.store.as_ref(),
+        );
+        types::Store::list_disabled_models(self.store.as_ref()).unwrap_or_default()
     }
 
     /// Marks RUNNING and PENDING runs whose runner died with the previous
@@ -237,6 +248,10 @@ pub async fn listen(address: &str) -> Result<(TcpListener, String), Error> {
 /// both accepted.
 pub async fn serve(listener: TcpListener, core: Arc<Core>) -> Result<(), Error> {
     core.reconcile_on_boot().await;
+    config::migrate_legacy_deny(
+        &config::policy_config_path(&core.state_dir()),
+        core.store.as_ref(),
+    )?;
     let _ = config::apply_agent_config(&core.state_dir());
     let app = routes::router(core.clone());
     let done = core.done();

@@ -6,7 +6,7 @@
 //! background executor; they use the same button colors with fast hover and press springs.
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -31,14 +31,14 @@ use crate::models::new_run::{
     run_label, start_request,
 };
 use crate::models::run_page::{
-    AttemptCard, CandidateExplain, CandidateOutcome, ClassifierBands, LinkedRow, MoreAction,
-    ReviewAction, RouteDecision, TokenUsage, area_label, candidate_explain, candidate_line,
-    candidate_outcomes, classifier_bands, coalesce_text, context_usage, difficulty_label,
-    duration_label, file_counts, follow_up_blocker, format_tokens, has_worktree, is_run_active,
-    linked_rows, map_route_decision, percent, policy_label, priority_label, proto_ms, rail_tokens,
-    role_summary, route_label, route_reason, run_cost, run_more_actions, run_review_action,
-    stored_usage, timing_label, token_breakdown, total_tokens, unmatched_attempts,
-    worktree_display_status,
+    AttemptCard, AttemptSwitch, CandidateExplain, CandidateOutcome, ClassifierBands, LinkedRow,
+    MoreAction, ReviewAction, RouteDecision, TokenUsage, area_label, attempt_switches,
+    candidate_explain, candidate_line, candidate_outcomes, classifier_bands, coalesce_text,
+    context_usage, difficulty_label, duration_label, file_counts, follow_up_blocker, format_tokens,
+    has_worktree, is_run_active, linked_rows, map_route_decision, percent, policy_label,
+    priority_label, proto_ms, rail_tokens, role_summary, route_label, route_reason, run_cost,
+    run_more_actions, run_review_action, stored_usage, timing_label, token_breakdown, total_tokens,
+    unmatched_attempts, worktree_display_status,
 };
 use crate::models::settings::parse_policy;
 use crate::motion::{Animator, SpringTier, SpringValue};
@@ -106,6 +106,7 @@ pub struct RunPageView {
     /// The Routing group lists every candidate, not just the first few.
     /// How many pages of five the Routing group lists.
     candidate_pages: usize,
+    expanded_handoffs: HashSet<usize>,
     worktree: Option<DispatchWorktree>,
     output_log: String,
     meta_for: String,
@@ -262,6 +263,7 @@ impl RunPageView {
             menu,
             cancelling: false,
             candidate_pages: 1,
+            expanded_handoffs: HashSet::new(),
             reviewing: None,
             confirm_open: false,
             confirm_progress: SpringValue::new(0.0, SpringTier::Moderate),
@@ -1405,6 +1407,7 @@ impl RunPageView {
             self.meta_for.clear();
             self.decision = None;
             self.candidate_pages = 1;
+            self.expanded_handoffs.clear();
             self.worktree = None;
             self.side_gen = self.side_gen.wrapping_add(1);
             self.side_inflight = false;
@@ -2192,6 +2195,44 @@ fn failed_attempts(attempts: &[&DispatchAttempt], theme: &Theme) -> Option<gpui:
     Some(list)
 }
 
+fn routing_attempt_switches(
+    switches: &[AttemptSwitch],
+    expanded: &HashSet<usize>,
+    view: &WeakEntity<RunPageView>,
+    theme: &Theme,
+) -> Option<gpui::Div> {
+    if switches.is_empty() {
+        return None;
+    }
+    let mut list = div().flex().min_w(px(0.0)).flex_col().gap(px(tw(1.0)));
+    for sw in switches {
+        let index = sw.index;
+        let is_open = expanded.contains(&index);
+        let handoff = (!sw.handoff.trim().is_empty()).then_some(sw.handoff.as_str());
+        let toggle = handoff.map(|_| {
+            let view = view.clone();
+            Rc::new(move |_: &mut Window, cx: &mut App| {
+                let _ = view.update(cx, |page, cx| {
+                    if !page.expanded_handoffs.remove(&index) {
+                        page.expanded_handoffs.insert(index);
+                    }
+                    page.routing.update(cx, |_, cx| cx.notify());
+                    cx.notify();
+                });
+            }) as Rc<dyn Fn(&mut Window, &mut App)>
+        });
+        list = list.child(crate::ui::parts::transcript::attempt_switch_divider(
+            10_000 + index,
+            &sw.label,
+            handoff,
+            is_open,
+            theme,
+            toggle,
+        ));
+    }
+    Some(list)
+}
+
 fn current_title(run: &DispatchRun, card: &AttemptCard) -> String {
     if !card.is_final {
         return card.title.clone();
@@ -2473,6 +2514,9 @@ fn paint_routing(view: &WeakEntity<RunPageView>, window: &mut Window, cx: &mut A
                 }),
         );
     }
+    let expanded_handoffs = view
+        .upgrade()
+        .map_or_else(HashSet::new, |v| v.read(cx).expanded_handoffs.clone());
     div()
         .w_full()
         .flex()
@@ -2482,6 +2526,15 @@ fn paint_routing(view: &WeakEntity<RunPageView>, window: &mut Window, cx: &mut A
         .children(
             failed_attempts(&unmatched_attempts(&decision, &pack.run), &theme)
                 .map(|list| list.px(px(tw(1.0)))),
+        )
+        .children(
+            routing_attempt_switches(
+                &attempt_switches(&pack.run),
+                &expanded_handoffs,
+                view,
+                &theme,
+            )
+            .map(|list| list.px(px(tw(1.0)))),
         )
         .child(candidates)
         .into_any_element()

@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 use serde_json::{Map, Value};
 
+use crate::models::run_page::{AttemptSwitch, parse_switch_line, switch_divider_label};
 use crate::models::sidebar::local_clock;
 
 /// One line of a run's transcript, in the shape `buildTranscript` returns.
@@ -32,6 +33,11 @@ pub enum TranscriptEntry {
     Event {
         event: String,
         text: String,
+    },
+    Switch {
+        index: usize,
+        label: String,
+        handoff: String,
     },
 }
 
@@ -114,6 +120,7 @@ pub struct TranscriptBuilder {
     streamed: bool,
     delta: Option<Delta>,
     plain_messages: Vec<usize>,
+    switches: usize,
 }
 
 impl TranscriptBuilder {
@@ -149,6 +156,29 @@ impl TranscriptBuilder {
             }
             if line.trim_start().starts_with("```") || line.trim_start().starts_with("~~~") {
                 self.fenced = !self.fenced;
+            }
+            if !self.fenced
+                && let Some((from_agent, from_model, to_agent, to_model, exit_class)) =
+                    parse_switch_line(line)
+            {
+                self.flush_text();
+                let switch_ix = self.switches;
+                self.switches += 1;
+                let has_handoff = matches!(exit_class.as_str(), "rate_limit" | "credits");
+                let label = switch_divider_label(
+                    &from_agent,
+                    &from_model,
+                    &to_agent,
+                    &to_model,
+                    &exit_class,
+                    has_handoff,
+                );
+                self.push(TranscriptEntry::Switch {
+                    index: switch_ix,
+                    label,
+                    handoff: String::new(),
+                });
+                continue;
             }
             if !self.fenced
                 && let Some((event, text)) = event_line(line)
@@ -1714,6 +1744,49 @@ fn first_tool_call_key(line: &str, call: &Map<String, Value>) -> String {
         .unwrap_or_default()
 }
 
+/// Attaches each attempt's hand-off and canonical switch label from `switches` to any
+/// `TranscriptEntry::Switch` in `entries`, and inserts missing switches at the start when
+/// `include_missing` is true (e.g. when the first attempt failed before writing to the log).
+pub fn enrich_transcript_switches(
+    mut entries: Vec<TranscriptEntry>,
+    switches: &[AttemptSwitch],
+    include_missing: bool,
+) -> Vec<TranscriptEntry> {
+    if switches.is_empty() {
+        return entries;
+    }
+    let mut seen = vec![false; switches.len()];
+    for entry in &mut entries {
+        if let TranscriptEntry::Switch {
+            index,
+            label,
+            handoff,
+        } = entry
+            && let Some(sw) = switches.get(*index)
+        {
+            seen[*index] = true;
+            *label = sw.label.clone();
+            *handoff = sw.handoff.clone();
+        }
+    }
+    if include_missing {
+        let missing: Vec<TranscriptEntry> = switches
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| !seen[*idx])
+            .map(|(_, sw)| TranscriptEntry::Switch {
+                index: sw.index,
+                label: sw.label.clone(),
+                handoff: sw.handoff.clone(),
+            })
+            .collect();
+        if !missing.is_empty() {
+            entries.splice(0..0, missing);
+        }
+    }
+    entries
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2252,5 +2325,54 @@ mod tests {
     fn recognises_a_diff() {
         assert!(looks_like_diff("@@ -1 +1 @@\n-a\n+b"));
         assert!(!looks_like_diff("just two\nplain lines"));
+    }
+
+    #[test]
+    fn parses_dispatch_attempt_switch_dividers_and_enriches_handoff() {
+        use super::enrich_transcript_switches;
+        use crate::models::run_page::AttemptSwitch;
+
+        let log = [
+            serde_json::json!({"type": "item.completed", "item": {"id": "m1", "type": "agent_message", "text": "Part 1 done."}}).to_string(),
+            "── dispatch: claude/claude-opus-5-5-high failed (rate_limit); trying codex/gpt-6-luna-medium ──".to_string(),
+            serde_json::json!({"type": "item.completed", "item": {"id": "m2", "type": "agent_message", "text": "Continuing from hand-off."}}).to_string(),
+        ]
+        .join("\n");
+        let parsed = build_transcript(&log, "");
+        assert_eq!(
+            parsed,
+            vec![
+                message("Part 1 done."),
+                TranscriptEntry::Switch {
+                    index: 0,
+                    label: "Switched claude/claude-opus-5-5-high \u{2192} codex/gpt-6-luna-medium \u{00b7} usage limit \u{00b7} hand-off".into(),
+                    handoff: String::new(),
+                },
+                message("Continuing from hand-off."),
+            ]
+        );
+        let enriched = enrich_transcript_switches(
+            parsed,
+            &[AttemptSwitch {
+                index: 0,
+                from_agent: "claude".into(),
+                from_model: "claude-opus-5-5-high".into(),
+                to_agent: "codex".into(),
+                to_model: "gpt-6-luna-medium".into(),
+                exit_class: "rate_limit".into(),
+                error: "429 usage limit".into(),
+                handoff: "## Original task\nFinish it".into(),
+                label: "Switched claude/claude-opus-5-5-high \u{2192} codex/gpt-6-luna-medium \u{00b7} usage limit \u{00b7} hand-off".into(),
+            }],
+            true,
+        );
+        assert_eq!(
+            enriched[1],
+            TranscriptEntry::Switch {
+                index: 0,
+                label: "Switched claude/claude-opus-5-5-high \u{2192} codex/gpt-6-luna-medium \u{00b7} usage limit \u{00b7} hand-off".into(),
+                handoff: "## Original task\nFinish it".into(),
+            }
+        );
     }
 }

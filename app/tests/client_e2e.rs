@@ -244,19 +244,29 @@ fn settings_change_the_policy_hooks_and_skills() {
         core.config("set", key, &[value]);
         assert_eq!(core.config("get", key, &[]), want, "{key}");
     }
-    core.config("allow-add", "models", &["fake-fast"]);
-    core.config("deny-add", "agents", &["codex"]);
-    assert_eq!(
-        core.config("get", "allow", &[])["models"],
-        serde_json::json!(["fake-fast"])
-    );
-    assert_eq!(
-        core.config("get", "deny", &[])["agents"],
-        serde_json::json!(["codex"])
-    );
-    core.config("allow-rm", "models", &["fake-fast"]);
-    core.config("deny-rm", "agents", &["codex"]);
-    assert!(core.config("get", "deny", &[]).get("agents").is_none());
+    let disabled = core
+        .client
+        .set_model_enabled(&dispatch_app::client::SetModelEnabledRequest {
+            provider: "fake".into(),
+            model: "fake-fast".into(),
+            enabled: false,
+        })
+        .unwrap();
+    assert!(!disabled.enabled);
+    let settings = core
+        .client
+        .list_model_settings(&dispatch_app::client::ListModelSettingsRequest::default())
+        .unwrap();
+    assert!(settings.providers.iter().any(
+        |p| p.provider == "fake" && p.models.iter().any(|m| m.id == "fake-fast" && !m.enabled)
+    ));
+    core.client
+        .set_model_enabled(&dispatch_app::client::SetModelEnabledRequest {
+            provider: "fake".into(),
+            model: "fake-fast".into(),
+            enabled: true,
+        })
+        .unwrap();
     let keys = core.config("get", "classifier_keys", &[]);
     assert!(keys.get("jev").is_some(), "{keys}");
 
@@ -358,21 +368,39 @@ fn roles_and_tiers_are_saved_and_removed() {
     assert!(removed.ok, "{}", removed.json);
     assert!(roles(&core).get("e2e-checker").is_none());
 
-    // The tier board saves what it lists.
-    let tiers = core
-        .client
-        .list_tiers(&ListTiersRequest::default())
-        .expect("tiers")
-        .tiers;
-    assert!(!tiers.is_empty());
+    // The tier board lists only enabled models: the harness turned off every provider but
+    // fake, which the default table never names. Saving the board keeps the hidden rows, and
+    // turning their provider back on brings them back.
+    let listed = |core: &Core| {
+        core.client
+            .list_tiers(&ListTiersRequest::default())
+            .expect("tiers")
+            .tiers
+    };
+    assert!(listed(&core).is_empty());
     let saved = core
         .client
         .replace_tiers(&ReplaceTiersRequest {
-            tiers: tiers.clone(),
+            tiers: vec![dispatch_app::client::DispatchTier {
+                name: "easy".into(),
+                agent: "fake".into(),
+                model: "fake-fast".into(),
+                ..Default::default()
+            }],
         })
         .expect("replace tiers")
         .tiers;
-    assert_eq!(saved.len(), tiers.len());
+    assert_eq!(saved.len(), 1);
+    core.client
+        .set_model_enabled(&dispatch_app::client::SetModelEnabledRequest {
+            provider: "openai".into(),
+            model: String::new(),
+            enabled: true,
+        })
+        .unwrap();
+    let back = listed(&core);
+    assert_eq!(back.first().map(|t| t.model.as_str()), Some("fake-fast"));
+    assert!(back.iter().any(|t| t.agent == "codex"), "{back:?}");
     core.client
         .check_tiers(&CheckTiersRequest::default())
         .expect("check tiers");

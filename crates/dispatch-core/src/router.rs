@@ -408,6 +408,7 @@ pub struct RouteOptions {
     pub prefer: Vec<String>,
     pub avoid: Vec<String>,
     pub role_board: crate::tiers::Table,
+    pub disabled: Vec<crate::types::DisabledModel>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -420,54 +421,6 @@ pub struct Plan {
 
 fn matches_model(model: &str, requested: &str) -> bool {
     !requested.is_empty() && (model == requested || base_model(model) == base_model(requested))
-}
-
-fn policy_reason(
-    policy: &crate::config::Policy,
-    provider: &str,
-    model: &str,
-    agent: &str,
-) -> String {
-    let mut policy = policy.clone();
-    let base = base_model(model);
-    if base != model {
-        for list in [&mut policy.allow.models, &mut policy.deny.models] {
-            if list.iter().any(|v| v == base) {
-                list.push(model.into());
-            }
-        }
-    }
-    policy.reason(provider, model, agent)
-}
-
-fn policy_request_reason(policy: &crate::config::Policy, f: &Filters) -> String {
-    for (value, dimension) in [(&f.provider, 0), (&f.model, 1), (&f.agent, 2)] {
-        if value.is_empty() {
-            continue;
-        }
-        let mut p = policy.clone();
-        if dimension != 0 {
-            p.allow.providers.clear();
-            p.deny.providers.clear();
-        }
-        if dimension != 1 {
-            p.allow.models.clear();
-            p.deny.models.clear();
-        }
-        if dimension != 2 {
-            p.allow.agents.clear();
-            p.deny.agents.clear();
-        }
-        let reason = match dimension {
-            0 => policy_reason(&p, value, "", ""),
-            1 => policy_reason(&p, "", value, ""),
-            _ => policy_reason(&p, "", "", value),
-        };
-        if !reason.is_empty() {
-            return reason;
-        }
-    }
-    String::new()
 }
 
 fn tier_effort(tier: &str) -> &str {
@@ -583,7 +536,8 @@ pub fn select_candidates(
         } else {
             e.provider.clone()
         };
-        let mut reason = policy_reason(policy, &provider, &e.model, &e.agent);
+        let mut reason =
+            crate::config::disabled_reason(&options.disabled, &provider, &e.agent, &e.model);
         if reason.is_empty() {
             reason = if !f.provider.is_empty() && f.provider != provider {
                 format!("provider filter requires {}", f.provider)
@@ -743,7 +697,15 @@ pub fn plan(
     }
     let (primary, mut eliminated) = select_candidates(&table, &policy, agents, &o);
     let mut extra = Vec::new();
-    if o.filters.relax && policy_request_reason(&policy, &o.filters).is_empty() {
+    if o.filters.relax
+        && crate::config::disabled_request_reason(
+            &o.disabled,
+            &o.filters.provider,
+            &o.filters.agent,
+            &o.filters.model,
+        )
+        .is_empty()
+    {
         let mut fallback = o.clone();
         if fallback.tier.is_empty() {
             fallback.tier = "normal".into();

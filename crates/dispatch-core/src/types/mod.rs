@@ -80,6 +80,8 @@ pub struct Attempt {
     pub exit_class: String,
     #[serde(rename = "DurationMs")]
     pub duration_ms: Option<i64>,
+    #[serde(rename = "Handoff", default, skip_serializing_if = "String::is_empty")]
+    pub handoff: String,
 }
 
 /// Caller identifies the calling conversation, never the worker's resume session.
@@ -341,6 +343,13 @@ pub struct WorktreeInfo {
     pub owner: String,
 }
 
+/// A disabled provider (`model` is empty) or a disabled base model under `provider`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisabledModel {
+    pub provider: String,
+    pub model: String,
+}
+
 /// The persistence boundary. The core implements it on SQLite; the engine
 /// must not open the database itself.
 pub trait Store: Send + Sync {
@@ -441,4 +450,17 @@ pub trait Store: Send + Sync {
     fn get_route_decision(&self, run_id: &str) -> Result<Option<RouteDecision>, Error>;
     /// Newest first; an empty `project_id` lists all.
     fn list_route_decisions(&self, project_id: &str) -> Result<Vec<RouteDecision>, Error>;
+    /// Disabled providers (`model` is empty) and base models.
+    fn list_disabled_models(&self) -> Result<Vec<DisabledModel>, Error> {
+        Ok(Vec::new())
+    }
+    /// Enables or disables a provider (`model` is empty) or a base model under `provider`.
+    fn set_model_enabled(
+        &self,
+        _provider: &str,
+        _model: &str,
+        _enabled: bool,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
 }

@@ -23,10 +23,11 @@ use crate::client::{
 use crate::models::roles::{
     GENERAL_ROLE, PaletteModel, RoleDraft, RoleListRow, RoleProfile, RoleRow, RoleSource,
     RolesList, TIER_COLUMNS, TierBuild, TierCardInput, TierColumns, TierSlot, board_row_count,
-    build_board, compose_profile, is_build_empty, models_label, palette_card, palette_groups,
-    parse_roles_list, parse_tier_build, place_tier_card, profile_error, profile_with_board,
-    remove_tier_card, rename_drops_previous, role_board_tiers, role_list_rows, role_models_prompt,
-    role_name_error, tier_columns, tier_matches, when_display,
+    build_board, compose_profile, is_build_empty, models_label, palette_card_at, palette_efforts,
+    palette_groups, parse_roles_list, parse_tier_build, place_tier_card, profile_error,
+    profile_with_board, remove_tier_card, rename_drops_previous, replace_tier_card,
+    role_board_tiers, role_list_rows, role_models_prompt, role_name_error, tier_columns,
+    tier_matches, when_display,
 };
 use crate::motion::{Animator, SpringTier, SpringValue};
 use crate::state::{AppState, Route, ToastTone, observe};
@@ -55,7 +56,7 @@ const ROLES_BOARD: &str = "roles-board";
 /// `DispatchAgentAvatar`'s default size.
 const AVATAR: f32 = 28.0;
 /// `TierModelPalette`: its popover's width and its tallest.
-const PALETTE_WIDTH: f32 = 360.0;
+const PALETTE_WIDTH: f32 = 400.0;
 const PALETTE_MAX_H: f32 = 360.0;
 /// The board grid's order column and its gap (`72px repeat(3, minmax(0, 1fr))`, `gap: 10px`).
 const ORDER_W: f32 = 72.0;
@@ -85,6 +86,8 @@ struct PointerDrag {
     over: Option<TierSlot>,
     /// The pointer, in page coordinates.
     pointer: (f32, f32),
+    /// The press landed on the card whose swap palette was open: letting go leaves it closed.
+    was_open: bool,
 }
 
 /// What the page draws: answered at once, so it waits on no agent CLI.
@@ -153,6 +156,8 @@ pub struct RolesView {
     palette_y: SpringValue,
     palette_slot: Option<TierSlot>,
     palette_anchor: Option<TierSlot>,
+    /// The palette swaps the card at `palette_slot` instead of adding one there.
+    palette_replace: bool,
     fetch_gen: u64,
     tier_write: u64,
     role_write: u64,
@@ -321,6 +326,7 @@ impl RolesView {
             palette_y: SpringValue::new(6.0, SpringTier::Fast),
             palette_slot: None,
             palette_anchor: None,
+            palette_replace: false,
             fetch_gen: 0,
             tier_write: 0,
             role_write: 0,
@@ -1147,13 +1153,34 @@ impl RolesView {
     }
 
     fn toggle_palette(&mut self, slot: TierSlot, cx: &mut Context<Self>) {
-        if self.palette_slot.as_ref() == Some(&slot) {
+        if self.palette_slot.as_ref() == Some(&slot) && !self.palette_replace {
             self.palette_slot = None;
         } else {
             self.palette_slot = Some(slot);
+            self.palette_replace = false;
             self.load_palette(cx);
         }
         cx.notify();
+    }
+
+    /// Opens the palette on the card at `slot`, to swap it for another model.
+    fn open_replace(&mut self, slot: TierSlot, cx: &mut Context<Self>) {
+        self.palette_slot = Some(slot);
+        self.palette_replace = true;
+        self.load_palette(cx);
+        cx.notify();
+    }
+
+    /// The model of the card the palette swaps, if it swaps one.
+    fn replacing_model(&self, cx: &Context<Self>) -> Option<(String, String)> {
+        let slot = self
+            .palette_slot
+            .as_ref()
+            .filter(|_| self.palette_replace)?;
+        tier_columns(&self.committed(cx))
+            .get(&slot.tier)
+            .get(slot.index)
+            .map(|tier| (tier.agent.clone(), tier.model.clone()))
     }
 
     fn place_new(&mut self, card: TierCardInput, cx: &mut Context<Self>) {
@@ -1161,8 +1188,13 @@ impl RolesView {
             return;
         };
         let committed = self.committed(cx);
-        let next = place_tier_card(&committed, &card, &slot, None);
+        let next = if self.palette_replace {
+            replace_tier_card(&committed, &card, &slot)
+        } else {
+            place_tier_card(&committed, &card, &slot, None)
+        };
         self.palette_slot = None;
+        self.palette_replace = false;
         if next != committed {
             self.commit_board(next, cx);
         } else {
@@ -1197,13 +1229,10 @@ impl RolesView {
     }
 
     fn begin_drag(&mut self, slot: TierSlot, x: f32, y: f32, cx: &mut Context<Self>) {
-        if !self.editable(cx)
-            || self.palette_slot.is_some()
-            || self.composer.is_some()
-            || self.build_open
-        {
+        if !self.editable(cx) || self.composer.is_some() || self.build_open {
             return;
         }
+        let was_open = self.palette_replace && self.palette_slot.as_ref() == Some(&slot);
         let committed = self.committed(cx);
         let Some(tier) = tier_columns(&committed)
             .get(&slot.tier)
@@ -1220,6 +1249,7 @@ impl RolesView {
             active: false,
             over: None,
             pointer: (0.0, 0.0),
+            was_open,
         });
         cx.notify();
     }
@@ -1265,6 +1295,13 @@ impl RolesView {
         let Some(drag) = self.drag.take() else {
             return;
         };
+        if !drag.active {
+            // A press that never moved is a click: it opens the swap palette on that card.
+            if !drag.was_open {
+                self.open_replace(drag.from, cx);
+            }
+            return;
+        }
         if drag.active {
             if let Some(over) = drag.over.clone() {
                 if over != drag.from {
@@ -1533,12 +1570,17 @@ impl RolesView {
                     }),
                 )
             };
-        let (catalog, jev, prompt) = (name.clone(), name.clone(), name);
+        let (catalog, cheapest, jev, prompt) = (name.clone(), name.clone(), name.clone(), name);
         let items = vec![
             item(
                 "From the catalog",
                 Icon::LibraryBig,
                 Rc::new(move |this, cx| this.open_build(&catalog, "", cx)),
+            ),
+            item(
+                "Cheapest on this machine",
+                Icon::CreditCard,
+                Rc::new(move |this, cx| this.open_build(&cheapest, "cheapest", cx)),
             ),
             item(
                 "Decision API recommendation",
@@ -1589,6 +1631,8 @@ impl RolesView {
         let general = self.build_role == GENERAL_ROLE;
         match (general, self.build_judge.as_str()) {
             (true, "jev") => "Tiers the Decision API recommends".to_string(),
+            (true, "cheapest") => "The cheapest tiers on this machine".to_string(),
+            (false, "cheapest") => format!("{}'s board, cheapest on this machine", self.build_role),
             (true, _) => "Build tiers from the model".to_string(),
             (false, "jev") => format!(
                 "{}'s board, as the Decision API recommends it",
@@ -1995,7 +2039,12 @@ impl RolesView {
             None if editable => cell.child(div().flex_1().min_h(px(CARD_MIN_H))),
             None => cell,
         };
-        if self.drop_over(tier, row) {
+        let swapping = self.palette_replace
+            && self
+                .palette_slot
+                .as_ref()
+                .is_some_and(|slot| slot.tier == tier && slot.index == row);
+        if self.drop_over(tier, row) || swapping {
             // `outline: 2px solid var(--color-accent); outline-offset: 2px`.
             cell = cell.child(
                 div()
@@ -2027,7 +2076,7 @@ impl RolesView {
         let open = self
             .palette_slot
             .as_ref()
-            .is_some_and(|slot| slot.tier == tier);
+            .is_some_and(|slot| slot.tier == tier && !self.palette_replace);
         let (fill, ink) = if open {
             (1.0, 1.0)
         } else {
@@ -2103,7 +2152,7 @@ impl RolesView {
         let remove = editable.then(|| {
             let view = cx.entity().clone();
             let slot = slot.clone();
-            Button::new(
+            let button = Button::new(
                 SharedString::from(format!("tier-remove-{}-{row}", tier.name)),
                 ButtonKind::Ghost,
             )
@@ -2115,7 +2164,11 @@ impl RolesView {
             ))
             .on_click(move |_, cx| {
                 view.update(cx, |this, cx| this.remove_at(slot.clone(), cx));
-            })
+            });
+            // Its press is not the card's: it neither drags nor opens the swap palette.
+            div()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(button)
         });
         let head = div()
             .flex()
@@ -2151,7 +2204,7 @@ impl RolesView {
         let mut body = div().flex_1().min_w(px(0.0)).flex().flex_col().child(head);
         if editable {
             let view = cx.entity().clone();
-            body = body.cursor(CursorStyle::OpenHand).on_mouse_down(
+            body = body.cursor(CursorStyle::PointingHand).on_mouse_down(
                 MouseButton::Left,
                 move |event: &MouseDownEvent, _, cx| {
                     view.update(cx, |this, cx| {
@@ -2195,6 +2248,7 @@ impl RolesView {
             return div().into_any_element();
         };
         let groups = palette_groups(&self.palette_models, &self.palette_query);
+        let replacing = self.replacing_model(cx);
         let view = cx.entity().clone();
         let mut list = div()
             .id("palette-scroll")
@@ -2229,8 +2283,48 @@ impl RolesView {
                         .child(agent),
                 );
                 for model in models {
-                    let card = palette_card(&model);
+                    let card = palette_card_at(&model, "");
                     let view = view.clone();
+                    // The board names a model at an effort (`claude-opus-5-5-high`): each effort
+                    // the agent takes is a chip that places the model at it; the row itself
+                    // places it at the agent's default.
+                    let mut efforts = div().flex_none().flex().items_center().gap(px(2.0));
+                    for effort in palette_efforts(&model.agent) {
+                        let at = palette_card_at(&model, effort);
+                        let current = replacing
+                            .as_ref()
+                            .is_some_and(|(agent, name)| *agent == at.agent && *name == at.model);
+                        let view = view.clone();
+                        efforts = efforts.child(
+                            div()
+                                .id(SharedString::from(format!(
+                                    "palette-{}-{}-{effort}",
+                                    model.agent, model.model
+                                )))
+                                .h(px(20.0))
+                                .px(px(6.0))
+                                .flex()
+                                .items_center()
+                                .rounded_full()
+                                .font_family(theme.font_mono)
+                                .text_size(px(10.5))
+                                .text_color(if current {
+                                    theme.color_text_primary
+                                } else {
+                                    theme.color_text_muted
+                                })
+                                .when(current, |chip| chip.bg(theme.color_surface_hover))
+                                .hover(|chip| {
+                                    chip.bg(theme.color_border_subtle)
+                                        .text_color(theme.color_text_primary)
+                                })
+                                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                    cx.stop_propagation();
+                                    view.update(cx, |this, cx| this.place_new(at.clone(), cx));
+                                })
+                                .child(effort.to_string()),
+                        );
+                    }
                     let subtitle = [model.provider.as_str(), model.tier.as_str()]
                         .into_iter()
                         .filter(|part| !part.is_empty())
@@ -2276,7 +2370,8 @@ impl RolesView {
                                             .text_color(theme.color_text_muted)
                                             .child(ellipsis(subtitle)),
                                     ),
-                            ),
+                            )
+                            .child(efforts),
                     );
                 }
                 list = list.child(group);
@@ -2338,6 +2433,10 @@ impl RolesView {
                 .pt(px(theme.space_2))
                 .pb(px(theme.space_3))
                 .bg(theme.color_surface_subtle)
+                // `floating_panel` occludes, so the wrapper under it never sees a press: the
+                // body keeps its own presses (the search, the custom pair) from the window's
+                // listener that closes the palette.
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .child(div().flex_none().child(self.palette_search.clone()))
                 .child(list)
                 .child(

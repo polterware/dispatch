@@ -210,6 +210,7 @@ pub(super) fn run_from_proto(p: &pb::DispatchRun) -> Run {
                 error: a.error.clone(),
                 exit_class: a.exit_class.clone(),
                 duration_ms: a.duration_ms,
+                handoff: a.handoff.clone(),
             })
             .collect(),
         ..Run::default()
@@ -414,6 +415,31 @@ pub(super) fn format_ms(ms: Option<i64>) -> String {
     }
     let rounded = (ms + 50) / 100 * 100;
     super::flags::format_duration(Duration::from_millis(u64::try_from(rounded).unwrap_or(0)))
+}
+
+pub fn format_attempts(attempts: &[Attempt]) -> String {
+    if attempts.is_empty() {
+        return "no fallback attempts\n".into();
+    }
+    let mut out = String::new();
+    for a in attempts {
+        out.push_str(&format!(
+            "{}/{} class={} duration={} {}\n",
+            a.agent,
+            a.model,
+            or_unknown(&a.exit_class),
+            format_ms(a.duration_ms),
+            a.error
+        ));
+        if !a.handoff.trim().is_empty() {
+            for line in a.handoff.trim().lines() {
+                out.push_str("  ");
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    out
 }
 
 /// A token count as 950, 12k, or 6.5M.
@@ -822,20 +848,7 @@ pub(super) async fn result(db_path: &Path, args: &[String]) -> CliResult {
                 return Ok(());
             }
             let attempts = run.attempts.unwrap_or_default();
-            if attempts.is_empty() {
-                println!("no fallback attempts");
-                return Ok(());
-            }
-            for a in &attempts {
-                println!(
-                    "{}/{} class={} duration={} {}",
-                    a.agent,
-                    a.model,
-                    or_unknown(&a.exit_class),
-                    format_ms(a.duration_ms),
-                    a.error
-                );
-            }
+            print!("{}", format_attempts(&attempts));
             Ok(())
         }
         "meta" => {

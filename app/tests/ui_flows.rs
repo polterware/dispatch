@@ -493,32 +493,33 @@ fn settings_menus_pick_the_priority_and_classifier_model(cx: &mut TestAppContext
 }
 
 #[gpui::test]
-fn a_token_picker_hangs_from_its_plus_after_the_page_scrolls(cx: &mut TestAppContext) {
+fn settings_models_switch_models_and_providers(cx: &mut TestAppContext) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let core = Core::new();
     let mut w = open(&core, cx);
-    // A short window, so Deny sits below the fold and the section scrolls to it.
-    w.cx.simulate_resize(gpui::size(gpui::px(1400.0), gpui::px(700.0)));
-    w.go(Route::Settings(SettingsPage::RoutingPolicy));
-    let plus = "settings-token-add-Deny-models";
-    w.scroll_settings_to(plus);
-    w.click(plus);
-    w.pump();
-    let plus = w.cx.debug_bounds(plus).expect("the Deny models +");
-    let panel =
-        w.cx.debug_bounds("settings-token-panel")
-            .expect("the token picker");
-    // The panel's right edge lines up with the "+" (the panel's padding inside it), and it
-    // hangs right under or over the "+", not where the row was before the scroll.
-    let gap = f32::from(plus.right() - panel.right());
-    assert!(
-        (0.0..=16.0).contains(&gap),
-        "plus {plus:?}, panel {panel:?}"
-    );
-    let below = f32::from(panel.top() - plus.bottom());
-    let above = f32::from(plus.top() - panel.bottom());
-    assert!(
-        (0.0..=24.0).contains(&below) || (0.0..=24.0).contains(&above),
-        "plus {plus:?}, panel {panel:?}"
-    );
+    w.go(Route::Settings(SettingsPage::Models));
+    let enabled = |id: &str| {
+        core.client
+            .list_models(&dispatch_app::client::ListModelsRequest::default())
+            .unwrap()
+            .models
+            .iter()
+            .any(|m| m.agent == "fake" && m.model == id)
+    };
+    w.scroll_settings_to("settings-model-fake-fake-fast");
+    w.click("settings-model-fake-fake-fast");
+    w.until("the model is disabled", || !enabled("fake-fast"));
+    assert!(enabled("fake-deep"));
+    w.click("settings-model-fake-fake-fast");
+    w.until("the model is enabled", || enabled("fake-fast"));
+    w.scroll_settings_to("settings-provider-fake");
+    w.click("settings-provider-fake");
+    w.until("the provider is disabled", || {
+        !enabled("fake-fast") && !enabled("fake-deep")
+    });
+    w.click("settings-provider-fake");
+    w.until("the provider is enabled", || {
+        enabled("fake-fast") && enabled("fake-deep")
+    });
+    assert!(w.toasts().is_empty(), "{:?}", w.toasts());
 }

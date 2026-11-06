@@ -190,6 +190,8 @@ pub struct DispatchAttempt {
     pub exit_class: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<ProtoI64>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub handoff: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -602,6 +604,49 @@ pub struct ListModelsRequest {}
 pub struct ListModelsResponse {
     pub models: Vec<DispatchModel>,
     pub problems: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DispatchModelSetting {
+    pub id: String,
+    pub enabled: bool,
+    pub agents: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DispatchProviderModels {
+    pub provider: String,
+    pub enabled: bool,
+    pub models: Vec<DispatchModelSetting>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ListModelSettingsRequest {}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ListModelSettingsResponse {
+    pub providers: Vec<DispatchProviderModels>,
+    pub problems: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SetModelEnabledRequest {
+    pub provider: String,
+    pub model: String,
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SetModelEnabledResponse {
+    pub provider: String,
+    pub model: String,
+    pub enabled: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -1302,6 +1347,7 @@ const SLOW_PROCEDURES: &[&str] = &[
     "dispatch.v1.DispatchService/ListAgents",
     "dispatch.v1.DispatchService/ListModelBenchmarks",
     "dispatch.v1.DispatchService/ListModelCatalog",
+    "dispatch.v1.DispatchService/ListModelSettings",
     "dispatch.v1.DispatchService/ListModels",
     "dispatch.v1.DispatchService/ListQuota",
     // Both ask git about every worktree folder.
@@ -1565,6 +1611,20 @@ impl CoreClient {
         request: &ListModelsRequest,
     ) -> Result<ListModelsResponse, CoreError> {
         self.rpc("dispatch.v1.DispatchService/ListModels", request)
+    }
+
+    pub fn list_model_settings(
+        &self,
+        request: &ListModelSettingsRequest,
+    ) -> Result<ListModelSettingsResponse, CoreError> {
+        self.rpc("dispatch.v1.DispatchService/ListModelSettings", request)
+    }
+
+    pub fn set_model_enabled(
+        &self,
+        request: &SetModelEnabledRequest,
+    ) -> Result<SetModelEnabledResponse, CoreError> {
+        self.rpc("dispatch.v1.DispatchService/SetModelEnabled", request)
     }
 
     pub fn replace_tiers(

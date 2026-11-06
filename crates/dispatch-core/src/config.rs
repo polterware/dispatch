@@ -1,4 +1,8 @@
-use crate::{Error, router::valid_priority};
+use crate::{
+    Error,
+    router::valid_priority,
+    types::{DisabledModel, Store},
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -17,23 +21,6 @@ pub fn valid_classifier(name: &str) -> bool {
     )
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Rules {
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub providers: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub models: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub agents: Vec<String>,
-}
-
-impl Rules {
-    pub fn is_empty(&self) -> bool {
-        self.providers.is_empty() && self.models.is_empty() && self.agents.is_empty()
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Policy {
@@ -41,10 +28,6 @@ pub struct Policy {
     pub priority: String,
     pub discover: bool,
     pub roles: bool,
-    #[serde(skip_serializing_if = "Rules::is_empty")]
-    pub allow: Rules,
-    #[serde(skip_serializing_if = "Rules::is_empty")]
-    pub deny: Rules,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub binaries: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -67,8 +50,6 @@ impl Default for Policy {
             priority: String::new(),
             discover: true,
             roles: true,
-            allow: Rules::default(),
-            deny: Rules::default(),
             binaries: BTreeMap::new(),
             acp_agents: BTreeMap::new(),
             classifier: String::new(),
@@ -135,24 +116,8 @@ impl Policy {
                 }
             }
         }
-        for key in ["allow", "deny"] {
-            if let Some(v) = root.get(key) {
-                let Some(obj) = v.as_object() else {
-                    return Err(Error::Message(format!("{key} must be an object")));
-                };
-                for dimension in ["providers", "models", "agents"] {
-                    if let Some(list) = obj.get(dimension)
-                        && !list
-                            .as_array()
-                            .is_some_and(|a| a.iter().all(|x| x.is_string()))
-                    {
-                        return Err(Error::Message(format!(
-                            "{key} {dimension} must be an array of strings"
-                        )));
-                    }
-                }
-            }
-        }
+        root.remove("allow");
+        root.remove("deny");
         if let Some(v) = root.get("binaries") {
             if v.is_null() {
                 root.remove("binaries");
@@ -210,28 +175,182 @@ impl Policy {
         }
         Ok(p)
     }
+}
 
-    pub fn reason(&self, provider: &str, model: &str, agent: &str) -> String {
-        for (name, list, value) in [
-            ("providers", &self.deny.providers, provider),
-            ("models", &self.deny.models, model),
-            ("agents", &self.deny.agents, agent),
-        ] {
-            if list.iter().any(|s| s == value) {
-                return format!("policy deny.{name} includes {value}");
-            }
+/// Normalizes a `(provider, agent, model)` triple to `(provider, base_model)` with no
+/// effort suffix or `<provider>/` prefix.
+pub fn normalize_model_key(provider: &str, agent: &str, model: &str) -> (String, String) {
+    let model = model.trim();
+    let provider = provider.trim();
+    let mut p = if !provider.is_empty() {
+        provider.to_ascii_lowercase()
+    } else {
+        crate::tiers::provider_of(agent.trim(), model)
+    };
+    if p.is_empty() {
+        if let Some((head, rest)) = model.split_once('/')
+            && !head.trim().is_empty()
+            && !rest.trim().is_empty()
+        {
+            p = head.trim().to_ascii_lowercase();
+        } else if !agent.trim().is_empty() {
+            p = agent.trim().to_ascii_lowercase();
         }
-        for (name, list, value) in [
-            ("providers", &self.allow.providers, provider),
-            ("models", &self.allow.models, model),
-            ("agents", &self.allow.agents, agent),
-        ] {
-            if !list.is_empty() && !list.iter().any(|s| s == value) {
-                return format!("policy allow.{name} requires one of {}", list.join(","));
-            }
-        }
-        String::new()
     }
+    let m = if model.is_empty() {
+        String::new()
+    } else {
+        let base = crate::catalog::base_model(model);
+        base.rsplit('/').next().unwrap_or(base).to_owned()
+    };
+    (p, m)
+}
+
+pub fn is_provider_disabled(disabled: &[DisabledModel], provider: &str) -> bool {
+    let p = provider.trim();
+    !p.is_empty()
+        && disabled
+            .iter()
+            .any(|d| d.model.is_empty() && d.provider.eq_ignore_ascii_case(p))
+}
+
+pub fn is_model_disabled(
+    disabled: &[DisabledModel],
+    provider: &str,
+    agent: &str,
+    model: &str,
+) -> bool {
+    !disabled_reason(disabled, provider, agent, model).is_empty()
+}
+
+/// Why `provider` or `model` is disabled, or empty when enabled.
+pub fn disabled_reason(
+    disabled: &[DisabledModel],
+    provider: &str,
+    agent: &str,
+    model: &str,
+) -> String {
+    if disabled.is_empty() {
+        return String::new();
+    }
+    let (p, m) = normalize_model_key(provider, agent, model);
+    if !p.is_empty() && is_provider_disabled(disabled, &p) {
+        return format!("provider {p} is disabled");
+    }
+    if !m.is_empty()
+        && disabled.iter().any(|d| {
+            d.model.eq_ignore_ascii_case(&m)
+                && (d.provider.is_empty() || d.provider.eq_ignore_ascii_case(&p))
+        })
+    {
+        if p.is_empty() {
+            return format!("model {m} is disabled");
+        }
+        return format!("model {p}/{m} is disabled");
+    }
+    String::new()
+}
+
+/// Catches a requested filter that names a disabled provider or model so `--relax`
+/// does not silently substitute a different model.
+pub fn disabled_request_reason(
+    disabled: &[DisabledModel],
+    provider: &str,
+    agent: &str,
+    model: &str,
+) -> String {
+    if disabled.is_empty() {
+        return String::new();
+    }
+    if !provider.trim().is_empty() && is_provider_disabled(disabled, provider) {
+        return format!(
+            "provider {} is disabled",
+            provider.trim().to_ascii_lowercase()
+        );
+    }
+    if !model.trim().is_empty() {
+        let (p, m) = normalize_model_key(provider, agent, model);
+        if !p.is_empty() && is_provider_disabled(disabled, &p) {
+            return format!("provider {p} is disabled");
+        }
+        if let Some(d) = disabled.iter().find(|d| {
+            !d.model.is_empty()
+                && d.model.eq_ignore_ascii_case(&m)
+                && (p.is_empty() || d.provider.is_empty() || d.provider.eq_ignore_ascii_case(&p))
+        }) {
+            let dp = if !p.is_empty() { &p } else { &d.provider };
+            if dp.is_empty() {
+                return format!("model {m} is disabled");
+            }
+            return format!("model {dp}/{m} is disabled");
+        }
+    }
+    String::new()
+}
+
+/// Carries legacy `deny.providers` and `deny.models` from `config.json` into `store` once,
+/// and drops `allow` and `deny` from the file.
+pub fn migrate_legacy_deny(path: &Path, store: &dyn Store) -> Result<(), Error> {
+    // Several settings and routing reads can arrive together at startup.
+    static MIGRATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = MIGRATION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    if text.trim().is_empty() {
+        return Ok(());
+    }
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Ok(());
+    };
+    let Some(mut raw) = val.as_object().cloned() else {
+        return Ok(());
+    };
+    if !raw.contains_key("deny") && !raw.contains_key("allow") {
+        return Ok(());
+    }
+    if let Some(deny) = raw.get("deny").and_then(|v| v.as_object()) {
+        if let Some(providers) = deny.get("providers").and_then(|v| v.as_array()) {
+            for p in providers.iter().filter_map(|v| v.as_str()) {
+                let p = p.trim();
+                if !p.is_empty() {
+                    store.set_model_enabled(p, "", false)?;
+                }
+            }
+        }
+        if let Some(models) = deny.get("models").and_then(|v| v.as_array()) {
+            let tiers = store.list_tiers().unwrap_or_default();
+            for m in models.iter().filter_map(|v| v.as_str()) {
+                let m = m.trim();
+                if m.is_empty() {
+                    continue;
+                }
+                let (mut p, base) = normalize_model_key("", "", m);
+                if p.is_empty()
+                    && let Some(t) = tiers.iter().find(|t| {
+                        let (_, tb) = normalize_model_key(&t.provider, &t.agent, &t.model);
+                        tb.eq_ignore_ascii_case(&base)
+                    })
+                {
+                    p = normalize_model_key(&t.provider, &t.agent, &t.model).0;
+                }
+                store.set_model_enabled(&p, &base, false)?;
+            }
+        }
+    }
+    raw.remove("allow");
+    raw.remove("deny");
+    write_policy_raw(path, &raw)?;
+    Ok(())
+}
+
+pub fn load_with_store(path: &Path, store: &dyn Store) -> Result<Policy, Error> {
+    migrate_legacy_deny(path, store)?;
+    load(path)
 }
 
 pub fn load(path: &Path) -> Result<Policy, Error> {
@@ -317,8 +436,8 @@ pub fn write_config(path: &Path, f: &Policy) -> Result<(), Error> {
     raw.insert("roles".into(), serde_json::to_value(f.roles)?);
     raw.remove("subagents");
     raw.remove("explore");
-    raw.insert("allow".into(), serde_json::to_value(&f.allow)?);
-    raw.insert("deny".into(), serde_json::to_value(&f.deny)?);
+    raw.remove("allow");
+    raw.remove("deny");
     for (k, v) in [
         ("classifier", &f.classifier),
         ("classifier_model", &f.classifier_model),

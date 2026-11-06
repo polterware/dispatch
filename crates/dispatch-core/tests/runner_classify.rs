@@ -221,3 +221,26 @@ fn test_tier_route_warns_when_the_catalog_expects_a_failure() {
         "a run with no difficulty must stay unpriced"
     );
 }
+
+#[tokio::test]
+async fn cli_classifier_skips_disabled_models_and_refuses_an_explicit_one() {
+    use dispatch_core::{classifier, runner::Classifier};
+    let ran = ran();
+    let mut t = test_deps(vec![Fake::new("a", &ran).out("easy").arc()]);
+    t.deps.table.tiers.insert(
+        "easy".into(),
+        vec![entry("a", "blocked"), entry("a", "enabled")],
+    );
+    t.store.set_model_enabled("a", "blocked", false).unwrap();
+    assert_eq!(classifier::cli_for(&t.deps).model, "enabled");
+    t.deps.policy.classifier_agent = "a/blocked".into();
+    let error = classifier::cli_for(&t.deps)
+        .classify(dispatch_core::runner::Task {
+            text: "hello".into(),
+            roles: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("disabled"), "{error}");
+    assert!(ran_list(&ran).is_empty());
+}

@@ -25,9 +25,10 @@ use crate::client::{
     CoreClient, DispatchRun, ProtoI64, ReadRunEventsRequest, ResultRequest, WatchRunRequest,
 };
 use crate::format::is_active_status;
+use crate::models::run_page::attempt_switches;
 use crate::models::transcript::{
     LogEvent, PagedEvent, PromptBubble, StreamedLog, TranscriptBuilder, TranscriptEntry,
-    build_transcript, prompt_bubble,
+    build_transcript, enrich_transcript_switches, prompt_bubble,
 };
 use crate::motion::{Animator, SpringTier, SpringValue};
 use crate::state::{AppState, observe};
@@ -136,6 +137,7 @@ pub struct TranscriptView {
     pinned: bool,
     held_start: usize,
     shown_live: bool,
+    shown_switches: usize,
     parse_inflight: bool,
     /// The stored log has come back once: until then the text shows as bones, not as a run
     /// with no output.
@@ -248,6 +250,7 @@ impl TranscriptView {
             pinned: true,
             held_start: 0,
             shown_live: false,
+            shown_switches: 0,
             parse_inflight: false,
             fetched: false,
             started: false,
@@ -295,9 +298,20 @@ impl TranscriptView {
             return;
         }
         let bubble = self.prompt_bubble(cx);
+        let switches = self
+            .state
+            .read(cx)
+            .run(&self.run_id)
+            .map(attempt_switches)
+            .unwrap_or_default();
+        let entries = enrich_transcript_switches(
+            std::mem::take(&mut self.entries),
+            &switches,
+            !self.earlier_more,
+        );
         self.earlier_runs.push(EarlierRun {
             bubble,
-            entries: std::mem::take(&mut self.entries),
+            entries,
             expanded: std::mem::take(&mut self.expanded),
         });
         self.generation = self.generation.wrapping_add(1);
@@ -395,13 +409,18 @@ impl TranscriptView {
                             let mut streamed = StreamedLog::default();
                             streamed.extend_paged(&events);
                             let log = streamed.join(&reply);
+                            let switches = attempt_switches(run);
                             EarlierRun {
                                 bubble: prompt_bubble(
                                     &run.prompt,
                                     &run.caller_agent,
                                     &run.created_at,
                                 ),
-                                entries: build_transcript(&log, &reply),
+                                entries: enrich_transcript_switches(
+                                    build_transcript(&log, &reply),
+                                    &switches,
+                                    true,
+                                ),
                                 expanded: HashSet::new(),
                             }
                         })
@@ -622,7 +641,18 @@ impl TranscriptView {
 
     fn rebuild_rows(&mut self, cx: &mut Context<Self>) {
         self.shown_live = self.live_now(cx);
-        let slice = self.visible_entries();
+        let switches = self
+            .state
+            .read(cx)
+            .run(&self.run_id)
+            .map(attempt_switches)
+            .unwrap_or_default();
+        self.shown_switches = switches.len();
+        let slice = enrich_transcript_switches(
+            self.visible_entries(),
+            &switches,
+            !self.compact && !self.earlier_more,
+        );
         let mut rows = flatten_transcript(&slice, &self.expanded, self.reveal_entry);
         // A live run with nothing yet shows only its thinking bot.
         if rows.is_empty() && !self.shown_live {
@@ -845,11 +875,39 @@ impl TranscriptView {
     fn expand(&mut self, entry: usize, cx: &mut Context<Self>) {
         if entry >= EARLIER_RUN_ENTRIES {
             let run = entry / EARLIER_RUN_ENTRIES - 1;
-            if let Some(earlier) = self.earlier_runs.get_mut(run)
-                && earlier.expanded.insert(entry % EARLIER_RUN_ENTRIES)
-            {
-                self.rebuild_rows(cx);
+            let idx = entry % EARLIER_RUN_ENTRIES;
+            if let Some(earlier) = self.earlier_runs.get_mut(run) {
+                let is_switch = matches!(
+                    earlier.entries.get(idx),
+                    Some(TranscriptEntry::Switch { .. })
+                );
+                if is_switch {
+                    if !earlier.expanded.remove(&idx) {
+                        earlier.expanded.insert(idx);
+                    }
+                    self.rebuild_rows(cx);
+                } else if earlier.expanded.insert(idx) {
+                    self.rebuild_rows(cx);
+                }
             }
+            return;
+        }
+        let switches = self
+            .state
+            .read(cx)
+            .run(&self.run_id)
+            .map(attempt_switches)
+            .unwrap_or_default();
+        let slice = enrich_transcript_switches(
+            self.visible_entries(),
+            &switches,
+            !self.compact && !self.earlier_more,
+        );
+        if matches!(slice.get(entry), Some(TranscriptEntry::Switch { .. })) {
+            if !self.expanded.remove(&entry) {
+                self.expanded.insert(entry);
+            }
+            self.rebuild_rows(cx);
             return;
         }
         if !self.expanded.insert(entry) {
@@ -896,6 +954,13 @@ impl TranscriptView {
             .read(cx)
             .run(&self.run_id)
             .is_some_and(|run| is_active_status(&run.status))
+    }
+
+    fn switches_len(&self, cx: &App) -> usize {
+        self.state
+            .read(cx)
+            .run(&self.run_id)
+            .map_or(0, |run| attempt_switches(run).len())
     }
 
     /// One step of [`Follow`], before this frame lays the list out from the last one's.
@@ -1084,8 +1149,13 @@ impl Render for TranscriptView {
         self.ensure_stream(cx);
         self.ensure_earlier_runs(cx);
         let live = self.live_now(cx);
-        if live != self.shown_live || self.prompt_visible(cx) != self.prompt_shown {
+        let switches_len = self.switches_len(cx);
+        if live != self.shown_live
+            || self.prompt_visible(cx) != self.prompt_shown
+            || switches_len != self.shown_switches
+        {
             self.shown_live = live;
+            self.shown_switches = switches_len;
             self.rebuild_rows(cx);
         }
         self.step_motion(window);

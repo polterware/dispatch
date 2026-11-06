@@ -9,11 +9,10 @@ use crate::{
         quota::{Quota, SOURCE_AGY_USAGE, SOURCE_CLAUDE_STREAM, SOURCE_CODEX_APP_SERVER},
         valid_tier,
     },
-    config::Policy,
     pass_model::difficulty_tier,
     router::{self, AutoInfo, Pace, Term},
     tiers::Table,
-    types::{Filters, QuotaSnapshot, RolePick, Store},
+    types::{DisabledModel, Filters, QuotaSnapshot, RolePick, Store},
 };
 use chrono::{DateTime, Utc};
 use serde::{Serialize, Serializer};
@@ -77,6 +76,19 @@ pub fn store_cooldowns(st: Option<&dyn Store>, now: DateTime<Utc>) -> Cooldowns 
     out
 }
 
+pub fn store_disabled(st: Option<&dyn Store>, state_dir: &str) -> Vec<DisabledModel> {
+    let Some(st) = st else {
+        return Vec::new();
+    };
+    if !state_dir.is_empty() {
+        let _ = crate::config::migrate_legacy_deny(
+            &crate::config::policy_config_path(std::path::Path::new(state_dir)),
+            st,
+        );
+    }
+    st.list_disabled_models().unwrap_or_default()
+}
+
 pub fn validate_options(o: &Options) -> Result<(), Error> {
     if !o.tier.is_empty() && o.tier != TIER_AUTO && !valid_tier(&o.tier) {
         return Err(msg(format!(
@@ -126,55 +138,10 @@ pub fn matches_model(model: &str, requested: &str) -> bool {
     !requested.is_empty() && (model == requested || base_model(model) == base_model(requested))
 }
 
-/// The exact persistent rule that excludes a candidate. A suffix variant is
-/// covered by a policy written for its base model.
-fn policy_reason(p: &Policy, provider: &str, model: &str, agent: &str) -> String {
-    let mut p = p.clone();
-    let base = base_model(model);
-    if base != model {
-        if p.allow.models.iter().any(|m| m == base) {
-            p.allow.models.push(model.into());
-        }
-        if p.deny.models.iter().any(|m| m == base) {
-            p.deny.models.push(model.into());
-        }
-    }
-    p.reason(provider, model, agent)
-}
-
-/// Catches a requested filter that is itself outside the persistent policy.
-/// In that case --relax must not silently substitute a different
-/// provider/model/agent.
-pub fn policy_request_reason(p: &Policy, f: &Filters) -> String {
-    if !f.provider.is_empty() {
-        let r = policy_reason(p, &f.provider, "", "");
-        if !r.is_empty() && !r.contains("models") && !r.contains("agents") {
-            return r;
-        }
-    }
-    if !f.model.is_empty() {
-        let mut q = p.clone();
-        q.allow.providers.clear();
-        q.allow.agents.clear();
-        q.deny.providers.clear();
-        q.deny.agents.clear();
-        let r = policy_reason(&q, "", &f.model, "");
-        if !r.is_empty() {
-            return r;
-        }
-    }
-    if !f.agent.is_empty() {
-        let mut q = p.clone();
-        q.allow.providers.clear();
-        q.allow.models.clear();
-        q.deny.providers.clear();
-        q.deny.models.clear();
-        let r = policy_reason(&q, "", "", &f.agent);
-        if !r.is_empty() {
-            return r;
-        }
-    }
-    String::new()
+/// Catches a requested filter that names a disabled provider or model.
+/// In that case `--relax` must not silently substitute a different model.
+pub fn disabled_request_reason(disabled: &[DisabledModel], f: &Filters) -> String {
+    crate::config::disabled_request_reason(disabled, &f.provider, &f.agent, &f.model)
 }
 
 /// Pace for a window of the given length that resets at `resets_at`, with
@@ -348,6 +315,7 @@ impl Deps {
                 cooled_down: false,
             });
         }
+        let disabled = store_disabled(self.store.as_deref(), &self.state_dir);
         let ro = router::RouteOptions {
             tier: o.tier.clone(),
             difficulty: None,
@@ -356,8 +324,9 @@ impl Deps {
             prefer: o.prefer.clone(),
             avoid: o.avoid.clone(),
             role_board: Table::default(),
+            disabled,
         };
-        let table = self.open_code_table(o, &mut agents).await;
+        let table = self.open_code_table(o, &mut agents, &ro.disabled).await;
         let (cs, mut rejected) = router::select_candidates(&table, &self.policy, &agents, &ro);
         let mut out = Vec::with_capacity(cs.len());
         for c in cs {
@@ -384,7 +353,12 @@ impl Deps {
     /// weighs all of them. A tier route keeps the tier's OpenCode entries when
     /// the table has some; otherwise it takes the models `build_tiers` would
     /// put in the tier, best first.
-    async fn open_code_table(&self, o: &Options, agents: &mut [router::Agent]) -> Table {
+    async fn open_code_table(
+        &self,
+        o: &Options,
+        agents: &mut [router::Agent],
+        disabled: &[DisabledModel],
+    ) -> Table {
         const OPEN_CODE: &str = crate::reports::OPEN_CODE_AGENT;
         let mut table = self.table.clone();
         if o.filters.agent != OPEN_CODE || !o.filters.model.is_empty() {
@@ -411,7 +385,11 @@ impl Deps {
         if !valid_tier(tier) {
             // Auto, or no tier: every listed model is weighed, as if discovered.
             if let Some(agent) = agents.iter_mut().find(|a| a.name == OPEN_CODE) {
-                agent.discovered = models.into_iter().map(|m| m.id).collect();
+                agent.discovered = models
+                    .into_iter()
+                    .filter(|m| !crate::config::is_model_disabled(disabled, "", OPEN_CODE, &m.id))
+                    .map(|m| m.id)
+                    .collect();
             }
             return table;
         }
@@ -427,9 +405,7 @@ impl Deps {
         let pool: Vec<_> = crate::reports::agent_pool(OPEN_CODE, &table, &listed)
             .into_iter()
             .filter(|e| {
-                self.policy
-                    .reason(&e.provider, &e.model, &e.agent)
-                    .is_empty()
+                !crate::config::is_model_disabled(disabled, &e.provider, &e.agent, &e.model)
             })
             .collect();
         let priority = if o.filters.priority.is_empty() {
@@ -521,7 +497,8 @@ impl Deps {
         let (d, o) = self.with_role_board(o);
         let (primary, mut rejected) = d.select_candidates_cool(&o, cool).await;
         let mut extra = Vec::new();
-        if o.filters.relax && policy_request_reason(&d.policy, &o.filters).is_empty() {
+        let disabled = store_disabled(d.store.as_deref(), &d.state_dir);
+        if o.filters.relax && disabled_request_reason(&disabled, &o.filters).is_empty() {
             let mut fb = o.clone();
             fb.filters = Filters {
                 priority: o.filters.priority.clone(),

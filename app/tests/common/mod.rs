@@ -82,7 +82,14 @@ impl Core {
         git(&repo, &["commit", "-qm", "init"]);
         let paths = Paths { home, data, repo };
         paths.cli(&["agents", "add", "fake", "--", FAKE]);
-        paths.cli(&["config", "allow", "add", "agents", "fake"]);
+        // Keep discovery's default while ensuring every test run stays on the fake agent.
+        let settings = json(&paths.cli(&["models", "--json"]));
+        for provider in settings["providers"].as_array().unwrap() {
+            let provider = provider["provider"].as_str().unwrap();
+            if provider != "fake" {
+                paths.cli(&["models", "disable", provider]);
+            }
+        }
         let client = CoreClient::connect(&paths.data).expect("connect to the core");
         Core {
             _dir: dir,

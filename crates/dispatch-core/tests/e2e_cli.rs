@@ -117,8 +117,14 @@ impl Env {
         };
         let agent = env.agent.to_string_lossy().into_owned();
         env.ok(&["agents", "add", "fake", "--", &agent]);
-        // Routing never reaches an agent CLI this machine has installed.
-        env.ok(&["config", "allow", "add", "agents", "fake"]);
+        // Discovery stays on, but routing can only reach the fake agent's provider.
+        let settings = env.json(&["models", "--json"]);
+        for provider in settings["providers"].as_array().unwrap() {
+            let provider = provider["provider"].as_str().unwrap();
+            if provider != "fake" {
+                env.ok(&["models", "disable", provider]);
+            }
+        }
         env
     }
 
@@ -466,7 +472,7 @@ fn a_failing_agent_fails_after_each_model() {
     assert!(!waited.status.success(), "wait exits 0 for a failed run");
 
     // A denied model is never tried.
-    env.ok(&["config", "deny", "add", "models", "fake-deep"]);
+    env.ok(&["models", "disable", "fake/fake-deep"]);
     let id = env.run("FAIL again", &["--readonly"]);
     let s = env.wait_for(&id, "FAILED");
     assert_eq!(s["attempts"], 1, "{s}");
@@ -771,22 +777,22 @@ fn config_is_set_read_and_global() {
             .contains("invalid priority")
     );
 
-    env.ok(&["config", "allow", "add", "agents", "codex"]);
-    assert_eq!(
-        env.json(&["config", "get", "allow"])["agents"],
-        serde_json::json!(["fake", "codex"])
+    env.ok(&["models", "disable", "fake/fake-deep"]);
+    let settings = env.json(&["models", "--json"]);
+    let fake = settings["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["provider"] == "fake")
+        .unwrap();
+    assert!(
+        fake["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["id"] == "fake-deep" && m["enabled"] == false)
     );
-    env.ok(&["config", "allow", "rm", "agents", "codex"]);
-    assert_eq!(
-        env.json(&["config", "get", "allow"])["agents"],
-        serde_json::json!(["fake"])
-    );
-    env.ok(&["config", "deny", "add", "models", "fake-deep"]);
-    assert_eq!(
-        env.json(&["config", "get", "deny"])["models"],
-        serde_json::json!(["fake-deep"])
-    );
-    env.ok(&["config", "deny", "rm", "models", "fake-deep"]);
+    env.ok(&["models", "enable", "fake/fake-deep"]);
     env.ok(&["config", "set", "discover", "false"]);
     assert_eq!(env.json(&["config", "get", "discover"]), false);
     env.ok(&["config", "set", "discover", "true"]);
@@ -1240,4 +1246,58 @@ fn a_core_started_from_a_background_thread_runs() {
     );
     env.ok(&["stop"]);
     let _ = reaper.join();
+}
+
+#[test]
+fn disabled_models_and_providers_leave_list_models_and_never_run() {
+    let env = Env::new();
+    let clients = coreclient::new(&runstate::read_core(env.db()).unwrap(), "e2e");
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let models = || {
+        rt.block_on(clients.dispatch.list_models(&pb::ListModelsRequest {}))
+            .unwrap()
+            .models
+    };
+    assert!(
+        models()
+            .iter()
+            .any(|m| m.agent == "fake" && m.model == "fake-fast")
+    );
+    env.ok(&["models", "disable", "fake/fake-fast-high"]);
+    assert!(
+        !models()
+            .iter()
+            .any(|m| m.agent == "fake" && m.model == "fake-fast")
+    );
+    let route = env.output(&[
+        "route",
+        "--agent",
+        "fake",
+        "--model",
+        "fake-fast",
+        "--relax",
+        "--json",
+        "hello",
+    ]);
+    assert!(!route.status.success());
+    let report: Value = serde_json::from_slice(&route.stdout).unwrap();
+    assert!(
+        report["candidates"]
+            .as_array()
+            .is_none_or(|cs| cs.is_empty()),
+        "{report}"
+    );
+    env.ok(&["models", "enable", "fake/fake-fast"]);
+    assert!(
+        models()
+            .iter()
+            .any(|m| m.agent == "fake" && m.model == "fake-fast")
+    );
+    env.ok(&["models", "disable", "fake"]);
+    assert!(!models().iter().any(|m| m.agent == "fake"));
+    let id = env.run("must not invoke the agent", &["--readonly"]);
+    let run = env.wait_for(&id, "FAILED");
+    assert_eq!(run["attempts"], 0);
+    env.ok(&["models", "enable", "fake"]);
+    assert!(models().iter().any(|m| m.agent == "fake"));
 }

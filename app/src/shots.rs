@@ -404,7 +404,7 @@ pub fn start_tour(
                 settle(cx, 2500).await;
                 for (name, open) in [
                     ("18-settings-panels-priority", 0usize),
-                    ("18-settings-panels-tokens", 1),
+                    ("18-settings-models", 1),
                 ] {
                     let _ = cx.update(|_, app| {
                         settings.update(app, |settings, cx| settings.tour_open(open, cx))

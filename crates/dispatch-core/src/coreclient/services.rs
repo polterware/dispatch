@@ -279,6 +279,18 @@ impl DispatchClient {
         proto::ListModelsResponse
     );
     unary_rpc!(
+        list_model_settings,
+        "ListModelSettings",
+        proto::ListModelSettingsRequest,
+        proto::ListModelSettingsResponse
+    );
+    unary_rpc!(
+        set_model_enabled,
+        "SetModelEnabled",
+        proto::SetModelEnabledRequest,
+        proto::SetModelEnabledResponse
+    );
+    unary_rpc!(
         replace_tiers,
         "ReplaceTiers",
         proto::ReplaceTiersRequest,

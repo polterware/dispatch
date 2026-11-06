@@ -79,6 +79,7 @@ message DispatchAttempt {
   string error = 3;
   string exit_class = 4;
   optional int64 duration_ms = 5;
+  string handoff = 6;
 }
 
 message DispatchRunEvent {
@@ -383,6 +384,40 @@ message ListModelsResponse {
   repeated string problems = 2;
 }
 
+// A base model under a provider, with its enabled state and the agents that serve it.
+message DispatchModelSetting {
+  string id = 1;
+  bool enabled = 2;
+  repeated string agents = 3;
+}
+
+// A provider and its base models, for Settings > Models and `dispatch models`.
+message DispatchProviderModels {
+  string provider = 1;
+  bool enabled = 2;
+  repeated DispatchModelSetting models = 3;
+}
+
+message ListModelSettingsRequest {}
+
+message ListModelSettingsResponse {
+  repeated DispatchProviderModels providers = 1;
+  repeated string problems = 2;
+}
+
+message SetModelEnabledRequest {
+  string provider = 1;
+  // Empty turns the whole provider on or off; otherwise the base model id under provider.
+  string model = 2;
+  bool enabled = 3;
+}
+
+message SetModelEnabledResponse {
+  string provider = 1;
+  string model = 2;
+  bool enabled = 3;
+}
+
 // Replaces the whole tier table. Rows keep their order within each tier; position is recomputed.
 message ReplaceTiersRequest {
   repeated DispatchTier tiers = 1;
@@ -566,7 +601,7 @@ message RecoverRunRequest {
 
 // The routing policy is global: one file in the state dir, the same for every repository.
 message ConfigRequest {
-  // get, set, allow-add, allow-rm, deny-add, or deny-rm.
+  // get or set.
   string action = 1;
   string key = 4;
   repeated string values = 5;
@@ -759,6 +794,8 @@ service DispatchService {
   rpc ListHistory(ListHistoryRequest) returns (ListHistoryResponse);
   rpc CheckTiers(CheckTiersRequest) returns (CheckTiersResponse);
   rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
+  rpc ListModelSettings(ListModelSettingsRequest) returns (ListModelSettingsResponse);
+  rpc SetModelEnabled(SetModelEnabledRequest) returns (SetModelEnabledResponse);
   rpc ReplaceTiers(ReplaceTiersRequest) returns (ReplaceTiersResponse);
   rpc Stats(StatsRequest) returns (StatsResponse);
   rpc GetRouteDecision(GetRouteDecisionRequest) returns (GetRouteDecisionResponse);

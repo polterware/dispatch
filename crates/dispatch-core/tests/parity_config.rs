@@ -1,8 +1,8 @@
 use dispatch_core::{
     adapters::acp::{custom_agents, set_custom_agents},
     config::{
-        CLASSIFIER_JEV, Policy, Rules, apply_agent_config, default_policy, load,
-        policy_config_path, validate_config, write_config, write_config_key,
+        CLASSIFIER_JEV, Policy, apply_agent_config, default_policy, load, policy_config_path,
+        validate_config, write_config, write_config_key,
     },
 };
 use std::collections::{BTreeMap, HashMap};
@@ -37,11 +37,7 @@ fn test_load_missing_and_priority() {
 fn test_rejects_wrong_known_types_and_write_preserves_unknown() {
     let dir = tempfile::tempdir().expect("tempdir");
     let p = dir.path().join("config.json");
-    for body in [
-        r#"{"discover":"yes"}"#,
-        r#"{"allow":[]}"#,
-        r#"{"deny":{"agents":"codex"}}"#,
-    ] {
+    for body in [r#"{"discover":"yes"}"#] {
         std::fs::write(&p, body).expect("write invalid type");
         assert!(load(&p).is_err(), "accepted {body}");
     }
@@ -56,10 +52,6 @@ fn test_rejects_wrong_known_types_and_write_preserves_unknown() {
         &Policy {
             priority: "quality".into(),
             discover: true,
-            allow: Rules {
-                providers: vec!["openai".into()],
-                ..Default::default()
-            },
             ..Default::default()
         },
     )
@@ -167,4 +159,60 @@ fn test_validate_config_and_apply_agent_config() {
     apply_agent_config(dir.path()).expect("apply_agent_config");
     assert!(custom_agents().contains_key("custom-acp"));
     set_custom_agents(HashMap::new());
+}
+
+#[test]
+fn legacy_deny_migrates_once_and_drops_allow_and_agent_rules() {
+    use dispatch_core::{
+        config::{is_model_disabled, is_provider_disabled, load_with_store},
+        store::Store,
+        types::Store as _,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    let db = dir.path().join("dispatch.db");
+    let store = Store::new(db.to_str().unwrap()).unwrap();
+    std::fs::write(&path, r#"{"priority":"speed","future":42,"allow":{"models":["gpt-6"]},"deny":{"providers":["google"],"models":["claude-opus-5-5-high","openai/gpt-6-high","custom-unknown"],"agents":["codex"]}}"#).unwrap();
+    let policy = load_with_store(&path, &store).unwrap();
+    assert_eq!(policy.priority, "speed");
+    let disabled = store.list_disabled_models().unwrap();
+    assert_eq!(disabled.len(), 4);
+    assert!(is_provider_disabled(&disabled, "google"));
+    assert!(is_model_disabled(
+        &disabled,
+        "anthropic",
+        "antigravity",
+        "claude-opus-5-5-low"
+    ));
+    assert!(is_model_disabled(&disabled, "openai", "codex", "gpt-6"));
+    assert!(is_model_disabled(
+        &disabled,
+        "custom",
+        "custom",
+        "custom-unknown"
+    ));
+    assert!(!is_model_disabled(
+        &disabled,
+        "openai",
+        "codex",
+        "gpt-other"
+    ));
+    let raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(raw.get("deny").is_none() && raw.get("allow").is_none());
+    assert_eq!(raw["future"], 42);
+    store.set_model_enabled("openai", "gpt-6", true).unwrap();
+    drop(store);
+    let store = Store::new(db.to_str().unwrap()).unwrap();
+    load_with_store(&path, &store).unwrap();
+    assert!(!is_model_disabled(
+        &store.list_disabled_models().unwrap(),
+        "openai",
+        "codex",
+        "gpt-6-high"
+    ));
+    assert!(is_provider_disabled(
+        &store.list_disabled_models().unwrap(),
+        "google"
+    ));
 }

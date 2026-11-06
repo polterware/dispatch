@@ -35,6 +35,7 @@ fn attempts(list: &[Attempt]) -> Vec<pb::DispatchAttempt> {
             error: a.error.clone(),
             exit_class: a.exit_class.clone(),
             duration_ms: a.duration_ms,
+            handoff: a.handoff.clone(),
         })
         .collect()
 }

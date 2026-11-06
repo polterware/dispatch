@@ -66,6 +66,7 @@ fn test_compute_rates_percentiles_and_ranks() {
         error: "429 too many requests".into(),
         exit_class: "rate_limit".into(),
         duration_ms: None,
+        handoff: String::new(),
     }];
     recs.push(mk(
         "a6",

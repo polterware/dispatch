@@ -106,8 +106,23 @@ pub struct AttemptCard {
     pub title: String,
     pub status: String,
     pub error: String,
+    pub exit_class: String,
+    pub handoff: String,
     pub duration_ms: Option<i64>,
     pub is_final: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttemptSwitch {
+    pub index: usize,
+    pub from_agent: String,
+    pub from_model: String,
+    pub to_agent: String,
+    pub to_model: String,
+    pub exit_class: String,
+    pub error: String,
+    pub handoff: String,
+    pub label: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -858,6 +873,8 @@ pub fn agent_attempt_cards(run: &DispatchRun) -> Vec<AttemptCard> {
             title: dotted(&[&final_agent, &run.model, &run.provider]),
             status: or_unknown(&run.status),
             error: run.error.trim().to_string(),
+            exit_class: run.exit_class.trim().to_string(),
+            handoff: String::new(),
             duration_ms: run.run_ms.map(|value| value.0),
             is_final: true,
         });
@@ -898,9 +915,119 @@ fn map_attempt(
             "failed".to_string()
         },
         error,
+        exit_class: attempt.exit_class.trim().to_string(),
+        handoff: attempt.handoff.trim().to_string(),
         duration_ms: attempt.duration_ms.map(|value| value.0),
         is_final,
     }
+}
+
+pub fn attempt_model_id(agent: &str, model: &str) -> String {
+    match (agent.trim(), model.trim()) {
+        ("", "") => "agent".to_string(),
+        (a, "") => a.to_string(),
+        ("", m) => m.to_string(),
+        (a, m) => format!("{a}/{m}"),
+    }
+}
+
+pub fn switch_reason_label(exit_class: &str) -> String {
+    match exit_class.trim() {
+        "rate_limit" | "credits" => "usage limit".to_string(),
+        "" => "failed".to_string(),
+        other => other.replace('_', " "),
+    }
+}
+
+/// The divider copy between two attempts in a conversation, such as
+/// `"Switched claude/claude-opus-5-5-high → codex/gpt-6-luna-medium · usage limit · hand-off"`.
+pub fn switch_divider_label(
+    from_agent: &str,
+    from_model: &str,
+    to_agent: &str,
+    to_model: &str,
+    exit_class: &str,
+    has_handoff: bool,
+) -> String {
+    let from = attempt_model_id(from_agent, from_model);
+    let to = attempt_model_id(to_agent, to_model);
+    let reason = switch_reason_label(exit_class);
+    if has_handoff {
+        format!("Switched {from} \u{2192} {to} \u{00b7} {reason} \u{00b7} hand-off")
+    } else {
+        format!("Switched {from} \u{2192} {to} \u{00b7} {reason}")
+    }
+}
+
+/// Parses a `── dispatch: <from> failed (<class>); trying <to> ──` separator line.
+pub fn parse_switch_line(line: &str) -> Option<(String, String, String, String, String)> {
+    let trimmed = line.trim();
+    let inner = trimmed
+        .strip_prefix("── dispatch:")?
+        .strip_suffix("──")?
+        .trim();
+    let (failed_part, to_raw) = inner.split_once("; trying ")?;
+    let (from_raw, class_part) = failed_part.trim().rsplit_once(" failed (")?;
+    let exit_class = class_part.strip_suffix(')')?.trim().to_string();
+    let (from_agent, from_model) = split_agent_model(from_raw);
+    let (to_agent, to_model) = split_agent_model(to_raw);
+    Some((from_agent, from_model, to_agent, to_model, exit_class))
+}
+
+fn split_agent_model(raw: &str) -> (String, String) {
+    let trimmed = raw.trim().trim_matches('/');
+    match trimmed.split_once('/') {
+        Some((a, m)) => (a.trim().to_string(), m.trim().to_string()),
+        None => (trimmed.to_string(), String::new()),
+    }
+}
+
+/// The model switches between attempts of `run`, in order.
+pub fn attempt_switches(run: &DispatchRun) -> Vec<AttemptSwitch> {
+    let total = run.attempts.len();
+    let mut switches = Vec::new();
+    for (index, attempt) in run.attempts.iter().enumerate() {
+        let (to_agent, to_model) = if index + 1 < total {
+            let next = &run.attempts[index + 1];
+            (next.agent.trim(), next.model.trim())
+        } else {
+            let final_agent = run.agent.trim();
+            let final_model = run.model.trim();
+            let same_target =
+                final_agent == attempt.agent.trim() && final_model == attempt.model.trim();
+            let switched_to_final = (!final_agent.is_empty() || !final_model.is_empty())
+                && (!same_target
+                    || !attempt.handoff.trim().is_empty()
+                    || is_run_active(&run.status)
+                    || run.status.eq_ignore_ascii_case("completed"));
+            if !switched_to_final {
+                continue;
+            }
+            (final_agent, final_model)
+        };
+        let handoff = attempt.handoff.trim().to_string();
+        let has_handoff = !handoff.is_empty();
+        let label = switch_divider_label(
+            &attempt.agent,
+            &attempt.model,
+            to_agent,
+            to_model,
+            &attempt.exit_class,
+            has_handoff,
+        );
+        switches.push(AttemptSwitch {
+            index,
+            from_agent: attempt.agent.trim().to_string(),
+            from_model: attempt.model.trim().to_string(),
+            to_agent: to_agent.to_string(),
+            to_model: to_model.to_string(),
+            exit_class: attempt.exit_class.trim().to_string(),
+            error: attempt.error.trim().to_string(),
+            handoff,
+            label,
+        });
+    }
+    switches
 }
 
 fn or_unknown(status: &str) -> String {
@@ -1506,6 +1633,7 @@ mod tests {
                     error: "out of credits".into(),
                     exit_class: "credits".into(),
                     duration_ms: None,
+                    ..DispatchAttempt::default()
                 },
                 DispatchAttempt {
                     agent: "pi".into(),
@@ -1787,5 +1915,54 @@ mod tests {
         let counts = file_counts(Some(1), Some(2), Some(3)).unwrap();
         assert_eq!(format_files(&counts), "1 file  +2  \u{2212}3");
         assert!(file_counts(None, None, None).is_none());
+    }
+
+    #[test]
+    fn formats_attempt_switches_and_handoff_dividers() {
+        use super::{attempt_switches, parse_switch_line, switch_divider_label};
+        assert_eq!(
+            switch_divider_label(
+                "claude",
+                "claude-opus-5-5-high",
+                "codex",
+                "gpt-6-luna-medium",
+                "rate_limit",
+                true,
+            ),
+            "Switched claude/claude-opus-5-5-high \u{2192} codex/gpt-6-luna-medium \u{00b7} usage limit \u{00b7} hand-off"
+        );
+        assert_eq!(
+            parse_switch_line(
+                "── dispatch: claude/claude-opus-5-5-high failed (rate_limit); trying codex/gpt-6-luna-medium ──"
+            ),
+            Some((
+                "claude".to_string(),
+                "claude-opus-5-5-high".to_string(),
+                "codex".to_string(),
+                "gpt-6-luna-medium".to_string(),
+                "rate_limit".to_string(),
+            ))
+        );
+        let run = Run {
+            agent: "codex".into(),
+            model: "gpt-6-luna-medium".into(),
+            status: "COMPLETED".into(),
+            attempts: vec![DispatchAttempt {
+                agent: "claude".into(),
+                model: "claude-opus-5-5-high".into(),
+                error: "429 usage limit".into(),
+                exit_class: "rate_limit".into(),
+                handoff: "## Original task\nFix it".into(),
+                duration_ms: None,
+            }],
+            ..Run::default()
+        };
+        let switches = attempt_switches(&run);
+        assert_eq!(switches.len(), 1);
+        assert_eq!(
+            switches[0].label,
+            "Switched claude/claude-opus-5-5-high \u{2192} codex/gpt-6-luna-medium \u{00b7} usage limit \u{00b7} hand-off"
+        );
+        assert_eq!(switches[0].handoff, "## Original task\nFix it");
     }
 }

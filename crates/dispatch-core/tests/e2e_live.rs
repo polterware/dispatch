@@ -286,13 +286,19 @@ fn live_jev_classifies_and_auto_routes() {
     );
 
     // Auto picks among the cheap models only.
-    let (agents, names): (Vec<String>, Vec<String>) = models().into_iter().unzip();
-    let mut allow = vec!["config", "allow", "add", "agents"];
-    allow.extend(agents.iter().map(String::as_str));
-    live.ok(&repo, &allow);
-    let mut allow = vec!["config", "allow", "add", "models"];
-    allow.extend(names.iter().map(String::as_str));
-    live.ok(&repo, &allow);
+    let names: Vec<String> = models().into_iter().map(|(_, model)| model).collect();
+    let settings = live.json(&repo, &["models", "--json"]);
+    for provider in settings["providers"].as_array().unwrap() {
+        let p = provider["provider"].as_str().unwrap();
+        for model in provider["models"].as_array().unwrap() {
+            let id = model["id"].as_str().unwrap();
+            if !names.iter().any(|name| {
+                dispatch_core::catalog::catalog_key(name) == dispatch_core::catalog::catalog_key(id)
+            }) {
+                live.ok(&repo, &["models", "disable", &format!("{p}/{id}")]);
+            }
+        }
+    }
     let route = live.json(
         &repo,
         &[

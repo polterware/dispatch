@@ -178,6 +178,26 @@ fn mark_attempt(path: &str, prev: &[Attempt], c: &Candidate) {
     }
 }
 
+fn last_attempt_log(path: &str) -> String {
+    if path.is_empty() {
+        return String::new();
+    }
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return String::new();
+    };
+    let mut start = 0;
+    let mut offset = 0;
+    for line in raw.split_inclusive('\n') {
+        let next = offset + line.len();
+        let trimmed = line.trim();
+        if trimmed.starts_with("── dispatch:") && trimmed.ends_with("──") {
+            start = next;
+        }
+        offset = next;
+    }
+    raw[start..].to_owned()
+}
+
 fn missing_flags(r: &ProbeReport, capability: &str) -> Vec<String> {
     r.flags
         .iter()
@@ -418,9 +438,11 @@ impl Deps {
 
         let timeout = Duration::from_secs(u64::try_from(rec.timeout_sec).unwrap_or(0));
         let child_env = child_environ(&rec.id, &self.env(RUN_ID_ENV));
+        let log_path = agent_log_path(&self.state_dir(), &rec.id);
         // The start of the attempt that ends the run.
         let mut agent_start = None;
         let mut skipped = Vec::new();
+        let mut last_attempt_output = String::new();
 
         for c in &cands {
             if let Some(key) = cooling(&cool, c.agent(), &candidate_provider(c)) {
@@ -432,6 +454,25 @@ impl Deps {
                 skipped.push(blocked);
                 continue;
             }
+            let handoff = if let Some(prev) = rec.attempts.last()
+                && super::handoff::is_limit_class(&prev.exit_class)
+            {
+                let log_slice = last_attempt_log(&log_path);
+                let built = super::handoff::build_handoff(
+                    &rec,
+                    prev,
+                    &dir,
+                    &log_slice,
+                    &last_attempt_output,
+                );
+                super::handoff::write_worktree_handoff(&rec, &dir, &built);
+                if let Some(last_mut) = rec.attempts.last_mut() {
+                    last_mut.handoff.clone_from(&built);
+                }
+                Some(built)
+            } else {
+                None
+            };
             let attempt_start = self.now();
             agent_start = Some(attempt_start);
             let (res, run_err) = self
@@ -443,6 +484,7 @@ impl Deps {
                     &resume_session,
                     timeout,
                     &child_env,
+                    handoff.as_deref(),
                 )
                 .await?;
             // The agent ended its turn with only the provider's limit notice: the account is
@@ -468,6 +510,7 @@ impl Deps {
                     return self.finish_run(rec, agent_start, STATUS_TIMED_OUT, &e);
                 }
                 Some(e) => {
+                    last_attempt_output = res.output;
                     if self.record_attempt_failure(&mut rec, c, &e.to_string(), attempt_start) {
                         cool = store_cooldowns(self.store.as_deref(), self.now());
                     }
@@ -654,6 +697,7 @@ impl Deps {
         resume_session: &str,
         timeout: Duration,
         child_env: &[String],
+        handoff: Option<&str>,
     ) -> Result<(RunResult, Option<AttemptError>), Error> {
         rec.agent_pid = 0;
         rec.status = STATUS_RUNNING.into();
@@ -711,9 +755,13 @@ impl Deps {
                 super::linked::linked_env(rec)
             ));
         }
+        let base_prompt = match handoff {
+            Some(h) if !h.is_empty() => super::handoff::prompt_with_handoff(h),
+            _ => rec.prompt.clone(),
+        };
         let request = Request {
             effort: rec.effort.clone(),
-            prompt: format!("{}{}", rec.prompt, super::linked::prompt_note(rec)),
+            prompt: format!("{base_prompt}{}", super::linked::prompt_note(rec)),
             tier: rec.tier.clone(),
             dir: dir.into(),
             read_only: rec.read_only,
@@ -849,6 +897,7 @@ impl Deps {
             error: err.into(),
             exit_class: cls,
             duration_ms: Some(non_neg_ms(now - attempt_start)),
+            handoff: String::new(),
         });
         cooled
     }
@@ -878,6 +927,7 @@ impl Deps {
         rec.note = sandbox::redact(&rec.note);
         for a in &mut rec.attempts {
             a.error = sandbox::redact(&a.error);
+            a.handoff = sandbox::redact(&a.handoff);
         }
         if let Some(st) = self.store.as_deref() {
             st.save_run(&rec)?;

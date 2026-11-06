@@ -197,7 +197,7 @@ fn conversation_migration_from_0005() {
     assert_eq!(old.session_id, "worker-session");
     assert_eq!(old.conversation_id, "");
     assert_eq!(old.caller_agent, "");
-    assert_eq!(count(&s, "PRAGMA user_version"), 10);
+    assert_eq!(count(&s, "PRAGMA user_version"), 11);
     assert_eq!(
         count(
             &s,
@@ -237,7 +237,7 @@ fn tier_speed_strength_migration_keeps_rows() {
         .unwrap();
     }
     let s = Store::new(path.to_str().unwrap()).unwrap();
-    assert_eq!(count(&s, "PRAGMA user_version"), 10);
+    assert_eq!(count(&s, "PRAGMA user_version"), 11);
     assert_eq!(
         count(
             &s,
@@ -580,4 +580,38 @@ fn event_pages_read_sizes_and_slices_on_whole_characters() {
         "into main"
     );
     assert!(s.event_slice("r", 9, 0, 1).unwrap().is_none());
+}
+
+#[test]
+fn disabled_models_persist_and_provider_switch_keeps_model_choices() {
+    use dispatch_core::config::is_model_disabled;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("dispatch.db");
+    let path = db.to_str().unwrap();
+    let store = Store::new(path).unwrap();
+    store
+        .set_model_enabled("anthropic", "claude-opus-5-5-high", false)
+        .unwrap();
+    store.set_model_enabled("anthropic", "", false).unwrap();
+    store.set_model_enabled("anthropic", "", true).unwrap();
+    let disabled = store.list_disabled_models().unwrap();
+    assert!(is_model_disabled(
+        &disabled,
+        "anthropic",
+        "antigravity",
+        "claude-opus-5-5-low"
+    ));
+    assert!(!is_model_disabled(
+        &disabled,
+        "anthropic",
+        "claude",
+        "claude-sonnet-5-5"
+    ));
+    drop(store);
+    let store = Store::new(path).unwrap();
+    assert_eq!(store.list_disabled_models().unwrap(), disabled);
+    store
+        .set_model_enabled("anthropic", "claude-opus-5-5", true)
+        .unwrap();
+    assert!(store.list_disabled_models().unwrap().is_empty());
 }

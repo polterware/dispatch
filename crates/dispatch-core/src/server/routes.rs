@@ -169,6 +169,16 @@ pub(super) fn router(core: Arc<Core>) -> Router {
     let r = unary!(r, "/dispatch.v1.DispatchService/ListModels", list_models);
     let r = unary!(
         r,
+        "/dispatch.v1.DispatchService/ListModelSettings",
+        list_model_settings
+    );
+    let r = unary!(
+        r,
+        "/dispatch.v1.DispatchService/SetModelEnabled",
+        set_model_enabled
+    );
+    let r = unary!(
+        r,
         "/dispatch.v1.DispatchService/ReplaceTiers",
         replace_tiers
     );

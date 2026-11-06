@@ -13,7 +13,7 @@ pub use merge::{
     lock_timeout, merge_tree, set_lock_timeout, uncommitted_overlaps,
 };
 pub use ops::{
-    NumStat, branch_name, commit, create, current_branch, dirty, exclude, forget, has_commits,
-    head, main_checkout, main_root, merge, nothing_to_merge, num_stat, recover, rel, remove,
-    remove_folder, root, worktree_path,
+    FileStat, NumStat, branch_name, commit, create, current_branch, dirty, exclude, file_changes,
+    forget, has_commits, head, is_excluded, main_checkout, main_root, merge, nothing_to_merge,
+    num_stat, recover, rel, remove, remove_folder, root, worktree_path,
 };

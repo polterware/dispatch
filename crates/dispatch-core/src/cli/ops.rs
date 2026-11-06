@@ -28,11 +28,10 @@ use std::time::Duration;
 
 pub(crate) const OPS_USAGE: &str = "       dispatch wait <id> [--timeout <dur>] [--json=false]
        dispatch route [--tier <auto|easy|normal|hard>] [--provider <p>] [--model <m>] [--effort <e>] [--agent <a>] [--priority speed|balanced|quality] [--relax] [--readonly] [--role <name|none>] [--card <slug>] [--dir <repo>] [--json] [<prompt>]
-       dispatch models [--json] | refresh | bench [--json]
+       dispatch models [--json] | enable|disable <provider>[/<model>] | refresh | bench [--json]
        dispatch classify [--card <slug>] [--dir <repo>] [--json] <prompt>
-       dispatch config get [priority|discover|roles|classifier|classifier_model|classifier_agent|classifier_keys|classifier_cli|allow|deny]
+       dispatch config get [priority|discover|roles|classifier|classifier_model|classifier_agent|classifier_keys|classifier_cli]
        dispatch config set priority <speed|balanced|quality> | discover <true|false> | roles <true|false> | classifier <off|jev|openai|cli> | classifier_model <model> | classifier_agent <agent[/model]|default>
-       dispatch config allow|deny add|rm providers|models|agents <value>...   (one routing policy, for every repository)
        dispatch config key set|clear jev|openai   (set reads the key from stdin into a Keychain item only dispatch reads; TYPESAFE_API_KEY or OPENAI_API_KEY wins over it)
        dispatch doctor [--json]
        dispatch merge <id>
@@ -421,24 +420,55 @@ fn role_line(profile: &str, pick: Option<&RolePick>) -> String {
     line
 }
 
-/// Prints the catalog the auto route prices models with, refreshes its prices
-/// from models.dev, or prints the installed models' benchmarks.
+/// Prints the catalog the auto route prices models with, enables or disables a
+/// provider or base model, refreshes prices from models.dev, or prints benchmarks.
 pub(super) async fn models(db_path: &Path, args: &[String]) -> CliResult {
     let mut f = Flags::new("models");
     f.bool("json", false, "print JSON");
     let positional = f.parse_interspersed(args)?;
-    let sub = match positional.as_slice() {
-        [] => "",
-        [s] if s == "refresh" || s == "bench" => s.as_str(),
-        _ => {
-            return Err(usage_err(
-                "usage: dispatch models [--json] | refresh | bench [--json]",
-            ));
+    let usage = || {
+        usage_err(
+            "usage: dispatch models [--json] | enable|disable <provider>[/<model>] | refresh | bench [--json]",
+        )
+    };
+    let (sub, target) = match positional.as_slice() {
+        [] => ("", ""),
+        [s] if s == "refresh" || s == "bench" => (s.as_str(), ""),
+        [s, t] if (s == "enable" || s == "disable") && !t.trim().is_empty() => {
+            (s.as_str(), t.trim())
         }
+        _ => return Err(usage()),
     };
     let (c, _) = dial_workspace(db_path, "").await?;
     let as_json = f.flag("json");
     match sub {
+        "enable" | "disable" => {
+            let enabled = sub == "enable";
+            let res = c
+                .dispatch
+                .set_model_enabled(&pb::SetModelEnabledRequest {
+                    provider: target.to_owned(),
+                    model: String::new(),
+                    enabled,
+                })
+                .await
+                .map_err(run_error)?;
+            if as_json {
+                write_json(&serde_json::json!({
+                    "provider": res.provider,
+                    "model": res.model,
+                    "enabled": res.enabled,
+                }))?;
+                return Ok(());
+            }
+            let state = if res.enabled { "enabled" } else { "disabled" };
+            if res.model.is_empty() {
+                println!("{}: {state}", res.provider);
+            } else {
+                println!("{}/{}: {state}", res.provider, res.model);
+            }
+            Ok(())
+        }
         "bench" => {
             let res = c
                 .dispatch
@@ -474,8 +504,34 @@ pub(super) async fn models(db_path: &Path, args: &[String]) -> CliResult {
                 .list_model_catalog(&pb::ListModelCatalogRequest {})
                 .await
                 .map_err(run_error)?;
+            let settings = c
+                .dispatch
+                .list_model_settings(&pb::ListModelSettingsRequest {})
+                .await
+                .map_err(run_error)?;
             if as_json {
-                return print_op(res.ok, &res.json);
+                let mut v: Value = serde_json::from_str(&res.json)?;
+                if let Some(obj) = v.as_object_mut() {
+                    // Written field by field: the wire form drops a false `enabled`.
+                    let providers: Vec<Value> = settings
+                        .providers
+                        .iter()
+                        .map(|p| {
+                            serde_json::json!({
+                                "provider": p.provider,
+                                "enabled": p.enabled,
+                                "models": p.models.iter().map(|m| serde_json::json!({
+                                    "id": m.id,
+                                    "enabled": m.enabled,
+                                    "agents": m.agents,
+                                })).collect::<Vec<_>>(),
+                            })
+                        })
+                        .collect();
+                    obj.insert("providers".into(), Value::Array(providers));
+                }
+                write_json(&sort_keys(v))?;
+                return if res.ok { Ok(()) } else { Err(Fail::Exit(1)) };
             }
             let report: CatalogReport = serde_json::from_str(&res.json)?;
             print!(
@@ -509,6 +565,23 @@ pub(super) async fn models(db_path: &Path, args: &[String]) -> CliResult {
                     or_unknown(&e.effort),
                     pass.join(" ")
                 );
+            }
+            for p in &settings.providers {
+                let p_state = if p.enabled { "enabled" } else { "disabled" };
+                println!("provider {}: {p_state}", p.provider);
+                for m in &p.models {
+                    let m_state = if p.enabled && m.enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    };
+                    let via = if m.agents.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", m.agents.join(", "))
+                    };
+                    println!("  {}/{:<28} {m_state}{via}", p.provider, m.id);
+                }
             }
             for s in &report.sources {
                 println!("source: {} ({}): {}", s.name, s.license, s.fields);
@@ -576,7 +649,7 @@ fn print_benchmarks(report: &BenchmarkReport) {
 pub(super) async fn config(db_path: &Path, args: &[String]) -> CliResult {
     let usage = || {
         usage_err(
-            "usage: dispatch config get [key] | set priority|discover|classifier|classifier_model|classifier_agent <value> | allow|deny add|rm providers|models|agents <value>... | key set|clear jev|openai",
+            "usage: dispatch config get [key] | set priority|discover|roles|classifier|classifier_model|classifier_agent <value> | key set|clear jev|openai",
         )
     };
     // The routing policy is global, so the command takes no repository.
@@ -599,14 +672,6 @@ pub(super) async fn config(db_path: &Path, args: &[String]) -> CliResult {
             req.action = "set".into();
             req.key = positional[1].clone();
             req.values = positional[2..].to_vec();
-        }
-        list @ ("allow" | "deny") => {
-            if positional.len() < 4 || (positional[1] != "add" && positional[1] != "rm") {
-                return Err(usage());
-            }
-            req.action = format!("{list}-{}", positional[1]);
-            req.key = positional[2].clone();
-            req.values = positional[3..].to_vec();
         }
         "key" => {
             // The key never goes in the arguments, where the shell history and ps would keep it.

@@ -1,8 +1,8 @@
 use crate::{
     Error,
     adapters::Model,
-    catalog::{Catalog, base_model},
-    config::Policy,
+    catalog::Catalog,
+    config::{Policy, is_model_disabled},
     pass_model::difficulty_tier,
     router::{Agent, RouteOptions, RouteReport, route},
     tiers::{Entry, Table, provider_of},
@@ -80,19 +80,6 @@ pub fn merge_agent(table: &Table, built: &Table, agent: &str) -> Table {
     out
 }
 
-fn policy_reason(policy: &Policy, provider: &str, model: &str, agent: &str) -> String {
-    let mut p = policy.clone();
-    let base = base_model(model);
-    if base != model {
-        for list in [&mut p.allow.models, &mut p.deny.models] {
-            if list.iter().any(|v| v == base) {
-                list.push(model.into());
-            }
-        }
-    }
-    p.reason(provider, model, agent)
-}
-
 fn listed_entries(models: Vec<Model>) -> Vec<Entry> {
     models
         .into_iter()
@@ -109,7 +96,7 @@ fn listed_entries(models: Vec<Model>) -> Vec<Entry> {
 pub async fn open_code_entries<A: OpenCodeAdapter>(
     adapter: Option<&A>,
     table: &Table,
-    policy: &Policy,
+    _policy: &Policy,
     cat: &Catalog,
     options: &RouteOptions,
     mut entries: Vec<TieredEntry>,
@@ -136,7 +123,9 @@ pub async fn open_code_entries<A: OpenCodeAdapter>(
             .map(|e| format!("{}/{}", e.entry.agent, e.entry.model))
             .collect();
         for e in agent_pool(OPEN_CODE_AGENT, &Table::default(), &listed) {
-            if !known.contains(&format!("{}/{}", e.agent, e.model)) {
+            if !is_model_disabled(&options.disabled, &e.provider, &e.agent, &e.model)
+                && !known.contains(&format!("{}/{}", e.agent, e.model))
+            {
                 entries.push(TieredEntry {
                     entry: e,
                     tier: "normal".into(),
@@ -148,7 +137,7 @@ pub async fn open_code_entries<A: OpenCodeAdapter>(
     }
     let pool: Vec<Entry> = agent_pool(OPEN_CODE_AGENT, table, &listed)
         .into_iter()
-        .filter(|e| policy_reason(policy, &e.provider, &e.model, &e.agent).is_empty())
+        .filter(|e| !is_model_disabled(&options.disabled, &e.provider, &e.agent, &e.model))
         .collect();
     entries.retain(|e| e.entry.agent != OPEN_CODE_AGENT);
     let priority = if options.filters.priority.is_empty() {
@@ -273,7 +262,7 @@ pub async fn route_with_opencode<A: OpenCodeAdapter>(
     }
     let pool: Vec<Entry> = agent_pool(OPEN_CODE_AGENT, &adj_table, &listed)
         .into_iter()
-        .filter(|e| policy_reason(&adj_policy, &e.provider, &e.model, &e.agent).is_empty())
+        .filter(|e| !is_model_disabled(&adj_options.disabled, &e.provider, &e.agent, &e.model))
         .collect();
     let priority = if adj_options.filters.priority.is_empty() {
         "balanced"

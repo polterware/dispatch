@@ -58,6 +58,7 @@ pub struct AppView {
     resizing: Option<(f32, f32)>,
     /// The toasts whose lifetime is already counting down.
     timed_toasts: Vec<u64>,
+    models_revision: u64,
     /// Holds Enter and Escape while the app asks before removing a repository.
     confirm_focus: gpui::FocusHandle,
 }
@@ -104,7 +105,15 @@ impl AppView {
         observe(&state, cx);
         // Each toast goes on its own once its lifetime has passed.
         cx.observe(&state, |this: &mut Self, state, cx| {
-            this.time_toasts(&state, cx)
+            this.time_toasts(&state, cx);
+            let revision = state.read(cx).models_revision();
+            if this.models_revision != revision {
+                this.models_revision = revision;
+                // Drop model-list caches after Settings changes their source in the core.
+                this.roles = cx.new(|cx| RolesView::new(state.clone(), cx));
+                this.intelligence = cx.new(|cx| IntelligenceView::new(state.clone(), cx));
+                cx.notify();
+            }
         })
         .detach();
         let commander =
@@ -125,6 +134,7 @@ impl AppView {
             state,
             resizing: None,
             timed_toasts: Vec::new(),
+            models_revision: 0,
             confirm_focus: cx.focus_handle(),
         };
         let width = view.state.read(cx).sidebar_width();

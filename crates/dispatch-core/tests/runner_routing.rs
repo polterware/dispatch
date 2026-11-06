@@ -5,7 +5,6 @@ use chrono::{DateTime, TimeDelta, TimeZone, Utc};
 use dispatch_core::{
     adapters::{Capabilities, quota::Quota},
     catalog::{BenchScore, Catalog},
-    config::Rules,
     router,
     runner::{
         Candidate, Options, PRIORITY_BALANCED, PRIORITY_QUALITY, PRIORITY_SPEED, RouteReport,
@@ -591,30 +590,34 @@ async fn test_relax_after_filtered_candidates_fail() {
 }
 
 #[tokio::test]
-async fn test_persistent_policy_applies_to_fallback_relax_and_flags() {
-    let mut r = routing_deps();
-    r.t.deps.policy.allow.providers = vec!["openai".into()];
-    r.t.deps.policy.deny.models = vec!["gpt-small".into()];
+async fn test_disabled_models_apply_to_fallback_relax_and_flags() {
+    let r = routing_deps();
+    r.t.store.set_model_enabled("google", "", false).unwrap();
+    r.t.store
+        .set_model_enabled("openai", "gpt-small", false)
+        .unwrap();
     let rec = r.run(opts("easy", filters(|f| f.relax = true))).await;
     assert!(
         rec.status == STATUS_FAILED
             && ran_list(&r.ran).is_empty()
-            && rec.error.contains("policy deny.models"),
+            && rec.error.contains("model openai/gpt-small is disabled"),
         "{rec:?}"
     );
-    r.t.deps.policy.deny = Rules::default();
+    r.t.store
+        .set_model_enabled("openai", "gpt-small", true)
+        .unwrap();
     let google = filters(|f| {
         f.provider = "google".into();
         f.relax = true;
     });
     let (cs, why) = r.select(opts("easy", google.clone())).await;
     assert!(
-        cs.is_empty() && why.join(";").contains("policy allow.providers"),
+        cs.is_empty() && why.join(";").contains("provider google is disabled"),
         "{cs:?} {why:?}"
     );
     let rec = r.run(opts("easy", google)).await;
     assert!(
-        rec.status == STATUS_FAILED && rec.error.contains("policy allow.providers"),
+        rec.status == STATUS_FAILED && rec.error.contains("provider google is disabled"),
         "{rec:?}"
     );
 }

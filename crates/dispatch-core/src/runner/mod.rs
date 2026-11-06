@@ -4,6 +4,7 @@ mod classify;
 mod decision;
 mod empirical;
 mod execute;
+mod handoff;
 mod host;
 mod lifecycle;
 pub mod linked;
@@ -19,12 +20,16 @@ pub use empirical::empirical_quota;
 pub use execute::{
     agent_log_path, child_environ, complete_telemetry, exit_class, join_note, terminal_status,
 };
+pub use handoff::{
+    HANDOFF_FILE, HANDOFF_INSTRUCTION, HANDOFF_MAX_CHARS, build_handoff, is_limit_class,
+    prompt_with_handoff, write_worktree_handoff,
+};
 pub use host::{AgentRunHost, HOST_TIMEOUT, complete_linked_agent_run, dispatch_run_task};
 pub use lifecycle::{pid_alive, process_start};
 pub use ops::MergeResult;
 pub use routing::{
-    FiltersJson, RouteCandidate, RouteReport, cooling, credit_key, linear, matches_model,
-    normalize_priority, policy_request_reason, store_cooldowns, validate_options,
+    FiltersJson, RouteCandidate, RouteReport, cooling, credit_key, disabled_request_reason, linear,
+    matches_model, normalize_priority, store_cooldowns, store_disabled, validate_options,
 };
 pub use summary::{
     RunSummary, SUMMARY_SCHEMA, class_of, classify_run, go_duration, limit_notice, observed_ms,

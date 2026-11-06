@@ -540,6 +540,12 @@ impl Core {
                 short_run(&prev.id)
             )));
         }
+        let disabled = self.disabled_models();
+        let reason =
+            crate::config::disabled_reason(&disabled, &prev.provider, &prev.agent, &prev.model);
+        if !reason.is_empty() {
+            return Err(RpcError::invalid(reason));
+        }
         let project_id = if m.project_id.trim().is_empty() {
             prev.project_id.clone()
         } else {
@@ -1056,7 +1062,14 @@ impl Core {
 
     pub(crate) fn tier_rows(&self) -> RpcResult<Vec<pb::DispatchTier>> {
         let rows = self.store.list_tiers().map_err(RpcError::internal)?;
-        Ok(rows.iter().map(convert::tier).collect())
+        let disabled = self.disabled_models();
+        Ok(rows
+            .iter()
+            .filter(|row| {
+                !crate::config::is_model_disabled(&disabled, &row.provider, &row.agent, &row.model)
+            })
+            .map(convert::tier)
+            .collect())
     }
 
     pub(crate) async fn list_tiers(
@@ -1085,7 +1098,22 @@ impl Core {
         m: pb::ReplaceTiersRequest,
     ) -> RpcResult<pb::ReplaceTiersResponse> {
         let mut table = Table::default();
-        for row in m.tiers {
+        // The board lists only enabled models, so it never sends the disabled ones: they stay
+        // in their tier, after the board's rows, until their model is turned back on.
+        let disabled = self.disabled_models();
+        let mut kept = self.store.list_tiers().map_err(RpcError::internal)?;
+        kept.retain(|row| {
+            crate::config::is_model_disabled(&disabled, &row.provider, &row.agent, &row.model)
+        });
+        kept.sort_by_key(|row| row.position);
+        let kept = kept.into_iter().map(|row| pb::DispatchTier {
+            name: row.name,
+            provider: row.provider,
+            agent: row.agent,
+            model: row.model,
+            ..pb::DispatchTier::default()
+        });
+        for row in m.tiers.into_iter().chain(kept) {
             let tier = row.name.trim().to_owned();
             if !crate::adapters::valid_tier(&tier) {
                 return Err(RpcError::invalid(format!("unknown tier {:?}", row.name)));
@@ -1118,6 +1146,15 @@ impl Core {
     }
 
     pub(crate) async fn models_report(&self) -> pb::ListModelsResponse {
+        let mut out = self.raw_models_report().await;
+        let disabled = self.disabled_models();
+        out.models.retain(|m| {
+            !crate::config::is_model_disabled(&disabled, &m.provider, &m.agent, &m.model)
+        });
+        out
+    }
+
+    pub(crate) async fn raw_models_report(&self) -> pb::ListModelsResponse {
         let listed = futures::future::join_all(
             known::known()
                 .into_iter()

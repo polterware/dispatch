@@ -2,8 +2,8 @@ use super::{Store, db, format_time, now, parse_time};
 use crate::{
     Error,
     types::{
-        self, Agent, Attempt, DecisionCandidate, DispatchError, Filters, QuotaSnapshot, RolePick,
-        RouteDecision, Run, RunEvent, Tier, Usage, WorktreeInfo, new_id,
+        self, Agent, Attempt, DecisionCandidate, DisabledModel, DispatchError, Filters,
+        QuotaSnapshot, RolePick, RouteDecision, Run, RunEvent, Tier, Usage, WorktreeInfo, new_id,
     },
 };
 use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter, types::Value};
@@ -1074,5 +1074,68 @@ impl types::Store for Store {
             out.push(scan_decision(r)?);
         }
         Ok(out)
+    }
+
+    fn list_disabled_models(&self) -> Result<Vec<DisabledModel>, Error> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT provider, model FROM dispatch_disabled_models ORDER BY provider ASC, model ASC",
+            )
+            .map_err(db)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(DisabledModel {
+                    provider: r.get(0)?,
+                    model: r.get(1)?,
+                })
+            })
+            .map_err(db)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db)
+    }
+
+    fn set_model_enabled(&self, provider: &str, model: &str, enabled: bool) -> Result<(), Error> {
+        let provider = provider.trim().to_ascii_lowercase();
+        let model = model.trim();
+        let model = if model.is_empty() {
+            String::new()
+        } else {
+            let base = crate::catalog::base_model(model);
+            match base.split_once('/') {
+                Some((head, rest))
+                    if !rest.is_empty()
+                        && (provider.is_empty() || head.eq_ignore_ascii_case(&provider)) =>
+                {
+                    rest.to_owned()
+                }
+                _ => base.to_owned(),
+            }
+        };
+        if provider.is_empty() && model.is_empty() {
+            return Err(Error::Message("provider is required".into()));
+        }
+        let conn = self.conn();
+        if enabled {
+            if model.is_empty() {
+                conn.execute(
+                    "DELETE FROM dispatch_disabled_models WHERE lower(provider) = lower(?1) AND model = ''",
+                    params![provider],
+                )
+                .map_err(db)?;
+            } else {
+                conn.execute(
+                    "DELETE FROM dispatch_disabled_models WHERE (lower(provider) = lower(?1) OR provider = '') AND lower(model) = lower(?2)",
+                    params![provider, model],
+                )
+                .map_err(db)?;
+            }
+        } else {
+            conn.execute(
+                "INSERT OR IGNORE INTO dispatch_disabled_models (provider, model) VALUES (?1, ?2)",
+                params![provider, model],
+            )
+            .map_err(db)?;
+        }
+        Ok(())
     }
 }
