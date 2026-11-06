@@ -279,6 +279,129 @@ impl Core {
         })
     }
 
+    /// The worktree folders of every repository runs have used, and of the one holding
+    /// `dir`.
+    pub(crate) async fn list_worktree_folders(
+        &self,
+        m: pb::ListWorktreeFoldersRequest,
+    ) -> RpcResult<pb::ListWorktreeFoldersResponse> {
+        let deps = self.deps_in("").map_err(RpcError::internal)?;
+        let dir = super::workspace::expand_path(&m.dir);
+        let folders = tokio::task::spawn_blocking(move || deps.worktree_folders(&dir))
+            .await
+            .map_err(RpcError::internal)?
+            .map_err(RpcError::internal)?;
+        Ok(pb::ListWorktreeFoldersResponse {
+            folders: folders
+                .iter()
+                .map(super::convert::worktree_folder)
+                .collect(),
+        })
+    }
+
+    /// Removes the folders whose run ended with nothing to merge, or no longer exists.
+    pub(crate) async fn prune_worktree_folders(
+        &self,
+        m: pb::PruneWorktreeFoldersRequest,
+    ) -> RpcResult<pb::PruneWorktreeFoldersResponse> {
+        let deps = self.deps_in("").map_err(RpcError::internal)?;
+        let dir = super::workspace::expand_path(&m.dir);
+        // One prune at a time, and none while a run is being started or deleted.
+        let _start = self.start_mu.lock().await;
+        let (removed, kept) =
+            tokio::task::spawn_blocking(move || deps.prune_worktree_folders(&dir))
+                .await
+                .map_err(RpcError::internal)?
+                .map_err(RpcError::internal)?;
+        Ok(pb::PruneWorktreeFoldersResponse {
+            removed: removed
+                .iter()
+                .map(super::convert::worktree_folder)
+                .collect(),
+            kept: kept.iter().map(super::convert::worktree_folder).collect(),
+        })
+    }
+
+    pub(crate) async fn delete_runs(
+        &self,
+        m: pb::DeleteRunsRequest,
+    ) -> RpcResult<pb::DeleteRunsResponse> {
+        let conversation = m.conversation_id.trim().to_owned();
+        let mut ids = Vec::new();
+        for id in m.ids.iter().map(|id| id.trim()).filter(|id| !id.is_empty()) {
+            let id = self.full_run_id(id)?;
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        if !conversation.is_empty() {
+            for run in self
+                .store
+                .list_runs("", 0, 0, &conversation)
+                .map_err(RpcError::internal)?
+            {
+                if !ids.contains(&run.id) {
+                    ids.push(run.id);
+                }
+            }
+        }
+        if ids.is_empty() && conversation.is_empty() {
+            return Err(RpcError::invalid("give run ids or a conversation id"));
+        }
+        let mut guards = Vec::with_capacity(ids.len());
+        for id in &ids {
+            guards.push(self.run_mu(id).lock_owned().await);
+        }
+        for id in &ids {
+            let run = self.store.get_run(id).map_err(op_error)?;
+            if !runner::terminal_status(&run.status) {
+                return Err(RpcError::invalid(format!(
+                    "run {} is {}; cancel it before deleting",
+                    run.id, run.status
+                )));
+            }
+        }
+        let deps = self.deps_in("").map_err(RpcError::internal)?;
+        let store = self.store.clone();
+        let state_dir = self.state_dir().to_string_lossy().into_owned();
+        let doomed = ids.clone();
+        let worktrees = tokio::task::spawn_blocking(move || {
+            let mut removed = Vec::new();
+            for id in &doomed {
+                let Ok(run) = store.get_run(id) else {
+                    continue;
+                };
+                // Deleting a run discards the worktree and branch Dispatch cut for it, merged
+                // or not. A folder given with `--worktree`, or a branch not Dispatch's, is the
+                // user's: it stays.
+                if !run.worktree.is_empty()
+                    && !run.no_worktree
+                    && run.branch.starts_with("dispatch/")
+                    && deps.owns_worktree(&run.repo, &run.worktree)
+                    && deps.clean(id, true).is_ok()
+                {
+                    removed.push(run.worktree);
+                }
+                let log = runner::agent_log_path(&state_dir, id);
+                if !log.is_empty() {
+                    let _ = std::fs::remove_file(log);
+                }
+            }
+            removed
+        })
+        .await
+        .map_err(RpcError::internal)?;
+        let deleted = self
+            .store
+            .delete_runs(&ids, &conversation)
+            .map_err(RpcError::internal)?;
+        drop(guards);
+        Ok(pb::DeleteRunsResponse {
+            deleted: i32::try_from(deleted).unwrap_or(i32::MAX),
+            json: body(&json!({"ids": ids, "worktrees": worktrees}))?,
+        })
+    }
+
     pub(crate) async fn recover_run(
         &self,
         m: pb::RecoverRunRequest,

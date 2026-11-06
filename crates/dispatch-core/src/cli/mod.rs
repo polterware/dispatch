@@ -33,6 +33,9 @@ const COMMANDS: &[(&str, &str)] = &[
     ("models", "models"),
     ("merge", "merge"),
     ("clean", "clean"),
+    ("worktrees", "worktrees"),
+    ("delete", "delete"),
+    ("rename", "rename"),
     ("recover", "recover"),
     ("roles", "roles"),
     ("tiers", "tiers"),
@@ -144,7 +147,13 @@ pub fn main(args: Vec<String>) -> i32 {
             if sub.is_none()
                 && !matches!(
                     command.as_str(),
-                    "stop" | "workspace" | "workspaces" | "dispatch"
+                    "stop"
+                        | "workspace"
+                        | "workspaces"
+                        | "repo"
+                        | "repos"
+                        | "repository"
+                        | "dispatch"
                 )
             {
                 eprintln!("unknown command {command:?}");
@@ -158,7 +167,13 @@ pub fn main(args: Vec<String>) -> i32 {
             runtime.block_on(async {
                 match command.as_str() {
                     "stop" => serve::run_stop(&db_path).await,
-                    "workspace" | "workspaces" => workspace::run_workspace(&db_path, rest).await,
+                    "workspace" | "workspaces" => {
+                        workspace::run_workspace(&db_path, rest, workspace::Noun::Workspace).await
+                    }
+                    // The app's one word for it: the same command, in repository words.
+                    "repo" | "repos" | "repository" => {
+                        workspace::run_workspace(&db_path, rest, workspace::Noun::Repository).await
+                    }
                     // `dispatch dispatch hook` is the hook Polterware registered before.
                     "dispatch" => run_dispatch(&db_path, rest).await,
                     _ => {
@@ -303,6 +318,9 @@ async fn run_dispatch(db_path: &Path, args: &[String]) -> CliResult {
         "doctor" => ops::doctor(db_path, rest).await,
         "merge" => ops::merge(db_path, rest).await,
         "clean" => ops::clean(db_path, rest).await,
+        "worktrees" => ops::worktrees(db_path, rest).await,
+        "delete" => ops::delete(db_path, rest).await,
+        "rename" => ops::rename(db_path, rest).await,
         "recover" => ops::recover(db_path, rest).await,
         "roles" => ops::roles(db_path, rest).await,
         "on" => ops::on(db_path),

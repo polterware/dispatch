@@ -14,5 +14,6 @@ pub use merge::{
 };
 pub use ops::{
     NumStat, branch_name, commit, create, current_branch, dirty, exclude, forget, has_commits,
-    head, merge, num_stat, recover, rel, remove, root, worktree_path,
+    head, main_root, merge, nothing_to_merge, num_stat, recover, rel, remove, remove_folder, root,
+    worktree_path,
 };

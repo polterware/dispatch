@@ -434,17 +434,145 @@ fn a_cancelled_run_ends_with_its_agent() {
     env.wait_for(&id, "RUNNING");
     wait_until("the agent runs", || env.agent_alive());
 
-    // One run at a time in a folder.
-    let err = env.fails(&["run", "--agent", "fake", "--readonly", "--json", "another"]);
-    assert!(err.contains("already active"), "{err}");
+    // Runs share a folder: a read-only one, and a writable one in a worktree of its own,
+    // start and end while the first still works.
+    let reader = env.run("say hi", &["--readonly"]);
+    env.wait_for(&reader, "COMPLETED");
+    let writer = env.run("say hi", &[]);
+    env.wait_for(&writer, "COMPLETED");
+    assert_eq!(env.status(&id)["status"], "RUNNING");
 
     env.ok(&["cancel", &id[..8]]);
     env.wait_for(&id, "CANCELLED");
     wait_until("the cancelled agent is gone", || !env.agent_alive());
+}
 
-    // The folder takes a run again.
-    let next = env.run("say hi", &["--readonly"]);
-    env.wait_for(&next, "COMPLETED");
+#[test]
+fn two_runs_editing_one_folder_itself_are_refused() {
+    let env = Env::new();
+    let folder = env.repo.to_string_lossy().into_owned();
+    let id = env.run("SLOW answer", &["--worktree", &folder]);
+    env.wait_for(&id, "RUNNING");
+    // Both would write in the folder itself, with no worktree of their own.
+    let err = env.fails(&[
+        "run",
+        "--agent",
+        "fake",
+        "--json",
+        "--worktree",
+        &folder,
+        "another",
+    ]);
+    assert!(err.contains("is editing"), "{err}");
+    // A read-only run there is fine.
+    let reader = env.run("say hi", &["--readonly", "--worktree", &folder]);
+    env.wait_for(&reader, "COMPLETED");
+    env.ok(&["cancel", &id[..8]]);
+    env.wait_for(&id, "CANCELLED");
+}
+
+#[test]
+fn a_run_in_place_edits_the_folder_itself() {
+    let env = Env::new();
+    let id = env.run("WRITE a file", &["--worktree-mode", "in-place"]);
+    let s = env.wait_for(&id, "COMPLETED");
+    assert!(s["worktree"].as_str().unwrap_or_default().is_empty(), "{s}");
+    assert!(read(env.repo.join("e2e.txt")).starts_with("written by the fake agent"));
+    assert_eq!(env.worktrees(), "", "an in-place run cut a branch");
+}
+
+#[test]
+fn a_new_worktree_needs_git_and_a_busy_folder_offers_one() {
+    let env = Env::new();
+    let plain = env.root.join("plain");
+    std::fs::create_dir_all(&plain).expect("mkdir");
+    let plain = plain.to_string_lossy().into_owned();
+    let err = env.fails(&[
+        "run",
+        "--agent",
+        "fake",
+        "--json",
+        "--worktree-mode",
+        "worktree",
+        "--dir",
+        &plain,
+        "x",
+    ]);
+    assert!(err.contains("not a git checkout"), "{err}");
+
+    // In place, the checkout takes one writer at a time, and the refusal offers a worktree.
+    let first = env.run("SLOW answer", &["--worktree-mode", "in-place"]);
+    env.wait_for(&first, "RUNNING");
+    let err = env.fails(&[
+        "run",
+        "--agent",
+        "fake",
+        "--json",
+        "--worktree-mode",
+        "in-place",
+        "another",
+    ]);
+    assert!(err.contains("--worktree-mode worktree"), "{err}");
+    let second = env.run("WRITE a file", &["--worktree-mode", "worktree"]);
+    let s = env.wait_for(&second, "COMPLETED");
+    let worktree = PathBuf::from(s["worktree"].as_str().expect("worktree"));
+    assert!(worktree.join("e2e.txt").exists(), "{s}");
+    env.ok(&["cancel", &first[..8]]);
+    env.wait_for(&first, "CANCELLED");
+}
+
+#[test]
+fn a_run_that_changed_nothing_leaves_no_worktree_and_prune_clears_the_rest() {
+    let env = Env::new();
+    let quiet = env.run("say hi", &[]);
+    let s = env.wait_for(&quiet, "COMPLETED");
+    let gone = PathBuf::from(s["worktree"].as_str().expect("worktree"));
+    assert!(!gone.exists(), "the empty run's worktree stayed: {s}");
+    assert_eq!(env.worktrees(), "", "the empty run's branch stayed");
+
+    let kept = env.run("WRITE a file", &[]);
+    env.wait_for(&kept, "COMPLETED");
+    // A worktree no run owns any more.
+    let ghost = env.repo.join(".dispatch").join("worktrees").join("ghost");
+    git(
+        &env.repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "dispatch/ghost",
+            &ghost.to_string_lossy(),
+            "HEAD",
+        ],
+    );
+    let listed = env.json(&["worktrees", "--json"]);
+    let rows = listed["worktrees"].as_array().expect("worktrees").clone();
+    let row = |id: &str| {
+        rows.iter()
+            .find(|row| row["run_id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("no {id} in {listed}"))
+    };
+    assert_eq!(rows.len(), 2, "{listed}");
+    assert_eq!(row("ghost")["prunable"], true);
+    assert_eq!(row(&kept)["changes"], true);
+    assert_eq!(row(&kept)["prunable"], false);
+
+    let pruned = env.json(&["worktrees", "--prune", "--json"]);
+    assert_eq!(
+        pruned["removed"].as_array().map(Vec::len),
+        Some(1),
+        "{pruned}"
+    );
+    assert_eq!(pruned["removed"][0]["run_id"], "ghost");
+    assert!(!ghost.exists(), "prune left the ghost worktree");
+    // `+` marks a branch a worktree has checked out.
+    assert_eq!(
+        env.worktrees().trim().trim_start_matches('+').trim(),
+        format!("dispatch/{kept}"),
+        "prune took the wrong branches"
+    );
 }
 
 #[test]
@@ -695,6 +823,93 @@ fn workspaces_are_added_listed_and_removed() {
         env.fails(&["workspace", "add", &missing])
             .contains("not a folder")
     );
+}
+
+#[test]
+fn repo_is_workspace_in_repository_words_and_names_the_main_checkout() {
+    let env = Env::new();
+    // A run makes the repository a workspace; a subfolder of it is the same one.
+    env.wait_for(&env.run("say hi", &["--readonly"]), "COMPLETED");
+    let sub = env.repo.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    let added = env.ok(&["repo", "add", &sub.to_string_lossy()]);
+    assert!(added.starts_with("repository "), "{added}");
+    let listed = env.json(&["repo", "ls", "--json"]);
+    let repo = items(&listed["workspaces"])
+        .iter()
+        .find(|w| added.contains(w["id"].as_str().unwrap_or("-")))
+        .unwrap_or_else(|| panic!("{added} not in {listed}"))
+        .clone();
+    assert_eq!(
+        std::fs::canonicalize(repo["path"].as_str().unwrap()).unwrap(),
+        std::fs::canonicalize(&env.repo).unwrap(),
+        "a subfolder names its repository"
+    );
+    assert!(env.fails(&["repo", "nope"]).contains("dispatch repo"));
+}
+
+#[test]
+fn delete_takes_the_worktrees_dispatch_cut_and_keeps_the_users() {
+    let env = Env::new();
+    let ours = env.run("WRITE a file", &[]);
+    let s = env.wait_for(&ours, "COMPLETED");
+    let cut = PathBuf::from(s["worktree"].as_str().expect("worktree"));
+    assert!(cut.exists());
+    let deleted = env.ok(&["delete", &ours]);
+    assert!(
+        deleted.contains("deleted 1 run and its worktree"),
+        "{deleted}"
+    );
+    assert!(!cut.exists(), "the run's worktree stayed");
+    assert!(
+        !env.worktrees().contains(&format!("dispatch/{ours}")),
+        "the run's branch stayed"
+    );
+    assert!(
+        !env.output(&["status", &ours]).status.success(),
+        "the deleted run is still there"
+    );
+
+    // A worktree the user cut and handed to the run is theirs.
+    let mine = env.root.join("mine");
+    git(
+        &env.repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "mine",
+            &mine.to_string_lossy(),
+            "HEAD",
+        ],
+    );
+    let theirs = env.run("WRITE a file", &["--worktree", &mine.to_string_lossy()]);
+    env.wait_for(&theirs, "COMPLETED");
+    let deleted = env.ok(&["delete", &theirs]);
+    assert_eq!(deleted.trim(), "deleted 1 run", "{deleted}");
+    assert!(mine.exists(), "delete removed the user's worktree");
+    assert!(
+        git(&env.repo, &["branch", "--list", "mine"]).contains("mine"),
+        "delete removed the user's branch"
+    );
+    assert!(
+        env.fails(&["delete"])
+            .contains("needs run ids or --conversation")
+    );
+}
+
+#[test]
+fn a_conversation_is_renamed_and_named_by_its_prompt_again() {
+    let env = Env::new();
+    let named = env.ok(&["rename", "conv-1", "Release", "notes"]);
+    assert!(named.contains("renamed \"Release notes\""), "{named}");
+    let cleared = env.ok(&["rename", "conv-1"]);
+    assert!(
+        cleared.contains("named by its first prompt again"),
+        "{cleared}"
+    );
+    assert!(env.fails(&["rename"]).contains("needs a conversation id"));
 }
 
 #[test]

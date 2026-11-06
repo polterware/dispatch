@@ -78,9 +78,13 @@ impl Core {
         self.store.get_workspace(&ws.id)
     }
 
-    /// The workspace that holds `dir`: the Polterware project whose
-    /// repository is cloned there, else a folder added before, else a new
-    /// standalone workspace for `dir` itself.
+    /// The workspace of `dir`, as coding harnesses (OpenCode, Claude Code)
+    /// take a project: the Polterware project whose repository is cloned
+    /// there; else the git repository holding `dir`, named by its main
+    /// checkout so a subfolder and every worktree of it are one workspace;
+    /// else `dir` itself. A folder added before holds only its own path, so
+    /// a home folder added as a workspace never takes in the repositories
+    /// under it.
     async fn workspace_at(&self, dir: &str, name: &str) -> Result<Workspace, Error> {
         let dir = super::runs::absolute(&expand_path(dir));
         if let Ok(project) = with_host(self.host.resolve_project("", &dir)).await
@@ -100,9 +104,15 @@ impl Core {
                 other => other,
             };
         }
-        match self.store.workspace_at(&dir) {
-            Err(e) if store::is_no_workspace(&e) => {}
-            other => return other,
+        let main = crate::worktree::main_root(&dir);
+        let dir = if main.is_empty() { dir } else { main };
+        if let Some(ws) = self
+            .store
+            .list_workspaces()?
+            .into_iter()
+            .find(|ws| !ws.path.is_empty() && clean_dir(&ws.path) == clean_dir(&dir))
+        {
+            return Ok(ws);
         }
         if !Path::new(&dir).is_dir() {
             return Err(Error::Message(format!("not a folder: {dir}")));
@@ -351,9 +361,30 @@ impl Core {
         _: pb::ListSectionsRequest,
     ) -> RpcResult<pb::ListSectionsResponse> {
         let sections = self.store.list_sections().map_err(section_error)?;
+        let names = self
+            .store
+            .conversation_names()
+            .map_err(RpcError::internal)?;
         Ok(pb::ListSectionsResponse {
             sections: sections.iter().map(convert::section).collect(),
+            conversation_names: names
+                .into_iter()
+                .map(|(conversation_id, name)| pb::ConversationName {
+                    conversation_id,
+                    name,
+                })
+                .collect(),
         })
+    }
+
+    pub(crate) async fn rename_conversation(
+        &self,
+        m: pb::RenameConversationRequest,
+    ) -> RpcResult<pb::RenameConversationResponse> {
+        self.store
+            .rename_conversation(&m.conversation_id, &m.name)
+            .map_err(section_error)?;
+        Ok(pb::RenameConversationResponse {})
     }
 
     pub(crate) async fn save_section(
@@ -393,4 +424,10 @@ impl Core {
             .map_err(section_error)?;
         Ok(pb::MoveToSectionResponse {})
     }
+}
+
+/// `dir` without trailing slashes, to compare a workspace's folder with another.
+fn clean_dir(dir: &str) -> &str {
+    let trimmed = dir.trim_end_matches('/');
+    if trimmed.is_empty() { "/" } else { trimmed }
 }

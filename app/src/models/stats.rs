@@ -421,7 +421,7 @@ pub fn most_used_detail(rank: &DispatchStatRank) -> String {
 
 /// The core times only completed runs (the heading's tooltip says so); a card has room for
 /// little more than the figure.
-pub fn slowest_detail(rank: &DispatchStatRank) -> String {
+pub fn longest_median_detail(rank: &DispatchStatRank) -> String {
     format!(
         "p50 {} over {}",
         format_duration_ms(millis(rank.p50_ms)),
@@ -429,22 +429,8 @@ pub fn slowest_detail(rank: &DispatchStatRank) -> String {
     )
 }
 
-/// How many of the runs the model ended itself failed, read back from the success rate the
-/// core rounds to a tenth of a percent.
-pub fn most_failed_detail(rank: &DispatchStatRank) -> String {
-    match rank.success_pct {
-        Some(pct) if rank.runs > 0 => {
-            let passed = (rank.runs as f64 * pct / 100.0).round() as i64;
-            let failed = (rank.runs as i64 - passed).max(0);
-            format!("{failed} of {} failed", plural(rank.runs, "run"))
-        }
-        _ => plural(rank.runs, "run"),
-    }
-}
-
-/// What each comparison ranking reads, for its card's tooltip.
-pub const SLOWEST_ABOUT: &str = "The median time of each model's completed runs, among models with at least 5. A model handed bigger tasks takes longer, so this reads your runs, not the model's speed.";
-pub const MOST_FAILED_ABOUT: &str = "Failed or timed-out runs, over the runs each model ended itself: cancels, orphans, and rate-limited ends are left out. Ranked by the failure rate's 95% lower bound, so a rate from few runs weighs less.";
+/// What Longest median run reads, for its card's tooltip.
+pub const LONGEST_MEDIAN_ABOUT: &str = "The model whose completed runs have the highest median duration, among models with at least 5 completed runs. It reads how long your runs took, not how fast the model is: a model handed bigger tasks takes longer.";
 
 /// The breakdown table's columns, in order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -640,8 +626,8 @@ mod tests {
 
     use super::{
         STATS_COLUMNS, StatsColumn, bar_fraction, chart_bars, compact_lines, days_from_civil,
-        display_key, empty_periods, format_duration_ms, format_pct, most_failed_detail,
-        period_label, plural, rank_is_known, rank_reason, slowest_detail, utc_date_key,
+        display_key, empty_periods, format_duration_ms, format_pct, longest_median_detail,
+        period_label, plural, rank_is_known, rank_reason, utc_date_key,
     };
     use crate::client::{DispatchStatRank, DispatchStatsRow, ProtoI64};
     use crate::models::sort::SortValue;
@@ -769,28 +755,12 @@ mod tests {
             key: "unknown".to_string(),
             ..DispatchStatRank::default()
         }));
-        assert_eq!(slowest_detail(&known), "p50 1.5s over 6 runs");
-        assert_eq!(
-            most_failed_detail(&DispatchStatRank {
-                runs: 16,
-                success_pct: Some(93.8),
-                ..known.clone()
-            }),
-            "1 of 16 runs failed"
-        );
+        assert_eq!(longest_median_detail(&known), "p50 1.5s over 6 runs");
         assert_eq!(
             rank_reason("needs two models with enough runs (minimum 5)"),
             "Needs two models with 5 runs"
         );
         assert_eq!(rank_reason("no failures in range"), "No failures in range");
-        assert_eq!(
-            most_failed_detail(&DispatchStatRank {
-                runs: 2,
-                success_pct: None,
-                ..known.clone()
-            }),
-            "2 runs"
-        );
         assert_eq!(bar_fraction(0, 1, 0.04), 0.04);
         assert_eq!(bar_fraction(3, 3, 0.02), 1.0);
     }

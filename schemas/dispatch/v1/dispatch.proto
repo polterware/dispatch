@@ -47,6 +47,9 @@ message DispatchRun {
   // The run kept its agent's session, so StartRunRequest.resume can send it a
   // follow-up once it has ended.
   bool resumable = 41;
+  // in_place: a writable run that edits its folder itself, with no worktree of
+  // its own (worktree_mode in_place, --worktree, or a folder outside git).
+  bool in_place = 42;
 }
 
 // Tokens a run spent as its agent CLIs reported them, summed over attempts:
@@ -178,6 +181,13 @@ message StartRunRequest {
   // follow-up, in its worktree, as a new run whose resumed_of is that run. The
   // project, directory, and routing fields come from that run.
   string resume = 19;
+  // worktree_mode says whether a writable run gets a git worktree of its own:
+  // "worktree" always (the folder must be a git checkout with commits),
+  // "in_place" never (the run edits the folder itself, and a second one that
+  // would edit it too is refused while the first works), and "auto" or empty,
+  // for callers that predate it, a worktree wherever the folder is a git
+  // checkout with commits. A read-only run never gets one.
+  string worktree_mode = 20;
 }
 
 // The conversation that called dispatch, separate from the worker's resume session.
@@ -205,7 +215,19 @@ message DispatchSection {
 message ListSectionsRequest {}
 message ListSectionsResponse {
   repeated DispatchSection sections = 1;
+  // The names people gave conversations; a conversation without one shows its first message.
+  repeated ConversationName conversation_names = 2;
 }
+message ConversationName {
+  string conversation_id = 1;
+  string name = 2;
+}
+// Names a conversation in the sidebar; an empty name gives back its first message's title.
+message RenameConversationRequest {
+  string conversation_id = 1;
+  string name = 2;
+}
+message RenameConversationResponse {}
 message SaveSectionRequest {
   string id = 1;
   string name = 2;
@@ -508,6 +530,14 @@ message CleanRunRequest {
   bool force = 2;
 }
 
+// Deletes runs for good: the ids given, and every run of conversation_id (in any workspace,
+// whoever started it). It refuses while one of them still works. Each run's worktree and
+// branch are discarded, merged or not, with its agent log and section place.
+message DeleteRunsRequest {
+  repeated string ids = 1;
+  string conversation_id = 2;
+}
+
 message RecoverRunRequest {
   string id = 1;
 }
@@ -615,6 +645,52 @@ message MergeRunResponse {
   string json = 2;
 }
 
+// deleted counts the runs removed; json lists their ids and the worktrees discarded.
+message DeleteRunsResponse {
+  int32 deleted = 1;
+  string json = 2;
+}
+
+// A folder under a repository's .dispatch/worktrees: a run's worktree, or what
+// is left of one.
+message WorktreeFolder {
+  string path = 1;
+  // repo is the checkout the worktree belongs to.
+  string repo = 2;
+  string branch = 3;
+  // run_id names the run the folder is for; run_status is empty when that run
+  // no longer exists.
+  string run_id = 4;
+  string run_status = 5;
+  // changes: uncommitted files, or commits the repository's HEAD does not
+  // have, so there is something to merge.
+  bool changes = 6;
+  // prunable: PruneWorktreeFolders would remove it, since its run ended with
+  // nothing to merge or no longer exists.
+  bool prunable = 7;
+}
+
+// ListWorktreeFolders lists the worktree folders of every repository runs have
+// used, plus the one holding dir.
+message ListWorktreeFoldersRequest {
+  string dir = 1;
+}
+
+message ListWorktreeFoldersResponse {
+  repeated WorktreeFolder folders = 1;
+}
+
+// PruneWorktreeFolders removes the prunable folders and their branches.
+message PruneWorktreeFoldersRequest {
+  string dir = 1;
+}
+
+message PruneWorktreeFoldersResponse {
+  repeated WorktreeFolder removed = 1;
+  // kept are the folders left, as ListWorktreeFolders lists them.
+  repeated WorktreeFolder kept = 2;
+}
+
 // ok is false when the operation ran but reports a failure; json is its body.
 message CleanRunResponse {
   bool ok = 1;
@@ -644,6 +720,7 @@ service DispatchService {
   rpc SaveSection(SaveSectionRequest) returns (SaveSectionResponse);
   rpc DeleteSection(DeleteSectionRequest) returns (DeleteSectionResponse);
   rpc MoveToSection(MoveToSectionRequest) returns (MoveToSectionResponse);
+  rpc RenameConversation(RenameConversationRequest) returns (RenameConversationResponse);
   rpc ListRuns(ListRunsRequest) returns (ListRunsResponse);
   rpc GetRun(GetRunRequest) returns (GetRunResponse);
   rpc StartRun(StartRunRequest) returns (StartRunResponse);
@@ -652,6 +729,8 @@ service DispatchService {
   rpc WatchRun(WatchRunRequest) returns (stream WatchRunResponse);
   rpc ReadRunEvents(ReadRunEventsRequest) returns (ReadRunEventsResponse);
   rpc ListWorktrees(ListWorktreesRequest) returns (ListWorktreesResponse);
+  rpc ListWorktreeFolders(ListWorktreeFoldersRequest) returns (ListWorktreeFoldersResponse);
+  rpc PruneWorktreeFolders(PruneWorktreeFoldersRequest) returns (PruneWorktreeFoldersResponse);
   rpc ListQuota(ListQuotaRequest) returns (ListQuotaResponse);
   rpc ListTiers(ListTiersRequest) returns (ListTiersResponse);
   rpc ListAgents(ListAgentsRequest) returns (ListAgentsResponse);
@@ -670,6 +749,7 @@ service DispatchService {
   rpc ListModelBenchmarks(ListModelBenchmarksRequest) returns (ListModelBenchmarksResponse);
   rpc MergeRun(MergeRunRequest) returns (MergeRunResponse);
   rpc CleanRun(CleanRunRequest) returns (CleanRunResponse);
+  rpc DeleteRuns(DeleteRunsRequest) returns (DeleteRunsResponse);
   rpc RecoverRun(RecoverRunRequest) returns (RecoverRunResponse);
   rpc Config(ConfigRequest) returns (ConfigResponse);
   rpc Subagents(SubagentsRequest) returns (SubagentsResponse);

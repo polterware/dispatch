@@ -147,6 +147,8 @@ pub struct DispatchRun {
     pub conversation_id: String,
     pub caller_agent: String,
     pub resumable: bool,
+    /// A writable run that edits its folder itself, with no worktree of its own.
+    pub in_place: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -291,6 +293,10 @@ pub struct StartRunRequest {
     /// An ended run to send `prompt` to as a follow-up.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub resume: String,
+    /// `worktree` (a git worktree of its own) or `in_place` (the folder itself); empty
+    /// leaves it to the core (a worktree in a git checkout with commits).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub worktree_mode: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -329,7 +335,69 @@ pub struct ListSectionsRequest {}
 #[serde(rename_all = "camelCase", default)]
 pub struct ListSectionsResponse {
     pub sections: Vec<DispatchSection>,
+    /// The names people gave conversations, over their first message.
+    pub conversation_names: Vec<ConversationName>,
 }
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ConversationName {
+    pub conversation_id: String,
+    pub name: String,
+}
+
+/// A folder under a repository's `.dispatch/worktrees`, as `dispatch worktrees` lists it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct WorktreeFolder {
+    pub path: String,
+    pub repo: String,
+    pub branch: String,
+    pub run_id: String,
+    /// Empty when the run no longer exists.
+    pub run_status: String,
+    /// Uncommitted files, or commits the repository's HEAD does not have.
+    pub changes: bool,
+    /// Clean up would remove it.
+    pub prunable: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ListWorktreeFoldersRequest {
+    pub dir: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ListWorktreeFoldersResponse {
+    pub folders: Vec<WorktreeFolder>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PruneWorktreeFoldersRequest {
+    pub dir: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PruneWorktreeFoldersResponse {
+    pub removed: Vec<WorktreeFolder>,
+    pub kept: Vec<WorktreeFolder>,
+}
+
+/// Names a conversation; an empty name gives back its first message's title.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RenameConversationRequest {
+    pub conversation_id: String,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RenameConversationResponse {}
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -707,6 +775,38 @@ pub struct MergeRunRequest {
 pub struct CleanRunRequest {
     pub id: String,
     pub force: bool,
+}
+
+/// Deletes the runs given and every run of `conversation_id`, whoever started them.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DeleteRunsRequest {
+    pub ids: Vec<String>,
+    pub conversation_id: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DeleteRunsResponse {
+    pub deleted: i32,
+    /// `{"ids": [...], "worktrees": [...]}`: the runs deleted and the worktrees discarded.
+    pub json: String,
+}
+
+impl DeleteRunsResponse {
+    /// The ids of the runs the core deleted.
+    pub fn ids(&self) -> Vec<String> {
+        serde_json::from_str::<serde_json::Value>(&self.json)
+            .ok()
+            .and_then(|v| {
+                v["ids"].as_array().map(|ids| {
+                    ids.iter()
+                        .filter_map(|id| id.as_str().map(str::to_owned))
+                        .collect()
+                })
+            })
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -1175,12 +1275,17 @@ const SLOW_PROCEDURES: &[&str] = &[
     "dispatch.v1.DispatchService/CheckTiers",
     "dispatch.v1.DispatchService/Classify",
     "dispatch.v1.DispatchService/CleanRun",
+    // It discards each run's worktree with git.
+    "dispatch.v1.DispatchService/DeleteRuns",
     "dispatch.v1.DispatchService/ListAgents",
     "dispatch.v1.DispatchService/ListModelBenchmarks",
     "dispatch.v1.DispatchService/ListModelCatalog",
     "dispatch.v1.DispatchService/ListModels",
     "dispatch.v1.DispatchService/ListQuota",
+    // Both ask git about every worktree folder.
+    "dispatch.v1.DispatchService/ListWorktreeFolders",
     "dispatch.v1.DispatchService/MergeRun",
+    "dispatch.v1.DispatchService/PruneWorktreeFolders",
     "dispatch.v1.DispatchService/RecoverRun",
     "dispatch.v1.DispatchService/RefreshModelCatalog",
     "dispatch.v1.DispatchService/ReplaceTiers",
@@ -1314,6 +1419,13 @@ impl CoreClient {
         request: &ListSectionsRequest,
     ) -> Result<ListSectionsResponse, CoreError> {
         self.rpc("dispatch.v1.DispatchService/ListSections", request)
+    }
+
+    pub fn rename_conversation(
+        &self,
+        request: &RenameConversationRequest,
+    ) -> Result<RenameConversationResponse, CoreError> {
+        self.rpc("dispatch.v1.DispatchService/RenameConversation", request)
     }
 
     pub fn save_section(
@@ -1497,6 +1609,27 @@ impl CoreClient {
 
     pub fn clean_run(&self, request: &CleanRunRequest) -> Result<CleanRunResponse, CoreError> {
         self.rpc("dispatch.v1.DispatchService/CleanRun", request)
+    }
+
+    pub fn delete_runs(
+        &self,
+        request: &DeleteRunsRequest,
+    ) -> Result<DeleteRunsResponse, CoreError> {
+        self.rpc("dispatch.v1.DispatchService/DeleteRuns", request)
+    }
+
+    pub fn list_worktree_folders(
+        &self,
+        request: &ListWorktreeFoldersRequest,
+    ) -> Result<ListWorktreeFoldersResponse, CoreError> {
+        self.rpc("dispatch.v1.DispatchService/ListWorktreeFolders", request)
+    }
+
+    pub fn prune_worktree_folders(
+        &self,
+        request: &PruneWorktreeFoldersRequest,
+    ) -> Result<PruneWorktreeFoldersResponse, CoreError> {
+        self.rpc("dispatch.v1.DispatchService/PruneWorktreeFolders", request)
     }
 
     pub fn recover_run(
@@ -1717,11 +1850,50 @@ mod tests {
     use std::{fs, os::unix::fs::PermissionsExt};
 
     use super::{
-        CoreError, DispatchRun, EnvelopeDecoder, GetRunResponse, ListRunsResponse, MAX_AT_ONCE,
-        ProtoI64, QUICK_READ, ResultResponse, SLOW_PROCEDURES, SLOW_READ, WatchRunResponse,
+        ConversationName, CoreError, DeleteRunsResponse, DispatchRun, EnvelopeDecoder,
+        GetRunResponse, ListRunsResponse, ListSectionsResponse, MAX_AT_ONCE, ProtoI64, QUICK_READ,
+        RenameConversationRequest, ResultResponse, SLOW_PROCEDURES, SLOW_READ, WatchRunResponse,
         at_once, each_at_once, encode_envelope, end_stream_error, interpret_frame,
         read_core_config, read_timeout, strip_ansi, validate_loopback_endpoint,
     };
+
+    #[test]
+    fn a_delete_reads_back_the_runs_it_removed() {
+        let response = DeleteRunsResponse {
+            deleted: 2,
+            json: r#"{"ids":["a1","a2"],"worktrees":["/w/a1"]}"#.into(),
+        };
+        assert_eq!(response.ids(), ["a1", "a2"]);
+        assert!(DeleteRunsResponse::default().ids().is_empty());
+        assert_eq!(
+            super::read_timeout("dispatch.v1.DispatchService/DeleteRuns"),
+            SLOW_READ
+        );
+    }
+
+    #[test]
+    fn a_section_list_reads_the_names_given_to_conversations() {
+        let response: ListSectionsResponse = serde_json::from_str(
+            r#"{"sections":[],"conversationNames":[{"conversationId":"c1","name":"Release notes"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            response.conversation_names,
+            [ConversationName {
+                conversation_id: "c1".into(),
+                name: "Release notes".into(),
+            }]
+        );
+        let request = serde_json::to_value(RenameConversationRequest {
+            conversation_id: "c1".into(),
+            name: String::new(),
+        })
+        .unwrap();
+        assert_eq!(
+            request,
+            serde_json::json!({"conversationId": "c1", "name": ""})
+        );
+    }
 
     #[test]
     fn two_calls_run_at_the_same_time() {

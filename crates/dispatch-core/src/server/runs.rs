@@ -75,6 +75,59 @@ pub(crate) fn which(bin: &str) -> bool {
         .any(|d| executable(&Path::new(if d.is_empty() { "." } else { d }).join(bin)))
 }
 
+/// What the refusal of a second run editing a folder in place offers, word for word: the
+/// app finds it to offer New worktree in one click.
+pub const IN_PLACE_BUSY_HINT: &str = "--worktree-mode worktree";
+
+/// `StartRunRequest.worktree_mode`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorktreeMode {
+    /// A worktree wherever the folder is a git checkout with commits: callers that
+    /// predate the field.
+    Auto,
+    Worktree,
+    InPlace,
+}
+
+pub(crate) fn worktree_mode(value: &str) -> RpcResult<WorktreeMode> {
+    match value.trim() {
+        "" | "auto" => Ok(WorktreeMode::Auto),
+        "worktree" => Ok(WorktreeMode::Worktree),
+        "in_place" | "in-place" => Ok(WorktreeMode::InPlace),
+        other => Err(RpcError::invalid(format!(
+            "worktree mode must be worktree, in-place, or auto, not {other:?}"
+        ))),
+    }
+}
+
+/// Whether a run in `dir` can get a worktree: the folder is in a git checkout with commits.
+pub(crate) fn can_branch(dir: &str) -> bool {
+    let root = worktree::root(dir);
+    !root.is_empty() && worktree::has_commits(&root)
+}
+
+/// Whether a run edits `dir` itself rather than a worktree of its own: a writable run given a
+/// folder to work in, or one in a folder that is not a git checkout with commits. Every other
+/// run reads only, or gets its own worktree, so any number of them share a folder.
+pub(crate) fn edits_in_place(
+    read_only: bool,
+    no_worktree: bool,
+    worktree: &str,
+    dir: &str,
+) -> bool {
+    if read_only {
+        return false;
+    }
+    if no_worktree {
+        return true;
+    }
+    if !worktree.is_empty() {
+        return false;
+    }
+    let root = worktree::root(dir);
+    root.is_empty() || !worktree::has_commits(&root)
+}
+
 pub(crate) fn same_dir(a: &str, b: &str) -> bool {
     if a.is_empty() || b.is_empty() {
         return false;
@@ -140,7 +193,9 @@ fn since_text(t: Option<DateTime<Utc>>) -> String {
 
 /// Saves the run's worktree with the status its run's end gives it.
 pub(crate) fn save_run_worktree(store: &dyn types::Store, run: &Run) -> Result<(), Error> {
-    if run.worktree.is_empty() {
+    // A folder already gone keeps the status its removal wrote (an empty run's worktree
+    // goes as the run ends).
+    if run.worktree.is_empty() || !Path::new(&run.worktree).exists() {
         return Ok(());
     }
     let status = match run.status.as_str() {
@@ -282,8 +337,14 @@ impl Core {
         // project's only repository; a standalone workspace runs in its folder.
         let mut dir = expand_path(&m.dir);
         let req_worktree = m.worktree.trim().to_owned();
-        let no_worktree = !req_worktree.is_empty();
-        if no_worktree {
+        let mode = worktree_mode(&m.worktree_mode)?;
+        if mode == WorktreeMode::Worktree && !req_worktree.is_empty() {
+            return Err(RpcError::invalid(
+                "--worktree runs in that folder itself: it cannot also get a new worktree",
+            ));
+        }
+        let no_worktree = !req_worktree.is_empty() || mode == WorktreeMode::InPlace;
+        if !req_worktree.is_empty() {
             dir = expand_path(&req_worktree);
         }
         let card_slug = m.card_slug.trim().to_owned();
@@ -292,23 +353,14 @@ impl Core {
             .await
             .map_err(|e| RpcError::invalid(e.to_string()))?;
         let dir = absolute(&hosted.dir);
+        if mode == WorktreeMode::Worktree && !m.read_only && !can_branch(&dir) {
+            return Err(RpcError::invalid(format!(
+                "{dir} is not a git checkout with commits, so a run there cannot get a worktree: run it in the folder itself (--worktree-mode in-place)"
+            )));
+        }
         let deps = self.deps_in(&dir).map_err(RpcError::internal)?;
 
         let start = self.start_mu.lock().await;
-        let existing = self
-            .store
-            .list_runs(&project_id, 0, 0, "")
-            .map_err(RpcError::internal)?;
-        for r in &existing {
-            if r.status != STATUS_PENDING && r.status != STATUS_RUNNING {
-                continue;
-            }
-            if same_dir(&r.dir, &dir) || (!r.worktree.is_empty() && same_dir(&r.worktree, &dir)) {
-                return Err(RpcError::invalid(format!(
-                    "another dispatch run is already active in {dir}"
-                )));
-            }
-        }
         let caller = m.caller.unwrap_or_default();
         let mut opts = Options {
             caller: Caller {
@@ -341,6 +393,35 @@ impl Core {
         if !profile.is_empty() {
             self.apply_profile(&mut opts, profile)
                 .map_err(|e| RpcError::invalid(e.to_string()))?;
+        }
+        // Runs share a folder freely; only two editing the same folder itself would clash.
+        if edits_in_place(opts.read_only, no_worktree, "", &dir) {
+            let busy = self
+                .store
+                .list_runs(&project_id, 0, 0, "")
+                .map_err(RpcError::internal)?
+                .into_iter()
+                .find(|r| {
+                    (r.status == STATUS_PENDING || r.status == STATUS_RUNNING)
+                        && edits_in_place(r.read_only, r.no_worktree, &r.worktree, &r.dir)
+                        && same_dir(&r.dir, &dir)
+                });
+            if let Some(busy) = busy {
+                let way_out = if can_branch(&dir) {
+                    format!(
+                        "start this one in a new worktree ({IN_PLACE_BUSY_HINT}), read-only, or once that run ends"
+                    )
+                } else {
+                    "start this one read-only, or once that run ends".to_owned()
+                };
+                return Err(RpcError::new(
+                    "failed_precondition",
+                    format!(
+                        "run {} is editing {dir} itself, with no worktree of its own: {way_out}",
+                        short_run(&busy.id)
+                    ),
+                ));
+            }
         }
         let begun = deps.begin(opts).await;
         drop(start);

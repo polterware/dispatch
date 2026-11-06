@@ -37,6 +37,9 @@ pub(crate) const OPS_USAGE: &str = "       dispatch wait <id> [--timeout <dur>] 
        dispatch doctor [--json]
        dispatch merge <id>
        dispatch clean <id> [--force]
+       dispatch worktrees [--prune] [--dir <repo>] [--json]
+       dispatch delete <id>... | --conversation <id> [--json]   (ended runs, their transcripts, and the worktrees Dispatch cut for them)
+       dispatch rename <conversation-id> <name>   (an empty name gives the conversation back its first prompt)
        dispatch recover <id>
        dispatch roles [--check] [--dir <repo>]
        dispatch roles save <name> [--when <text>] [--tier easy|normal|hard] [--easy|--normal|--hard agent/model,...] [--readonly] [--instructions <text>] [--manual] [--prefer a,b] [--avoid a,b] [--timeout <dur>] | remove <name>
@@ -730,6 +733,195 @@ pub(super) async fn clean(db_path: &Path, args: &[String]) -> CliResult {
         .await
         .map_err(run_error)?;
     print_op(res.ok, &res.json)
+}
+
+/// `dispatch delete <id>... | --conversation <id>`: deletes ended runs for good, as the app's
+/// Delete run and Delete conversation do: their records, transcripts, and the worktrees and
+/// branches Dispatch cut for them, merged or not. A run still working is refused.
+pub(super) async fn delete(db_path: &Path, args: &[String]) -> CliResult {
+    let mut f = Flags::new("dispatch delete");
+    f.string("conversation", "", "delete every run of this conversation")
+        .bool("json", false, "print one JSON object");
+    let ids = f.parse_interspersed(args)?;
+    let conversation = f.str("conversation");
+    if ids.is_empty() && conversation.trim().is_empty() {
+        return Err(usage_err(format!(
+            "dispatch delete needs run ids or --conversation\n{OPS_USAGE}"
+        )));
+    }
+    let c = super::dial(db_path).await?;
+    let res = c
+        .dispatch
+        .delete_runs(&pb::DeleteRunsRequest {
+            ids,
+            conversation_id: conversation.trim().to_owned(),
+        })
+        .await
+        .map_err(run_error)?;
+    if f.flag("json") {
+        return print_op(true, &res.json);
+    }
+    let body: Value = serde_json::from_str(&res.json).unwrap_or(Value::Null);
+    let worktrees = body
+        .get("worktrees")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    println!(
+        "deleted {} run{}{}",
+        res.deleted,
+        if res.deleted == 1 { "" } else { "s" },
+        match worktrees {
+            0 => String::new(),
+            1 => " and its worktree".to_string(),
+            n => format!(" and {n} worktrees"),
+        }
+    );
+    Ok(())
+}
+
+/// `dispatch rename <conversation-id> <name>`: the name the app shows for a conversation; an
+/// empty one gives it back its first prompt.
+pub(super) async fn rename(db_path: &Path, args: &[String]) -> CliResult {
+    let mut f = Flags::new("dispatch rename");
+    let positional = f.parse_interspersed(args)?;
+    let [conversation, name @ ..] = positional.as_slice() else {
+        return Err(usage_err(format!(
+            "dispatch rename needs a conversation id and a name\n{OPS_USAGE}"
+        )));
+    };
+    let name = name.join(" ");
+    let c = super::dial(db_path).await?;
+    c.dispatch
+        .rename_conversation(&pb::RenameConversationRequest {
+            conversation_id: conversation.trim().to_owned(),
+            name: name.trim().to_owned(),
+        })
+        .await
+        .map_err(run_error)?;
+    if name.trim().is_empty() {
+        println!("conversation {conversation} named by its first prompt again");
+    } else {
+        println!("conversation {conversation} renamed {:?}", name.trim());
+    }
+    Ok(())
+}
+
+/// `dispatch worktrees [--prune]`: every folder under a repository's `.dispatch/worktrees`,
+/// with its run, the run's status, and whether it has anything to merge; `--prune` removes
+/// the ones whose run ended with nothing to merge, or no longer exists.
+pub(super) async fn worktrees(db_path: &Path, args: &[String]) -> CliResult {
+    let mut f = Flags::new("dispatch worktrees");
+    f.bool(
+        "prune",
+        false,
+        "remove the worktrees whose run ended with nothing to merge, or no longer exists",
+    )
+    .string(
+        "dir",
+        "",
+        "also look in the repository holding this folder (default: current directory)",
+    )
+    .bool("json", false, "print one JSON object");
+    if !f.parse_interspersed(args)?.is_empty() {
+        return Err(usage_err(format!(
+            "dispatch worktrees takes no arguments\n{OPS_USAGE}"
+        )));
+    }
+    let dir = working_dir(&f.str("dir"))?;
+    let c = super::dial(db_path).await?;
+    let (removed, kept, pruned) = if f.flag("prune") {
+        let res = c
+            .dispatch
+            .prune_worktree_folders(&pb::PruneWorktreeFoldersRequest { dir })
+            .await?;
+        (res.removed, res.kept, true)
+    } else {
+        let res = c
+            .dispatch
+            .list_worktree_folders(&pb::ListWorktreeFoldersRequest { dir })
+            .await?;
+        (Vec::new(), res.folders, false)
+    };
+    if f.flag("json") {
+        let rows = |items: &[pb::WorktreeFolder]| -> Vec<Value> {
+            items.iter().map(folder_json).collect()
+        };
+        let body = if pruned {
+            serde_json::json!({"removed": rows(&removed), "kept": rows(&kept)})
+        } else {
+            serde_json::json!({"worktrees": rows(&kept)})
+        };
+        write_json(&body)?;
+        return Ok(());
+    }
+    let mut out = String::new();
+    if pruned {
+        out.push_str(&format!("removed {}\n", plural_worktrees(removed.len())));
+        for item in &removed {
+            out.push_str(&format!("  {}\n", item.path));
+        }
+    }
+    if kept.is_empty() {
+        if !pruned {
+            out.push_str("no worktrees\n");
+        }
+    } else {
+        if pruned {
+            out.push_str("kept:\n");
+        }
+        for item in &kept {
+            out.push_str(&format!("{}\n", folder_line(item)));
+        }
+        let prunable = kept.iter().filter(|item| item.prunable).count();
+        if !pruned && prunable > 0 {
+            out.push_str(&format!(
+                "{} can go: dispatch worktrees --prune\n",
+                plural_worktrees(prunable)
+            ));
+        }
+    }
+    super::print_out(&out)?;
+    Ok(())
+}
+
+fn plural_worktrees(n: usize) -> String {
+    if n == 1 {
+        "1 worktree".into()
+    } else {
+        format!("{n} worktrees")
+    }
+}
+
+/// One folder as `dispatch worktrees` prints it: run, status, changes, branch, path.
+fn folder_line(item: &pb::WorktreeFolder) -> String {
+    let run = item.run_id.get(..12).unwrap_or(&item.run_id);
+    let status = if item.run_status.is_empty() {
+        "no run".to_owned()
+    } else {
+        item.run_status.to_lowercase()
+    };
+    let changes = if item.changes {
+        "changes"
+    } else {
+        "no changes"
+    };
+    let prune = if item.prunable { "  (can go)" } else { "" };
+    format!(
+        "{run:<12}  {status:<10}  {changes:<10}  {:<20}  {}{prune}",
+        item.branch, item.path
+    )
+}
+
+fn folder_json(item: &pb::WorktreeFolder) -> Value {
+    serde_json::json!({
+        "path": item.path,
+        "repo": item.repo,
+        "branch": item.branch,
+        "run_id": item.run_id,
+        "run_status": item.run_status,
+        "changes": item.changes,
+        "prunable": item.prunable,
+    })
 }
 
 pub(super) async fn recover(db_path: &Path, args: &[String]) -> CliResult {

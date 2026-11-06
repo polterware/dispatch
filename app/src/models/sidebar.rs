@@ -23,7 +23,9 @@ pub const HOVER_CLOSE_MS: u64 = 150;
 #[serde(rename_all = "lowercase")]
 pub enum GroupBy {
     Conversation,
-    Workspace,
+    /// One group a repository. A Display saved before runs grouped so says `workspace`.
+    #[serde(alias = "workspace")]
+    Repository,
     Date,
     Status,
     Agent,
@@ -77,7 +79,8 @@ impl GroupBy {
     fn parse(value: &str) -> Option<Self> {
         Some(match value {
             "conversation" => Self::Conversation,
-            "workspace" => Self::Workspace,
+            // `workspace` is what a Display saved before runs grouped by repository.
+            "repository" | "workspace" => Self::Repository,
             "date" => Self::Date,
             "status" => Self::Status,
             "agent" => Self::Agent,
@@ -89,7 +92,7 @@ impl GroupBy {
     fn as_str(self) -> &'static str {
         match self {
             Self::Conversation => "conversation",
-            Self::Workspace => "workspace",
+            Self::Repository => "repository",
             Self::Date => "date",
             Self::Status => "status",
             Self::Agent => "agent",
@@ -139,6 +142,8 @@ pub struct SidebarRun {
     pub model: String,
     pub project_id: String,
     pub workspace_name: String,
+    /// The repository the run works in: its main checkout, else its folder.
+    pub repo: String,
     pub branch: String,
     pub created_at: String,
     pub started_at: String,
@@ -170,7 +175,13 @@ pub fn has_unseen_update(run: &SidebarRun, seen: &HashMap<String, String>) -> bo
 }
 
 impl SidebarRun {
-    pub fn from_dispatch(run: &DispatchRun, workspace_name: &str) -> Self {
+    pub fn from_dispatch(run: &DispatchRun, workspace_name: &str, workspace_path: &str) -> Self {
+        let repo = [run.repo.as_str(), run.dir.as_str(), workspace_path]
+            .into_iter()
+            .map(|path| path.trim().trim_end_matches('/'))
+            .find(|path| !path.is_empty())
+            .map(main_checkout)
+            .unwrap_or_default();
         Self {
             id: run.id.clone(),
             prompt: run.prompt.clone(),
@@ -179,6 +190,7 @@ impl SidebarRun {
             model: run.model.clone(),
             project_id: run.project_id.clone(),
             workspace_name: workspace_name.to_string(),
+            repo,
             branch: run.branch.clone(),
             created_at: run.created_at.clone(),
             started_at: run.started_at.clone(),
@@ -193,6 +205,72 @@ impl SidebarRun {
     }
 }
 
+/// The runs a group's Delete runs takes: each ended row's run and the earlier runs folded
+/// into it. A row still working is left out, since the core refuses to delete it.
+pub fn ended_run_ids(runs: &[SidebarRun]) -> Vec<String> {
+    let mut ids = Vec::new();
+    for run in runs {
+        let working = matches!(
+            run.status.to_ascii_lowercase().as_str(),
+            "pending" | "running" | "queued"
+        );
+        if working {
+            continue;
+        }
+        for id in run.earlier.iter().chain(std::iter::once(&run.id)) {
+            if !ids.contains(id) {
+                ids.push(id.clone());
+            }
+        }
+    }
+    ids
+}
+
+/// The main checkout of the repository `path` is in, as the core names a repository
+/// (`worktree::main_root`), read without git so the sidebar can ask for every row: a linked
+/// worktree's `.git` file points into the main checkout's `.git/worktrees`, and a Dispatch
+/// worktree that is gone is still under its repository's `.dispatch/worktrees`. Any other
+/// path is its own. Answers are kept, since a folder's repository does not change.
+pub fn main_checkout(path: &str) -> String {
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(Default::default);
+    if let Some(found) = seen.lock().ok().and_then(|seen| seen.get(path).cloned()) {
+        return found;
+    }
+    let found = read_main_checkout(path);
+    if let Ok(mut seen) = seen.lock() {
+        seen.insert(path.to_string(), found.clone());
+    }
+    found
+}
+
+fn read_main_checkout(path: &str) -> String {
+    let dot_git = std::path::Path::new(path).join(".git");
+    if let Ok(text) = std::fs::read_to_string(&dot_git)
+        && let Some(gitdir) = text.trim().strip_prefix("gitdir:")
+    {
+        // `<main>/.git/worktrees/<name>`.
+        let gitdir = std::path::Path::new(gitdir.trim());
+        let gitdir = if gitdir.is_relative() {
+            std::path::Path::new(path).join(gitdir)
+        } else {
+            gitdir.to_path_buf()
+        };
+        if let Some(main_git) = gitdir.parent().and_then(|worktrees| {
+            (worktrees.file_name()? == "worktrees").then(|| worktrees.parent())?
+        }) && main_git.file_name().is_some_and(|name| name == ".git")
+            && let Some(main) = main_git.parent()
+        {
+            return main.to_string_lossy().into_owned();
+        }
+    }
+    if let Some((repo, _)) = path.split_once("/.dispatch/worktrees/") {
+        return repo.to_string();
+    }
+    path.to_string()
+}
+
 /// Joins each run to its workspace name. A missing workspace leaves the name empty
 /// so grouping can fall back to the project id.
 ///
@@ -200,9 +278,12 @@ impl SidebarRun {
 /// message started, which shows the latest status under the chat's first prompt and its
 /// first run's created time.
 pub fn sidebar_runs(workspaces: &[Workspace], runs: &[DispatchRun]) -> Vec<SidebarRun> {
-    let mut names: HashMap<&str, &str> = HashMap::new();
+    let mut names: HashMap<&str, (&str, &str)> = HashMap::new();
     for workspace in workspaces {
-        names.insert(workspace.id.as_str(), workspace.name.as_str());
+        names.insert(
+            workspace.id.as_str(),
+            (workspace.name.as_str(), workspace.path.as_str()),
+        );
     }
     let by_id: HashMap<&str, &DispatchRun> =
         runs.iter().map(|run| (run.id.as_str(), run)).collect();
@@ -214,8 +295,11 @@ pub fn sidebar_runs(workspaces: &[Workspace], runs: &[DispatchRun]) -> Vec<Sideb
     runs.iter()
         .filter(|run| !followed.contains(run.id.as_str()))
         .map(|run| {
-            let name = names.get(run.project_id.as_str()).copied().unwrap_or("");
-            let mut row = SidebarRun::from_dispatch(run, name);
+            let (name, path) = names
+                .get(run.project_id.as_str())
+                .copied()
+                .unwrap_or(("", ""));
+            let mut row = SidebarRun::from_dispatch(run, name, path);
             let mut at = run;
             while let Some(prev) = by_id.get(at.resumed_of.trim()) {
                 if row.earlier.iter().any(|id| id == &prev.id) || prev.id == run.id {
@@ -236,7 +320,7 @@ pub fn sidebar_runs(workspaces: &[Workspace], runs: &[DispatchRun]) -> Vec<Sideb
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GroupKind {
     Conversation,
-    Workspace,
+    Repository,
     Date,
     Status,
     Agent,
@@ -418,6 +502,28 @@ pub fn section_ref(group_id: &str) -> Option<&str> {
     group_id.strip_prefix("section:")
 }
 
+/// The repository a Group by Repository group stands for: its main checkout's path (or,
+/// for runs with no folder, their workspace's id).
+pub fn repository_ref(group_id: &str) -> Option<&str> {
+    let rest = group_id.strip_prefix("repository:")?;
+    if rest.is_empty() { None } else { Some(rest) }
+}
+
+/// The workspace Remove repository forgets for a repository group: one added on its own
+/// whose folder is that repository (or whose id the group fell back to). A repository a
+/// Polterware project brings follows the project, so it has none.
+pub fn removable_repository(repository: &str, workspaces: &[Workspace]) -> Option<String> {
+    let key = repository.trim_end_matches('/');
+    workspaces
+        .iter()
+        .filter(|workspace| workspace.polterware_project_id.is_empty())
+        .find(|workspace| {
+            workspace.id == key
+                || (!workspace.path.is_empty() && workspace.path.trim_end_matches('/') == key)
+        })
+        .map(|workspace| workspace.id.clone())
+}
+
 /// What the runs list shows besides its groups: one thing at a time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunsNotice {
@@ -448,7 +554,7 @@ pub fn runs_notice(listed: bool, connecting: bool, failed: bool) -> RunsNotice {
 fn kind_of(group_by: GroupBy) -> GroupKind {
     match group_by {
         GroupBy::Conversation => GroupKind::Conversation,
-        GroupBy::Workspace => GroupKind::Workspace,
+        GroupBy::Repository => GroupKind::Repository,
         GroupBy::Date => GroupKind::Date,
         GroupBy::Status => GroupKind::Status,
         GroupBy::Agent => GroupKind::Agent,
@@ -477,14 +583,15 @@ fn automatic_key(
                 )
             }
         }
-        GroupBy::Workspace => {
-            let key = run.project_id.clone();
-            let title = if run.workspace_name.trim().is_empty() {
-                key.clone()
+        GroupBy::Repository => {
+            // One repository is one group, whatever workspace or worktree its runs came
+            // through; a run with no folder falls back to its workspace.
+            let key = if run.repo.is_empty() {
+                run.project_id.clone()
             } else {
-                run.workspace_name.clone()
+                run.repo.clone()
             };
-            (key, title, None)
+            (key, repository_title(run), None)
         }
         GroupBy::Date => {
             let title = date_group(&run.created_at, now_ms).to_string();
@@ -505,6 +612,42 @@ fn automatic_key(
         }
         GroupBy::None => ("all".to_string(), "All runs".to_string(), None),
     }
+}
+
+/// A repository group's title: its folder's name, as harnesses name a project.
+fn repository_title(run: &SidebarRun) -> String {
+    let name = std::path::Path::new(&run.repo)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    [
+        name.as_str(),
+        run.workspace_name.trim(),
+        run.project_id.as_str(),
+    ]
+    .into_iter()
+    .find(|title| !title.is_empty())
+    .unwrap_or("Repository")
+    .to_string()
+}
+
+/// The section that holds the item itself: a `kind` item ("run" or "conversation") whose ref
+/// is one of `refs` (a run row's id and its earlier ones). `None` when the item is in no
+/// section, or shows in one only through its conversation.
+pub fn holding_section<'a>(
+    sections: &'a [DispatchSection],
+    kind: &str,
+    refs: &[&str],
+) -> Option<&'a str> {
+    sections
+        .iter()
+        .find(|section| {
+            section
+                .items
+                .iter()
+                .any(|item| item.kind == kind && refs.contains(&item.item_ref.as_str()))
+        })
+        .map(|section| section.id.as_str())
 }
 
 fn section_index(sections: &[&DispatchSection], run: &SidebarRun) -> Option<usize> {
@@ -838,6 +981,7 @@ mod tests {
             model: String::new(),
             project_id: String::new(),
             workspace_name: String::new(),
+            repo: String::new(),
             branch: String::new(),
             created_at: "2026-11-02T09:00:00Z".to_string(),
             started_at: String::new(),
@@ -1003,11 +1147,104 @@ mod tests {
     }
 
     #[test]
-    fn uses_workspace_names_and_run_agents_for_the_corresponding_groups() {
+    fn finds_the_section_that_holds_an_item_itself() {
+        let sections = vec![
+            section("chat", 0, vec![item("conversation", "c1")]),
+            section("row", 1, vec![item("run", "old")]),
+        ];
+        assert_eq!(
+            super::holding_section(&sections, "conversation", &["c1"]),
+            Some("chat")
+        );
+        // A run row holds its section through an earlier run it folds in.
+        assert_eq!(
+            super::holding_section(&sections, "run", &["new", "old"]),
+            Some("row")
+        );
+        // A run of a conversation in a section is not in it itself.
+        assert_eq!(super::holding_section(&sections, "run", &["c1"]), None);
+        assert_eq!(
+            super::holding_section(&sections, "conversation", &["c2"]),
+            None
+        );
+    }
+
+    #[test]
+    fn delete_runs_takes_the_ended_rows_and_their_earlier_runs() {
+        let rows = vec![
+            run("a", |run| {
+                run.status = "COMPLETED".into();
+                run.earlier = vec!["a0".into()];
+            }),
+            run("b", |run| run.status = "RUNNING".into()),
+            run("c", |run| run.status = "failed".into()),
+        ];
+        assert_eq!(super::ended_run_ids(&rows), ["a0", "a", "c"]);
+    }
+
+    #[test]
+    fn a_worktree_is_grouped_with_its_main_checkout() {
+        let root = tempfile::tempdir().unwrap();
+        let main = root.path().join("app");
+        let linked = root.path().join("lanes").join("core-c");
+        std::fs::create_dir_all(main.join(".git").join("worktrees").join("core-c")).unwrap();
+        std::fs::create_dir_all(&linked).unwrap();
+        std::fs::write(
+            linked.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                main.join(".git").join("worktrees").join("core-c").display()
+            ),
+        )
+        .unwrap();
+        let main_path = main.to_string_lossy().into_owned();
+        assert_eq!(super::main_checkout(&linked.to_string_lossy()), main_path);
+        assert_eq!(super::main_checkout(&main_path), main_path);
+        // A Dispatch worktree that is gone still names its repository.
+        assert_eq!(
+            super::main_checkout("/code/app/.dispatch/worktrees/3d38a36d"),
+            "/code/app"
+        );
+        assert_eq!(super::main_checkout("/gone/lane"), "/gone/lane");
+    }
+
+    #[test]
+    fn a_repository_group_can_remove_the_workspace_it_was_added_as() {
+        let workspace = |id: &str, path: &str, project: &str| crate::client::Workspace {
+            id: id.into(),
+            path: path.into(),
+            polterware_project_id: project.into(),
+            ..crate::client::Workspace::default()
+        };
+        let all = [
+            workspace("ws-a", "/code/dispatch", ""),
+            workspace("ws-home", "/Users/me", ""),
+            workspace("proj-1", "", "pw-1"),
+        ];
+        assert_eq!(
+            super::repository_ref("repository:/code/dispatch"),
+            Some("/code/dispatch")
+        );
+        assert_eq!(super::repository_ref("conversation:c1"), None);
+        assert_eq!(
+            super::removable_repository("/code/dispatch/", &all).as_deref(),
+            Some("ws-a")
+        );
+        assert_eq!(
+            super::removable_repository("/Users/me", &all).as_deref(),
+            Some("ws-home")
+        );
+        assert_eq!(super::removable_repository("proj-1", &all), None);
+        assert_eq!(super::removable_repository("/code/other", &all), None);
+    }
+
+    #[test]
+    fn groups_by_repository_and_by_agent() {
         let runs = vec![
             run("a", |run| {
-                run.project_id = "one".into();
-                run.workspace_name = "First".into();
+                run.project_id = "home".into();
+                run.workspace_name = "Home".into();
+                run.repo = "/code/dispatch".into();
                 run.agent = "codex".into();
             }),
             run("b", |run| {
@@ -1015,20 +1252,27 @@ mod tests {
                 run.workspace_name = "Second".into();
                 run.agent = "claude".into();
             }),
+            run("c", |run| {
+                // Another workspace, the same repository: one group.
+                run.project_id = "other".into();
+                run.repo = "/code/dispatch".into();
+                run.agent = "codex".into();
+            }),
         ];
-        let by_workspace = display(|display| display.group_by = GroupBy::Workspace);
+        let by_repository = display(|display| display.group_by = GroupBy::Repository);
         let titles = |groups: Vec<super::SidebarGroup>| -> Vec<String> {
             groups.into_iter().map(|group| group.title).collect()
         };
         assert_eq!(
-            titles(group_sidebar_runs(&runs, &[], &by_workspace, 0)),
-            ["First", "Second"]
+            titles(group_sidebar_runs(&runs, &[], &by_repository, 0)),
+            ["dispatch", "Second"]
         );
         let by_agent = display(|display| display.group_by = GroupBy::Agent);
         assert_eq!(
             titles(group_sidebar_runs(&runs, &[], &by_agent, 0)),
             ["codex", "claude"]
         );
+        assert_eq!(GroupBy::parse("workspace"), Some(GroupBy::Repository));
     }
 
     #[test]

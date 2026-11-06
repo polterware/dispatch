@@ -73,6 +73,12 @@ async fn check(State(core): State<Arc<Core>>, headers: HeaderMap, body: Bytes) -
                 uptime_sec: core.started.elapsed().as_secs_f64(),
                 build: core.build.clone(),
                 pid: i32::try_from(std::process::id()).unwrap_or(0),
+                active_runs: core
+                    .store
+                    .count_active_runs()
+                    .ok()
+                    .and_then(|n| i32::try_from(n).ok())
+                    .unwrap_or(0),
             }),
         ),
         Err(e) => e.into_response(),
@@ -132,6 +138,11 @@ pub(super) fn router(core: Arc<Core>) -> Router {
     );
     let r = unary!(
         r,
+        "/dispatch.v1.DispatchService/RenameConversation",
+        rename_conversation
+    );
+    let r = unary!(
+        r,
         "/dispatch.v1.DispatchService/MoveToSection",
         move_to_section
     );
@@ -188,6 +199,17 @@ pub(super) fn router(core: Arc<Core>) -> Router {
     );
     let r = unary!(r, "/dispatch.v1.DispatchService/MergeRun", merge_run);
     let r = unary!(r, "/dispatch.v1.DispatchService/CleanRun", clean_run);
+    let r = unary!(r, "/dispatch.v1.DispatchService/DeleteRuns", delete_runs);
+    let r = unary!(
+        r,
+        "/dispatch.v1.DispatchService/ListWorktreeFolders",
+        list_worktree_folders
+    );
+    let r = unary!(
+        r,
+        "/dispatch.v1.DispatchService/PruneWorktreeFolders",
+        prune_worktree_folders
+    );
     let r = unary!(r, "/dispatch.v1.DispatchService/RecoverRun", recover_run);
     let r = unary!(r, "/dispatch.v1.DispatchService/Config", config);
     let r = unary!(r, "/dispatch.v1.DispatchService/Subagents", subagents);

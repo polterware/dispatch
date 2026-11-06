@@ -93,3 +93,71 @@ fn test_clean_unmerged_worktree() {
         "worktree still exists"
     );
 }
+
+#[test]
+fn test_prune_removes_only_what_runs_left_with_nothing_to_merge() {
+    use dispatch_core::types::STATUS_RUNNING;
+    let t = test_deps(vec![]);
+    let root_dir = temp_dir();
+    let root = path_of(&root_dir);
+    git(&root, &["init", "-q"]);
+    git(&root, &["commit", "--allow-empty", "-qm", "base"]);
+    let base = t.deps.worktree_dir.clone();
+    let cut = |id: &str, status: &str, saved: bool, commit: bool| -> String {
+        let path = format!("{base}/{id}");
+        let branch = worktree::create(&root, &path, id).unwrap();
+        let base_sha = worktree::head(&path).unwrap();
+        if commit {
+            std::fs::write(format!("{path}/work.txt"), "work\n").unwrap();
+            git(&path, &["add", "work.txt"]);
+            git(&path, &["commit", "-qm", "work"]);
+        }
+        if saved {
+            t.store
+                .save_run(&Run {
+                    id: id.into(),
+                    status: status.into(),
+                    repo: root.clone(),
+                    dir: root.clone(),
+                    worktree: path.clone(),
+                    branch,
+                    base_sha,
+                    ..Run::default()
+                })
+                .unwrap();
+        }
+        path
+    };
+    let empty = cut("ended-empty", STATUS_COMPLETED, true, false);
+    let changed = cut("with-changes", STATUS_COMPLETED, true, true);
+    let working = cut("still-working", STATUS_RUNNING, true, false);
+    let ghost = cut("no-run", "", false, false);
+
+    let listed = t.deps.worktree_folders(&root).unwrap();
+    let by_id = |id: &str| listed.iter().find(|f| f.run_id == id).cloned().unwrap();
+    assert_eq!(listed.len(), 4, "{listed:?}");
+    assert!(by_id("ended-empty").prunable && !by_id("ended-empty").changes);
+    assert!(by_id("with-changes").changes && !by_id("with-changes").prunable);
+    assert!(!by_id("still-working").prunable);
+    assert!(by_id("no-run").prunable && by_id("no-run").run_status.is_empty());
+    assert_eq!(by_id("with-changes").branch, "dispatch/with-changes");
+
+    let (removed, kept) = t.deps.prune_worktree_folders(&root).unwrap();
+    let mut gone: Vec<&str> = removed.iter().map(|f| f.run_id.as_str()).collect();
+    gone.sort_unstable();
+    assert_eq!(gone, ["ended-empty", "no-run"]);
+    assert_eq!(kept.len(), 2);
+    for path in [&empty, &ghost] {
+        assert!(!std::path::Path::new(path).exists(), "{path} stayed");
+    }
+    for path in [&changed, &working] {
+        assert!(std::path::Path::new(path).exists(), "{path} went");
+    }
+    let branches = git(&root, &["branch", "--list", "dispatch/*"]);
+    assert!(
+        !branches.contains("ended-empty") && !branches.contains("no-run"),
+        "{branches}"
+    );
+    assert!(branches.contains("with-changes") && branches.contains("still-working"));
+    assert_worktree_status(&t, "ended-empty", WORKTREE_REMOVED);
+}

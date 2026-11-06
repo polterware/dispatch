@@ -422,6 +422,12 @@ impl Deps {
                     &child_env,
                 )
                 .await?;
+            // The agent ended its turn with only the provider's limit notice: the account is
+            // out, so this attempt failed and the next candidate takes the task.
+            let run_err = match run_err {
+                None => super::summary::limit_notice(&res.output).map(AttemptError::Failed),
+                other => other,
+            };
             match run_err {
                 Some(AttemptError::ProcessesAlive) => {
                     let e = AttemptError::ProcessesAlive.to_string();
@@ -538,17 +544,28 @@ impl Deps {
             rec.dir.clone()
         };
         dir = self.abs(&dir);
+        // Where to cut the worktree: the run's own folder, or the one a follow-up's run had.
+        let mut path = String::new();
         if !rec.resumed_of.is_empty() {
-            if !rec.worktree.is_empty() {
-                if std::path::Path::new(&rec.worktree).exists() {
-                    if !worktree::root(&rec.worktree).is_empty() {
-                        dir.clone_from(&rec.worktree);
-                    }
-                } else {
-                    rec.note = format!("previous worktree is gone; resumed in {dir}");
-                }
+            if rec.worktree.is_empty() {
+                return Ok(dir);
             }
-            return Ok(dir);
+            if std::path::Path::new(&rec.worktree).exists() {
+                if !worktree::root(&rec.worktree).is_empty() {
+                    dir.clone_from(&rec.worktree);
+                }
+                return Ok(dir);
+            }
+            if rec.read_only || rec.no_worktree || !self.owns_worktree(&rec.repo, &rec.worktree) {
+                rec.note = format!("previous worktree is gone; resumed in {dir}");
+                return Ok(dir);
+            }
+            // The earlier run's worktree went, with nothing to merge: the follow-up cuts it
+            // again at the same path, where the agent's session was, on a branch of its own.
+            path = std::mem::take(&mut rec.worktree);
+            rec.branch.clear();
+            rec.base_sha.clear();
+            rec.note = "the previous run's worktree had nothing to merge and was removed; this follow-up cut it again on a new branch".into();
         }
         if rec.read_only || rec.no_worktree {
             return Ok(dir);
@@ -557,13 +574,15 @@ impl Deps {
         if root.is_empty() || !worktree::has_commits(&root) {
             return Ok(dir);
         }
-        let base = if self.worktree_dir.is_empty() {
+        if self.worktree_dir.is_empty() {
             let _ = worktree::exclude(&root, ".dispatch/");
-            format!("{root}/.dispatch/worktrees")
+        }
+        if path.is_empty() {
+            path = format!("{}/{}", self.worktrees_base(&root), rec.id);
         } else {
-            self.worktree_dir.clone()
-        };
-        let path = format!("{}/{}", base.trim_end_matches('/'), rec.id);
+            // Forget the old registration, should the folder have gone by hand.
+            let _ = worktree::git_exit(&root, &["worktree", "prune"]);
+        }
         let branch =
             worktree::create(&root, &path, &rec.id).map_err(|e| format!("worktree: {e}"))?;
         rec.repo.clone_from(&root);
@@ -727,7 +746,18 @@ impl Deps {
                     cooled = true;
                 }
                 "rate_limit" => {
-                    let _ = st.set_cooldown(c.agent(), &fmt_time(now + COOLDOWN_FOR));
+                    // Until the reset the notice names, else an hour. Antigravity keeps a
+                    // quota per family of models, so only this provider inside it waits.
+                    let wait = super::summary::resets_in(err)
+                        .and_then(|d| chrono::TimeDelta::from_std(d).ok())
+                        .filter(|d| *d <= super::MAX_COOLDOWN_FOR)
+                        .unwrap_or(COOLDOWN_FOR);
+                    let key = if c.agent() == "antigravity" {
+                        credit_key(c.agent(), &candidate_provider(c))
+                    } else {
+                        c.agent().to_owned()
+                    };
+                    let _ = st.set_cooldown(&key, &fmt_time(now + wait));
                     cooled = true;
                 }
                 _ => {}
@@ -762,6 +792,7 @@ impl Deps {
             rec.run_ms = Some(non_neg_ms(now - start));
         }
         complete_telemetry(&mut rec, Some(now));
+        self.drop_empty_worktree(&mut rec);
         rec.output = sandbox::redact(&rec.output);
         rec.error = sandbox::redact(&rec.error);
         rec.note = sandbox::redact(&rec.note);

@@ -91,6 +91,10 @@ pub fn run(r: &Run) -> pb::DispatchRun {
             context_window: u.context_window,
         }),
         worktree_status: r.worktree_status.clone(),
+        // A pending run has not cut its worktree yet.
+        in_place: !r.read_only
+            && (r.no_worktree
+                || (r.worktree.is_empty() && r.status != crate::types::STATUS_PENDING)),
     }
 }
 
@@ -134,6 +138,18 @@ pub fn worktree(w: &WorktreeInfo) -> pb::DispatchWorktree {
         base_sha: w.base_sha.clone(),
         status: w.status.clone(),
         owner: w.owner.clone(),
+    }
+}
+
+pub fn worktree_folder(f: &crate::runner::WorktreeFolder) -> pb::WorktreeFolder {
+    pb::WorktreeFolder {
+        path: f.path.clone(),
+        repo: f.repo.clone(),
+        branch: f.branch.clone(),
+        run_id: f.run_id.clone(),
+        run_status: f.run_status.clone(),
+        changes: f.changes,
+        prunable: f.prunable,
     }
 }
 

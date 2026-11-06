@@ -166,6 +166,9 @@ pub struct TranscriptView {
     /// How tall the header floating over the run page's list is: the list runs up under it
     /// and keeps that much clear above its first row.
     top_inset: f32,
+    /// The room the run page keeps after the text: its rows stop that far from the list's
+    /// end, where the scrollbar sits flush (`rail_page_end_pad`).
+    end_pad: f32,
     /// The jump-to-end button's presence: in while the reader is away from the end.
     end_button: SpringValue,
     /// Text may come before what the stream opened with, and no read has said otherwise.
@@ -262,6 +265,7 @@ impl TranscriptView {
             overflowed: Rc::new(Cell::new(false)),
             measured_width: Rc::new(Cell::new(0.0)),
             top_inset: 0.0,
+            end_pad: 0.0,
             end_button: SpringValue::new(0.0, SpringTier::Moderate),
             earlier_more: false,
             earlier_inflight: false,
@@ -733,10 +737,21 @@ impl TranscriptView {
             });
         } else {
             let start = shared.min(old_len);
+            let top = self.list.logical_scroll_top();
             self.list
                 .splice(start..old_len, new_len.saturating_sub(start));
+            let tail = old_sigs[start..]
+                .iter()
+                .rev()
+                .zip(new_sigs[start..].iter().rev())
+                .take_while(|(left, right)| left == right)
+                .count();
+            if let Some(kept) = kept_top(top, start, old_len, new_len, tail) {
+                self.list.scroll_to(kept);
+            }
         }
-        if new_len > old_len {
+        // Only a new last row fades in: the thinking bot under a growing log stays lit.
+        if new_len > old_len && old_sigs.last() != new_sigs.last() {
             self.enter.snap(0.0);
             self.enter.set_target(1.0);
         }
@@ -999,6 +1014,17 @@ impl TranscriptView {
         }
     }
 
+    /// Keeps `pad` clear after the rows, the scrollbar's gutter in it, for a list that runs
+    /// to the page's edge.
+    pub(crate) fn set_end_pad(&mut self, pad: f32, cx: &mut Context<Self>) {
+        if (self.end_pad - pad).abs() > 0.5 {
+            self.end_pad = pad;
+            // The rows wrap in what is left: measure them again.
+            self.measured_width.set(-1.0);
+            cx.notify();
+        }
+    }
+
     /// The jump-to-end button: glide down to the end, where the log follows again.
     pub(crate) fn jump_to_end(&mut self, cx: &mut Context<Self>) {
         self.glide = true;
@@ -1047,6 +1073,14 @@ impl TranscriptView {
 impl Render for TranscriptView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let top_inset = self.top_inset;
+        // The scrollbar's gutter is part of the room after the rows, once the text overflows.
+        let row_end = (self.end_pad
+            - if self.overflowed.get() {
+                SCROLLBAR_GUTTER
+            } else {
+                0.0
+            })
+        .max(0.0);
         self.ensure_stream(cx);
         self.ensure_earlier_runs(cx);
         let live = self.live_now(cx);
@@ -1105,6 +1139,7 @@ impl Render for TranscriptView {
             div()
                 .w_full()
                 .when(index == 0, |row| row.pt(px(tw(PAGE_TOP) + top_inset)))
+                .pr(px(row_end))
                 .flex()
                 .justify_center()
                 .child(
@@ -1227,7 +1262,8 @@ impl Render for TranscriptView {
                 div()
                     .absolute()
                     .left(px(0.0))
-                    .right(px(gutter))
+                    // Centered on the text, which keeps the page's room after it.
+                    .right(px(gutter.max(self.end_pad)))
                     .bottom(px(JUMP_INSET))
                     .flex()
                     .justify_center()
@@ -1322,6 +1358,33 @@ fn sticks(stick: bool, moved: Moved, glide: bool, left: f32) -> bool {
     }
 }
 
+/// Where the list's top goes back after rows from `start` on were spliced: gpui moves a top
+/// row inside the spliced rows to their first one, at its start, which on a live log read at
+/// its end jumps the text down to where the changed rows begin and then back up as the view
+/// follows the end. The top row is the same stretch of text it was, so its place stays: a
+/// row among the `tail` rows that end both lists alike keeps its distance from the end, and
+/// one among the changed rows (the growing message) keeps its index.
+fn kept_top(
+    top: ListOffset,
+    start: usize,
+    old_len: usize,
+    new_len: usize,
+    tail: usize,
+) -> Option<ListOffset> {
+    if top.item_ix < start {
+        return None;
+    }
+    let item_ix = if top.item_ix >= old_len.saturating_sub(tail) {
+        new_len.saturating_sub(old_len.saturating_sub(top.item_ix))
+    } else {
+        top.item_ix
+    };
+    Some(ListOffset {
+        item_ix: item_ix.min(new_len),
+        offset_in_item: top.offset_in_item,
+    })
+}
+
 fn split_stable(log: &str) -> (&str, &str) {
     match log.rfind('\n') {
         Some(index) => (&log[..=index], &log[index + 1..]),
@@ -1401,6 +1464,28 @@ fn recv_batch(rx: &Mutex<mpsc::Receiver<StreamMsg>>) -> Option<Vec<StreamMsg>> {
 
 #[cfg(test)]
 mod tests {
+    use super::kept_top;
+    use gpui::{ListOffset, px};
+
+    fn at(item_ix: usize, offset: f32) -> ListOffset {
+        ListOffset {
+            item_ix,
+            offset_in_item: px(offset),
+        }
+    }
+
+    #[test]
+    fn a_live_splice_keeps_the_readers_row() {
+        // Read at the end: the growing message (row 40) is the top row; it and the gap and
+        // thinking bot after it are spliced. The top stays inside it, where it was.
+        let kept = kept_top(at(40, 120.0), 40, 43, 43, 2).unwrap();
+        assert_eq!((kept.item_ix, kept.offset_in_item), (40, px(120.0)));
+        // The message split into two rows: a top among the rows after it follows them.
+        let kept = kept_top(at(42, 6.0), 40, 43, 44, 2).unwrap();
+        assert_eq!((kept.item_ix, kept.offset_in_item), (43, px(6.0)));
+        // Rows changed below the top: gpui keeps it, nothing to do.
+        assert!(kept_top(at(12, 0.0), 40, 43, 44, 2).is_none());
+    }
     use super::{Moved, sticks};
 
     const STILL: Moved = Moved {

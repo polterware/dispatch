@@ -7,8 +7,9 @@ use dispatch_core::{
     coreclient,
     host::NoHost,
     proto::{
-        AddWorkspaceRequest, CheckRequest, CheckResponse, GetRunRequest, ListRunsRequest,
-        ListWorkspacesRequest, ReadRunEventsRequest, ShutdownRequest, WatchRunRequest,
+        AddWorkspaceRequest, CheckRequest, CheckResponse, DeleteRunsRequest, GetRunRequest,
+        ListRunsRequest, ListSectionsRequest, ListWorkspacesRequest, ReadRunEventsRequest,
+        RenameConversationRequest, ShutdownRequest, WatchRunRequest,
     },
     runstate,
     server::{self, Core},
@@ -89,6 +90,87 @@ async fn serves_json_with_the_session_token() {
         .unwrap();
     assert!(!listed.linked);
     assert_eq!(listed.workspaces.len(), 1);
+
+    // A folder inside an added one gets its own workspace when added itself.
+    let inner = folder.path().join("inner");
+    std::fs::create_dir(&inner).unwrap();
+    let nested = c
+        .workspaces
+        .add_workspace(&AddWorkspaceRequest {
+            path: inner.to_string_lossy().into_owned(),
+            name: String::new(),
+        })
+        .await
+        .unwrap()
+        .workspace
+        .unwrap();
+    assert_ne!(nested.id, added.id);
+    assert_eq!(nested.name, "inner");
+    let again = c
+        .workspaces
+        .add_workspace(&AddWorkspaceRequest {
+            path: format!("{}/", inner.to_string_lossy()),
+            name: String::new(),
+        })
+        .await
+        .unwrap()
+        .workspace
+        .unwrap();
+    assert_eq!(again.id, nested.id, "adding the same folder again keeps it");
+    let listed = c
+        .workspaces
+        .list_workspaces(&ListWorkspacesRequest {})
+        .await
+        .unwrap();
+    assert_eq!(listed.workspaces.len(), 2);
+
+    // A repository is its main checkout: a subfolder and a worktree of it name it.
+    let repo = folder.path().join("repo");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "first",
+    ]);
+    let tree = folder.path().join("tree");
+    git(&["worktree", "add", "-q", tree.to_str().unwrap()]);
+    let add = |path: std::path::PathBuf| {
+        let c = &c;
+        async move {
+            c.workspaces
+                .add_workspace(&AddWorkspaceRequest {
+                    path: path.to_string_lossy().into_owned(),
+                    name: String::new(),
+                })
+                .await
+                .unwrap()
+                .workspace
+                .unwrap()
+        }
+    };
+    let by_root = add(repo.clone()).await;
+    assert_eq!(by_root.name, "repo");
+    assert_eq!(add(repo.join("src")).await.id, by_root.id);
+    assert_eq!(add(tree).await.id, by_root.id);
 
     let runs = c
         .dispatch
@@ -255,4 +337,143 @@ async fn a_watch_opens_at_the_end_and_reads_back_page_by_page() {
         all += 1;
     }
     assert_eq!(all, 3);
+}
+
+#[tokio::test]
+async fn deletes_a_conversation_and_its_runs_but_not_a_working_one() {
+    let store = Store::new(":memory:").unwrap();
+    let run = |id: &str, project: &str, conversation: &str, status: &str| types::Run {
+        id: id.into(),
+        project_id: project.into(),
+        conversation_id: conversation.into(),
+        status: status.into(),
+        ..Default::default()
+    };
+    // One conversation across two workspaces, started by another agent's chat.
+    store
+        .save_run(&run("a1", "p", "codex:chat", types::STATUS_COMPLETED))
+        .unwrap();
+    store
+        .save_run(&run("a2", "q", "codex:chat", types::STATUS_FAILED))
+        .unwrap();
+    store
+        .save_run(&run("b1", "p", "claude:other", types::STATUS_COMPLETED))
+        .unwrap();
+    // Still working: its runner (this test) is alive, so the core's boot check keeps it.
+    store
+        .save_run(&types::Run {
+            pid: i64::from(std::process::id()),
+            ..run("live", "p", "claude:busy", types::STATUS_RUNNING)
+        })
+        .unwrap();
+    store
+        .append_event(&types::RunEvent {
+            run_id: "a1".into(),
+            kind: types::EVENT_STARTED.into(),
+            text: "go".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let r = start_with(store).await;
+    let c = clients(&r);
+
+    let out = c
+        .dispatch
+        .delete_runs(&DeleteRunsRequest {
+            conversation_id: "codex:chat".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(out.deleted, 2);
+    for id in ["a1", "a2"] {
+        assert!(r.core.store.get_run(id).is_err(), "{id} survived");
+    }
+    assert!(r.core.store.get_run("b1").is_ok());
+
+    // A single run by id.
+    let out = c
+        .dispatch
+        .delete_runs(&DeleteRunsRequest {
+            ids: vec!["b1".into()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(out.deleted, 1);
+
+    // A run that still works is refused, and kept.
+    let err = c
+        .dispatch
+        .delete_runs(&DeleteRunsRequest {
+            conversation_id: "claude:busy".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("cancel it before deleting"),
+        "{err}"
+    );
+    assert!(r.core.store.get_run("live").is_ok());
+}
+
+#[tokio::test]
+async fn names_a_conversation_and_forgets_it_with_the_conversation() {
+    let store = Store::new(":memory:").unwrap();
+    store
+        .save_run(&types::Run {
+            id: "c1".into(),
+            project_id: "p".into(),
+            conversation_id: "codex:chat".into(),
+            status: types::STATUS_COMPLETED.into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let r = start_with(store).await;
+    let c = clients(&r);
+    let names = |c: &dispatch_core::coreclient::Clients| {
+        let c = c.clone();
+        async move {
+            c.dispatch
+                .list_sections(&ListSectionsRequest::default())
+                .await
+                .unwrap()
+                .conversation_names
+                .into_iter()
+                .map(|n| (n.conversation_id, n.name))
+                .collect::<Vec<_>>()
+        }
+    };
+    let rename = |name: &str| RenameConversationRequest {
+        conversation_id: "codex:chat".into(),
+        name: name.into(),
+    };
+    c.dispatch
+        .rename_conversation(&rename("  Buttons  "))
+        .await
+        .unwrap();
+    c.dispatch
+        .rename_conversation(&rename("Round buttons"))
+        .await
+        .unwrap();
+    assert_eq!(
+        names(&c).await,
+        [("codex:chat".to_string(), "Round buttons".to_string())]
+    );
+    // An empty name gives the conversation back its first message.
+    c.dispatch.rename_conversation(&rename("")).await.unwrap();
+    assert!(names(&c).await.is_empty());
+    c.dispatch
+        .rename_conversation(&rename("Again"))
+        .await
+        .unwrap();
+    c.dispatch
+        .delete_runs(&DeleteRunsRequest {
+            conversation_id: "codex:chat".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(names(&c).await.is_empty());
 }

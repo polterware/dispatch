@@ -13,20 +13,26 @@ use gpui::{
 
 use super::TranscriptView;
 use crate::avatar::agent_avatar_live;
-use crate::client::{CoreError, DeleteSectionRequest, MoveToSectionRequest, SaveSectionRequest};
+use crate::client::{
+    CoreError, DeleteRunsRequest, DeleteSectionRequest, MoveToSectionRequest,
+    RemoveWorkspaceRequest, RenameConversationRequest, SaveSectionRequest,
+};
 use crate::format::agent_display_name;
 use crate::models::sidebar::{
     COLLAPSED_PREFERENCE, DISPLAY_PREFERENCE, Direction, GroupBy, GroupKind, HOVER_CLOSE_MS,
     HOVER_OPEN_MS, RunsNotice, SEEN_PREFERENCE, Show, SidebarDisplay, SidebarGroup, SidebarRun,
-    SortBy, conversation_ref, group_sidebar_runs, has_unseen_update, now_unix_ms,
-    parse_sidebar_display, run_mark, runs_notice, section_ref, sidebar_run_title, sidebar_runs,
+    SortBy, conversation_ref, ended_run_ids, group_sidebar_runs, has_unseen_update,
+    holding_section, now_unix_ms, parse_sidebar_display, removable_repository, repository_ref,
+    run_mark, runs_notice, section_ref, sidebar_run_title, sidebar_runs,
 };
 use crate::motion::{Animator, SpringTier, SpringValue};
 use crate::state::{AppState, ConnectionState, Route, SettingsPage, observe};
 use crate::theme::Theme;
 use crate::ui::list_skeleton;
 use crate::ui::parts::sidebar::{preview_surface, run_dot, run_none};
-use crate::ui::patterns::{FadeEdges, fade_item, fade_scroll};
+use crate::ui::patterns::{
+    FadeEdges, composer_card, composer_footer, fade_item, fade_scroll, modal_layer,
+};
 use crate::ui::{
     Button, ButtonKind, ButtonSize, Icon, MascotMood, Menu, MenuEntry, MenuItem, SidebarItem,
     SidebarSectionLabel, TextInput, ToastTone, button, ellipsis, icon_button, kbd, list_empty,
@@ -89,6 +95,12 @@ pub struct SidebarView {
     editor_focus: bool,
     section_name: Entity<TextInput>,
     editor_progress: SpringValue,
+    /// The conversation the rename dialog is naming, while it is open.
+    renaming: Option<String>,
+    rename_focus: bool,
+    conversation_name: Entity<TextInput>,
+    rename_opacity: SpringValue,
+    rename_y: SpringValue,
     scroll: ScrollHandle,
     animator: Animator,
 }
@@ -141,6 +153,34 @@ impl SidebarView {
                     })
             }
         });
+        let conversation_name = cx.new({
+            let view = view.clone();
+            move |cx| {
+                TextInput::new(cx)
+                    .bare()
+                    .title()
+                    .wrap()
+                    .placeholder("Conversation name")
+                    .on_submit({
+                        let view = view.clone();
+                        move |_, window, cx| {
+                            let view = view.clone();
+                            window.defer(cx, move |_, cx| {
+                                let _ = view.update(cx, |this, cx| this.commit_rename(cx));
+                            });
+                        }
+                    })
+                    .on_cancel({
+                        let view = view.clone();
+                        move |window, cx| {
+                            let view = view.clone();
+                            window.defer(cx, move |_, cx| {
+                                let _ = view.update(cx, |this, cx| this.close_rename(cx));
+                            });
+                        }
+                    })
+            }
+        });
         Self {
             state,
             display,
@@ -162,6 +202,11 @@ impl SidebarView {
             editor_focus: false,
             section_name,
             editor_progress: SpringValue::new(0.0, SpringTier::Fast),
+            renaming: None,
+            rename_focus: false,
+            conversation_name,
+            rename_opacity: SpringValue::new(0.0, SpringTier::Fast),
+            rename_y: SpringValue::new(8.0, SpringTier::Fast),
             scroll: ScrollHandle::new(),
             animator: Animator::new(),
         }
@@ -170,7 +215,14 @@ impl SidebarView {
     fn read_snapshot(&self, cx: &gpui::App) -> Snapshot {
         let app = self.state.read(cx);
         let runs = sidebar_runs(app.workspaces(), app.runs());
-        let groups = group_sidebar_runs(&runs, app.sections(), &self.display, now_unix_ms());
+        let mut groups = group_sidebar_runs(&runs, app.sections(), &self.display, now_unix_ms());
+        // A conversation someone named shows that name over its first message.
+        for group in &mut groups {
+            if let Some(name) = conversation_ref(&group.id).and_then(|id| app.conversation_name(id))
+            {
+                group.title = name.to_string();
+            }
+        }
         let show_error = matches!(app.connection(), ConnectionState::Offline { .. })
             || app.last_error().is_some();
         Snapshot {
@@ -196,6 +248,10 @@ impl SidebarView {
             .set_target(if self.editor.is_some() { 1.0 } else { 0.0 });
         self.preview_progress
             .set_target(if self.preview_open { 1.0 } else { 0.0 });
+        let renaming = self.renaming.is_some();
+        self.rename_opacity
+            .set_target(if renaming { 1.0 } else { 0.0 });
+        self.rename_y.set_target(if renaming { 0.0 } else { 8.0 });
     }
 
     fn advance(&mut self, window: &mut Window) {
@@ -203,6 +259,8 @@ impl SidebarView {
         if dt > 0.0 {
             self.preview_progress.step(dt);
             self.editor_progress.step(dt);
+            self.rename_opacity.step(dt);
+            self.rename_y.step(dt);
         }
         if self.moving() {
             let _ = self.animator.dt(window, true);
@@ -214,7 +272,10 @@ impl SidebarView {
     }
 
     fn moving(&self) -> bool {
-        !self.preview_progress.settled() || !self.editor_progress.settled()
+        !self.preview_progress.settled()
+            || !self.editor_progress.settled()
+            || !self.rename_opacity.settled()
+            || !self.rename_y.settled()
     }
 
     fn is_collapsed(&self, id: &str) -> bool {
@@ -362,7 +423,7 @@ impl SidebarView {
         };
         let group_index = match self.display.group_by {
             GroupBy::Conversation => 0,
-            GroupBy::Workspace => 1,
+            GroupBy::Repository => 1,
             GroupBy::Date => 2,
             GroupBy::Status => 3,
             GroupBy::Agent => 4,
@@ -402,7 +463,7 @@ impl SidebarView {
                 radios(
                     &[
                         "Conversation",
-                        "Workspace",
+                        "Repository",
                         "Date",
                         "Status",
                         "Agent",
@@ -455,7 +516,7 @@ impl SidebarView {
     fn pick_group(&mut self, index: usize, cx: &mut Context<Self>) {
         let value = match index {
             0 => GroupBy::Conversation,
-            1 => GroupBy::Workspace,
+            1 => GroupBy::Repository,
             2 => GroupBy::Date,
             3 => GroupBy::Status,
             4 => GroupBy::Agent,
@@ -651,10 +712,28 @@ impl SidebarView {
         items.into_iter().map(|(id, name, _)| (id, name)).collect()
     }
 
+    /// Move to each section the item is not in, and Remove from section only when the item
+    /// is in one itself.
     fn move_entries(&self, kind: &str, item_ref: &str, cx: &mut Context<Self>) -> Vec<MenuEntry> {
         let view = cx.entity();
+        let holder = {
+            let app = self.state.read(cx);
+            let mut refs = vec![item_ref.to_string()];
+            if kind == "run"
+                && let Some(run) = sidebar_runs(app.workspaces(), app.runs())
+                    .into_iter()
+                    .find(|run| run.id == item_ref)
+            {
+                refs.extend(run.earlier);
+            }
+            let refs: Vec<&str> = refs.iter().map(String::as_str).collect();
+            holding_section(app.sections(), kind, &refs).map(str::to_string)
+        };
         let mut items = Vec::new();
         for (id, name) in self.section_names(cx) {
+            if holder.as_deref() == Some(id.as_str()) {
+                continue;
+            }
             let request = MoveToSectionRequest {
                 kind: kind.to_string(),
                 item_ref: item_ref.to_string(),
@@ -671,6 +750,9 @@ impl SidebarView {
                         view.update(cx, |this, cx| this.spawn_job(SectionJob::Move(request), cx));
                 }),
             });
+        }
+        if holder.is_none() {
+            return items;
         }
         let request = MoveToSectionRequest {
             kind: kind.to_string(),
@@ -723,6 +805,97 @@ impl SidebarView {
         ]
     }
 
+    /// Remove repository: the core forgets the workspace the repository was added as. Its
+    /// runs stay in the store, and the sidebar no longer lists them; adding the repository
+    /// again brings them back.
+    fn remove_repository_entry(
+        &self,
+        id: String,
+        name: String,
+        cx: &mut Context<Self>,
+    ) -> MenuEntry {
+        let view = cx.entity();
+        MenuEntry {
+            label: "Remove repository".into(),
+            icon: None,
+            danger: true,
+            on_select: Rc::new(move |_, cx| {
+                let (id, name) = (id.clone(), name.clone());
+                let _ = view.update(cx, |this, cx| this.remove_repository(id, name, cx));
+            }),
+        }
+    }
+
+    fn remove_repository(&mut self, id: String, name: String, cx: &mut Context<Self>) {
+        let Some(client) = self.state.read(cx).client() else {
+            self.toast("Dispatch core is not running", cx);
+            return;
+        };
+        let request = RemoveWorkspaceRequest { id: id.clone() };
+        cx.spawn(async move |this, async_cx| {
+            let result = async_cx
+                .background_spawn(async move { client.remove_workspace(&request) })
+                .await;
+            let _ = this.update(async_cx, |this, cx| match result {
+                Ok(_) => {
+                    this.state.update(cx, |app, cx| {
+                        app.forget_workspace(&id);
+                        app.push_toast(format!("Removed {name}"), ToastTone::Success);
+                        app.request_refresh(cx);
+                        cx.notify();
+                    });
+                    cx.notify();
+                }
+                Err(error) => this.toast(core_message(error), cx),
+            });
+        })
+        .detach();
+    }
+
+    /// A danger entry that deletes runs for good: their records, transcripts, and worktrees.
+    fn delete_entry(
+        &self,
+        label: &'static str,
+        request: DeleteRunsRequest,
+        cx: &mut Context<Self>,
+    ) -> MenuEntry {
+        let view = cx.entity();
+        MenuEntry {
+            label: label.into(),
+            icon: None,
+            danger: true,
+            on_select: Rc::new(move |_, cx| {
+                let request = request.clone();
+                let _ = view.update(cx, |this, cx| this.delete_runs(request, cx));
+            }),
+        }
+    }
+
+    fn delete_runs(&mut self, request: DeleteRunsRequest, cx: &mut Context<Self>) {
+        let Some(client) = self.state.read(cx).client() else {
+            self.toast("Dispatch core is not running", cx);
+            return;
+        };
+        cx.spawn(async move |this, async_cx| {
+            let result = async_cx
+                .background_spawn(async move { client.delete_runs(&request) })
+                .await;
+            let _ = this.update(async_cx, |this, cx| match result {
+                Ok(response) => {
+                    let ids = response.ids();
+                    this.state.update(cx, |app, cx| {
+                        app.forget_runs(&ids);
+                        app.request_refresh(cx);
+                        cx.notify();
+                    });
+                    cx.notify();
+                }
+                Err(error) => this.toast(core_message(error), cx),
+            });
+        })
+        .detach();
+    }
+
     fn open_run_menu(
         &mut self,
         run_id: &str,
@@ -731,7 +904,15 @@ impl SidebarView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let items = self.move_entries("run", run_id, cx);
+        let mut items = self.move_entries("run", run_id, cx);
+        items.push(self.delete_entry(
+            "Delete run",
+            DeleteRunsRequest {
+                ids: vec![run_id.to_string()],
+                ..Default::default()
+            },
+            cx,
+        ));
         self.place_menu(x, y, items, window, cx);
     }
 
@@ -748,12 +929,155 @@ impl SidebarView {
                 return;
             };
             self.section_entries(id, group.title.clone(), cx)
+        } else if let Some(repository) = repository_ref(&group.id) {
+            let mut items = Vec::new();
+            if let Some(id) = removable_repository(repository, self.state.read(cx).workspaces()) {
+                items.push(self.remove_repository_entry(id, group.title.clone(), cx));
+            }
+            // A repository no workspace was added as (a worktree's, one that is gone) can
+            // still be cleared: its ended runs go, a working one stays.
+            let ids = ended_run_ids(&group.runs);
+            if !ids.is_empty() {
+                items.push(self.delete_entry(
+                    "Delete runs",
+                    DeleteRunsRequest {
+                        ids,
+                        ..Default::default()
+                    },
+                    cx,
+                ));
+            }
+            if items.is_empty() {
+                return;
+            }
+            items
         } else if let Some(conversation) = conversation_ref(&group.id) {
-            self.move_entries("conversation", conversation, cx)
+            let mut items = vec![self.rename_entry(conversation, &group.title, cx)];
+            items.extend(self.move_entries("conversation", conversation, cx));
+            items.push(self.delete_entry(
+                "Delete conversation",
+                DeleteRunsRequest {
+                    conversation_id: conversation.to_string(),
+                    ..Default::default()
+                },
+                cx,
+            ));
+            items
         } else {
             return;
         };
         self.place_menu(x, y, items, window, cx);
+    }
+
+    /// Rename…: opens the rename dialog on the conversation's name as it shows.
+    fn rename_entry(&self, conversation: &str, title: &str, cx: &mut Context<Self>) -> MenuEntry {
+        let view = cx.entity();
+        let conversation = conversation.to_string();
+        let title = title.to_string();
+        MenuEntry {
+            label: "Rename…".into(),
+            icon: None,
+            danger: false,
+            on_select: Rc::new(move |_, cx| {
+                let conversation = conversation.clone();
+                let title = title.clone();
+                let _ = view.update(cx, |this, cx| this.open_rename(conversation, title, cx));
+            }),
+        }
+    }
+
+    fn open_rename(&mut self, conversation: String, title: String, cx: &mut Context<Self>) {
+        self.renaming = Some(conversation);
+        self.rename_focus = true;
+        self.display_open = false;
+        self.close_editor(cx);
+        self.conversation_name
+            .update(cx, |input, cx| input.set_text(title, cx));
+        self.close_menu(cx);
+        cx.notify();
+    }
+
+    fn close_rename(&mut self, cx: &mut Context<Self>) {
+        if self.renaming.take().is_some() {
+            self.rename_focus = false;
+            cx.notify();
+        }
+    }
+
+    /// Saves the name; an empty one gives the conversation back its first message's title.
+    fn commit_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(conversation_id) = self.renaming.clone() else {
+            return;
+        };
+        let Some(client) = self.state.read(cx).client() else {
+            self.toast("Dispatch core is not running", cx);
+            return;
+        };
+        let name = self.conversation_name.read(cx).text().trim().to_string();
+        let request = RenameConversationRequest {
+            conversation_id: conversation_id.clone(),
+            name: name.clone(),
+        };
+        cx.spawn(async move |this, async_cx| {
+            let result = async_cx
+                .background_spawn(async move { client.rename_conversation(&request) })
+                .await;
+            let _ = this.update(async_cx, |this, cx| match result {
+                Ok(_) => {
+                    if this.renaming.as_deref() == Some(conversation_id.as_str()) {
+                        this.close_rename(cx);
+                    }
+                    this.state.update(cx, |app, cx| {
+                        app.note_conversation_name(&conversation_id, &name);
+                        app.request_refresh(cx);
+                        cx.notify();
+                    });
+                    cx.notify();
+                }
+                Err(error) => this.toast(core_message(error), cx),
+            });
+        })
+        .detach();
+    }
+
+    /// The rename dialog: the Composer card with the name as its title field, and Save.
+    fn rename_layer(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let t = self.rename_opacity.value();
+        if self.renaming.is_none() && t < 0.01 {
+            return None;
+        }
+        let view = cx.entity();
+        let closer = view.clone();
+        let saver = view.clone();
+        let card = composer_card("Rename conversation", t, self.rename_y.value(), theme)
+            .on_close(Rc::new(move |_, cx| {
+                let _ = closer.update(cx, |this, cx| this.close_rename(cx));
+            }))
+            .child(self.conversation_name.clone())
+            .footer(composer_footer(
+                Vec::new(),
+                [button(
+                    "sidebar-rename-save",
+                    "Save",
+                    ButtonKind::Primary,
+                    Rc::new(move |_, cx| {
+                        let _ = saver.update(cx, |this, cx| this.commit_rename(cx));
+                    }),
+                    cx,
+                )
+                .size(ButtonSize::Sm)
+                .into_any_element()],
+                theme,
+            ));
+        Some(modal_layer(
+            t,
+            self.renaming.is_some(),
+            Rc::new(move |_, cx| {
+                let _ = view.update(cx, |this, cx| this.close_rename(cx));
+            }),
+            card,
+            theme,
+        ))
     }
 
     fn open_editor(
@@ -861,7 +1185,8 @@ impl SidebarView {
         .detach();
     }
 
-    /// The pages: `<nav class="pw-sidebar-group">`, New conversation, Commander, and then each
+    /// The pages: `<nav class="pw-sidebar-group">`, New (+), Commander (their ⌘N and ⌘K show
+    /// under the pointer), and then each
     /// page, 2px apart.
     fn nav_block(
         &self,
@@ -878,9 +1203,10 @@ impl SidebarView {
             .gap(px(theme.sidebar_row_gap))
             .child({
                 let view = view.clone();
-                let item = SidebarItem::new("sidebar-nav-New", "New conversation")
-                    .icon(Icon::Pencil)
+                let item = SidebarItem::new("sidebar-nav-New", "New")
+                    .icon(Icon::Plus)
                     .trailing(kbd("⌘N", &theme))
+                    .trailing_on_hover()
                     .active(matches!(route, Route::NewRun))
                     .on_click(move |_, cx| {
                         let _ = view.update(cx, |this, cx| this.go(Route::NewRun, false, cx));
@@ -899,6 +1225,7 @@ impl SidebarView {
                 let item = SidebarItem::new("sidebar-nav-Commander", "Commander")
                     .icon(Icon::Search)
                     .trailing(kbd("⌘K", &theme))
+                    .trailing_on_hover()
                     .on_click(move |_, cx| {
                         let _ = view.update(cx, |this, cx| this.open_commander(cx));
                     });
@@ -986,10 +1313,12 @@ impl SidebarView {
         column.into_any_element()
     }
 
-    /// `.dispatch-runs-header`: "Runs" in 12px/500 muted with 8px before it, and the Display
-    /// menu's ghost icon button at the end.
+    /// `.dispatch-runs-header`: "Runs" in 12px/500 muted with 8px before it, then the Display
+    /// menu's ghost icon button and Add repository's `+` at the end. A repository added there
+    /// opens New on it.
     fn runs_header(&self, theme: Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
         let view = cx.entity();
+        let state = self.state.clone();
         div()
             .flex_none()
             .pl(px(theme.space_2))
@@ -1003,12 +1332,27 @@ impl SidebarView {
             .child(
                 div()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .flex()
+                    .items_center()
                     .child(icon_button(
                         "sidebar-display",
                         Icon::ListFilter,
                         "Display",
                         Rc::new(move |_, cx| {
                             let _ = view.update(cx, |this, cx| this.toggle_display(cx));
+                        }),
+                        cx,
+                    ))
+                    .child(icon_button(
+                        "sidebar-add-repository",
+                        Icon::Plus,
+                        "Add repository",
+                        Rc::new(move |_, cx| {
+                            let _ = state.update(cx, |state, cx| {
+                                state.add_repository(cx, |state, _, _, _| {
+                                    state.navigate(Route::NewRun);
+                                });
+                            });
                         }),
                         cx,
                     )),
@@ -1428,12 +1772,20 @@ impl Render for SidebarView {
             self.section_name.read(cx).focus_handle(cx).focus(window);
             self.editor_focus = false;
         }
+        if self.rename_focus {
+            self.conversation_name
+                .read(cx)
+                .focus_handle(cx)
+                .focus(window);
+            self.rename_focus = false;
+        }
         let nav = self.nav_block(theme, &snapshot.route, window, cx);
         let runs = self.runs_block(theme, &snapshot, window, cx);
         let footer = self.footer_block(theme, &snapshot.route, cx);
         let editor = self.editor_panel(theme, window, cx);
         let preview = self.preview_card(theme, &snapshot, window, cx);
         let menu = self.menu_anchor(theme);
+        let rename = self.rename_layer(&theme, cx);
 
         // The whole sidebar is the drag region. On macOS, gpui 0.2.2 ignores
         // window-control hit testing, so the native titlebar strip is what moves the window.
@@ -1487,6 +1839,9 @@ impl Render for SidebarView {
             .child(menu);
         if let Some(editor) = editor {
             root = root.child(editor);
+        }
+        if let Some(rename) = rename {
+            root = root.child(rename);
         }
         if let Some(preview) = preview {
             root = root.child(preview);

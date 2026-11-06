@@ -10,7 +10,7 @@ use dispatch_core::{
     },
     runner::{
         AttemptError, CREDIT_COOLDOWN_FOR, Options, agent_log_path, empirical_quota, is_recursive,
-        page, store_cooldowns, summary,
+        limit_notice, page, resets_in, store_cooldowns, summary,
     },
     types::{
         Attempt, Run, STATUS_COMPLETED, STATUS_FAILED, STATUS_ORPHANED, STATUS_RUNNING,
@@ -460,4 +460,161 @@ async fn test_credit_error_cools_down_model_scope_and_marks_log() {
     clear(&r);
     let _ = run(&t, read_only("p")).await;
     assert_eq!(ran_list(&r), vec!["b/m2"], "a/m1 should be skipped");
+}
+
+const AGY_QUOTA: &str = "⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 4h54m49s.";
+
+#[test]
+fn test_limit_notice_is_a_short_reply_naming_a_reached_limit() {
+    assert_eq!(
+        limit_notice(&format!("\n{AGY_QUOTA}\n")).as_deref(),
+        Some(AGY_QUOTA)
+    );
+    assert!(limit_notice("You've hit your usage limit. Try again later.").is_some());
+    assert!(limit_notice("Usage limit reached for this week.").is_some());
+    // An answer about quotas is not a notice.
+    assert!(limit_notice("Done: the quota check now reads the remaining fraction.").is_none());
+    assert!(
+        limit_notice(&format!(
+            "{} {AGY_QUOTA}",
+            "Here is the change. ".repeat(30)
+        ))
+        .is_none()
+    );
+    assert!(limit_notice("").is_none());
+    assert_eq!(
+        resets_in(AGY_QUOTA),
+        Some(Duration::from_secs(4 * 3600 + 54 * 60 + 49))
+    );
+    assert_eq!(resets_in("resets in 12m"), Some(Duration::from_secs(720)));
+    assert_eq!(resets_in("no reset named"), None);
+}
+
+#[tokio::test]
+async fn test_a_quota_reply_fails_the_attempt_and_falls_back() {
+    let r = ran();
+    let t = test_deps(vec![
+        Fake::new("a", &r).out(AGY_QUOTA).arc(),
+        Fake::new("b", &r).out("ok").arc(),
+    ]);
+    let rec = run(&t, read_only("p")).await.unwrap();
+    assert!(
+        rec.status == STATUS_COMPLETED
+            && rec.agent == "b"
+            && rec.attempts.len() == 1
+            && rec.attempts[0].exit_class == "rate_limit",
+        "{rec:?}"
+    );
+    // The agent waits until the reset the notice named, not the default hour.
+    let until = store_cooldowns(Some(t.store.as_ref()), Utc::now())
+        .get("a")
+        .copied();
+    assert!(
+        until.is_some_and(|u| u > Utc::now() + chrono::TimeDelta::hours(4)),
+        "cooldown until {until:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_antigravity_quota_cools_only_that_provider() {
+    let r = ran();
+    let mut t = test_deps(vec![
+        Fake::new("antigravity", &r).out(AGY_QUOTA).arc(),
+        Fake::new("b", &r).out("ok").arc(),
+    ]);
+    t.deps.table = table(&[(
+        "easy",
+        vec![entry("antigravity", "claude-opus-5-5"), entry("b", "m2")],
+    )]);
+    let rec = run(&t, read_only("p")).await.unwrap();
+    assert!(
+        rec.agent == "b"
+            && rec
+                .attempts
+                .first()
+                .is_some_and(|a| a.exit_class == "rate_limit"),
+        "{rec:?}"
+    );
+    let cool = store_cooldowns(Some(t.store.as_ref()), Utc::now());
+    // Its Gemini models keep their own quota: only Anthropic's inside Antigravity waits.
+    assert!(!cool.contains_key("antigravity"), "{cool:?}");
+    assert!(cool.contains_key("antigravity:anthropic"), "{cool:?}");
+}
+
+#[tokio::test]
+async fn test_a_run_that_changed_nothing_leaves_no_worktree() {
+    let (_dir, root) = repo(&[("README", "hi\n")]);
+    let r = ran();
+    let t = test_deps(vec![Fake::new("a", &r).out("ok\n").arc()]);
+    let rec = run(
+        &t,
+        Options {
+            dir: root.clone(),
+            ..easy("p")
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(rec.status, STATUS_COMPLETED, "{rec:?}");
+    assert!(!rec.worktree.is_empty(), "the run had no worktree: {rec:?}");
+    assert!(
+        !std::path::Path::new(&rec.worktree).exists(),
+        "the empty worktree stayed"
+    );
+    assert_eq!(git(&root, &["branch", "--list", &rec.branch]), "");
+    assert!(rec.note.contains("no changes to merge"), "{}", rec.note);
+    assert_eq!(rec.files_changed, Some(0));
+    let tree = t.store.list_worktrees("").unwrap();
+    assert!(
+        tree.iter()
+            .any(|w| w.run_id == rec.id && w.status == "removed"),
+        "{tree:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_a_follow_up_cuts_an_emptied_worktree_again_where_it_was() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (_dir, root) = repo(&[("README", "hi\n")]);
+    let r = ran();
+    let write = std::sync::Arc::new(AtomicBool::new(false));
+    let edits = write.clone();
+    let f = Fake::new("a", &r).out("ok\n").edit(move |dir| {
+        if edits.load(Ordering::SeqCst) {
+            std::fs::write(std::path::Path::new(dir).join("later.txt"), "x\n").unwrap();
+        }
+    });
+    let t = test_deps(vec![f.arc()]);
+    let first = run(
+        &t,
+        Options {
+            dir: root.clone(),
+            ..easy("p")
+        },
+    )
+    .await
+    .unwrap();
+    assert!(!std::path::Path::new(&first.worktree).exists());
+    write.store(true, Ordering::SeqCst);
+    let second = run(
+        &t,
+        Options {
+            prompt: "now write".into(),
+            resume: first.id.clone(),
+            ..Options::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(second.status, STATUS_COMPLETED, "{second:?}");
+    // The agent's session was there: the follow-up works at the same path.
+    assert_eq!(second.worktree, first.worktree);
+    assert_eq!(second.branch, format!("dispatch/{}", second.id));
+    assert!(
+        std::path::Path::new(&second.worktree)
+            .join("later.txt")
+            .exists()
+    );
+    assert_eq!(second.files_changed, Some(1));
+    assert!(!std::path::Path::new(&root).join("later.txt").exists());
 }

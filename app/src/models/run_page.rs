@@ -47,6 +47,8 @@ pub struct DecisionCandidate {
     pub theta: Option<f64>,
     pub theta_source: String,
     pub qualified: bool,
+    /// The quota-pace score every route orders by: lower runs first.
+    pub score: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -202,6 +204,7 @@ fn map_candidate(value: &Value) -> DecisionCandidate {
         theta: opt_f64(value, "theta"),
         theta_source: json_str(value, "thetaSource"),
         qualified: value.get("qualified") == Some(&Value::Bool(true)),
+        score: opt_f64(value, "score"),
     }
 }
 
@@ -301,22 +304,327 @@ pub fn area_label(decision: &RouteDecision) -> String {
 }
 
 /// One candidate's price: P(pass), its bound, effective cost, and quota multiplier.
-pub fn candidate_price(candidate: &DecisionCandidate) -> String {
+/// The pass bar of a decision's priority (`balanced` when it names none).
+fn priority_bar(decision: &RouteDecision) -> f64 {
+    let priority = if decision.priority.is_empty() {
+        "balanced"
+    } else {
+        decision.priority.as_str()
+    };
+    PRIORITY_BARS
+        .iter()
+        .find(|(name, _)| *name == priority)
+        .map_or(0.8, |(_, bar)| *bar)
+}
+
+fn percent(value: f64) -> String {
+    format!("{:.0}%", value * 100.0)
+}
+
+/// What the quota-pace score says, as the router reads it: cooldown, a quota that will not
+/// last or runs behind, none known, or on pace.
+pub fn pace_label(score: f64) -> &'static str {
+    if score >= 10000.0 {
+        "Cooling down"
+    } else if score >= 3000.0 {
+        "Quota won't last"
+    } else if score >= 2000.0 {
+        "Quota behind pace"
+    } else if score >= 1000.0 {
+        "Quota unknown"
+    } else {
+        "Quota on pace"
+    }
+}
+
+/// A candidate's second line: under Auto its chance to pass this task and what a run costs
+/// here; otherwise its quota, which is all a tier or a named model orders by.
+pub fn candidate_line(candidate: &DecisionCandidate) -> String {
     let mut parts = Vec::new();
     if let Some(p_pass) = candidate.p_pass {
-        let bound = match candidate.p_pass_low {
-            Some(low) => format!(" \u{2265} {}", fixed(low, 2)),
-            None => String::new(),
-        };
-        parts.push(format!("P {}{bound}", fixed(p_pass, 2)));
-    }
-    if let Some(cost) = candidate.effective_cost {
-        parts.push(format!("${}", fixed(cost, 2)));
-    }
-    if let Some(quota) = candidate.quota_multiplier.filter(|quota| *quota != 1.0) {
-        parts.push(format!("q \u{00d7}{}", fixed(quota, 1)));
+        parts.push(format!("{} to pass", percent(p_pass)));
+        if let Some(cost) = candidate.effective_cost {
+            parts.push(format!("${}", fixed(cost, 2)));
+        }
+    } else if let Some(theta) = candidate.theta {
+        // Not scored against the message: its skill, as Intelligence rates it.
+        parts.push(format!("Skill {}", skill_score(theta)));
+        if let Some(price) = candidate.price {
+            parts.push(format!("${}", fixed(price, 2)));
+        }
+    } else if let Some(score) = candidate.score {
+        parts.push(pace_label(score).to_string());
     }
     parts.join(" \u{00b7} ")
+}
+
+/// A skill θ as Intelligence's score: 100·σ(θ), the chance to pass a task of difficulty 0.
+pub fn skill_score(theta: f64) -> String {
+    format!("{:.0}", 100.0 / (1.0 + (-theta).exp()))
+}
+
+/// What became of a candidate in this run, for the badge on its row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CandidateOutcome {
+    /// The model that ran the task (or runs it now): the run's status.
+    Used { status: String },
+    /// Tried before the one used and failed: how (its exit class) and its error.
+    Failed { class: String, error: String },
+    /// Before the one used in routing order but never started (cooling down, missing).
+    Skipped,
+}
+
+impl CandidateOutcome {
+    pub fn label(&self) -> String {
+        match self {
+            Self::Used { status } if is_run_active(status) => "Running".to_string(),
+            Self::Used { status } => match status.to_ascii_lowercase().as_str() {
+                "failed" | "timed_out" => "Used, failed".to_string(),
+                "cancelled" => "Used, cancelled".to_string(),
+                _ => "Used".to_string(),
+            },
+            Self::Failed { class, .. } => match class.trim() {
+                "" | "failed" => "Failed".to_string(),
+                class => format!("Failed: {}", class.replace('_', " ")),
+            },
+            Self::Skipped => "Not tried".to_string(),
+        }
+    }
+}
+
+fn same_model(agent: &str, model: &str, candidate: &DecisionCandidate) -> bool {
+    !candidate.model.is_empty()
+        && candidate.model == model.trim()
+        && (candidate.agent.is_empty() || candidate.agent == agent.trim())
+}
+
+/// Each candidate's outcome in `run`, in routing order: the failed attempts, the one used,
+/// and the ones before it that never started. Those after the one used have none.
+pub fn candidate_outcomes(
+    decision: &RouteDecision,
+    run: &DispatchRun,
+) -> Vec<Option<CandidateOutcome>> {
+    let mut out: Vec<Option<CandidateOutcome>> = decision
+        .candidates
+        .iter()
+        .map(|candidate| {
+            run.attempts
+                .iter()
+                .find(|attempt| same_model(&attempt.agent, &attempt.model, candidate))
+                .map(|attempt| CandidateOutcome::Failed {
+                    class: attempt.exit_class.clone(),
+                    error: attempt.error.trim().to_string(),
+                })
+        })
+        .collect();
+    let used = decision
+        .candidates
+        .iter()
+        .enumerate()
+        .position(|(index, candidate)| {
+            out[index].is_none() && same_model(&run.agent, &run.model, candidate)
+        });
+    if let Some(used) = used {
+        out[used] = Some(CandidateOutcome::Used {
+            status: run.status.clone(),
+        });
+        for slot in out.iter_mut().take(used) {
+            if slot.is_none() {
+                *slot = Some(CandidateOutcome::Skipped);
+            }
+        }
+    }
+    out
+}
+
+/// The failed attempts no candidate stands for (a model the decision named otherwise), which
+/// the Routing group lists on their own.
+pub fn unmatched_attempts<'a>(
+    decision: &RouteDecision,
+    run: &'a DispatchRun,
+) -> Vec<&'a DispatchAttempt> {
+    run.attempts
+        .iter()
+        .filter(|attempt| {
+            !decision
+                .candidates
+                .iter()
+                .any(|candidate| same_model(&attempt.agent, &attempt.model, candidate))
+        })
+        .collect()
+}
+
+/// A candidate's tooltip: what it was judged on, its numbers, and how they made its place.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CandidateExplain {
+    pub about: String,
+    pub rows: Vec<(String, String)>,
+    pub how: String,
+}
+
+pub fn candidate_explain(
+    decision: &RouteDecision,
+    candidate: &DecisionCandidate,
+) -> CandidateExplain {
+    let mut rows = Vec::new();
+    let pace = candidate.score.map(|score| pace_label(score).to_string());
+    let Some(p_pass) = candidate.p_pass else {
+        if let Some(theta) = candidate.theta {
+            let source = if candidate.theta_source.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", candidate.theta_source)
+            };
+            rows.push((
+                "Skill".to_string(),
+                format!(
+                    "{} \u{00b7} \u{03b8} {}{source}",
+                    skill_score(theta),
+                    fixed(theta, 2)
+                ),
+            ));
+        }
+        if let Some(price) = candidate.price {
+            rows.push(("Price".to_string(), format!("${} a task", fixed(price, 2))));
+        }
+        if let Some(pace) = pace {
+            rows.push(("Quota".to_string(), pace));
+        }
+        let (about, how) = if decision.route == "model" {
+            (
+                "Named by the request: the message was not scored.",
+                "A named model runs as asked; its quota only orders its own efforts.",
+            )
+        } else {
+            (
+                "Picked from the tier table: the message was not scored.",
+                "A tier runs its models in the table's order, those with quota to spare first. Skill is the chance to pass a task of difficulty 0; Auto scores each model against the message instead.",
+            )
+        };
+        return CandidateExplain {
+            about: about.to_string(),
+            rows,
+            how: how.to_string(),
+        };
+    };
+    if let Some(difficulty) = decision.difficulty {
+        let tier = if decision.tier.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", decision.tier)
+        };
+        rows.push((
+            "Task".to_string(),
+            format!("d {}{tier}", fixed(difficulty, 2)),
+        ));
+    }
+    if let Some(theta) = candidate.theta {
+        let source = if candidate.theta_source.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", candidate.theta_source)
+        };
+        rows.push((
+            "Skill \u{03b8}".to_string(),
+            format!("{}{source}", fixed(theta, 2)),
+        ));
+    }
+    let low = candidate
+        .p_pass_low
+        .map(|low| format!(", at least {}", percent(low)))
+        .unwrap_or_default();
+    rows.push(("Pass".to_string(), format!("{}{low}", percent(p_pass))));
+    let bar = priority_bar(decision);
+    rows.push((
+        "Bar".to_string(),
+        format!(
+            "{}: {}",
+            percent(bar),
+            if candidate.qualified {
+                "clears it"
+            } else {
+                "below it"
+            }
+        ),
+    ));
+    if let Some(price) = candidate.price {
+        rows.push(("Price".to_string(), format!("${} a task", fixed(price, 2))));
+    }
+    if let Some(cost) = candidate.effective_cost {
+        let quota = candidate
+            .quota_multiplier
+            .filter(|quota| *quota != 1.0)
+            .map(|quota| format!(" (quota \u{00d7}{})", fixed(quota, 2)))
+            .unwrap_or_default();
+        rows.push((
+            "Cost here".to_string(),
+            format!("${}{quota}", fixed(cost, 2)),
+        ));
+    }
+    if let Some(pace) = pace {
+        rows.push(("Quota".to_string(), pace));
+    }
+    let classifier = if decision.classifier.is_empty() {
+        "The classifier".to_string()
+    } else {
+        decision.classifier.clone()
+    };
+    CandidateExplain {
+        about: format!("How it scored against the first message, as {classifier} read it."),
+        rows,
+        how: "Pass is \u{03c3}(\u{03b8} \u{2212} d): the more its skill exceeds the task's difficulty, the likelier it passes. Auto runs the cheapest whose lower bound clears the bar; quota scales the price.".to_string(),
+    }
+}
+
+/// The Routing group's Why: how this route came to try its first model.
+pub fn route_reason(decision: &RouteDecision) -> Option<String> {
+    let chosen = usize::try_from(decision.chosen)
+        .ok()
+        .and_then(|index| decision.candidates.get(index));
+    let name = chosen
+        .map(|candidate| candidate.model.clone())
+        .unwrap_or_default();
+    // An Auto record always scores; older ones may not name their route.
+    let route = if decision.policy == "auto-v1" {
+        "auto"
+    } else {
+        decision.route.as_str()
+    };
+    match route {
+        "model" => Some("The request named the model: nothing was scored".to_string()),
+        "auto" => {
+            let read = match (decision.difficulty, decision.tier.is_empty()) {
+                (Some(d), false) => {
+                    format!("read the message as {} (d {})", decision.tier, fixed(d, 2))
+                }
+                (Some(d), true) => format!("read the message at d {}", fixed(d, 2)),
+                (None, _) => "judged the message".to_string(),
+            };
+            let classifier = if decision.classifier.is_empty() {
+                "The classifier".to_string()
+            } else {
+                decision.classifier.clone()
+            };
+            let qualified = decision.candidates.iter().filter(|c| c.qualified).count();
+            let bar = percent(priority_bar(decision));
+            let pick = match chosen {
+                Some(candidate) if candidate.qualified => {
+                    format!("{name} is the cheapest of {qualified} that clear the {bar} bar")
+                }
+                Some(_) => format!("none clears the {bar} bar, so {name} came closest"),
+                None => String::new(),
+            };
+            Some(if pick.is_empty() {
+                format!("{classifier} {read}")
+            } else {
+                format!("{classifier} {read}; {pick}")
+            })
+        }
+        "tier" if !name.is_empty() => Some(format!(
+            "The tier table's first model with quota to spare: {name}. The message was not scored"
+        )),
+        _ => None,
+    }
 }
 
 pub fn worktree_display_status(run_status: &str, worktree_status: &str) -> String {
@@ -1031,12 +1339,14 @@ fn json_i64(value: &Value, key: &str) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        MoreAction, ReviewAction, RolePick, RouteDecision, TokenUsage, candidate_price,
-        context_usage, decision_summary, dispatch_op_body, file_counts, format_cost,
-        format_duration, format_files, format_tokens, live_usage, map_route_decision,
-        parse_time_ms, role_summary, run_cost, run_more_actions, run_review_action,
-        token_breakdown, total_tokens, worktree_display_status,
+        CandidateOutcome, DecisionCandidate, MoreAction, ReviewAction, RolePick, RouteDecision,
+        TokenUsage, candidate_explain, candidate_line, candidate_outcomes, context_usage,
+        decision_summary, dispatch_op_body, file_counts, format_cost, format_duration,
+        format_files, format_tokens, live_usage, map_route_decision, pace_label, parse_time_ms,
+        role_summary, route_reason, run_cost, run_more_actions, run_review_action, token_breakdown,
+        total_tokens, unmatched_attempts, worktree_display_status,
     };
+    use crate::client::{DispatchAttempt, DispatchRun as Run};
     use serde_json::{Value, json};
     use std::collections::BTreeMap;
 
@@ -1113,9 +1423,156 @@ mod tests {
             "d -0.50 (hard) \u{00b7} jev: easy 0.10, normal 0.20, hard 0.70 \u{00b7} quality, bar 0.90"
         );
         assert_eq!(
-            candidate_price(&decision.candidates[0]),
-            "P 0.91 \u{2265} 0.90 \u{00b7} $0.20 \u{00b7} q \u{00d7}2.0"
+            candidate_line(&decision.candidates[0]),
+            "91% to pass \u{00b7} $0.20"
         );
+        assert_eq!(
+            route_reason(&decision).as_deref(),
+            Some(
+                "jev read the message as hard (d -0.50); m is the cheapest of 1 that clear the 90% bar"
+            )
+        );
+        let explain = candidate_explain(&decision, &decision.candidates[0]);
+        let rows: Vec<(&str, &str)> = explain
+            .rows
+            .iter()
+            .map(|(label, value)| (label.as_str(), value.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("Task", "d -0.50 (hard)"),
+                ("Pass", "91%, at least 90%"),
+                ("Bar", "90%: clears it"),
+                ("Cost here", "$0.20 (quota \u{00d7}2.00)"),
+            ]
+        );
+        assert!(explain.about.contains("first message"));
+    }
+
+    #[test]
+    fn a_candidate_shows_what_became_of_it() {
+        let mut decision = base_decision();
+        let candidate = |agent: &str, model: &str| DecisionCandidate {
+            agent: agent.into(),
+            model: model.into(),
+            effort: String::new(),
+            p_pass: None,
+            p_pass_low: None,
+            price: Some(2.5),
+            quota_multiplier: None,
+            effective_cost: None,
+            theta: Some(0.0),
+            theta_source: "cursorbench".into(),
+            qualified: false,
+            score: Some(0.0),
+        };
+        decision.candidates = vec![
+            candidate("cursor", "gemini-4-argon-low"),
+            candidate("claude", "claude-sonnet-5-5"),
+            candidate("codex", "gpt-6.1-sol"),
+            candidate("codex", "gpt-6-astra"),
+        ];
+        let run = Run {
+            agent: "codex".into(),
+            model: "gpt-6.1-sol".into(),
+            status: "COMPLETED".into(),
+            attempts: vec![
+                DispatchAttempt {
+                    agent: "cursor".into(),
+                    model: "gemini-4-argon-low".into(),
+                    error: "out of credits".into(),
+                    exit_class: "credits".into(),
+                    duration_ms: None,
+                },
+                DispatchAttempt {
+                    agent: "pi".into(),
+                    model: "elsewhere".into(),
+                    ..DispatchAttempt::default()
+                },
+            ],
+            ..Run::default()
+        };
+        let outcomes = candidate_outcomes(&decision, &run);
+        let labels: Vec<Option<String>> = outcomes
+            .iter()
+            .map(|outcome| outcome.as_ref().map(CandidateOutcome::label))
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                Some("Failed: credits".to_string()),
+                Some("Not tried".to_string()),
+                Some("Used".to_string()),
+                None,
+            ]
+        );
+        assert_eq!(
+            outcomes[0],
+            Some(CandidateOutcome::Failed {
+                class: "credits".into(),
+                error: "out of credits".into()
+            })
+        );
+        let unmatched = unmatched_attempts(&decision, &run);
+        assert_eq!(unmatched.len(), 1);
+        assert_eq!(unmatched[0].agent, "pi");
+        assert_eq!(
+            candidate_line(&decision.candidates[0]),
+            "Skill 50 \u{00b7} $2.50"
+        );
+        let running = Run {
+            status: "RUNNING".into(),
+            ..run
+        };
+        assert_eq!(
+            candidate_outcomes(&decision, &running)[2]
+                .as_ref()
+                .map(CandidateOutcome::label),
+            Some("Running".to_string())
+        );
+    }
+
+    #[test]
+    fn a_tier_or_named_route_says_the_message_was_not_scored() {
+        let mut decision = base_decision();
+        decision.policy = "tier-v2".into();
+        decision.route = "tier".into();
+        decision.classifier.clear();
+        decision.candidates = vec![DecisionCandidate {
+            agent: "claude".into(),
+            model: "claude-sonnet-5-5".into(),
+            effort: "high".into(),
+            p_pass: None,
+            p_pass_low: None,
+            price: None,
+            quota_multiplier: None,
+            effective_cost: None,
+            theta: None,
+            theta_source: String::new(),
+            qualified: false,
+            score: Some(1000.0),
+        }];
+        assert_eq!(candidate_line(&decision.candidates[0]), "Quota unknown");
+        assert_eq!(
+            route_reason(&decision).as_deref(),
+            Some(
+                "The tier table's first model with quota to spare: claude-sonnet-5-5. The message was not scored"
+            )
+        );
+        let explain = candidate_explain(&decision, &decision.candidates[0]);
+        assert_eq!(
+            explain.rows,
+            [("Quota".to_string(), "Quota unknown".to_string())]
+        );
+        decision.route = "model".into();
+        assert_eq!(
+            route_reason(&decision).as_deref(),
+            Some("The request named the model: nothing was scored")
+        );
+        assert_eq!(pace_label(-43.0), "Quota on pace");
+        assert_eq!(pace_label(3000.8), "Quota won't last");
+        assert_eq!(pace_label(10000.0), "Cooling down");
     }
 
     fn base_decision() -> RouteDecision {

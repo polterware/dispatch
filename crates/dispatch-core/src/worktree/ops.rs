@@ -1,11 +1,29 @@
 use crate::{Error, worktree::git::git};
 use std::{
+    collections::HashMap,
     ffi::OsString,
     fs::{self, OpenOptions},
     io::Write,
     os::unix::fs::OpenOptionsExt,
     path::{Component, Path, PathBuf},
+    sync::{Arc, LazyLock, Mutex, PoisonError},
 };
+
+/// One lock per repository, so runs started side by side cut their worktrees and edit the
+/// repo's exclude file one at a time instead of racing on git's own lock files.
+static REPO_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> =
+    LazyLock::new(Default::default);
+
+fn with_repo_lock<T>(root: &Path, f: impl FnOnce() -> T) -> T {
+    let lock = REPO_LOCKS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry(root.to_path_buf())
+        .or_default()
+        .clone();
+    let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+    f()
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NumStat {
@@ -18,6 +36,31 @@ pub struct NumStat {
 /// Returns the repo top-level containing `dir`, or `""` when `dir` is not in a git work tree.
 pub fn root(dir: impl AsRef<Path>) -> String {
     git(dir.as_ref(), &["rev-parse", "--show-toplevel"]).unwrap_or_default()
+}
+
+/// The main checkout of the repository holding `dir`: the top folder of `dir`'s checkout, or
+/// for a linked worktree the checkout it was cut from, so every worktree of a repository
+/// names the same one. Empty outside a repository or for a bare one.
+pub fn main_root(dir: impl AsRef<Path>) -> String {
+    let dir = dir.as_ref();
+    let Ok(common) = git(
+        dir,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    ) else {
+        return String::new();
+    };
+    let common = Path::new(common.trim());
+    if common.file_name().is_some_and(|name| name == ".git")
+        && let Some(parent) = common.parent()
+    {
+        return parent.to_string_lossy().into_owned();
+    }
+    // A bare repository has no checkout of its own; a checkout whose git folder lives
+    // elsewhere (`--separate-git-dir`) is its own top.
+    if git(dir, &["rev-parse", "--is-bare-repository"]).is_ok_and(|bare| bare.trim() == "true") {
+        return String::new();
+    }
+    root(dir)
 }
 
 /// Reports whether `HEAD` resolves (a worktree needs a commit).
@@ -33,6 +76,10 @@ pub fn dirty(root: impl AsRef<Path>) -> bool {
 /// Adds `pattern` to the repo's local `.git/info/exclude` if it is not there yet.
 pub fn exclude(root: impl AsRef<Path>, pattern: &str) -> Result<(), Error> {
     let root = root.as_ref();
+    with_repo_lock(root, || exclude_locked(root, pattern))
+}
+
+fn exclude_locked(root: &Path, pattern: &str) -> Result<(), Error> {
     let raw = git(root, &["rev-parse", "--git-path", "info/exclude"])?;
     let p = Path::new(&raw);
     let exclude_path = if p.is_absolute() {
@@ -75,10 +122,12 @@ pub fn worktree_path(root: impl AsRef<Path>, id: &str) -> PathBuf {
 pub fn create(root: impl AsRef<Path>, path: impl AsRef<Path>, id: &str) -> Result<String, Error> {
     let branch = branch_name(id);
     let path_str = path.as_ref().to_string_lossy();
-    git(
-        root.as_ref(),
-        &["worktree", "add", "-b", &branch, &path_str, "HEAD"],
-    )?;
+    with_repo_lock(root.as_ref(), || {
+        git(
+            root.as_ref(),
+            &["worktree", "add", "-b", &branch, &path_str, "HEAD"],
+        )
+    })?;
     Ok(branch)
 }
 
@@ -144,6 +193,13 @@ pub fn remove(
     Ok(())
 }
 
+/// Deletes the worktree at `path`, whatever it holds, and leaves its branch alone.
+pub fn remove_folder(root: impl AsRef<Path>, path: impl AsRef<Path>) -> Result<(), Error> {
+    let path_str = path.as_ref().to_string_lossy();
+    git(root.as_ref(), &["worktree", "remove", &path_str, "--force"])?;
+    Ok(())
+}
+
 /// Clears what is left of a worktree whose folder is gone (a merge removed it, or someone
 /// deleted it): its stale registration, and its branch while one remains. Without force it
 /// keeps a branch that is not merged.
@@ -158,6 +214,25 @@ pub fn forget(root: impl AsRef<Path>, branch: &str, force: bool) -> Result<(), E
         git(root, &["branch", del, branch])?;
     }
     Ok(())
+}
+
+/// Whether a worktree holds nothing to merge: no uncommitted files, and its HEAD is `base`
+/// (the commit it was cut from) or a commit the repository's HEAD already has. An empty
+/// `base` leaves only the second test.
+pub fn nothing_to_merge(root: impl AsRef<Path>, path: impl AsRef<Path>, base: &str) -> bool {
+    let path = path.as_ref();
+    if dirty(path) {
+        return false;
+    }
+    let Ok(tip) = head(path) else {
+        return false;
+    };
+    (!base.is_empty() && tip == base)
+        || git(
+            root.as_ref(),
+            &["merge-base", "--is-ancestor", &tip, "HEAD"],
+        )
+        .is_ok()
 }
 
 fn has_branch(root: &Path, branch: &str) -> bool {

@@ -6,10 +6,13 @@ message CheckResponse {
   string status = 1;
   string version = 2;
   double uptime_sec = 3;
-  // build identifies the core binary; a client with a newer build asks the
+  // build identifies the core binary; a client with a newer build asks an idle
   // core to shut down and starts its own.
   string build = 4;
   int32 pid = 5;
+  // active_runs counts the runs still pending or running: a newer client leaves a core with
+  // any alone, since stopping it would orphan them, and replaces it once they end.
+  int32 active_runs = 6;
 }
 
 // Shutdown stops the core after the response is sent.

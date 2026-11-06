@@ -15,7 +15,8 @@ use gpui::{
 use crate::avatar::agent_avatar;
 use crate::client::{
     ApplyAgentSetupRequest, ClassifyRequest, ConfigRequest, ConfigResponse, CoreClient, CoreError,
-    GetAgentSetupRequest, ListAgentsRequest, ListModelsRequest, at_once,
+    GetAgentSetupRequest, ListAgentsRequest, ListModelsRequest, ListWorktreeFoldersRequest,
+    PruneWorktreeFoldersRequest, WorktreeFolder, at_once,
 };
 use crate::models::settings::{
     CLASSIFIERS, CliState, Dimension, InstallState, ListedModel, Policy, RuleSide, SAMPLE_TASK,
@@ -51,11 +52,12 @@ const EDITOR_HEIGHT: f32 = 44.0;
 /// The token picker's trigger, the row's "+" icon button, which the picker lines up with.
 const TOKEN_TRIGGER: f32 = 28.0;
 
-const RAIL: [(SettingsPage, &str, Icon); 4] = [
+const RAIL: [(SettingsPage, &str, Icon); 5] = [
     (SettingsPage::Agents, "Agents", Icon::Settings),
     (SettingsPage::Classifier, "Classifier", Icon::AiBrain01Icon),
     (SettingsPage::PickRole, "Pick a role", Icon::Route),
     (SettingsPage::RoutingPolicy, "Routing policy", Icon::Sliders),
+    (SettingsPage::Worktrees, "Worktrees", Icon::GitBranch),
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -78,6 +80,9 @@ pub struct SettingsView {
     models: Vec<ListedModel>,
     setup: Option<crate::models::settings::AgentSetup>,
     setup_ticket: u64,
+    /// The worktree folders runs left, once read for the Worktrees page.
+    worktrees: Option<Vec<WorktreeFolder>>,
+    worktrees_inflight: bool,
     busy: String,
     busy_ticket: u64,
     classify_report: Option<crate::models::settings::ClassifyView>,
@@ -156,6 +161,8 @@ impl SettingsView {
             epoch: 0,
             policy: None,
             policy_ticket: 0,
+            worktrees: None,
+            worktrees_inflight: false,
             keys: BTreeMap::new(),
             keys_ready: false,
             keys_inflight: false,
@@ -226,6 +233,69 @@ impl SettingsView {
         {
             self.load_keys(cx);
         }
+        let on_worktrees = matches!(
+            self.state.read(cx).route(),
+            Route::Settings(SettingsPage::Worktrees)
+        );
+        if !on_worktrees {
+            // Read again on the next visit: runs come and go.
+            if !self.worktrees_inflight {
+                self.worktrees = None;
+            }
+        } else if online && self.worktrees.is_none() && !self.worktrees_inflight {
+            self.load_worktrees(false, cx);
+        }
+    }
+
+    /// Reads the worktree folders runs left, or with `prune` removes the ones Clean up
+    /// takes and reads what is left.
+    fn load_worktrees(&mut self, prune: bool, cx: &mut Context<Self>) {
+        let Some(client) = self.client(cx) else {
+            return;
+        };
+        self.worktrees_inflight = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    if prune {
+                        client
+                            .prune_worktree_folders(&PruneWorktreeFoldersRequest::default())
+                            .map(|response| (response.removed.len(), response.kept))
+                    } else {
+                        client
+                            .list_worktree_folders(&ListWorktreeFoldersRequest::default())
+                            .map(|response| (0, response.folders))
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                view.worktrees_inflight = false;
+                match result {
+                    Ok((removed, folders)) => {
+                        view.worktrees = Some(folders);
+                        if prune {
+                            let text = match removed {
+                                0 => "Nothing to clean up.".to_string(),
+                                1 => "Removed 1 worktree.".to_string(),
+                                n => format!("Removed {n} worktrees."),
+                            };
+                            view.toast(text, ToastTone::Success, cx);
+                        }
+                    }
+                    Err(err) => {
+                        view.worktrees = Some(Vec::new());
+                        view.toast(
+                            core_message(&err, "Could not read the worktrees."),
+                            ToastTone::Danger,
+                            cx,
+                        );
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// The open section; while the dialog plays out, the one it showed.
@@ -1192,7 +1262,56 @@ impl SettingsView {
             SettingsPage::Classifier => self.classifier_page(theme, cx),
             SettingsPage::PickRole => self.roles_page(theme, cx),
             SettingsPage::RoutingPolicy => self.policy_page(theme, cx),
+            SettingsPage::Worktrees => self.worktrees_page(theme, cx),
         }
+    }
+
+    /// Worktrees: every folder runs left under a repository's `.dispatch/worktrees`, with
+    /// its run and whether it has anything to merge, and Clean up.
+    fn worktrees_page(&self, theme: Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
+        if self.client(cx).is_none() {
+            return note("Dispatch core is not running.", theme);
+        }
+        let folders = self.worktrees.as_deref().unwrap_or_default();
+        let prunable = folders.iter().filter(|folder| folder.prunable).count();
+        let view = cx.entity();
+        let clean = button(
+            "worktrees-clean-up",
+            "Clean up",
+            ButtonKind::Secondary,
+            Rc::new(move |_, cx| {
+                view.update(cx, |this, cx| this.load_worktrees(true, cx));
+            }),
+            cx,
+        )
+        .disabled(prunable == 0 || self.worktrees_inflight)
+        .into_any_element();
+        let body = if self.worktrees.is_none() {
+            note("Reading the worktrees…", theme)
+        } else if folders.is_empty() {
+            note("No run has left a worktree.", theme)
+        } else {
+            let mut rows = div().flex().flex_col();
+            for folder in folders {
+                let (title, description, label, tone) = worktree_row(folder);
+                rows = rows.child(settings_row(
+                    title,
+                    Some(description.into()),
+                    chip(label, tone, cx),
+                    cx,
+                ));
+            }
+            rows.into_any_element()
+        };
+        settings_section(
+            Icon::GitBranch,
+            TileTone::Integration,
+            "Worktrees",
+            "A run that gets a worktree works under its repository's .dispatch/worktrees, on a branch of its own. One that changed nothing goes when its run ends; Clean up removes those whose run ended with nothing to merge, or no longer exists, and keeps the ones with changes.",
+            Some(clean),
+            body,
+            cx,
+        )
     }
 
     fn agents_page(&self, theme: Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -2196,6 +2315,31 @@ fn row_wash(theme: &Theme, hover: f32, press: f32) -> gpui::Rgba {
         theme.color_surface_hover
     };
     wash(color, hover.max(press))
+}
+
+/// A worktree folder's row: its run and branch, where it is and its run's status, and
+/// whether it has changes or Clean up would take it.
+fn worktree_row(folder: &WorktreeFolder) -> (String, String, &'static str, StatusTone) {
+    let run = folder.run_id.get(..12).unwrap_or(&folder.run_id);
+    let title = if folder.branch.is_empty() {
+        run.to_string()
+    } else {
+        format!("{run}  {}", folder.branch)
+    };
+    let status = if folder.run_status.is_empty() {
+        "its run no longer exists".to_string()
+    } else {
+        format!("run {}", folder.run_status.to_lowercase())
+    };
+    let description = format!("{}, {status}", folder.path);
+    let (label, tone) = if folder.prunable {
+        ("Can go", StatusTone::Muted)
+    } else if folder.changes {
+        ("Changes", StatusTone::Warn)
+    } else {
+        ("In use", StatusTone::Syncing)
+    };
+    (title, description, label, tone)
 }
 
 fn note(text: &str, theme: Theme) -> gpui::AnyElement {

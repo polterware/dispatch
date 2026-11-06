@@ -5,7 +5,7 @@
 //! (`FilterPopover::pills`, on a control with no button): Group by and a Since that fits the grouping (days for a day chart, weeks for a week
 //! chart, any span for a group), so each card reads its own figures. Both fields always hold
 //! a value: a removed pill comes back at its default. The rankings follow the chart's Since.
-//! The toolbar holds the runs in flight.
+//! Runs still in flight are left out: the core's report counts only runs that ended.
 //!
 //! It reads the app's current workspace (the one of the last run opened), as the Electron
 //! page does, and has no workspace picker.
@@ -26,14 +26,14 @@ use crate::models::stats::{
     default_since, empty_stats, fitting_since, is_time_series, since_options, utc_now_ms,
 };
 use crate::state::{AppState, ConnectionState, Route, observe};
-use crate::theme::{StatusTone, Theme, tw};
+use crate::theme::{Theme, tw};
 use crate::ui::parts::stats::{
     COMPACT_ROW_HEIGHT, ChartMark, TABLE_ROW_HEIGHT, ranking_grid, runs_columns, runs_groups,
     stats_table,
 };
 use crate::ui::{
     CollapsibleSection, FilterField, FilterPopover, FiltersChanged, Icon, MascotMood, TileTone,
-    ToastTone, card, chip, page_content, page_empty, table_height, toolbar,
+    ToastTone, card, page_content, page_empty, table_height, toolbar,
 };
 use crate::ui::{SkeletonLayout, page_skeleton};
 
@@ -509,23 +509,6 @@ fn heading_pills(
 }
 
 impl StatsView {
-    fn toolbar_end(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let in_flight = self.chart.stats.in_flight;
-        div()
-            .flex()
-            .items_center()
-            .gap(px(8.0))
-            .when(in_flight > 0, |end| {
-                end.child(chip(
-                    format!("{in_flight} in flight"),
-                    StatusTone::Syncing,
-                    cx,
-                ))
-            })
-    }
-}
-
-impl StatsView {
     /// The loaded page: the rankings, the chart, and the table, `padding` apart.
     fn content(
         &self,
@@ -589,7 +572,7 @@ impl Render for StatsView {
         } else {
             self.content(padding, chart, window, cx)
         };
-        let bar = toolbar(div(), self.toolbar_end(cx), cx);
+        let bar = toolbar(div(), div(), cx);
         div()
             .size_full()
             .relative()

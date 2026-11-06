@@ -10,6 +10,7 @@ mod ops;
 mod routing;
 mod summary;
 mod usage;
+mod worktrees;
 
 pub use classify::{run_difficulty, task_text, tier_warning};
 pub use decision::route_kind;
@@ -25,10 +26,11 @@ pub use routing::{
     normalize_priority, policy_request_reason, store_cooldowns, validate_options,
 };
 pub use summary::{
-    RunSummary, SUMMARY_SCHEMA, class_of, classify_run, go_duration, observed_ms, page, summarize,
-    summary,
+    RunSummary, SUMMARY_SCHEMA, class_of, classify_run, go_duration, limit_notice, observed_ms,
+    page, resets_in, summarize, summary,
 };
 pub use usage::{add_usage, load_catalog, usage_cost};
+pub use worktrees::{WORKTREES_DIR, WorktreeFolder};
 
 use crate::{
     Error,
@@ -83,6 +85,8 @@ pub(crate) fn msg(s: impl Into<String>) -> Error {
 }
 
 const COOLDOWN_FOR: chrono::TimeDelta = chrono::TimeDelta::hours(1);
+/// The longest a reset a limit notice names may hold an agent back.
+const MAX_COOLDOWN_FOR: chrono::TimeDelta = chrono::TimeDelta::days(7);
 /// A model outside the plan's allowance stays out until the user buys
 /// credits or the allowance resets.
 pub const CREDIT_COOLDOWN_FOR: chrono::TimeDelta = chrono::TimeDelta::hours(12);

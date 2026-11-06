@@ -157,6 +157,7 @@ async fn test_dispatch_client_forwards_caller_conversation_and_headers() {
                     uptime_sec: 1.5,
                     build: "1700000000-123".into(),
                     pid: 42,
+                    active_runs: 0,
                 })
             }),
         )
@@ -440,6 +441,7 @@ struct LifecycleServerState {
     db_path: PathBuf,
     reported_build: Arc<Mutex<String>>,
     shutdown_reasons: Arc<Mutex<Vec<String>>>,
+    active_runs: Arc<std::sync::atomic::AtomicI32>,
 }
 
 #[tokio::test]
@@ -450,10 +452,12 @@ async fn test_lifecycle_start_ensure_replace_older_build_and_stop() {
 
     let reported_build = Arc::new(Mutex::new(String::from("1000-1")));
     let shutdown_reasons = Arc::new(Mutex::new(Vec::new()));
+    let active_runs = Arc::new(std::sync::atomic::AtomicI32::new(0));
     let state = LifecycleServerState {
         db_path: db_path.clone(),
         reported_build: Arc::clone(&reported_build),
         shutdown_reasons: Arc::clone(&shutdown_reasons),
+        active_runs: Arc::clone(&active_runs),
     };
 
     let app = Router::new()
@@ -467,6 +471,7 @@ async fn test_lifecycle_start_ensure_replace_older_build_and_stop() {
                     uptime_sec: 1.0,
                     build,
                     pid: 1,
+                    active_runs: st.active_runs.load(std::sync::atomic::Ordering::SeqCst),
                 })
             }),
         )
@@ -500,6 +505,16 @@ async fn test_lifecycle_start_ensure_replace_older_build_and_stop() {
         .expect("start first core");
     assert!(pid_alive(first.pid));
     assert_eq!(first.endpoint, endpoint);
+
+    // 1b. An older core with live runs keeps serving: replacing it would orphan them.
+    active_runs.store(2, std::sync::atomic::Ordering::SeqCst);
+    let kept = ensure_with_exe(&exe_path, &db_path)
+        .await
+        .expect("ensure keeps a busy older core");
+    assert_eq!(kept.pid, first.pid);
+    assert!(pid_alive(first.pid));
+    assert!(shutdown_reasons.lock().expect("lock").is_empty());
+    active_runs.store(0, std::sync::atomic::Ordering::SeqCst);
 
     // 2. When HealthService/Check reports an older build ("1000-1"), ensure_with_exe
     // stops the older core and starts a fresh one. Ensure the replacement reports current build.

@@ -6,6 +6,7 @@
 //! background executor; they use the same button colors with fast hover and press springs.
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -18,20 +19,24 @@ use gpui::{
 
 use crate::avatar::{agent_avatar, route_avatar};
 use crate::client::{
-    CancelRunRequest, CleanRunRequest, ConfigRequest, CoreClient, CoreError, DispatchRun,
-    DispatchWorktree, GetRouteDecisionRequest, ListModelsRequest, ListTiersRequest,
-    ListWorktreesRequest, MergeRunRequest, RecoverRunRequest, ResultRequest, StartRunRequest,
+    AddWorkspaceRequest, CancelRunRequest, CleanRunRequest, ConfigRequest, CoreClient, CoreError,
+    DispatchAttempt, DispatchRun, DispatchWorktree, GetRouteDecisionRequest, ListModelsRequest,
+    ListTiersRequest, ListWorkspaceCardsRequest, ListWorktreesRequest, MergeRunRequest,
+    RecoverRunRequest, ResultRequest, StartRunRequest, WorkspaceRepository,
 };
 use crate::models::new_run::{
-    RouteChoice, RouteLabel, default_pick, pick_label, route_choices, run_label, start_request,
+    FolderChoice, PLACE_PREFERENCE, PlaceMode, RouteChoice, RouteLabel, RunPlace, default_pick,
+    default_place, folder_choices, offers_worktree, pick_label, place_label, route_choices,
+    run_label, start_request,
 };
 use crate::models::run_page::{
-    AttemptCard, LinkedRow, MoreAction, ReviewAction, RouteDecision, TokenUsage,
-    agent_attempt_cards, area_label, candidate_price, coalesce_text, context_usage,
-    decision_summary, duration_label, file_counts, follow_up_blocker, format_tokens, has_worktree,
-    is_run_active, linked_rows, map_route_decision, policy_label, proto_ms, rail_tokens,
-    role_summary, route_label, run_cost, run_more_actions, run_review_action, stored_usage,
-    timing_label, token_breakdown, total_tokens, worktree_display_status,
+    AttemptCard, CandidateExplain, CandidateOutcome, LinkedRow, MoreAction, ReviewAction,
+    RouteDecision, TokenUsage, area_label, candidate_explain, candidate_line, candidate_outcomes,
+    coalesce_text, context_usage, decision_summary, duration_label, file_counts, follow_up_blocker,
+    format_tokens, has_worktree, is_run_active, linked_rows, map_route_decision, policy_label,
+    proto_ms, rail_tokens, role_summary, route_label, route_reason, run_cost, run_more_actions,
+    run_review_action, stored_usage, timing_label, token_breakdown, total_tokens,
+    unmatched_attempts, worktree_display_status,
 };
 use crate::models::settings::parse_policy;
 use crate::motion::{Animator, SpringTier, SpringValue};
@@ -44,11 +49,16 @@ use crate::ui::patterns::window_layer;
 use crate::ui::patterns::{message_composer, message_input};
 use crate::ui::{
     Button, ButtonKind, ButtonSize, Icon, MascotMood, Menu, MenuEntry, PageWidth, RailGroup,
-    RailPresence, ToastTone, chip, mono, page_empty_with, rail_page_body_under, rail_page_header,
-    rail_properties, rail_property, rail_toggle_label, sans, tabular, toolbar, tooltip, wrap_text,
+    RailPresence, ToastTone, button, chip, mono, page_empty_with, rail_page_body_flush,
+    rail_page_body_under, rail_page_end_pad, rail_page_header, rail_properties, rail_property,
+    rail_toggle_label, rich_tooltip, sans, tabular, toolbar, tooltip, tooltip_heading, tooltip_row,
+    wrap_text,
 };
 use crate::ui::{PropertyOption, PropertyPicker, PropertyPickerEvent, text_swap};
 use crate::ui::{SkeletonLayout, TextInput, WIDE_MEASURE, page_skeleton};
+
+/// The route picker's Loading row, which cannot be picked.
+const ROUTES_LOADING: &str = "routes-loading";
 
 /// Where the rail's open state is remembered, as `railStorageKey` names it.
 const RAIL_PREFERENCE: &str = "polterware.run.rail";
@@ -88,7 +98,11 @@ pub struct RunPageView {
     reviewing: Option<Op>,
     confirm_open: bool,
     confirm_progress: SpringValue,
+    /// The rail toggle's entrance: 0 while the run works, springing to 1 once it ends.
+    rail_reveal: SpringValue,
     decision: Option<RouteDecision>,
+    /// The Routing group lists every candidate, not just the first few.
+    all_candidates: bool,
     worktree: Option<DispatchWorktree>,
     output_log: String,
     meta_for: String,
@@ -133,6 +147,8 @@ struct Draft {
     picked: bool,
     /// The routes offered, once the core has answered.
     choices: Vec<RouteChoice>,
+    /// The agents' models are still being asked for: the picker says so in a row.
+    models_loading: bool,
     /// The routes were asked for in this new conversation.
     asked: bool,
     picker: Entity<PropertyPicker>,
@@ -142,6 +158,20 @@ struct Draft {
     /// the route it was started on, which its header shows until the run has an agent and
     /// then turns into it.
     started: Option<(String, u64, String)>,
+    /// Where the run works, once picked; until then the default (`default_place`).
+    place: Option<RunPlace>,
+    /// The place last picked in each workspace (`PLACE_PREFERENCE`).
+    remembered: HashMap<String, RunPlace>,
+    /// Each linked project's cloned repositories, by workspace id, once the core answered.
+    repos: HashMap<String, Vec<WorkspaceRepository>>,
+    /// The repositories were asked for in this new conversation.
+    repos_asked: bool,
+    /// The folder picker, hung from the folder pill.
+    place_picker: Entity<PropertyPicker>,
+    folder_anchor: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// The last start was refused because another run edits the folder itself: the core's
+    /// message, over Worktree, which starts it again in a worktree of its own.
+    busy: Option<String>,
 }
 
 /// The header pill's key for a new conversation's route, which the run it starts keeps.
@@ -203,6 +233,20 @@ impl RunPageView {
             }
         })
         .detach();
+        let place_picker = cx.new(PropertyPicker::new);
+        cx.subscribe(
+            &place_picker,
+            |view, _, event: &PropertyPickerEvent, cx| match event {
+                PropertyPickerEvent::Pick(value)
+                    if value.as_ref() == crate::models::new_run::ADD_REPOSITORY =>
+                {
+                    view.add_repository(cx)
+                }
+                PropertyPickerEvent::Pick(value) => view.pick_place(value, cx),
+                _ => {}
+            },
+        )
+        .detach();
         let mut view = Self {
             state,
             transcript,
@@ -213,9 +257,11 @@ impl RunPageView {
             linked,
             menu,
             cancelling: false,
+            all_candidates: false,
             reviewing: None,
             confirm_open: false,
             confirm_progress: SpringValue::new(0.0, SpringTier::Moderate),
+            rail_reveal: SpringValue::new(0.0, SpringTier::Moderate),
             decision: None,
             worktree: None,
             output_log: String::new(),
@@ -248,10 +294,18 @@ impl RunPageView {
                 pick: default_pick(false).to_string(),
                 picked: false,
                 choices: Vec::new(),
+                models_loading: false,
                 asked: false,
                 picker,
                 anchor: Rc::new(Cell::new(None)),
                 started: None,
+                place: None,
+                remembered: HashMap::new(),
+                repos: HashMap::new(),
+                repos_asked: false,
+                place_picker,
+                folder_anchor: Rc::new(Cell::new(None)),
+                busy: None,
             },
         };
         view.install_bodies(cx);
@@ -317,16 +371,206 @@ impl RunPageView {
         }
         self.draft.open = true;
         self.draft.generation = self.draft.generation.wrapping_add(1);
-        let auto = self
-            .draft
-            .choices
-            .iter()
-            .any(|choice| choice.value == crate::models::new_run::AUTO);
+        let auto = self.draft.choices.iter().any(|choice| {
+            choice.value == crate::models::new_run::AUTO && choice.disabled.is_none()
+        });
         self.draft.pick = default_pick(auto).to_string();
         self.draft.picked = false;
         self.draft.asked = false;
+        self.draft.place = None;
+        self.draft.busy = None;
+        self.draft.repos_asked = false;
+        self.draft.remembered = self
+            .state
+            .read(cx)
+            .read_preference::<HashMap<String, RunPlace>>(PLACE_PREFERENCE)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
         self.message.update(cx, |input, cx| input.set_text("", cx));
         self.load_routes(cx);
+        self.load_folders(cx);
+    }
+
+    /// The folders a new conversation's run can work in, from the workspaces and the
+    /// repositories read so far.
+    fn folders(&self, cx: &App) -> Vec<FolderChoice> {
+        folder_choices(self.state.read(cx).workspaces(), &self.draft.repos)
+    }
+
+    /// Where the new conversation's run works: the place picked, else the current
+    /// workspace's last pick, else its folder itself.
+    fn place(&self, cx: &App) -> Option<RunPlace> {
+        if let Some(place) = &self.draft.place {
+            return Some(place.clone());
+        }
+        default_place(
+            self.state.read(cx).current_workspace(),
+            &self.draft.remembered,
+            &self.folders(cx),
+        )
+    }
+
+    /// Reads each linked project's cloned repositories, which the folder picker offers.
+    fn load_folders(&mut self, cx: &mut Context<Self>) {
+        if self.draft.repos_asked {
+            return;
+        }
+        let (client, linked) = {
+            let state = self.state.read(cx);
+            let linked: Vec<String> = state
+                .workspaces()
+                .iter()
+                .filter(|workspace| !workspace.polterware_project_id.is_empty())
+                .map(|workspace| workspace.id.clone())
+                .collect();
+            (state.client(), linked)
+        };
+        let Some(client) = client else {
+            return;
+        };
+        if linked.is_empty() {
+            return;
+        }
+        self.draft.repos_asked = true;
+        cx.spawn(async move |this, cx| {
+            let repos = cx
+                .background_spawn(async move {
+                    linked
+                        .into_iter()
+                        .filter_map(|workspace_id| {
+                            client
+                                .list_workspace_cards(&ListWorkspaceCardsRequest {
+                                    workspace_id: workspace_id.clone(),
+                                })
+                                .ok()
+                                .map(|response| (workspace_id, response.repositories))
+                        })
+                        .collect::<HashMap<_, _>>()
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                view.draft.repos = repos;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// A pick from the folder or mode picker: the place changes and is remembered for its
+    /// workspace.
+    fn pick_place(&mut self, value: &str, cx: &mut Context<Self>) {
+        let Some(mut place) = self.place(cx) else {
+            return;
+        };
+        if let Some(mode) = PlaceMode::from_value(value) {
+            place.mode = mode;
+        } else if let Some(folder) = self
+            .folders(cx)
+            .into_iter()
+            .find(|folder| folder.value() == value)
+        {
+            place.workspace_id = folder.workspace_id;
+            place.dir = folder.dir;
+        } else {
+            return;
+        }
+        self.draft.busy = None;
+        self.draft
+            .remembered
+            .insert(place.workspace_id.clone(), place.clone());
+        let _ = self
+            .state
+            .read(cx)
+            .write_preference(PLACE_PREFERENCE, &self.draft.remembered);
+        self.draft.place = Some(place);
+        cx.notify();
+    }
+
+    /// Opens the folder picker under its pill, or closes it.
+    fn toggle_folder_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.draft.picker.read(cx).is_open() {
+            self.draft.picker.update(cx, |picker, cx| picker.close(cx));
+        }
+        if self.draft.place_picker.read(cx).is_open() {
+            self.draft
+                .place_picker
+                .update(cx, |picker, cx| picker.close(cx));
+            return;
+        }
+        let Some(place) = self.place(cx) else {
+            return;
+        };
+        let options = self.folder_options(cx);
+        let height = self
+            .draft
+            .folder_anchor
+            .get()
+            .map_or(28.0, |bounds| f32::from(bounds.size.height));
+        let value = SharedString::from(format!("dir:{}", place.dir));
+        self.draft.place_picker.update(cx, |picker, cx| {
+            picker.set_options("Repository", options, Some(value), 320.0, cx);
+            picker.set_trigger_height(height);
+            picker.open(window, cx);
+        });
+    }
+
+    /// The repository picker's rows: each repository, then Add repository. A repository is
+    /// removed from its group's context menu in the sidebar.
+    fn folder_options(&self, cx: &App) -> Vec<PropertyOption> {
+        let mut options: Vec<PropertyOption> = self
+            .folders(cx)
+            .iter()
+            .map(|folder| {
+                PropertyOption::new(folder.value(), folder.label.clone())
+                    .hint(folder.dir.clone())
+                    .icon(Icon::Folder)
+            })
+            .collect();
+        options.push(
+            PropertyOption::new(crate::models::new_run::ADD_REPOSITORY, "Add repository")
+                .icon(Icon::Plus)
+                .action(),
+        );
+        options
+    }
+
+    /// Add repository in the folder picker: the folder chosen becomes a workspace, and the
+    /// new conversation's place, in the mode picked so far.
+    fn add_repository(&mut self, cx: &mut Context<Self>) {
+        let mode = self
+            .place(cx)
+            .map(|place| place.mode)
+            .unwrap_or(PlaceMode::InPlace);
+        let page = cx.entity().downgrade();
+        self.state.update(cx, |state, cx| {
+            state.add_repository(cx, move |_, workspace, dir, cx| {
+                let place = RunPlace {
+                    workspace_id: workspace.id.clone(),
+                    dir: dir.to_string(),
+                    mode,
+                };
+                // After the state's update ends: the page reads the state to list folders.
+                cx.defer(move |cx| {
+                    let _ = page.update(cx, |view, cx| {
+                        view.draft.place = Some(place);
+                        view.draft.busy = None;
+                        // A project's repositories are read again, the new one among them.
+                        view.draft.repos_asked = false;
+                        view.load_folders(cx);
+                        cx.notify();
+                    });
+                });
+            });
+        });
+    }
+
+    /// Worktree, after a refusal for a folder another run edits: the same message
+    /// again, in a worktree of its own.
+    fn retry_in_worktree(&mut self, cx: &mut Context<Self>) {
+        self.pick_place(PlaceMode::Worktree.value(), cx);
+        let text = self.message.read(cx).text().to_string();
+        self.start_conversation(text, cx);
     }
 
     /// Reads whether a classifier is on, the tier table, and the agents' models, and offers
@@ -339,8 +583,12 @@ impl RunPageView {
             return;
         };
         self.draft.asked = true;
+        self.draft.models_loading = true;
         cx.spawn(async move |this, cx| {
-            let routes = cx
+            // Auto and the tiers first, which the core answers at once; the agents' models
+            // after, which can take seconds while a CLI is asked for the first time.
+            let models_client = client.clone();
+            let (auto, tiers) = cx
                 .background_spawn(async move {
                     let auto = client
                         .config(&ConfigRequest {
@@ -353,32 +601,49 @@ impl RunPageView {
                         .list_tiers(&ListTiersRequest {})
                         .map(|response| response.tiers)
                         .unwrap_or_default();
-                    let models = client
-                        .list_models(&ListModelsRequest {})
-                        .map(|response| response.models)
-                        .unwrap_or_default();
-                    (auto, route_choices(auto, &tiers, &models))
+                    (auto, tiers)
                 })
                 .await;
+            let shown_tiers = tiers.clone();
             let _ = this.update(cx, |view, cx| {
-                let (auto, choices) = routes;
                 if !view.draft.picked {
                     view.draft.pick = default_pick(auto).to_string();
                 }
-                view.draft.choices = choices;
+                // Keep the models an earlier load listed until the new list comes.
+                let models: Vec<RouteChoice> = view
+                    .draft
+                    .choices
+                    .iter()
+                    .filter(|choice| choice.agent.is_some())
+                    .cloned()
+                    .collect();
+                view.draft.choices = route_choices(auto, &shown_tiers, &[]);
+                view.draft.choices.extend(models);
+                view.refresh_route_picker(cx);
+                cx.notify();
+            });
+            let models = cx
+                .background_spawn(async move {
+                    models_client
+                        .list_models(&ListModelsRequest {})
+                        .map(|response| response.models)
+                        .unwrap_or_default()
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                view.draft.choices = route_choices(auto, &tiers, &models);
+                view.draft.models_loading = false;
+                view.refresh_route_picker(cx);
                 cx.notify();
             });
         })
         .detach();
     }
 
-    /// Opens the header's picker of routes under its pill, or closes it.
-    pub(crate) fn toggle_route_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.draft.picker.read(cx).is_open() {
-            self.draft.picker.update(cx, |picker, cx| picker.close(cx));
-            return;
-        }
-        let options = self
+    /// The route picker's rows, from the routes read so far, with a Loading row while the
+    /// agents' models are still being asked for.
+    fn route_options(&self) -> Vec<PropertyOption> {
+        let mut options: Vec<PropertyOption> = self
             .draft
             .choices
             .iter()
@@ -387,6 +652,9 @@ impl RunPageView {
                     .group(choice.group.clone());
                 if !choice.hint.is_empty() {
                     option = option.hint(choice.hint.clone());
+                }
+                if let Some(reason) = &choice.disabled {
+                    option = option.disabled(reason.clone());
                 }
                 match &choice.agent {
                     Some(agent) => {
@@ -399,6 +667,47 @@ impl RunPageView {
                 }
             })
             .collect();
+        if self.draft.models_loading {
+            options.push(
+                PropertyOption::new(ROUTES_LOADING, "Loading models\u{2026}")
+                    .group("Models")
+                    .hint("Asking each agent CLI")
+                    .icon(Icon::Activity)
+                    .disabled("The agents' models are still loading"),
+            );
+        }
+        options
+    }
+
+    /// Puts the routes read so far in the route picker while it is open.
+    fn refresh_route_picker(&mut self, cx: &mut Context<Self>) {
+        if !self.draft.picker.read(cx).is_open() {
+            return;
+        }
+        let options = self.route_options();
+        let value = SharedString::from(self.draft.pick.clone());
+        self.draft.picker.update(cx, |picker, cx| {
+            picker.set_options("Route", options, Some(value), 320.0, cx);
+        });
+    }
+
+    /// Opens the header's picker of routes under its pill, or closes it.
+    pub(crate) fn toggle_route_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.draft.place_picker.read(cx).is_open() {
+            self.draft
+                .place_picker
+                .update(cx, |picker, cx| picker.close(cx));
+        }
+        if self.draft.picker.read(cx).is_open() {
+            self.draft.picker.update(cx, |picker, cx| picker.close(cx));
+            return;
+        }
+        // The core did not answer the routes (it may have been starting): ask again.
+        if self.draft.choices.is_empty() {
+            self.draft.asked = false;
+            self.load_routes(cx);
+        }
+        let options = self.route_options();
         let height = self
             .draft
             .anchor
@@ -419,22 +728,14 @@ impl RunPageView {
         if prompt.is_empty() || self.sending {
             return;
         }
-        let (client, workspace) = {
-            let state = self.state.read(cx);
-            (
-                state.client(),
-                state
-                    .current_workspace()
-                    .map(|workspace| workspace.id.clone()),
-            )
-        };
+        let client = self.state.read(cx).client();
         let Some(client) = client else {
             self.toast("Dispatch core is not running", ToastTone::Danger, cx);
             return;
         };
-        let Some(workspace) = workspace else {
+        let Some(place) = self.place(cx) else {
             self.toast(
-                "Add a workspace to start a conversation",
+                "Add a repository to start a conversation",
                 ToastTone::Danger,
                 cx,
             );
@@ -442,12 +743,26 @@ impl RunPageView {
         };
         let pick = self.draft.pick.clone();
         let generation = self.draft.generation;
-        let request = start_request(&pick, &prompt, &workspace);
+        let request = start_request(&pick, &prompt, &place);
+        self.draft.busy = None;
         self.sending = true;
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
-                .background_spawn(async move { client.start_run(&request) })
+                .background_spawn(async move {
+                    let mut request = request;
+                    // A repository only runs named: the core adds it, as its main checkout.
+                    if request.project_id.trim().is_empty() {
+                        request.project_id = client
+                            .add_workspace(&AddWorkspaceRequest {
+                                path: request.dir.clone(),
+                                name: String::new(),
+                            })?
+                            .workspace
+                            .id;
+                    }
+                    client.start_run(&request)
+                })
                 .await;
             let _ = this.update(cx, |view, cx| {
                 view.sending = false;
@@ -465,6 +780,13 @@ impl RunPageView {
                         });
                     }
                     Ok(_) => cx.notify(),
+                    // Another run edits the folder itself: Worktree, under the message.
+                    Err(CoreError::Rpc(message))
+                        if offers_worktree(&message) && place.mode == PlaceMode::InPlace =>
+                    {
+                        view.draft.busy = Some(message);
+                        cx.notify();
+                    }
                     Err(error) => {
                         let message = match error {
                             CoreError::Rpc(message) if !message.is_empty() => {
@@ -500,8 +822,8 @@ impl RunPageView {
         self.sync_menu("", &[], cx);
         let theme = *Theme::global(cx);
         let weak = cx.weak_entity();
-        let visible = self.rail_visible();
-        self.rail.set_open(visible);
+        // Nothing has run yet: no rail, and no toggle to open one.
+        self.rail.set_open(false);
         let label = pick_label(&self.draft.pick);
         let open_picker: PillClick = Rc::new({
             let weak = weak.clone();
@@ -509,36 +831,41 @@ impl RunPageView {
                 let _ = weak.update(cx, |view, cx| view.toggle_route_picker(window, cx));
             }
         });
-        let anchor = self.draft.anchor.clone();
-        let pill = div()
-            .relative()
-            .child(route_pill(
+        let route = anchored(
+            route_pill(
                 &draft_key(self.draft.generation),
                 &label,
                 "",
                 Some(open_picker),
                 cx,
-            ))
-            .child(
-                canvas(
-                    move |bounds, _, _| anchor.set(Some(bounds)),
-                    |_, _, _, _| {},
-                )
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full(),
-            );
-        let toggle_view = weak.clone();
-        let end = Button::new("run-rail-toggle", ButtonKind::Secondary)
-            .size(ButtonSize::Icon)
-            .icon(Icon::SidebarRightIcon)
-            .tooltip(rail_toggle_label(visible))
-            .selected(visible)
-            .on_click(move |_, cx| {
-                let _ = toggle_view.update(cx, |view, cx| view.toggle_rail(cx));
+            ),
+            self.draft.anchor.clone(),
+        );
+        self.load_folders(cx);
+        let mut pills = div().flex().items_center().gap(px(6.0)).child(route);
+        if let Some(place) = self.place(cx) {
+            let folder_label = {
+                let state = self.state.read(cx);
+                place_label(&place, &self.folders(cx), state.workspaces())
+            };
+            let click: PillClick = Rc::new({
+                let weak = weak.clone();
+                move |window, cx| {
+                    let _ = weak.update(cx, |view, cx| view.toggle_folder_picker(window, cx));
+                }
             });
-        let bar = rail_page_header(pill, end, cx).into_any_element();
+            pills = pills.child(anchored(
+                place_pill(
+                    "draft-folder",
+                    Icon::Folder,
+                    &folder_label,
+                    &place.dir,
+                    Some(click),
+                ),
+                self.draft.folder_anchor.clone(),
+            ));
+        }
+        let bar = rail_page_header(pills, div(), cx).into_any_element();
         let header = theme.page_header_height;
         let can_send = self.state.read(cx).current_workspace().is_some();
         let input = self.message.clone();
@@ -552,6 +879,70 @@ impl RunPageView {
         if !can_send {
             card = card.can_send(false);
         }
+        // Worktree: a ghost button that takes the primary colors while on, when the run gets
+        // a git worktree and branch of its own; off, it edits the folder itself.
+        if let Some(place) = self.place(cx) {
+            let on = place.mode == PlaceMode::Worktree;
+            let toggle = weak.clone();
+            // A small neutral toggle at its own width, at the right beside Send: the raised
+            // secondary face when on.
+            let button = Button::new(
+                "draft-worktree",
+                if on {
+                    ButtonKind::Secondary
+                } else {
+                    ButtonKind::Ghost
+                },
+            )
+            .size(ButtonSize::Sm)
+            .height(24.0)
+            .pad_x(8.0)
+            .icon(Icon::GitBranch)
+            .label(PlaceMode::Worktree.label())
+            .selected(on)
+            .tooltip(PlaceMode::Worktree.hint())
+            .on_click(move |_, cx| {
+                let mode = if on {
+                    PlaceMode::InPlace
+                } else {
+                    PlaceMode::Worktree
+                };
+                let _ = toggle.update(cx, |view, cx| view.pick_place(mode.value(), cx));
+            });
+            card = card.footer_start(
+                div()
+                    .w_full()
+                    .flex()
+                    .justify_end()
+                    .child(div().flex_none().child(button)),
+            );
+        }
+        // Another run edits the folder itself: say so over the composer, with Worktree.
+        let busy = self.draft.busy.clone().map(|message| {
+            let retry = weak.clone();
+            div()
+                .w_full()
+                .mb(px(8.0))
+                .flex()
+                .items_center()
+                .gap(px(10.0))
+                .text_size(px(theme.font_size_xs))
+                .text_color(theme.color_text_muted)
+                .child(div().flex_1().min_w(px(0.0)).child(wrap_text(message)))
+                .child(
+                    button(
+                        "draft-new-worktree",
+                        "Worktree",
+                        ButtonKind::Primary,
+                        Rc::new(move |_, cx| {
+                            let _ = retry.update(cx, |view, cx| view.retry_in_worktree(cx));
+                        }),
+                        cx,
+                    )
+                    .size(ButtonSize::Sm),
+                )
+        });
+        let card = div().w_full().children(busy).child(card);
         let column = div()
             .flex_1()
             .min_h(px(0.0))
@@ -571,7 +962,7 @@ impl RunPageView {
                     .child(div().w_full().max_w(px(WIDE_MEASURE)).child(card)),
             );
         // Nothing has run yet, so the rail has nothing to hold.
-        let (row, drawer) = rail_page_body_under(
+        let (row, _) = rail_page_body_under(
             column,
             div().into_any_element(),
             &self.rail,
@@ -584,19 +975,12 @@ impl RunPageView {
         let overlay = (picker.read(cx).is_presented())
             .then(|| self.draft.anchor.get())
             .flatten()
-            .map(|anchor| {
-                window_layer(
-                    div().size_full().child(
-                        div()
-                            .absolute()
-                            .left(anchor.origin.x)
-                            .top(anchor.origin.y)
-                            .w(anchor.size.width)
-                            .h(anchor.size.height)
-                            .child(picker),
-                    ),
-                )
-            });
+            .map(|anchor| hang(anchor, picker.into_any_element()));
+        let place_picker = self.draft.place_picker.clone();
+        let place_overlay = (place_picker.read(cx).is_presented())
+            .then(|| self.draft.folder_anchor.get())
+            .flatten()
+            .map(|anchor| hang(anchor, place_picker.into_any_element()));
         div()
             .relative()
             .size_full()
@@ -619,8 +1003,8 @@ impl RunPageView {
                         theme.radius_surface,
                     )),
             )
-            .children(drawer)
             .children(overlay)
+            .children(place_overlay)
             .into_any_element()
     }
 
@@ -684,11 +1068,17 @@ impl RunPageView {
     }
 
     /// The composer under the transcript, for a run whose agent kept its session.
-    fn composer(&self, run: &DispatchRun, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if !run.resumable {
-            return None;
-        }
-        let blocked = follow_up_blocker(run, self.state.read(cx).runs());
+    /// The composer under the transcript, on every run's page: its send waits while the run
+    /// (or a message to it, or another run in its folder) works, and stays off for a run that
+    /// kept no session to send to.
+    fn composer(
+        &self,
+        run: &DispatchRun,
+        end_pad: f32,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let blocked =
+            follow_up_blocker(run, self.state.read(cx).runs()).is_some() || !run.resumable;
         let weak = cx.weak_entity();
         let input = self.message.clone();
         let mut card = message_composer("run-message", &self.message, &self.message_scroll)
@@ -697,7 +1087,7 @@ impl RunPageView {
                 let text = input.read(cx).text().to_string();
                 let _ = weak.update(cx, |view, cx| view.send_message(text, cx));
             }));
-        if blocked.is_some() {
+        if blocked {
             card = card.can_send(false);
         }
         Some(
@@ -706,7 +1096,9 @@ impl RunPageView {
                 .flex_none()
                 .flex()
                 .justify_center()
-                .px(px(16.0))
+                .pl(px(16.0))
+                // The column runs to the page's edge: the composer keeps the text's room.
+                .pr(px(16.0 + end_pad))
                 .pb(px(16.0))
                 .child(div().w_full().max_w(px(WIDE_MEASURE)).child(card))
                 .into_any_element(),
@@ -987,6 +1379,7 @@ impl RunPageView {
             self.log_for.clear();
             self.meta_for.clear();
             self.decision = None;
+            self.all_candidates = false;
             self.worktree = None;
             self.side_gen = self.side_gen.wrapping_add(1);
             self.side_inflight = false;
@@ -1033,6 +1426,9 @@ impl RunPageView {
             .and_then(|meter| meter.percent)
             .map(|percent| percent as f32 / 100.0)
             .unwrap_or(0.0);
+        // A run shows its rail toggle while it works too, so its routing and changes can
+        // be read live; a new conversation, with no run yet, has none.
+        self.rail_reveal.snap(1.0);
         if switched {
             self.context_fill.snap(fraction);
             if live {
@@ -1049,11 +1445,14 @@ impl RunPageView {
     fn step_motion(&mut self, window: &mut Window) {
         self.confirm_progress
             .set_target(if self.confirm_open { 1.0 } else { 0.0 });
-        let moving = !self.confirm_progress.settled() || !self.context_fill.settled();
+        let moving = !self.confirm_progress.settled()
+            || !self.context_fill.settled()
+            || !self.rail_reveal.settled();
         let dt = self.animator.dt(window, moving);
         if dt > 0.0 {
             self.confirm_progress.step(dt);
             self.context_fill.step(dt);
+            self.rail_reveal.step(dt);
         }
     }
 
@@ -1258,6 +1657,11 @@ impl Render for RunPageView {
         if self.draft.picker.read(cx).is_open() {
             self.draft.picker.update(cx, |picker, cx| picker.close(cx));
         }
+        if self.draft.place_picker.read(cx).is_open() {
+            self.draft
+                .place_picker
+                .update(cx, |picker, cx| picker.close(cx));
+        }
         let theme = *Theme::global(cx);
         let (route_id, connection, run, links, reply) = {
             let state = self.state.read(cx);
@@ -1303,28 +1707,73 @@ impl Render for RunPageView {
 
         let weak = cx.weak_entity();
         let menu_open = self.menu.read(cx).is_open();
-        let visible = self.rail_visible();
+        // Any run has its rail and toggle, working or ended.
+        let ended = self.snapshot_run.is_some();
+        let visible = ended && self.rail_visible();
         self.rail.set_open(visible);
+        let reveal = self.rail_reveal.value().clamp(0.0, 1.2);
         let bar = if let Some(run) = self.snapshot_run.clone() {
             let toggle_view = weak.clone();
             let end = div()
                 .flex()
                 .items_center()
-                .gap(px(8.0))
                 .child(self.toolbar_end(&run, menu_open, weak.clone()))
-                .child(
-                    Button::new("run-rail-toggle", ButtonKind::Secondary)
-                        .size(ButtonSize::Icon)
-                        .icon(Icon::SidebarRightIcon)
-                        .tooltip(rail_toggle_label(visible))
-                        .selected(visible)
-                        .on_click(move |_, cx| {
-                            let _ = toggle_view.update(cx, |view, cx| view.toggle_rail(cx));
-                        }),
-                );
+                .when(ended || reveal > 0.001, |end| {
+                    // The toggle grows into its slot (the 8px gap and the 28px button) and
+                    // fades in, pushing the actions before it aside, on the spring's overshoot.
+                    end.child(
+                        div()
+                            .flex_none()
+                            .w(px(RAIL_TOGGLE_SLOT * reveal.max(0.0)))
+                            // gpui 0.2.2 clips both axes even for x alone, so the clip box
+                            // reaches 4px past the button above and below: its edge and drop
+                            // stay whole while the width grows.
+                            .overflow_hidden()
+                            .py(px(4.0))
+                            .my(px(-4.0))
+                            .opacity(reveal.clamp(0.0, 1.0))
+                            .flex()
+                            .justify_end()
+                            .child(
+                                Button::new("run-rail-toggle", ButtonKind::Secondary)
+                                    .size(ButtonSize::Icon)
+                                    .icon(Icon::SidebarRightIcon)
+                                    .tooltip(rail_toggle_label(visible))
+                                    .selected(visible)
+                                    .on_click(move |_, cx| {
+                                        let _ =
+                                            toggle_view.update(cx, |view, cx| view.toggle_rail(cx));
+                                    }),
+                            ),
+                    )
+                });
             let (key, label) = self.run_route(&run);
-            rail_page_header(route_pill(&key, &label, &run.status, None, cx), end, cx)
-                .into_any_element()
+            // Whether the run has a worktree of its own, once that is known (a pending run has
+            // not cut one yet).
+            let worktree = match worktree_badge(&run) {
+                Some(true) => Some(place_pill(
+                    "run-worktree",
+                    Icon::GitBranch,
+                    "Worktree",
+                    &run.branch,
+                    None,
+                )),
+                Some(false) => Some(place_pill(
+                    "run-worktree",
+                    Icon::Folder,
+                    "No worktree",
+                    &run.dir,
+                    None,
+                )),
+                None => None,
+            };
+            let start = div()
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .child(route_pill(&key, &label, &run.status, None, cx))
+                .children(worktree);
+            rail_page_header(start, end, cx).into_any_element()
         } else {
             toolbar(div(), div(), cx).into_any_element()
         };
@@ -1345,6 +1794,11 @@ impl Render for RunPageView {
                 .child(changes)
                 .when(show_linked, |rail| rail.child(linked))
                 .into_any_element();
+            // The column runs to the page's edge (or the rail), so the transcript's scrollbar
+            // sits as far right as it can; the text and the composer keep the room after.
+            let end_pad = rail_page_end_pad(&self.rail, &self.page_width);
+            self.transcript
+                .update(cx, |transcript, cx| transcript.set_end_pad(end_pad, cx));
             // `flex min-w-0 flex-col gap-6 pt-2` around the transcript and `logEnd`: the
             // transcript's list holds the `pt-2` and the gap as its padding, so they scroll.
             let column = div()
@@ -1363,12 +1817,12 @@ impl Render for RunPageView {
                 .children(
                     self.snapshot_run
                         .clone()
-                        .and_then(|run| self.composer(&run, cx)),
+                        .and_then(|run| self.composer(&run, end_pad, cx)),
                 );
             // The transcript runs up under the header, which fades it out on its trail.
             self.transcript
                 .update(cx, |transcript, cx| transcript.set_top_inset(header, cx));
-            let (row, over) = rail_page_body_under(
+            let (row, over) = rail_page_body_flush(
                 column,
                 rail,
                 &self.rail,
@@ -1424,8 +1878,10 @@ impl Render for RunPageView {
                 div()
                     .absolute()
                     .top(px(0.0))
-                    // Under "…", which sits before the rail toggle.
-                    .right(px(theme.space_4 + 36.0))
+                    // Under "…", which sits before the rail toggle once it is in.
+                    .right(px(
+                        theme.space_4 + RAIL_TOGGLE_SLOT * self.rail_reveal.value().clamp(0.0, 1.0)
+                    ))
                     .w(px(200.0))
                     .child(menu),
             )
@@ -1547,6 +2003,76 @@ fn read_pack(view: &WeakEntity<RunPageView>, cx: &App) -> Option<Pack> {
 /// What a press on the header pill does.
 type PillClick = Rc<dyn Fn(&mut Window, &mut App)>;
 
+/// `element` with its bounds written to `anchor` each frame, for a picker to hang from.
+/// Whether `run` has a worktree of its own: `None` while that is not known yet.
+fn worktree_badge(run: &DispatchRun) -> Option<bool> {
+    if !run.worktree.is_empty() && !run.in_place {
+        Some(true)
+    } else if run.in_place
+        || run.read_only
+        || !is_run_active(&run.status)
+        || run.status == "RUNNING"
+    {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn anchored(element: AnyElement, anchor: Rc<Cell<Option<Bounds<Pixels>>>>) -> gpui::Div {
+    div().relative().child(element).child(
+        canvas(
+            move |bounds, _, _| anchor.set(Some(bounds)),
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full(),
+    )
+}
+
+/// `panel` laid over the window at `anchor`, the trigger it hangs from.
+fn hang(anchor: Bounds<Pixels>, panel: AnyElement) -> AnyElement {
+    window_layer(
+        div().size_full().child(
+            div()
+                .absolute()
+                .left(anchor.origin.x)
+                .top(anchor.origin.y)
+                .w(anchor.size.width)
+                .h(anchor.size.height)
+                .child(panel),
+        ),
+    )
+}
+
+/// A header pill for where a run works: its folder, or its mode. A run's is inert; the
+/// new conversation's folder opens its picker. `detail` is its tooltip.
+fn place_pill(
+    id: &'static str,
+    icon: Icon,
+    label: &str,
+    detail: &str,
+    on_click: Option<PillClick>,
+) -> AnyElement {
+    let mut pill = Button::new(id, ButtonKind::Secondary)
+        .size(ButtonSize::Sm)
+        .pill()
+        .pad_x(10.0)
+        .icon(icon)
+        .label(label.to_string());
+    if !detail.is_empty() {
+        pill = pill.tooltip(detail.to_string());
+    }
+    match on_click {
+        Some(click) => pill
+            .on_click(move |window, cx| click(window, cx))
+            .into_any_element(),
+        None => pill.inert().into_any_element(),
+    }
+}
+
 /// The header pill: the route's bot (the Polterware ghost for a tier, the agent's live bot
 /// once it has one) in Roles' role title material, then its name and, muted, its model. A new
 /// conversation's pill opens the route picker; a run's is inert. `key` holds what it showed,
@@ -1596,33 +2122,46 @@ fn route_pill(
     }
 }
 
-/// The attempts that failed before the one that ran, as 18px bots and a line each with their
-/// error, for the top of the Run group. `None` when the first attempt is the last.
-fn failed_attempts(run: &DispatchRun, theme: &Theme) -> Option<gpui::Div> {
-    let cards = agent_attempt_cards(run);
-    if cards.len() < 2 {
+/// The attempts that failed before the one that ran, as 18px bots beside their route with
+/// the error wrapped under it, for the Routing group. `None` when the first attempt is the last.
+/// The failed attempts no routing candidate stands for, each with its bot, its model, and
+/// its error wrapped under it; the others show their error on their own candidate row.
+fn failed_attempts(attempts: &[&DispatchAttempt], theme: &Theme) -> Option<gpui::Div> {
+    if attempts.is_empty() {
         return None;
     }
     let mut list = div().flex().min_w(px(0.0)).flex_col().gap(px(tw(1.5)));
-    for card in &cards[..cards.len() - 1] {
+    for attempt in attempts {
+        let title = [attempt.agent.trim(), attempt.model.trim()]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" / ");
         list = list.child(
             div()
                 .flex()
                 .min_w(px(0.0))
-                .items_center()
+                .items_start()
                 .gap(px(tw(2.0)))
                 .text_size(px(12.0))
                 .text_color(theme.color_text_muted)
-                .child(agent_avatar(&card.agent, "failed", 18.0))
-                .child(div().flex_none().child(card.title.clone()))
-                .when(!card.error.is_empty(), |row| {
-                    row.child(
-                        div()
-                            .min_w(px(0.0))
-                            .text_color(theme.color_danger)
-                            .child(ellipsis(card.error.clone())),
-                    )
-                }),
+                .child(agent_avatar(&attempt.agent, "failed", 18.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(wrapped(&title))
+                        .when(!attempt.error.trim().is_empty(), |column| {
+                            column.child(
+                                div()
+                                    .text_color(theme.color_danger)
+                                    .child(wrapped(attempt.error.trim())),
+                            )
+                        }),
+                ),
         );
     }
     Some(list)
@@ -1730,20 +2269,11 @@ fn paint_run(view: &WeakEntity<RunPageView>, window: &mut Window, cx: &mut App) 
     if !run.note.trim().is_empty() {
         rows = rows.child(rail_property("Note", wrapped(run.note.trim()), false, cx));
     }
-    match failed_attempts(run, &theme) {
-        Some(attempts) => div()
-            .flex()
-            .flex_col()
-            .gap(px(tw(3.0)))
-            .child(attempts)
-            .child(rows)
-            .into_any_element(),
-        None => rows.into_any_element(),
-    }
+    rows.into_any_element()
 }
 
-/// `RunRoutingGroup`: the decision's policy, task, role, and area, then each candidate in
-/// routing order (`mt-1 flex-col gap-0.5 px-1`), its 18px bot, `model @effort` in 12px mono
+/// `RunRoutingGroup`: the decision's policy, task, role, and area, the failed attempts, then the
+/// first few candidates in routing order (Show more lists the rest) (`mt-1 flex-col gap-0.5 px-1`), its 18px bot, `model @effort` in 12px mono
 /// and its price in 11px muted figures, with Tried first on the chosen one and Below bar on an
 /// Auto candidate that missed the bar.
 fn paint_routing(view: &WeakEntity<RunPageView>, window: &mut Window, cx: &mut App) -> AnyElement {
@@ -1773,33 +2303,83 @@ fn paint_routing(view: &WeakEntity<RunPageView>, window: &mut Window, cx: &mut A
     if !area.is_empty() {
         rows = rows.child(rail_property("Area", wrapped(&area), false, cx));
     }
+    if let Some(reason) = route_reason(&decision) {
+        rows = rows.child(rail_property("Why", wrapped(&reason), false, cx));
+    }
     let mut candidates = div()
         .mt(px(tw(1.0)))
         .flex()
         .flex_col()
         .gap(px(tw(0.5)))
         .px(px(tw(1.0)));
+    let all = view.upgrade().is_some_and(|v| v.read(cx).all_candidates);
+    let total = decision.candidates.len();
+    let outcomes = candidate_outcomes(&decision, &pack.run);
+    // The ones the run tried stay in view, however far down the list.
+    let pinned: Vec<bool> = outcomes
+        .iter()
+        .map(|outcome| {
+            matches!(
+                outcome,
+                Some(CandidateOutcome::Used { .. } | CandidateOutcome::Failed { .. })
+            )
+        })
+        .collect();
     for (index, candidate) in decision.candidates.iter().enumerate() {
-        let price = candidate_price(candidate);
+        if !shown_candidate(index, &pinned, all) {
+            continue;
+        }
+        let outcome = outcomes[index].clone();
+        let price = candidate_line(candidate);
+        let explain = candidate_explain(&decision, candidate);
+        let title = if candidate.effort.is_empty() {
+            candidate.model.clone()
+        } else {
+            format!("{} @{}", candidate.model, candidate.effort)
+        };
         let model_line = if candidate.effort.is_empty() {
             candidate.model.clone()
         } else {
             format!("{} @{}", candidate.model, candidate.effort)
         };
-        let marker = if decision.chosen == index as i64 {
-            Some(("Tried first", crate::theme::StatusTone::Ok))
-        } else if decision.policy == "auto-v1" && !candidate.qualified {
-            Some(("Below bar", crate::theme::StatusTone::Muted))
-        } else {
-            None
+        let error = match &outcome {
+            Some(CandidateOutcome::Failed { error, .. }) if !error.is_empty() => {
+                Some(error.clone())
+            }
+            _ => None,
+        };
+        // What became of it in this run; otherwise whether Auto counted it out.
+        let marker = match &outcome {
+            Some(found @ CandidateOutcome::Used { status }) => Some((
+                found.label(),
+                if is_run_active(status) {
+                    crate::theme::StatusTone::Syncing
+                } else {
+                    crate::theme::dispatch_status_tone(status)
+                },
+            )),
+            Some(found @ CandidateOutcome::Failed { .. }) => {
+                Some((found.label(), crate::theme::StatusTone::Danger))
+            }
+            Some(found @ CandidateOutcome::Skipped) => {
+                Some((found.label(), crate::theme::StatusTone::Muted))
+            }
+            None if decision.policy == "auto-v1" && !candidate.qualified => {
+                Some(("Below bar".to_string(), crate::theme::StatusTone::Muted))
+            }
+            None => None,
         };
         candidates = candidates.child(
             div()
+                .id(("routing-candidate", index))
                 .flex()
                 .min_w(px(0.0))
                 .items_center()
                 .gap(px(tw(2.0)))
                 .p(px(tw(1.0)))
+                .tooltip(rich_tooltip(CANDIDATE_TIP_WIDTH, move |_, cx| {
+                    candidate_tip(&title, &explain, cx)
+                }))
                 .child(agent_avatar(&candidate.agent, "", 18.0))
                 .child(
                     div()
@@ -1822,9 +2402,36 @@ fn paint_routing(view: &WeakEntity<RunPageView>, window: &mut Window, cx: &mut A
                                     .text_color(theme.color_text_muted)
                                     .child(ellipsis(price)),
                             )
-                        }),
+                        })
+                        .children(error.map(|error| {
+                            div()
+                                .pt(px(2.0))
+                                .text_size(px(12.0))
+                                .text_color(theme.color_danger)
+                                .child(wrapped(&error))
+                        })),
                 )
                 .children(marker.map(|(label, tone)| chip(label, tone, cx))),
+        );
+    }
+    if let Some(label) = more_candidates_label(total, &pinned, all) {
+        let toggle = view.clone();
+        candidates = candidates.child(
+            div()
+                .id("routing-more")
+                .p(px(tw(1.0)))
+                .cursor_pointer()
+                .text_size(px(12.0))
+                .text_color(theme.color_text_muted)
+                .hover(|style| style.text_color(theme.color_text_primary))
+                .child(label)
+                .on_click(move |_, _, cx| {
+                    let _ = toggle.update(cx, |page, cx| {
+                        page.all_candidates = !page.all_candidates;
+                        page.routing.update(cx, |_, cx| cx.notify());
+                        cx.notify();
+                    });
+                }),
         );
     }
     div()
@@ -1833,8 +2440,64 @@ fn paint_routing(view: &WeakEntity<RunPageView>, window: &mut Window, cx: &mut A
         .flex_col()
         .gap(px(6.0))
         .child(rows)
+        .children(
+            failed_attempts(&unmatched_attempts(&decision, &pack.run), &theme)
+                .map(|list| list.px(px(tw(1.0)))),
+        )
         .child(candidates)
         .into_any_element()
+}
+
+/// The width of a routing candidate's tooltip, so its sentences wrap inside it.
+const CANDIDATE_TIP_WIDTH: f32 = 300.0;
+
+/// A routing candidate's tooltip: what it was judged on, its numbers, and how they ranked it.
+fn candidate_tip(title: &str, explain: &CandidateExplain, cx: &App) -> AnyElement {
+    let theme = Theme::global(cx);
+    let mut tip = div().flex().flex_col().gap(px(8.0)).child(tooltip_heading(
+        title.to_string(),
+        Some(explain.about.clone().into()),
+        cx,
+    ));
+    for (label, value) in &explain.rows {
+        tip = tip.child(tooltip_row(
+            label.clone(),
+            SharedString::from(value.clone()),
+            cx,
+        ));
+    }
+    tip.child(
+        div()
+            .text_color(theme.color_text_secondary)
+            .child(SharedString::from(explain.how.clone())),
+    )
+    .into_any_element()
+}
+
+/// The rail toggle's room in the header: the 8px gap before it and the 28px icon button.
+const RAIL_TOGGLE_SLOT: f32 = 36.0;
+
+/// How many candidates the Routing group lists before Show more.
+const ROUTING_PREVIEW: usize = 5;
+
+/// Whether the Routing group lists this candidate: the first few, the one tried first, or
+/// every one once expanded.
+fn shown_candidate(index: usize, pinned: &[bool], all: bool) -> bool {
+    all || index < ROUTING_PREVIEW || pinned.get(index).copied().unwrap_or(false)
+}
+
+/// The Show more / Show fewer line, when some candidates are hidden or shown.
+fn more_candidates_label(total: usize, pinned: &[bool], all: bool) -> Option<String> {
+    let shown = (0..total)
+        .filter(|&i| shown_candidate(i, pinned, false))
+        .count();
+    if total <= shown {
+        None
+    } else if all {
+        Some("Show fewer".into())
+    } else {
+        Some(format!("Show {} more", total - shown))
+    }
 }
 
 fn paint_changes(view: &WeakEntity<RunPageView>, window: &mut Window, cx: &mut App) -> AnyElement {

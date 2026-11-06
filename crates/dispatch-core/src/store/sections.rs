@@ -96,6 +96,93 @@ impl Store {
             .ok_or_else(unknown)
     }
 
+    /// Deletes runs and what hangs on them: their events and route decisions (by cascade),
+    /// their worktree records, and their place in a section; `conversation`, when given,
+    /// also leaves its section and loses its name. Returns how many runs went.
+    pub fn delete_runs(&self, ids: &[String], conversation: &str) -> Result<usize, Error> {
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(db)?;
+        let mut n = 0;
+        for id in ids {
+            tx.execute("DELETE FROM dispatch_worktrees WHERE run_id = ?", [id])
+                .map_err(db)?;
+            tx.execute(
+                "DELETE FROM dispatch_section_items WHERE kind = 'run' AND ref = ?",
+                [id],
+            )
+            .map_err(db)?;
+            n += tx
+                .execute("DELETE FROM dispatch_runs WHERE id = ?", [id])
+                .map_err(db)?;
+        }
+        if !conversation.is_empty() {
+            tx.execute(
+                "DELETE FROM dispatch_section_items WHERE kind = 'conversation' AND ref = ?",
+                [conversation],
+            )
+            .map_err(db)?;
+            tx.execute(
+                "DELETE FROM dispatch_conversation_names WHERE conversation_id = ?",
+                [conversation],
+            )
+            .map_err(db)?;
+        }
+        tx.commit().map_err(db)?;
+        Ok(n)
+    }
+
+    /// The names given to conversations, by conversation id.
+    pub fn conversation_names(&self) -> Result<Vec<(String, String)>, Error> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT conversation_id, name FROM dispatch_conversation_names ORDER BY conversation_id",
+            )
+            .map_err(db)?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(db)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db)
+    }
+
+    /// Names a conversation; an empty name gives it back the title of its first message.
+    pub fn rename_conversation(&self, conversation_id: &str, name: &str) -> Result<(), Error> {
+        let id = conversation_id.trim();
+        if id.is_empty() {
+            return Err(invalid());
+        }
+        let name = name.trim();
+        let conn = self.conn();
+        if name.is_empty() {
+            conn.execute(
+                "DELETE FROM dispatch_conversation_names WHERE conversation_id = ?",
+                [id],
+            )
+            .map_err(db)?;
+        } else {
+            conn.execute(
+                "INSERT INTO dispatch_conversation_names (conversation_id, name, updated_at)
+                 VALUES (?, ?, ?)
+                 ON CONFLICT(conversation_id) DO UPDATE SET
+                    name = excluded.name, updated_at = excluded.updated_at",
+                [id, name, &now()],
+            )
+            .map_err(db)?;
+        }
+        Ok(())
+    }
+
+    /// How many runs are still pending or running.
+    pub fn count_active_runs(&self) -> Result<i64, Error> {
+        self.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM dispatch_runs WHERE status IN (?, ?)",
+                [crate::types::STATUS_PENDING, crate::types::STATUS_RUNNING],
+                |row| row.get(0),
+            )
+            .map_err(db)
+    }
+
     pub fn delete_section(&self, id: &str) -> Result<(), Error> {
         if id.trim().is_empty() {
             return Err(invalid());

@@ -40,7 +40,9 @@ BRIEF
 
 ## Parallelism
 
-Independent delegations go in the same response, each with its own `id`; then one `wait` per id. Write runs in a git repo get their own worktree and branch, so they do not conflict.
+Independent delegations go in the same response, each with its own `id`; then one `wait` per id. Write runs in a git repo get their own worktree and branch, so they do not conflict: any number run in one folder at once. That is the default; `--worktree-mode worktree` asks for it outright (refused outside git), and `--worktree-mode in-place` edits the folder itself (`--dir <repo>` says which folder). Only a second run that would edit the folder itself (in-place, outside git, or `--worktree <folder>`) is refused while the first works: start it with `--worktree-mode worktree` instead.
+
+A run that changed nothing leaves no worktree or branch behind; one with changes keeps them for `merge` or `clean`.
 
 ## Result
 
@@ -56,6 +58,10 @@ dispatch runs                  # history
 dispatch cancel <id>         # cancel a running run
 dispatch recover <id>        # ORPHANED: commit the preserved work
 dispatch clean <id> [--force]  # discard the worktree
+dispatch worktrees [--prune]   # list leftover worktrees; --prune removes the ones with nothing to merge
+dispatch delete <id>... | --conversation <id>  # delete ended runs and the worktrees Dispatch cut for them
+dispatch rename <conversation-id> <name>  # name a conversation as the app shows it
+dispatch repo ls|add|rm        # the repositories Dispatch knows (same as dispatch workspace)
 ```
 
 ## Roles

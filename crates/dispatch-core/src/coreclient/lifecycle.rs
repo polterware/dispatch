@@ -72,7 +72,9 @@ pub async fn ensure_with_exe(
             sleep(Duration::from_millis(200)).await;
             continue;
         };
-        if newer_build(&build, &health.build) {
+        // A newer build takes over an idle core only: stopping one with live runs would
+        // orphan them, so it keeps serving until they end.
+        if newer_build(&build, &health.build) && health.active_runs == 0 {
             stop(db_path)
                 .await
                 .map_err(|e| Error::Message(format!("replace older core: {e}")))?;

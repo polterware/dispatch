@@ -1,5 +1,6 @@
-//! `dispatch workspace`: lists, adds, and removes workspaces. Polterware's
-//! projects are listed while Polterware answers; a folder is added on its own.
+//! `dispatch workspace` (and `dispatch repo`, the app's word for it): lists, adds, and
+//! removes workspaces. Polterware's projects are listed while Polterware answers; a folder
+//! is added as the git repository holding it (its main checkout), else as itself.
 
 use super::{CliResult, Flags, dial, usage_err, write_json};
 use crate::proto as pb;
@@ -9,6 +10,34 @@ use std::path::Path;
 const WORKSPACE_USAGE: &str = "usage: dispatch workspace ls [--json]
        dispatch workspace add <folder> [--name <name>]
        dispatch workspace rm <id>";
+
+const REPO_USAGE: &str = "usage: dispatch repo ls [--json]
+       dispatch repo add <folder> [--name <name>]   (the git repository holding it)
+       dispatch repo rm <id>   (its runs stay, out of the app's list until it is added again)";
+
+/// The word the command was called by: `workspace`, which agents and Polterware parse, keeps
+/// the Go binary's text; `repo` says the same in the app's words. The JSON is the same.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Noun {
+    Workspace,
+    Repository,
+}
+
+impl Noun {
+    fn usage(self) -> &'static str {
+        match self {
+            Self::Workspace => WORKSPACE_USAGE,
+            Self::Repository => REPO_USAGE,
+        }
+    }
+
+    fn word(self) -> &'static str {
+        match self {
+            Self::Workspace => "workspace",
+            Self::Repository => "repository",
+        }
+    }
+}
 
 /// A workspace as the Go binary printed its message: snake_case keys, empty
 /// fields left out.
@@ -28,15 +57,19 @@ fn workspace_json(ws: &pb::Workspace) -> Value {
     Value::Object(m)
 }
 
-pub(super) async fn run_workspace(db_path: &Path, args: &[String]) -> CliResult {
+pub(super) async fn run_workspace(db_path: &Path, args: &[String], noun: Noun) -> CliResult {
     let ls = ["ls".to_owned()];
     let args = if args.is_empty() { &ls[..] } else { args };
     let (sub, rest) = (&args[0], &args[1..]);
-    let mut f = Flags::new(format!("workspace {sub}"));
+    let mut f = Flags::new(format!("{} {sub}", noun.word()));
     f.bool("json", false, "print JSON").string(
         "name",
         "",
-        "workspace name (default: the folder's)",
+        if noun == Noun::Workspace {
+            "workspace name (default: the folder's)"
+        } else {
+            "repository name (default: its folder's)"
+        },
     );
     let positional = f.parse_interspersed(rest)?;
     let c = dial(db_path).await?;
@@ -64,7 +97,14 @@ pub(super) async fn run_workspace(db_path: &Path, args: &[String]) -> CliResult 
                 println!("Polterware is not running: only folders are listed");
             }
             if res.workspaces.is_empty() {
-                println!("no workspaces; `dispatch run` in a folder adds it");
+                match noun {
+                    Noun::Workspace => {
+                        println!("no workspaces; `dispatch run` in a folder adds it")
+                    }
+                    Noun::Repository => {
+                        println!("no repositories; `dispatch run` in one adds it")
+                    }
+                }
             }
             for ws in &res.workspaces {
                 let place = if ws.polterware_project_id.is_empty() {
@@ -78,7 +118,7 @@ pub(super) async fn run_workspace(db_path: &Path, args: &[String]) -> CliResult 
         }
         "add" => {
             let [folder] = positional.as_slice() else {
-                return Err(usage_err(WORKSPACE_USAGE));
+                return Err(usage_err(noun.usage()));
             };
             let path = std::path::absolute(folder)?;
             let res = c
@@ -89,12 +129,12 @@ pub(super) async fn run_workspace(db_path: &Path, args: &[String]) -> CliResult 
                 })
                 .await?;
             let ws = res.workspace.unwrap_or_default();
-            println!("workspace {} ({})", ws.id, ws.name);
+            println!("{} {} ({})", noun.word(), ws.id, ws.name);
             Ok(())
         }
         "rm" | "remove" => {
             let [id] = positional.as_slice() else {
-                return Err(usage_err(WORKSPACE_USAGE));
+                return Err(usage_err(noun.usage()));
             };
             c.workspaces
                 .remove_workspace(&pb::RemoveWorkspaceRequest { id: id.clone() })
@@ -102,6 +142,6 @@ pub(super) async fn run_workspace(db_path: &Path, args: &[String]) -> CliResult 
             println!("removed {id}");
             Ok(())
         }
-        _ => Err(usage_err(WORKSPACE_USAGE)),
+        _ => Err(usage_err(noun.usage())),
     }
 }

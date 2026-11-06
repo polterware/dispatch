@@ -18,7 +18,7 @@ use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 
-const RUN_USAGE: &str = "usage: dispatch run [--tier <auto|easy|normal|hard>] [--role <name|none>] [--card <slug>] [--agent <name>] [--provider <p>] [--model <m>] [--effort <e>] [--priority <p>] [--relax] [--readonly] [--timeout <dur>] [--dir <repo>] [--worktree <dir>] [--json] [--compact] <prompt|->
+const RUN_USAGE: &str = "usage: dispatch run [--tier <auto|easy|normal|hard>] [--role <name|none>] [--card <slug>] [--agent <name>] [--provider <p>] [--model <m>] [--effort <e>] [--priority <p>] [--relax] [--readonly] [--timeout <dur>] [--dir <repo>] [--worktree-mode worktree|in-place] [--worktree <dir>] [--json] [--compact] <prompt|->
        dispatch send <id> [--json] [--compact] <message|->
        dispatch runs [--conversation <id>] [--project <id>] [--json] [--compact]
        dispatch status <id> [--json] [--compact]
@@ -522,13 +522,24 @@ pub(super) async fn run(db_path: &Path, args: &[String]) -> CliResult {
         "",
         "role to run as; none runs with no role and no pick",
     )
-    .string("dir", "", "repository (default: current directory)");
+    .string("dir", "", "repository (default: current directory)")
+    .string(
+        "worktree-mode",
+        "",
+        "worktree: a git worktree of its own, so runs go in parallel (the default in a git checkout with commits); in-place: edit the folder itself",
+    );
     common(&mut f);
     let positional = f.parse_interspersed(args)?;
     let tier = f.str("tier");
     if !tier.is_empty() && tier != "auto" && !valid_tier(&tier) {
         return Err(usage());
     }
+    let worktree_mode = match f.str("worktree-mode").trim() {
+        "" | "auto" => String::new(),
+        "worktree" => "worktree".to_owned(),
+        "in-place" | "in_place" => "in_place".to_owned(),
+        _ => return Err(usage()),
+    };
     let prompt = read_prompt(&positional)?;
     let wd = working_dir(&f.str("dir"))?;
     let (c, project) = dial_workspace(db_path, &f.str("project")).await?;
@@ -551,6 +562,7 @@ pub(super) async fn run(db_path: &Path, args: &[String]) -> CliResult {
             relax: f.flag("relax"),
             timeout_sec: i32::try_from(f.dur("timeout").as_secs()).unwrap_or(i32::MAX),
             profile: f.str("role").trim().into(),
+            worktree_mode,
             caller: Some(pb::DispatchCaller {
                 agent: who.agent,
                 session_id: who.session_id,

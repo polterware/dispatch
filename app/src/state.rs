@@ -15,8 +15,9 @@ use gpui::{App, AppContext as _, Context, Entity, SharedString};
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::client::{
-    CoreClient, CoreError, DispatchRun, DispatchSection, ListRunsRequest, ListSectionsRequest,
-    ListWorkspacesRequest, Workspace, at_once, core_json_path, each_at_once, resolve_data_dir,
+    AddWorkspaceRequest, CoreClient, CoreError, DispatchRun, DispatchSection, ListRunsRequest,
+    ListSectionsRequest, ListWorkspacesRequest, Workspace, at_once, core_json_path, each_at_once,
+    resolve_data_dir,
 };
 pub use crate::ui::{Toast, ToastTone};
 
@@ -44,6 +45,7 @@ pub enum SettingsPage {
     Classifier,
     PickRole,
     RoutingPolicy,
+    Worktrees,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -267,6 +269,7 @@ struct Snapshot {
     workspaces: Vec<Workspace>,
     linked: bool,
     sections: Vec<DispatchSection>,
+    conversation_names: HashMap<String, String>,
     runs: Vec<DispatchRun>,
     reply: Option<(String, String)>,
     last_error: Option<String>,
@@ -366,6 +369,7 @@ fn read_snapshot(data_dir: &Path, selected_run: Option<String>) -> Snapshot {
                 workspaces: Vec::new(),
                 linked: false,
                 sections: Vec::new(),
+                conversation_names: HashMap::new(),
                 runs: Vec::new(),
                 reply: None,
                 last_error: None,
@@ -379,6 +383,7 @@ fn read_snapshot(data_dir: &Path, selected_run: Option<String>) -> Snapshot {
         workspaces: Vec::new(),
         linked: false,
         sections: Vec::new(),
+        conversation_names: HashMap::new(),
         runs: Vec::new(),
         reply: None,
         last_error: None,
@@ -421,7 +426,14 @@ fn read_snapshot(data_dir: &Path, selected_run: Option<String>) -> Snapshot {
     );
 
     match sections {
-        Ok(response) => snapshot.sections = response.sections,
+        Ok(response) => {
+            snapshot.sections = response.sections;
+            snapshot.conversation_names = response
+                .conversation_names
+                .into_iter()
+                .map(|named| (named.conversation_id, named.name))
+                .collect();
+        }
         Err(CoreError::NotRunning) => return offline(offline_path),
         Err(CoreError::Rpc(message)) => snapshot.last_error = Some(message),
     }
@@ -456,6 +468,7 @@ fn offline(core_json_path: String) -> Snapshot {
         workspaces: Vec::new(),
         linked: false,
         sections: Vec::new(),
+        conversation_names: HashMap::new(),
         runs: Vec::new(),
         reply: None,
         last_error: None,
@@ -474,6 +487,7 @@ pub struct AppState {
     sidebar_width: f32,
     linked: bool,
     sections: Vec<DispatchSection>,
+    conversation_names: HashMap<String, String>,
     runs: Vec<DispatchRun>,
     replies: HashMap<String, String>,
     pending_reply: Option<String>,
@@ -504,7 +518,8 @@ impl AppState {
             .clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
         let state = Self {
             data_dir,
-            navigation: Navigation::new(Route::Roles),
+            // The app opens on a new conversation, ready for its first message.
+            navigation: Navigation::new(Route::NewRun),
             connection: ConnectionState::Connecting,
             client: None,
             workspaces: Vec::new(),
@@ -512,6 +527,7 @@ impl AppState {
             sidebar_width,
             linked: false,
             sections: Vec::new(),
+            conversation_names: HashMap::new(),
             runs: Vec::new(),
             replies: HashMap::new(),
             pending_reply: None,
@@ -529,6 +545,92 @@ impl AppState {
 
     pub fn reload_all(&mut self, cx: &mut Context<Self>) {
         self.spawn_load(cx);
+    }
+
+    /// Drops a workspace the core just forgot, before the next load says so.
+    pub fn forget_workspace(&mut self, id: &str) {
+        self.workspaces.retain(|workspace| workspace.id != id);
+    }
+
+    /// Asks for a repository's folder and adds it as a workspace, then makes it the current
+    /// one and hands it to `then` with the folder picked (a Polterware project's workspace,
+    /// which holds the repository, has no path of its own). A folder that is not a git checkout's top is refused, since
+    /// runs need a repository (the folder picker lists only those).
+    pub fn add_repository(
+        &mut self,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Self, &Workspace, &str, &mut Context<Self>) + 'static,
+    ) {
+        let Some(client) = self.client() else {
+            self.push_toast("Dispatch core is not running", ToastTone::Danger);
+            cx.notify();
+            return;
+        };
+        let picked = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Add repository".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = picked.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            if !path.join(".git").exists() {
+                let _ = this.update(cx, |state, cx| {
+                    state.push_toast(
+                        format!("{} is not a git repository's top folder", path.display()),
+                        ToastTone::Danger,
+                    );
+                    cx.notify();
+                });
+                return;
+            }
+            let dir = path.to_string_lossy().into_owned();
+            let request = AddWorkspaceRequest {
+                path: dir.clone(),
+                name: path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            };
+            let added = cx
+                .background_spawn(async move { client.add_workspace(&request) })
+                .await;
+            let _ = this.update(cx, |state, cx| {
+                match added {
+                    Ok(response) => {
+                        let workspace = response.workspace;
+                        if !state
+                            .workspaces
+                            .iter()
+                            .any(|known| known.id == workspace.id)
+                        {
+                            state.workspaces.push(workspace.clone());
+                        }
+                        state.set_workspace(workspace.id.clone());
+                        state.push_toast(format!("Added {}", workspace.name), ToastTone::Success);
+                        then(state, &workspace, &dir, cx);
+                        state.reload_all(cx);
+                    }
+                    Err(error) => {
+                        let reason = match error {
+                            CoreError::NotRunning => "Dispatch core is not running".to_string(),
+                            CoreError::Rpc(message) => message,
+                        };
+                        state.push_toast(
+                            format!("Could not add the repository: {reason}"),
+                            ToastTone::Danger,
+                        );
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub fn request_refresh(&mut self, cx: &mut Context<Self>) {
@@ -674,6 +776,23 @@ impl AppState {
         }
     }
 
+    /// The name given to `conversation_id`, if any.
+    pub fn conversation_name(&self, conversation_id: &str) -> Option<&str> {
+        self.conversation_names
+            .get(conversation_id)
+            .map(String::as_str)
+    }
+
+    /// Shows a new name at once, before the next refresh brings it.
+    pub fn note_conversation_name(&mut self, conversation_id: &str, name: &str) {
+        if name.trim().is_empty() {
+            self.conversation_names.remove(conversation_id);
+        } else {
+            self.conversation_names
+                .insert(conversation_id.to_string(), name.trim().to_string());
+        }
+    }
+
     pub fn sections(&self) -> &[DispatchSection] {
         &self.sections
     }
@@ -691,6 +810,26 @@ impl AppState {
         let mut runs = self.runs.clone();
         runs.insert(0, run);
         self.set_runs(runs);
+    }
+
+    /// Drops runs the core deleted, and leaves a deleted run's page for a new conversation.
+    pub fn forget_runs(&mut self, ids: &[String]) {
+        if ids.is_empty() {
+            return;
+        }
+        let runs = self
+            .runs
+            .iter()
+            .filter(|run| !ids.contains(&run.id))
+            .cloned()
+            .collect();
+        self.set_runs(runs);
+        for id in ids {
+            self.replies.remove(id);
+        }
+        if matches!(self.route(), Route::Run(id) if ids.contains(id)) {
+            self.navigate(Route::NewRun);
+        }
     }
 
     pub fn run(&self, id: &str) -> Option<&DispatchRun> {
@@ -813,6 +952,7 @@ impl AppState {
                 self.workspaces = snapshot.workspaces;
                 self.linked = snapshot.linked;
                 self.sections = snapshot.sections;
+                self.conversation_names = snapshot.conversation_names;
                 self.set_runs(snapshot.runs);
                 if let Some((id, reply)) = snapshot.reply {
                     self.replies.insert(id.clone(), reply);

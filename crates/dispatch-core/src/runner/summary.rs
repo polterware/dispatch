@@ -30,6 +30,43 @@ static CRASH_RE: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap_or_else(|_| never())
 });
 
+/// A reply that is only the provider saying the account is out ("⚠ Individual quota reached.
+/// … Resets in 4h54m49s."), which an agent such as Antigravity ends its turn with instead of
+/// failing: short, and naming a limit that was reached.
+static LIMIT_NOTICE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)\b(?:quota|usage limit|rate.?limit|credits?)\b[^.\n]{0,40}\b(?:reached|exceeded|exhausted|used up|ran out|run out)\b|\b(?:hit|reached|exceeded) (?:your |the )?(?:\w+ )?(?:quota|usage limit|rate.?limit)\b|\bout of (?:quota|credits)\b|\bresets? in \d+\s*[hms]",
+    )
+    .unwrap_or_else(|_| never())
+});
+static RESETS_IN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\bresets? in\s+(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*(?:(\d+)\s*s)?")
+        .unwrap_or_else(|_| never())
+});
+
+/// The most a reply may hold to count as a limit notice rather than an answer that mentions
+/// one.
+const LIMIT_NOTICE_MAX: usize = 400;
+
+/// The limit notice a reply is, when it is one: its text, which then fails the attempt.
+pub fn limit_notice(reply: &str) -> Option<String> {
+    let text = reply.trim();
+    (!text.is_empty() && text.chars().count() <= LIMIT_NOTICE_MAX && LIMIT_NOTICE.is_match(text))
+        .then(|| text.to_owned())
+}
+
+/// How long until the limit a notice names resets ("Resets in 4h54m49s").
+pub fn resets_in(notice: &str) -> Option<Duration> {
+    let caps = RESETS_IN.captures(notice)?;
+    let part = |i: usize| {
+        caps.get(i)
+            .and_then(|m| m.as_str().parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    let secs = part(1) * 3600 + part(2) * 60 + part(3);
+    (secs > 0).then(|| Duration::from_secs(secs))
+}
+
 /// A regex that matches nothing, for a pattern that failed to compile.
 fn never() -> Regex {
     Regex::new(r"[^\s\S]").unwrap_or_else(|_| never())

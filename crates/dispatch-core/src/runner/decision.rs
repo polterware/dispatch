@@ -48,9 +48,20 @@ impl Deps {
         }
         let views: Vec<_> = cs.iter().map(|c| c.route.clone()).collect();
         let mut candidates = decision_candidates(&views);
+        // A route the message was not scored for still names each model's skill and
+        // price from the catalog, as Intelligence does, so its candidates can be compared.
+        let cat = self.catalog();
         for (dc, c) in candidates.iter_mut().zip(cs) {
             if c.adapter.is_none() {
                 dc.agent.clear();
+            }
+            if dc.theta.is_none() {
+                let e = cat.estimate(&dc.model, &dc.effort);
+                if !e.theta_source.is_empty() {
+                    dc.theta = Some(e.theta);
+                    dc.theta_source = e.theta_source;
+                }
+                dc.price = e.cost_per_task;
             }
         }
         let mut dec = RouteDecision {

@@ -212,6 +212,8 @@ fn a_core_with_no_runs_refreshes_without_an_error(cx: &mut TestAppContext) {
     let core = Core::new();
     core.cli(&["workspace", "add", &core.repo.to_string_lossy()]);
     let mut w = open(&core, cx);
+    // The app opens on a new conversation.
+    assert_eq!(w.route(), Route::NewRun);
     w.go(Route::Stats);
     let (runs, error) = w.state.read_with(w.cx, |s, _| {
         (s.runs().len(), s.last_error().map(str::to_owned))

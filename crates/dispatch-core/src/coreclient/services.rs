@@ -341,6 +341,30 @@ impl DispatchClient {
         proto::CleanRunResponse
     );
     unary_rpc!(
+        rename_conversation,
+        "RenameConversation",
+        proto::RenameConversationRequest,
+        proto::RenameConversationResponse
+    );
+    unary_rpc!(
+        delete_runs,
+        "DeleteRuns",
+        proto::DeleteRunsRequest,
+        proto::DeleteRunsResponse
+    );
+    unary_rpc!(
+        list_worktree_folders,
+        "ListWorktreeFolders",
+        proto::ListWorktreeFoldersRequest,
+        proto::ListWorktreeFoldersResponse
+    );
+    unary_rpc!(
+        prune_worktree_folders,
+        "PruneWorktreeFolders",
+        proto::PruneWorktreeFoldersRequest,
+        proto::PruneWorktreeFoldersResponse
+    );
+    unary_rpc!(
         recover_run,
         "RecoverRun",
         proto::RecoverRunRequest,

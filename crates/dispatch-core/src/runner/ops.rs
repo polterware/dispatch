@@ -36,7 +36,7 @@ pub(crate) fn redact_err(e: Error) -> Error {
     msg(sandbox::redact(&e.to_string()))
 }
 
-fn worktree_info(rec: &Run, status: &str) -> WorktreeInfo {
+pub(super) fn worktree_info(rec: &Run, status: &str) -> WorktreeInfo {
     WorktreeInfo {
         id: rec.id.clone(),
         project_id: rec.project_id.clone(),
