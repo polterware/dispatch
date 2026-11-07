@@ -1,0 +1,6 @@
+{
+  "name": "@local-voice/client",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": { ".": "./src/index.ts", "./protocol": "./src/protocol.ts", "./discovery": "./src/discovery.ts", "./client": "./src/client.ts" }
+}
