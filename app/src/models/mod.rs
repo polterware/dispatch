@@ -1,3 +1,4 @@
+pub mod avatar;
 pub mod commander;
 pub mod conversation_usage;
 pub use polterware_ui::filter;

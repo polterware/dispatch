@@ -5,6 +5,7 @@
 use std::collections::HashSet;
 
 use crate::format::prompt_first_line;
+use crate::models::avatar::avatar_status;
 use crate::state::{Route, SettingsPage};
 
 /// How many runs the Recent group keeps. Newest first.
@@ -73,6 +74,8 @@ pub struct RecentRun {
     pub created_at: String,
     pub agent: String,
     pub status: String,
+    /// When the run merged, or empty: with `status` it says whether its bot celebrates.
+    pub merged_at: String,
 }
 
 pub fn static_commands() -> Vec<PaletteItem> {
@@ -165,7 +168,7 @@ fn recent_items(runs: &[RecentRun]) -> Vec<PaletteItem> {
             group: PaletteGroup::Recent,
             icon: PaletteIcon::Run {
                 agent: run.agent.clone(),
-                status: run.status.clone(),
+                status: avatar_status(&run.status, &run.merged_at).to_string(),
             },
         });
     }
@@ -233,6 +236,7 @@ mod tests {
                 created_at: "2026-01-01T00:00:00Z".into(),
                 agent: "codex".into(),
                 status: "merged".into(),
+                merged_at: String::new(),
             },
             RecentRun {
                 id: "new".into(),
@@ -240,6 +244,7 @@ mod tests {
                 created_at: "2026-06-01T00:00:00Z".into(),
                 agent: "grok".into(),
                 status: "running".into(),
+                merged_at: String::new(),
             },
             RecentRun {
                 id: "new".into(),
@@ -247,6 +252,7 @@ mod tests {
                 created_at: "2026-05-01T00:00:00Z".into(),
                 agent: "grok".into(),
                 status: "running".into(),
+                merged_at: String::new(),
             },
             RecentRun {
                 id: " ".into(),
@@ -254,6 +260,7 @@ mod tests {
                 created_at: "2026-07-01T00:00:00Z".into(),
                 agent: "pi".into(),
                 status: "done".into(),
+                merged_at: String::new(),
             },
             RecentRun {
                 id: "undated".into(),
@@ -261,6 +268,7 @@ mod tests {
                 created_at: String::new(),
                 agent: "claude".into(),
                 status: "pending".into(),
+                merged_at: String::new(),
             },
         ];
         for index in 0..8 {
@@ -270,6 +278,7 @@ mod tests {
                 created_at: format!("2026-03-{index:02}T00:00:00Z"),
                 agent: "cursor".into(),
                 status: "merged".into(),
+                merged_at: String::new(),
             });
         }
         let items = with_recent(&runs);
@@ -292,6 +301,7 @@ mod tests {
                 created_at: format!("2026-08-{index:02}T00:00:00Z"),
                 agent: "cursor".into(),
                 status: "merged".into(),
+                merged_at: String::new(),
             })
             .chain(std::iter::once(RecentRun {
                 id: "oldest".into(),
@@ -299,6 +309,7 @@ mod tests {
                 created_at: "2024-01-01T00:00:00Z".into(),
                 agent: "pi".into(),
                 status: "merged".into(),
+                merged_at: String::new(),
             }))
             .collect();
         let capped: Vec<PaletteItem> = with_recent(&overflow)

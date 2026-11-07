@@ -20,6 +20,7 @@ use crate::client::{
     SaveSectionRequest,
 };
 use crate::format::agent_display_name;
+use crate::models::avatar::avatar_status;
 use crate::models::sidebar::{
     COLLAPSED_PREFERENCE, DISPLAY_PREFERENCE, Direction, GroupBy, GroupKind, HOVER_CLOSE_MS,
     HOVER_OPEN_MS, REVEALED_PREFERENCE, RunsNotice, SEEN_PREFERENCE, SIDEBAR_PAGE_ROWS, Show,
@@ -1595,7 +1596,10 @@ impl SidebarView {
         let item = SidebarItem::new(SharedString::from(format!("run-row-{}", run.id)), "")
             .run_row()
             .active(active)
-            .leading(agent_avatar_live(&run.agent, &run.status, 40.0), 36.0)
+            .leading(
+                agent_avatar_live(&run.agent, avatar_status(&run.status, &run.merged_at), 40.0),
+                36.0,
+            )
             .content(content)
             .when(
                 self.seen

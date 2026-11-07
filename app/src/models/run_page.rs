@@ -151,6 +151,8 @@ pub struct LinkedRow {
     pub label: String,
     pub agent: String,
     pub status: String,
+    /// When the linked run merged, or empty: with `status` it says whether its bot celebrates.
+    pub merged_at: String,
     pub show_status: bool,
 }
 
@@ -1081,6 +1083,7 @@ pub fn linked_rows(run: &DispatchRun, runs: &[DispatchRun]) -> Vec<LinkedRow> {
             label: format!("Resumed from {}", short_run_id(resumed)),
             agent: String::new(),
             status: String::new(),
+            merged_at: String::new(),
             show_status: false,
         });
     }
@@ -1117,6 +1120,7 @@ fn linked_peer(run: &DispatchRun, label: &str) -> LinkedRow {
         label: label.to_string(),
         agent: run.agent.clone(),
         status: run.status.clone(),
+        merged_at: run.merged_at.clone(),
         show_status: !run.status.is_empty(),
     }
 }

@@ -6,6 +6,7 @@ use std::rc::Rc;
 use gpui::{AnyElement, App, FontWeight, IntoElement, SharedString, Window, div, prelude::*, px};
 
 use crate::avatar::agent_avatar;
+use crate::models::avatar::avatar_status;
 use crate::models::runs::{EM_DASH, RunRow, format_ago};
 use crate::theme::{Theme, status_tone, tw};
 use crate::ui::{
@@ -48,7 +49,11 @@ pub fn run_cell(row: &RunRow, cancelling: bool, on_cancel: RunAction, cx: &App) 
         .into_any_element()
     });
     primary_cell(
-        agent_avatar(&row.agent, &row.status, AVATAR),
+        agent_avatar(
+            &row.agent,
+            avatar_status(&row.status, &row.merged_at),
+            AVATAR,
+        ),
         row.title.clone(),
         sans(theme, FontWeight::MEDIUM),
         trailing,

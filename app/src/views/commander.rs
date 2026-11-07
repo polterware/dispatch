@@ -118,6 +118,7 @@ fn recent_runs(state: &AppState) -> Vec<RecentRun> {
             created_at: run.created_at.clone(),
             agent: run.agent.clone(),
             status: run.status.clone(),
+            merged_at: run.merged_at.clone(),
         })
         .collect()
 }

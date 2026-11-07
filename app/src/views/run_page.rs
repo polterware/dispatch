@@ -25,6 +25,7 @@ use crate::client::{
     ListTiersRequest, ListWorkspaceCardsRequest, ListWorktreesRequest, MergeRunRequest,
     RecoverRunRequest, ResultRequest, StartRunRequest, WorkspaceRepository,
 };
+use crate::models::avatar::avatar_status;
 use crate::models::new_run::{
     FolderChoice, PLACE_PREFERENCE, PlaceMode, RouteChoice, RouteLabel, RunPlace, default_pick,
     default_place, folder_choices, offers_worktree, pick_label, place_label, route_choices,
@@ -1799,7 +1800,13 @@ impl Render for RunPageView {
                 .flex()
                 .items_center()
                 .gap(px(6.0))
-                .child(route_pill(&key, &label, &run.status, None, cx))
+                .child(route_pill(
+                    &key,
+                    &label,
+                    avatar_status(&run.status, &run.merged_at),
+                    None,
+                    cx,
+                ))
                 .children(worktree);
             rail_page_header(start, end, cx).into_any_element()
         } else {
@@ -2749,7 +2756,11 @@ fn paint_linked(view: &WeakEntity<RunPageView>, window: &mut Window, cx: &mut Ap
                     let run_id = run_id.clone();
                     let _ = open.update(cx, |view, cx| view.open_run(run_id, cx));
                 })
-                .child(agent_avatar(&link.agent, link.status.as_str(), 18.0))
+                .child(agent_avatar(
+                    &link.agent,
+                    avatar_status(&link.status, &link.merged_at),
+                    18.0,
+                ))
                 .child(
                     div()
                         .flex_1()

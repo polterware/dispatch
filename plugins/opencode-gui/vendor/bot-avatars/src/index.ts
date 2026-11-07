@@ -30,6 +30,7 @@ export type { DrawConfig as BotAvatarDrawConfig } from "./draw";
 export type { Pose as BotAvatarPose } from "./engine";
 
 export type {
+  BotAvatarExpression,
   BotAvatarFace,
   BotAvatarGlasses,
   BotAvatarHat,

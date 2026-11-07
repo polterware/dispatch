@@ -541,6 +541,20 @@ test("the GUI's RPC copy matches rpc.js", async () => {
   assert.deepEqual(gui.Dispatch, Dispatch)
 })
 
+test("a run's bot face follows its status and merge", () => {
+  const { expressionFor } = loadGui().helpers
+  assert.equal(expressionFor("PENDING"), null)
+  assert.equal(expressionFor("RUNNING", "2026-11-04T10:05:00Z"), null)
+  assert.equal(expressionFor("COMPLETED"), "happy")
+  assert.equal(expressionFor("COMPLETED", "2026-11-04T10:05:00Z"), "celebrate")
+  assert.equal(expressionFor("FAILED"), "sad")
+  assert.equal(expressionFor("CANCELLED"), "cancelled")
+  assert.equal(expressionFor("TIMED_OUT"), "tired")
+  assert.equal(expressionFor("ORPHANED"), "confused")
+  assert.equal(expressionFor("completed", "  "), "happy")
+  assert.equal(expressionFor(""), null)
+})
+
 function stubModule(exports) {
   return new Proxy(exports, { get: (target, key) => (key in target ? target[key] : () => () => {}) })
 }

@@ -77,6 +77,7 @@ export function BotAvatar(props: BotAvatarProps) {
     "path",
     "face",
     "state",
+    "expression",
     "size",
     "color",
     "ink",
@@ -176,6 +177,7 @@ export function BotAvatar(props: BotAvatarProps) {
     const faceKind = local.face ?? preset.face;
     const state = local.state ?? "default";
     const stateKeyNow: BotAvatarState = state in stateLabels ? state : "default";
+    const expression = local.expression;
     const size = local.size ?? 64;
     const picked = local.color ?? preset.color;
     const brightness = local.brightness ?? preset.brightness ?? 1;
@@ -208,6 +210,7 @@ export function BotAvatar(props: BotAvatarProps) {
     const drawCfg: DrawConfig = {
       path: typeof Path2D === "undefined" ? (null as unknown as Path2D) : bodyPath(customPath ?? SHAPE_PATHS[type] ?? SHAPE_PATHS.clover),
       face: faceKind,
+      expression,
       faceX: preset.faceX,
       faceY: preset.faceY,
       faceScale: preset.faceScale,
@@ -271,6 +274,7 @@ export function BotAvatar(props: BotAvatarProps) {
       preset,
       faceKind,
       stateKey: stateKeyNow,
+      expression,
       size,
       seedValue: Math.min(1, Math.max(0, local.seed ?? hashSeed(instanceId))),
       speed,
@@ -622,6 +626,7 @@ export function BotAvatar(props: BotAvatarProps) {
       data-bot-avatar={model().type}
       data-face={model().faceKind}
       data-state={model().stateKey}
+      data-expression={model().expression ?? "none"}
       role="img"
       aria-label={local["aria-label"] ?? `${model().preset.label} bot, ${stateLabels[model().stateKey]}`}
       style={canvasStyle()}
