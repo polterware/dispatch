@@ -31,6 +31,12 @@ const LOG_BYTES = 256 * 1024
 // The app's own link, or a run in it.
 const RUN_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/
 const DISPATCH_LINK = /^dispatch:\/\/(run\/[A-Za-z0-9_-]{1,128})?$/
+// An agent or model a forced run may name; it never starts with a dash, so it
+// can never be read as a flag of its own.
+const SAFE_TARGET = /^[A-Za-z0-9][A-Za-z0-9._:@+~/-]{0,127}$/
+// The model list asks every installed CLI, which can take a while.
+const TARGETS_TIMEOUT_MS = 30_000
+const TARGETS_TTL_MS = 60_000
 
 const INSTRUCTIONS = [
   "Delegation in this session goes through Dispatch; OpenCode's own subagents are off.",
@@ -130,6 +136,36 @@ function asString(value) {
 // compact drops the keys with no value: OpenCode's RPC refuses undefined.
 function compact(view) {
   return Object.fromEntries(Object.entries(view).filter(([, value]) => value !== undefined))
+}
+
+// safeTarget reads the agent and model a forced run goes to; empty is Auto, and
+// both have to match the safe pattern to be passed on to the CLI.
+export function safeTarget(agent, model) {
+  const a = asString(agent).trim()
+  const m = asString(model).trim()
+  if (!a || !SAFE_TARGET.test(a) || !SAFE_TARGET.test(m)) return { agent: "", model: "" }
+  return { agent: a, model: m }
+}
+
+// forcedState reads the Delegate check as it was stored: an object with the
+// check and its target, or the boolean an earlier plugin saved.
+function forcedState(saved) {
+  if (saved === true) return { force: true, agent: "", model: "" }
+  if (saved && typeof saved === "object") {
+    return { force: saved.force === true, agent: asString(saved.agent), model: asString(saved.model) }
+  }
+  return { force: false, agent: "", model: "" }
+}
+
+// forcedInstructions is what a forced conversation is told on every model call,
+// naming the agent and model its runs go to when it has a target.
+function forcedInstructions(forced) {
+  const pick = safeTarget(forced.agent, forced.model)
+  if (!pick.agent) return FORCED
+  return [
+    FORCED,
+    `Every dispatch_run in this conversation goes to ${pick.agent} · ${pick.model}: Dispatch names that agent and model itself, whatever you pass.`,
+  ].join("\n")
 }
 
 // ANSI is what an agent's output colors, not text the panel can draw.
@@ -237,14 +273,68 @@ export default {
     }
 
     // The Delegate check, per conversation (the root session): kept in memory
-    // for the model calls and in storage, so it survives a restart.
+    // for the model calls and in storage, so it survives a restart. A forced
+    // conversation also keeps the agent and model its runs go to, empty for
+    // Auto, under the same key.
     const forced = new Map()
     const forceKey = (id) => `force/${id}`
     const forceOf = async (id) => {
       if (forced.has(id)) return forced.get(id)
       const saved = await ctx.storage.get(forceKey(id)).catch(() => undefined)
-      const value = saved === true
+      // An earlier Dispatch stored the check alone, as the boolean itself.
+      const state = forcedState(saved)
+      const value = { force: state.force, ...safeTarget(state.agent, state.model) }
       forced.set(id, value)
+      return value
+    }
+
+    // The agents and models a target can pick, from the CLIs' own lists, kept
+    // a minute so opening the pill again does not ask every agent.
+    let targetsCache
+    const targets = async () => {
+      const now = Date.now()
+      if (targetsCache && now - targetsCache.at < TARGETS_TTL_MS) return targetsCache.value
+      const [listed, catalog] = await Promise.all([
+        exec(binary(), ["agents", "--json"], { cwd: ctx.location.directory, timeout: READ_TIMEOUT_MS }),
+        exec(binary(), ["models", "--json"], { cwd: ctx.location.directory, timeout: TARGETS_TIMEOUT_MS }),
+      ])
+      const agents = parseJSON(listed.stdout)
+      const models = parseJSON(catalog.stdout)
+      let value
+      if (listed.code !== 0 || !agents) {
+        value = { agents: [], error: listed.stderr || `dispatch agents exited ${listed.code}` }
+      } else if (catalog.code !== 0 || !models) {
+        value = { agents: [], error: catalog.stderr || `dispatch models exited ${catalog.code}` }
+      } else {
+        // The catalog names each model as the agent's CLI does (an ACP agent's
+        // provider prefix included), which is what `dispatch run --model` takes.
+        const byAgent = new Map()
+        for (const entry of models.entries || []) {
+          const agent = asString(entry?.agent)
+          const model = asString(entry?.model)
+          if (!agent || !model) continue
+          if (!byAgent.has(agent)) byAgent.set(agent, new Set())
+          byAgent.get(agent).add(model)
+        }
+        const names = []
+        const disabled = new Set()
+        for (const raw of agents.agents || []) {
+          const name = asString(raw?.Name)
+          if (!name) continue
+          if (raw?.Enabled === false) disabled.add(name)
+          else if (!names.includes(name)) names.push(name)
+        }
+        // An agent the catalog knows and `dispatch agents` did not list still has models.
+        for (const name of byAgent.keys()) {
+          if (!names.includes(name) && !disabled.has(name)) names.push(name)
+        }
+        value = {
+          agents: names
+            .map((name) => ({ name, models: [...(byAgent.get(name) || [])].sort() }))
+            .filter((agent) => agent.models.length > 0),
+        }
+      }
+      targetsCache = { at: now, value }
       return value
     }
 
@@ -280,20 +370,30 @@ export default {
         }
         return { runs }
       },
-      // The conversation's Delegate check: true means every model call must
-      // hand its work to Dispatch.
+      // The conversation's Delegate check and its target: true means every
+      // model call must hand its work to Dispatch, and an agent with a model
+      // sends every run there instead of Auto.
       force: async (input) => {
         const root = await conversation(asString(input.sessionID))
-        return { force: await forceOf(root.id) }
+        return { ...(await forceOf(root.id)) }
       },
       setForce: async (input) => {
         const root = await conversation(asString(input.sessionID))
-        const value = input.force === true
+        const before = await forceOf(root.id)
+        // A pick passes the target, empty strings for Auto; a toggle passes
+        // neither and leaves the target as it was.
+        const pick =
+          typeof input.agent === "string" || typeof input.model === "string"
+            ? safeTarget(input.agent, input.model)
+            : { agent: before.agent, model: before.model }
+        const value = { force: input.force === true, ...pick }
         forced.set(root.id, value)
         await ctx.storage.set(forceKey(root.id), value).catch(() => {})
-        await registration.events.emit("forced", { sessionID: root.id, force: value })
-        return { force: value }
+        await registration.events.emit("forced", { sessionID: root.id, ...value })
+        return { ...value }
       },
+      // The agents and models a forced conversation can send its runs to.
+      targets: async () => targets(),
       // log answers the end of a run's output for the panel's log view, with
       // the run's status so the view knows when to stop asking.
       log: async (input) => {
@@ -385,6 +485,8 @@ export default {
             role: { type: "string", description: "Optional role, such as explorer, implementer, tester, reviewer, or planner." },
             card: { type: "string", description: "Optional Polterware Work card slug the run works on." },
             readonly: { type: "boolean", description: "Run read-only: the agent reads and reports but writes nothing." },
+            agent: { type: "string", description: "Optional agent to run on. A conversation forced to a target overrides it." },
+            model: { type: "string", description: "Optional model to run on. A conversation forced to a target overrides it." },
             wait: { type: "boolean", description: "Wait for the run to end (default true). With false, answers the run id at once." },
           },
           required: ["prompt"],
@@ -393,7 +495,20 @@ export default {
         options: { codemode: false },
         execute: async (input, context) => {
           const root = await conversation(context.sessionID)
+          // A forced conversation with a target sends every run to its agent
+          // and model, whatever the call asks for; without one, or not forced,
+          // the call's own agent and model stand, and Dispatch routes.
+          const flag = await forceOf(root.id)
+          const target = flag.force ? safeTarget(flag.agent, flag.model) : { agent: "", model: "" }
           const args = ["run", "--json", "--compact", "--dir", root.directory]
+          if (target.agent) {
+            args.push("--agent", target.agent, "--model", target.model)
+          } else {
+            const agent = asString(input.agent).trim()
+            const model = asString(input.model).trim()
+            if (SAFE_TARGET.test(agent)) args.push("--agent", agent)
+            if (SAFE_TARGET.test(model)) args.push("--model", model)
+          }
           if (TIERS.includes(input.tier)) args.push("--tier", input.tier)
           if (asString(input.role).trim()) args.push("--role", input.role.trim())
           if (asString(input.card).trim()) args.push("--card", input.card.trim())
@@ -462,11 +577,13 @@ export default {
         delete event.tools[NATIVE_SUBAGENT]
         event.system.push({ type: "text", text: INSTRUCTIONS })
         // A forced conversation is told to delegate, and loses the tools that
-        // would let it do the work itself.
+        // would let it do the work itself; with a target, it names the agent
+        // and model every run goes to.
         const root = await conversation(event.sessionID)
-        if (await forceOf(root.id)) {
+        const flag = await forceOf(root.id)
+        if (flag.force) {
           for (const name of WORK_TOOLS) delete event.tools[name]
-          event.system.push({ type: "text", text: FORCED })
+          event.system.push({ type: "text", text: forcedInstructions(flag) })
         }
         return
       }

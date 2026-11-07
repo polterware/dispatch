@@ -17,6 +17,12 @@ import { ACTIVE, FAILED, firstLine, formatDuration, formatTokens, runDetail, run
 type Ctx = any;
 type Session = { key: string; id: string; directory?: string; pending?: boolean };
 type Status = { enabled: boolean; binary: string; available: boolean; loaded: boolean };
+// The conversation's Delegate check and the target its runs go to, empty for Auto.
+type ForcedView = { force: boolean; agent: string; model: string };
+// One agent a forced run can go to, with the models its CLI lists.
+type TargetAgent = { name: string; models: string[] };
+// One row of the menu a composer pill opens.
+type PillRow = { id: string; label: string; icon?: string; tone?: string; run?: () => void };
 
 const POLL_ACTIVE_MS = 3_000;
 const POLL_IDLE_MS = 15_000;
@@ -91,6 +97,14 @@ const definition = Plugin.define({
       "pill.force.on": "Delegate",
       "pill.force.off": "Delegate",
       "pill.force.title": "Force delegation: this conversation must hand its work to Dispatch",
+      // The pill beside it, while the check is on: the agent and model each
+      // forced run goes to, or Auto.
+      "pill.target.auto": "Auto",
+      "pill.target.auto.row": "Auto (Dispatch decides)",
+      "pill.target.title": "Agent and model every forced run goes to",
+      "pill.target.loading": "Loading agents…",
+      "pill.target.empty": "No agents to pick",
+      "pill.target.failed": "Could not read the agents: {{error}}",
       "runs.one": "{{count}} run",
       "runs.other": "{{count}} runs",
       "runs.running": "{{count}} running",
@@ -104,8 +118,15 @@ const definition = Plugin.define({
     // Runs by session key, and the last error reading them.
     const [runs, setRuns] = createStore<Record<string, RunView[]>>({});
     const [errors, setErrors] = createStore<Record<string, string>>({});
-    // The conversation's Delegate check, as the server part holds it.
-    const [forced, setForced] = createStore<Record<string, boolean>>({});
+    // The conversation's Delegate check, as the server part holds it, and the
+    // agent and model its forced runs go to.
+    const [forced, setForced] = createStore<Record<string, ForcedView>>({});
+    // The agents and models a target can pick, read once from the CLIs when a
+    // conversation is forced; undefined until then.
+    const [targets, setTargets] = createSignal<TargetAgent[] | undefined>(undefined);
+    const [targetsError, setTargetsError] = createSignal("");
+    let targetsLoading = false;
+    let targetsTried = 0;
 
     const loadState = async () => {
       try {
@@ -125,6 +146,33 @@ const definition = Plugin.define({
     };
     const toggle = () => setEnabled(!status().enabled);
 
+    // forcedView reads the check and its target from an RPC answer, empty strings
+    // for Auto, so a server part from before the target only says force.
+    const forcedView = (answer: { force?: boolean; agent?: string; model?: string }): ForcedView => ({
+      force: answer.force === true,
+      agent: answer.agent || "",
+      model: answer.model || "",
+    });
+
+    // ensureTargets reads the agents and models a target can pick, once: a
+    // conversation that is forced gets the list behind its Agent pill, and a
+    // failure is tried again after a pause rather than on every render.
+    const ensureTargets = async () => {
+      if (targets() !== undefined || targetsLoading) return;
+      if (Date.now() - targetsTried < 15_000) return;
+      targetsTried = Date.now();
+      targetsLoading = true;
+      try {
+        const answer = await rpc().targets({});
+        setTargets(Array.isArray(answer.agents) ? answer.agents : []);
+        setTargetsError(answer.error || "");
+      } catch (error) {
+        setTargetsError(String((error as Error)?.message || error));
+      } finally {
+        targetsLoading = false;
+      }
+    };
+
     const refresh = async (session: Session | undefined) => {
       if (!session || session.pending) return;
       try {
@@ -138,7 +186,11 @@ const definition = Plugin.define({
         // so each bot stays mounted instead of being made again every poll.
         setRuns(session.key, reconcile(answer.runs || [], { key: "id" }));
         setErrors(session.key, answer.error || "");
-        if (flag) setForced(session.key, flag.force === true);
+        if (flag) {
+          const view = forcedView(flag);
+          setForced(session.key, view);
+          if (view.force) void ensureTargets();
+        }
       } catch (error) {
         setErrors(session.key, String((error as Error)?.message || error));
       }
@@ -147,10 +199,23 @@ const definition = Plugin.define({
     // toggleForce ticks or unticks the Delegate check: ticked, every model call
     // of the conversation must hand its work to Dispatch.
     const toggleForce = async (session: Session) => {
-      const force = !forced[session.key];
+      const force = forced[session.key]?.force !== true;
       try {
         const answer = await rpc().setForce({ sessionID: session.id, directory: session.directory || "", force });
-        setForced(session.key, answer.force === true);
+        setForced(session.key, forcedView(answer));
+        if (answer.force === true) void ensureTargets();
+      } catch (error) {
+        ctx.toast.show({ variant: "error", title: ctx.t("title"), description: String((error as Error)?.message || error) });
+      }
+    };
+
+    // pickTarget sends the conversation's forced runs to an agent and model,
+    // empty strings for Auto; it is stored with the check, per conversation.
+    const pickTarget = async (session: Session, agent: string, model: string) => {
+      const force = forced[session.key]?.force === true;
+      try {
+        const answer = await rpc().setForce({ sessionID: session.id, directory: session.directory || "", force, agent, model });
+        setForced(session.key, forcedView(answer));
       } catch (error) {
         ctx.toast.show({ variant: "error", title: ctx.t("title"), description: String((error as Error)?.message || error) });
       }
@@ -318,13 +383,60 @@ const definition = Plugin.define({
       // dispatch_run can take the work.
       show: (input: { session: Session }) => {
         if (!status().enabled) return undefined;
-        const on = forced[input.session.key] === true;
+        const on = forced[input.session.key]?.force === true;
         return {
           icon: on ? "circle-check" : undefined,
           label: ctx.t(on ? "pill.force.on" : "pill.force.off"),
           tone: on ? "success" : undefined,
           title: ctx.t("pill.force.title"),
           run: () => void toggleForce(input.session),
+        };
+      },
+    });
+
+    ctx.add(ComposerPill, {
+      id: "target",
+      // The agent and model every forced run goes to, beside the Delegate
+      // check while it is on: Auto, or a model of one of the agents here. The
+      // menu is read from the CLIs the first time a conversation needs it.
+      show: (input: { session: Session }) => {
+        if (!status().enabled || forced[input.session.key]?.force !== true) return undefined;
+        void ensureTargets();
+        const pick = forced[input.session.key];
+        const chosen = (agent: string, model: string) => pick?.agent === agent && (pick?.model || "") === model;
+        const rows: PillRow[] = [
+          {
+            id: "target:auto",
+            label: ctx.t("pill.target.auto.row"),
+            ...(chosen("", "") ? { icon: "circle-check", tone: "success" } : {}),
+            run: () => void pickTarget(input.session, "", ""),
+          },
+        ];
+        const list = targets();
+        if (!list) {
+          rows.push({
+            id: "target:loading",
+            label: targetsError() ? ctx.t("pill.target.failed", { error: targetsError() }) : ctx.t("pill.target.loading"),
+          });
+        } else {
+          for (const agent of list) {
+            for (const model of agent.models) {
+              const on = chosen(agent.name, model);
+              rows.push({
+                id: `target:${agent.name}:${model}`,
+                label: `${agent.name} · ${model}`,
+                ...(on ? { icon: "circle-check", tone: "success" } : {}),
+                run: () => void pickTarget(input.session, agent.name, model),
+              });
+            }
+          }
+          if (!list.length) rows.push({ id: "target:none", label: ctx.t("pill.target.empty") });
+        }
+        return {
+          icon: "models",
+          label: pick?.agent ? (pick.model ? `${pick.agent} · ${pick.model}` : pick.agent) : ctx.t("pill.target.auto"),
+          title: ctx.t("pill.target.title"),
+          rows,
         };
       },
     });

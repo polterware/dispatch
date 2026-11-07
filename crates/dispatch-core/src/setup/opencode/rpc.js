@@ -59,7 +59,9 @@ export const Dispatch = {
       },
     },
     // The Delegate check beside the composer pill, per conversation; directory
-    // is taken for symmetry with runs and not needed to resolve the root.
+    // is taken for symmetry with runs and not needed to resolve the root. A
+    // forced conversation also keeps the agent and model its runs go to, empty
+    // for Auto.
     force: {
       input: {
         type: "object",
@@ -69,8 +71,8 @@ export const Dispatch = {
       },
       output: {
         type: "object",
-        properties: { force: { type: "boolean" } },
-        required: ["force"],
+        properties: { force: { type: "boolean" }, agent: { type: "string" }, model: { type: "string" } },
+        required: ["force", "agent", "model"],
         additionalProperties: false,
       },
     },
@@ -81,14 +83,42 @@ export const Dispatch = {
           sessionID: { type: "string" },
           directory: { type: "string" },
           force: { type: "boolean" },
+          // The target the forced runs go to; empty strings mean Auto.
+          agent: { type: "string" },
+          model: { type: "string" },
         },
         required: ["sessionID", "force"],
         additionalProperties: false,
       },
       output: {
         type: "object",
-        properties: { force: { type: "boolean" } },
-        required: ["force"],
+        properties: { force: { type: "boolean" }, agent: { type: "string" }, model: { type: "string" } },
+        required: ["force", "agent", "model"],
+        additionalProperties: false,
+      },
+    },
+    // The agents and models a forced conversation can send its runs to, from
+    // `dispatch agents --json` and `dispatch models --json`.
+    targets: {
+      input: { type: "object", additionalProperties: false },
+      output: {
+        type: "object",
+        properties: {
+          agents: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                name: { type: "string" },
+                models: { type: "array", items: { type: "string" } },
+              },
+              required: ["name", "models"],
+              additionalProperties: false,
+            },
+          },
+          error: { type: "string" },
+        },
+        required: ["agents"],
         additionalProperties: false,
       },
     },
