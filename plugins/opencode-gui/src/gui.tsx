@@ -11,7 +11,7 @@ import { createStore, reconcile } from "solid-js/store";
 import { Dispatch } from "../../../crates/dispatch-core/src/setup/opencode/rpc.js";
 import { AgentBot, EmptyBot } from "./avatars";
 import { expressionFor } from "./expressions";
-import { ACTIVE, FAILED, firstLine, formatDuration, formatTokens, runDetail, runLink, statusLabel, type LogView, type RunView } from "./runs";
+import { ACTIVE, FAILED, filterTargets, firstLine, formatDuration, formatTokens, runDetail, runLink, statusLabel, type LogView, type RunView, type TargetAgent } from "./runs";
 
 // The app's context; its types live in @opencode/plugin/gui.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -20,10 +20,11 @@ type Session = { key: string; id: string; directory?: string; pending?: boolean 
 type Status = { enabled: boolean; binary: string; available: boolean; loaded: boolean };
 // The conversation's Delegate check and the target its runs go to, empty for Auto.
 type ForcedView = { force: boolean; agent: string; model: string };
-// One agent a forced run can go to, with the models its CLI lists.
-type TargetAgent = { name: string; models: string[] };
-// One row of the menu a composer pill opens.
-type PillRow = { id: string; label: string; icon?: string; tone?: string; run?: () => void };
+// One line of the Agent pill's popover: a selectable row, with the index the
+// keyboard moves by, or the heading of the agent whose models follow it.
+type TargetEntry =
+  | { kind: "row"; index: number; agent: string; model: string; label: string }
+  | { kind: "agent"; name: string };
 
 const POLL_ACTIVE_MS = 3_000;
 const POLL_IDLE_MS = 15_000;
@@ -59,6 +60,16 @@ const CSS = `
 .dispatch-empty-title { margin-top: 8px; color: var(--text-strong); font-size: 15px; font-weight: 600; }
 .dispatch-empty .dispatch-muted { max-width: 280px; line-height: 1.45; }
 .dispatch-settings { display: flex; flex-direction: column; gap: 16px; }
+.dispatch-target { display: flex; flex-direction: column; gap: 8px; width: 320px; box-sizing: border-box; }
+.dispatch-target-search { width: 100%; }
+.dispatch-target-list { display: flex; flex-direction: column; gap: 2px; min-height: 240px; max-height: 360px; overflow-y: auto; overscroll-behavior: contain; }
+.dispatch-target-agent { margin: 6px 8px 2px; color: var(--text-weak); font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; }
+.dispatch-target-row { display: flex; align-items: center; gap: 8px; width: 100%; padding: 6px 8px; border: 0; border-radius: 6px; background: transparent; color: var(--text-base); font: inherit; font-size: 13px; text-align: left; cursor: pointer; }
+.dispatch-target-row:hover, .dispatch-target-row-active { background: var(--surface-base-hover); outline: none; }
+.dispatch-target-row:focus-visible { background: var(--surface-base-hover); outline: none; }
+.dispatch-target-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dispatch-target-check { flex: none; display: grid; place-items: center; margin-left: auto; color: var(--text-weak); }
+.dispatch-target-note { margin: 0; padding: 8px; color: var(--text-weak); font-size: 12px; }
 `;
 
 const definition = Plugin.define({
@@ -103,8 +114,10 @@ const definition = Plugin.define({
       "pill.target.auto": "Auto",
       "pill.target.auto.row": "Auto (Dispatch decides)",
       "pill.target.title": "Agent and model every forced run goes to",
+      "pill.target.search": "Search agents and models",
       "pill.target.loading": "Loading agents…",
       "pill.target.empty": "No agents to pick",
+      "pill.target.none": "No models match",
       "pill.target.failed": "Could not read the agents: {{error}}",
       "runs.one": "{{count}} run",
       "runs.other": "{{count}} runs",
@@ -395,51 +408,129 @@ const definition = Plugin.define({
       },
     });
 
+    // TargetMenu is the Agent pill's popover: a search field, then Auto and the
+    // models the installed CLIs list, grouped by agent. The host owns the
+    // capsule, the placement, the focus and the dismissal; its list scrolls in
+    // a fixed box, so a long list never outgrows the window or jumps while the
+    // search narrows it.
+    const TargetMenu = (props: { session: Session; close: () => void }) => {
+      const [query, setQuery] = createSignal("");
+      const [active, setActive] = createSignal(0);
+      const elements: (HTMLButtonElement | undefined)[] = [];
+      void ensureTargets();
+      const pick = () => forced[props.session.key];
+      const chosen = (agent: string, model: string) => pick()?.agent === agent && (pick()?.model || "") === model;
+      // Auto first, then each agent the search keeps, with one row per model.
+      const entries = () => {
+        const list: TargetEntry[] = [];
+        let index = 0;
+        list.push({ kind: "row", index: index++, agent: "", model: "", label: ctx.t("pill.target.auto.row") });
+        for (const agent of filterTargets(targets() || [], query())) {
+          list.push({ kind: "agent", name: agent.name });
+          for (const model of agent.models) list.push({ kind: "row", index: index++, agent: agent.name, model, label: model });
+        }
+        return list;
+      };
+      const rows = () => entries().flatMap((entry) => (entry.kind === "row" ? [entry] : []));
+      const note = () => {
+        const list = targets();
+        if (!list) {
+          return targetsError() ? ctx.t("pill.target.failed", { error: targetsError() }) : ctx.t("pill.target.loading");
+        }
+        if (!list.length) return ctx.t("pill.target.empty");
+        if (query().trim() && rows().length <= 1) return ctx.t("pill.target.none");
+        return "";
+      };
+      const choose = (agent: string, model: string) => {
+        void pickTarget(props.session, agent, model);
+        props.close();
+      };
+      const move = (delta: number) => {
+        const next = Math.max(0, Math.min(rows().length - 1, active() + delta));
+        setActive(next);
+        elements[next]?.scrollIntoView({ block: "nearest" });
+      };
+      const onKeyDown = (event: KeyboardEvent) => {
+        if (event.key === "ArrowDown") {
+          event.preventDefault();
+          move(1);
+        } else if (event.key === "ArrowUp") {
+          event.preventDefault();
+          move(-1);
+        } else if (event.key === "Enter") {
+          const row = rows()[active()];
+          if (!row) return;
+          event.preventDefault();
+          choose(row.agent, row.model);
+        }
+      };
+      return (
+        <div class="dispatch-target" onKeyDown={onKeyDown}>
+          <ctx.ui.TextInput
+            class="dispatch-target-search"
+            value={query()}
+            placeholder={ctx.t("pill.target.search")}
+            label={ctx.t("pill.target.search")}
+            autofocus
+            onInput={(value: string) => {
+              setQuery(value);
+              setActive(0);
+            }}
+          />
+          <div class="dispatch-target-list" role="listbox" aria-label={ctx.t("pill.target.title")}>
+            <For each={entries()}>
+              {(entry) =>
+                entry.kind === "agent" ? (
+                  <p class="dispatch-target-agent">{entry.name}</p>
+                ) : (
+                  <button
+                    ref={(el) => (elements[entry.index] = el)}
+                    type="button"
+                    role="option"
+                    aria-selected={chosen(entry.agent, entry.model)}
+                    class="dispatch-target-row"
+                    classList={{ "dispatch-target-row-active": active() === entry.index }}
+                    onClick={() => choose(entry.agent, entry.model)}
+                  >
+                    <span class="dispatch-target-name" title={entry.label}>
+                      {entry.label}
+                    </span>
+                    <Show when={chosen(entry.agent, entry.model)}>
+                      <span class="dispatch-target-check">
+                        <ctx.ui.Icon name="circle-check" size={14} />
+                      </span>
+                    </Show>
+                  </button>
+                )
+              }
+            </For>
+            <Show when={note()}>
+              <p class="dispatch-target-note">{note()}</p>
+            </Show>
+          </div>
+        </div>
+      );
+    };
+
     ctx.add(ComposerPill, {
       id: "target",
       // The agent and model every forced run goes to, beside the Delegate
       // check while it is on: Auto, or a model of one of the agents here. The
-      // menu is read from the CLIs the first time a conversation needs it.
+      // capsule names the pick, and the popover searches the models the CLIs
+      // list, read the first time a conversation needs them.
       show: (input: { session: Session }) => {
         if (!status().enabled || forced[input.session.key]?.force !== true) return undefined;
         void ensureTargets();
         const pick = forced[input.session.key];
-        const chosen = (agent: string, model: string) => pick?.agent === agent && (pick?.model || "") === model;
-        const rows: PillRow[] = [
-          {
-            id: "target:auto",
-            label: ctx.t("pill.target.auto.row"),
-            ...(chosen("", "") ? { icon: "circle-check", tone: "success" } : {}),
-            run: () => void pickTarget(input.session, "", ""),
-          },
-        ];
-        const list = targets();
-        if (!list) {
-          rows.push({
-            id: "target:loading",
-            label: targetsError() ? ctx.t("pill.target.failed", { error: targetsError() }) : ctx.t("pill.target.loading"),
-          });
-        } else {
-          for (const agent of list) {
-            for (const model of agent.models) {
-              const on = chosen(agent.name, model);
-              rows.push({
-                id: `target:${agent.name}:${model}`,
-                label: `${agent.name} · ${model}`,
-                ...(on ? { icon: "circle-check", tone: "success" } : {}),
-                run: () => void pickTarget(input.session, agent.name, model),
-              });
-            }
-          }
-          if (!list.length) rows.push({ id: "target:none", label: ctx.t("pill.target.empty") });
-        }
         return {
           icon: "models",
           label: pick?.agent ? (pick.model ? `${pick.agent} · ${pick.model}` : pick.agent) : ctx.t("pill.target.auto"),
           title: ctx.t("pill.target.title"),
-          rows,
         };
       },
+      menu: (input: { session: Session; close: () => void }) => (
+        <TargetMenu session={input.session} close={input.close} />
+      ),
     });
 
     const tab = {
@@ -646,4 +737,4 @@ const definition = Plugin.define({
 
 export default definition;
 export { Dispatch };
-export const helpers = { firstLine, statusLabel, runDetail, runLink, formatTokens, formatDuration, expressionFor };
+export const helpers = { firstLine, statusLabel, runDetail, runLink, formatTokens, formatDuration, filterTargets, expressionFor };

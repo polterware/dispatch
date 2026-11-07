@@ -29,6 +29,9 @@ export type LogView = {
   error?: string;
 };
 
+/** One agent a forced run can go to, with the models its CLI lists. */
+export type TargetAgent = { name: string; models: string[] };
+
 export const ACTIVE = new Set(["PENDING", "RUNNING"]);
 export const FAILED = new Set(["FAILED", "CANCELLED", "TIMED_OUT", "ORPHANED"]);
 
@@ -54,6 +57,23 @@ export function firstLine(text: string | undefined, max: number): string {
 export function statusLabel(run: RunView): string {
   if (run.mergedAt) return "Merged";
   return STATUS_LABELS[run.status] || run.status || "Unknown";
+}
+
+/**
+ * filterTargets keeps the models whose agent or model name holds every word of
+ * the search, case-insensitive, and drops the agents the search leaves empty.
+ */
+export function filterTargets(agents: readonly TargetAgent[], query: string): TargetAgent[] {
+  const words = query.toLowerCase().split(/\s+/).filter(Boolean);
+  return agents
+    .map((agent) => ({
+      name: agent.name,
+      models: agent.models.filter((model) => {
+        const text = `${agent.name} ${model}`.toLowerCase();
+        return words.every((word) => text.includes(word));
+      }),
+    }))
+    .filter((agent) => agent.models.length > 0);
 }
 
 export function formatTokens(tokens: number | undefined): string {

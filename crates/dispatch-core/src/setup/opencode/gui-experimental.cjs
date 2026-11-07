@@ -6221,6 +6221,16 @@ function statusLabel(run) {
   if (run.mergedAt) return "Merged";
   return STATUS_LABELS[run.status] || run.status || "Unknown";
 }
+function filterTargets(agents, query) {
+  const words = query.toLowerCase().split(/\s+/).filter(Boolean);
+  return agents.map((agent) => ({
+    name: agent.name,
+    models: agent.models.filter((model) => {
+      const text = `${agent.name} ${model}`.toLowerCase();
+      return words.every((word) => text.includes(word));
+    })
+  })).filter((agent) => agent.models.length > 0);
+}
 function formatTokens(tokens) {
   if (typeof tokens !== "number" || tokens <= 0) return "";
   return tokens >= 1e3 ? `${(tokens / 1e3).toFixed(tokens >= 1e5 ? 0 : 1)}k tokens` : `${tokens} tokens`;
@@ -6241,7 +6251,7 @@ function runDetail(run) {
   if (took && !ACTIVE.has(run.status)) parts.push(took);
   return parts.join(" · ");
 }
-var _tmpl$ = /* @__PURE__ */ web.template(`<div class=dispatch-settings><p class=dispatch-muted></p><div>`), _tmpl$2 = /* @__PURE__ */ web.template(`<p class=dispatch-danger>`), _tmpl$3 = /* @__PURE__ */ web.template(`<pre class=dispatch-log-body>`), _tmpl$4 = /* @__PURE__ */ web.template(`<button class=dispatch-log-follow type=button>`), _tmpl$5 = /* @__PURE__ */ web.template(`<div class=dispatch-log-foot><span class=dispatch-muted>`), _tmpl$6 = /* @__PURE__ */ web.template(`<div class="dispatch-panel dispatch-panel-log"><div class=dispatch-log-head><span class=dispatch-run-bot></span><span class=dispatch-run-body><span class=dispatch-run-title></span><span></span></span></div><div class=dispatch-log-wrap>`), _tmpl$7 = /* @__PURE__ */ web.template(`<p class=dispatch-log-empty>`), _tmpl$8 = /* @__PURE__ */ web.template(`<span class=dispatch-muted> · `), _tmpl$9 = /* @__PURE__ */ web.template(`<ul class=dispatch-runs>`), _tmpl$0 = /* @__PURE__ */ web.template(`<div class=dispatch-panel><div class=dispatch-panel-head><span class=dispatch-panel-switch></span><span class=dispatch-panel-title></span><span class=dispatch-panel-actions>`), _tmpl$1 = /* @__PURE__ */ web.template(`<div class=dispatch-empty><p class=dispatch-empty-title></p><p class=dispatch-muted>`), _tmpl$10 = /* @__PURE__ */ web.template(`<li><button class=dispatch-run type=button><span class=dispatch-run-bot></span><span class=dispatch-run-body><span class=dispatch-run-title></span><span>`);
+var _tmpl$ = /* @__PURE__ */ web.template(`<div class=dispatch-settings><p class=dispatch-muted></p><div>`), _tmpl$2 = /* @__PURE__ */ web.template(`<p class=dispatch-target-note>`), _tmpl$3 = /* @__PURE__ */ web.template(`<div class=dispatch-target><div class=dispatch-target-list role=listbox>`), _tmpl$4 = /* @__PURE__ */ web.template(`<p class=dispatch-target-agent>`), _tmpl$5 = /* @__PURE__ */ web.template(`<span class=dispatch-target-check>`), _tmpl$6 = /* @__PURE__ */ web.template(`<button type=button role=option class=dispatch-target-row><span class=dispatch-target-name>`), _tmpl$7 = /* @__PURE__ */ web.template(`<p class=dispatch-danger>`), _tmpl$8 = /* @__PURE__ */ web.template(`<pre class=dispatch-log-body>`), _tmpl$9 = /* @__PURE__ */ web.template(`<button class=dispatch-log-follow type=button>`), _tmpl$0 = /* @__PURE__ */ web.template(`<div class=dispatch-log-foot><span class=dispatch-muted>`), _tmpl$1 = /* @__PURE__ */ web.template(`<div class="dispatch-panel dispatch-panel-log"><div class=dispatch-log-head><span class=dispatch-run-bot></span><span class=dispatch-run-body><span class=dispatch-run-title></span><span></span></span></div><div class=dispatch-log-wrap>`), _tmpl$10 = /* @__PURE__ */ web.template(`<p class=dispatch-log-empty>`), _tmpl$11 = /* @__PURE__ */ web.template(`<span class=dispatch-muted> · `), _tmpl$12 = /* @__PURE__ */ web.template(`<ul class=dispatch-runs>`), _tmpl$13 = /* @__PURE__ */ web.template(`<div class=dispatch-panel><div class=dispatch-panel-head><span class=dispatch-panel-switch></span><span class=dispatch-panel-title></span><span class=dispatch-panel-actions>`), _tmpl$14 = /* @__PURE__ */ web.template(`<div class=dispatch-empty><p class=dispatch-empty-title></p><p class=dispatch-muted>`), _tmpl$15 = /* @__PURE__ */ web.template(`<li><button class=dispatch-run type=button><span class=dispatch-run-bot></span><span class=dispatch-run-body><span class=dispatch-run-title></span><span>`);
 const POLL_ACTIVE_MS = 3e3;
 const POLL_IDLE_MS = 15e3;
 const LOG_POLL_MS = 2e3;
@@ -6273,6 +6283,16 @@ const CSS = `
 .dispatch-empty-title { margin-top: 8px; color: var(--text-strong); font-size: 15px; font-weight: 600; }
 .dispatch-empty .dispatch-muted { max-width: 280px; line-height: 1.45; }
 .dispatch-settings { display: flex; flex-direction: column; gap: 16px; }
+.dispatch-target { display: flex; flex-direction: column; gap: 8px; width: 320px; box-sizing: border-box; }
+.dispatch-target-search { width: 100%; }
+.dispatch-target-list { display: flex; flex-direction: column; gap: 2px; min-height: 240px; max-height: 360px; overflow-y: auto; overscroll-behavior: contain; }
+.dispatch-target-agent { margin: 6px 8px 2px; color: var(--text-weak); font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; }
+.dispatch-target-row { display: flex; align-items: center; gap: 8px; width: 100%; padding: 6px 8px; border: 0; border-radius: 6px; background: transparent; color: var(--text-base); font: inherit; font-size: 13px; text-align: left; cursor: pointer; }
+.dispatch-target-row:hover, .dispatch-target-row-active { background: var(--surface-base-hover); outline: none; }
+.dispatch-target-row:focus-visible { background: var(--surface-base-hover); outline: none; }
+.dispatch-target-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dispatch-target-check { flex: none; display: grid; place-items: center; margin-left: auto; color: var(--text-weak); }
+.dispatch-target-note { margin: 0; padding: 8px; color: var(--text-weak); font-size: 12px; }
 `;
 const definition = gui.Plugin.define({
   i18n: {
@@ -6315,8 +6335,10 @@ const definition = gui.Plugin.define({
       "pill.target.auto": "Auto",
       "pill.target.auto.row": "Auto (Dispatch decides)",
       "pill.target.title": "Agent and model every forced run goes to",
+      "pill.target.search": "Search agents and models",
       "pill.target.loading": "Loading agents…",
       "pill.target.empty": "No agents to pick",
+      "pill.target.none": "No models match",
       "pill.target.failed": "Could not read the agents: {{error}}",
       "runs.one": "{{count}} run",
       "runs.other": "{{count}} runs",
@@ -6638,60 +6660,173 @@ const definition = gui.Plugin.define({
         };
       }
     });
+    const TargetMenu = (props) => {
+      const [query, setQuery] = solidJs.createSignal("");
+      const [active, setActive] = solidJs.createSignal(0);
+      const elements = [];
+      void ensureTargets();
+      const pick = () => forced[props.session.key];
+      const chosen = (agent, model) => pick()?.agent === agent && (pick()?.model || "") === model;
+      const entries = () => {
+        const list = [];
+        let index = 0;
+        list.push({
+          kind: "row",
+          index: index++,
+          agent: "",
+          model: "",
+          label: ctx.t("pill.target.auto.row")
+        });
+        for (const agent of filterTargets(targets() || [], query())) {
+          list.push({
+            kind: "agent",
+            name: agent.name
+          });
+          for (const model of agent.models) list.push({
+            kind: "row",
+            index: index++,
+            agent: agent.name,
+            model,
+            label: model
+          });
+        }
+        return list;
+      };
+      const rows = () => entries().flatMap((entry) => entry.kind === "row" ? [entry] : []);
+      const note = () => {
+        const list = targets();
+        if (!list) {
+          return targetsError() ? ctx.t("pill.target.failed", {
+            error: targetsError()
+          }) : ctx.t("pill.target.loading");
+        }
+        if (!list.length) return ctx.t("pill.target.empty");
+        if (query().trim() && rows().length <= 1) return ctx.t("pill.target.none");
+        return "";
+      };
+      const choose = (agent, model) => {
+        void pickTarget(props.session, agent, model);
+        props.close();
+      };
+      const move = (delta) => {
+        const next = Math.max(0, Math.min(rows().length - 1, active() + delta));
+        setActive(next);
+        elements[next]?.scrollIntoView({
+          block: "nearest"
+        });
+      };
+      const onKeyDown = (event) => {
+        if (event.key === "ArrowDown") {
+          event.preventDefault();
+          move(1);
+        } else if (event.key === "ArrowUp") {
+          event.preventDefault();
+          move(-1);
+        } else if (event.key === "Enter") {
+          const row = rows()[active()];
+          if (!row) return;
+          event.preventDefault();
+          choose(row.agent, row.model);
+        }
+      };
+      return (() => {
+        var _el$4 = _tmpl$3(), _el$5 = _el$4.firstChild;
+        _el$4.$$keydown = onKeyDown;
+        web.insert(_el$4, web.createComponent(ctx.ui.TextInput, {
+          "class": "dispatch-target-search",
+          get value() {
+            return query();
+          },
+          get placeholder() {
+            return ctx.t("pill.target.search");
+          },
+          get label() {
+            return ctx.t("pill.target.search");
+          },
+          autofocus: true,
+          onInput: (value) => {
+            setQuery(value);
+            setActive(0);
+          }
+        }), _el$5);
+        web.insert(_el$5, web.createComponent(solidJs.For, {
+          get each() {
+            return entries();
+          },
+          children: (entry) => entry.kind === "agent" ? (() => {
+            var _el$7 = _tmpl$4();
+            web.insert(_el$7, () => entry.name);
+            return _el$7;
+          })() : (() => {
+            var _el$8 = _tmpl$6(), _el$9 = _el$8.firstChild;
+            _el$8.$$click = () => choose(entry.agent, entry.model);
+            web.use((el) => elements[entry.index] = el, _el$8);
+            web.insert(_el$9, () => entry.label);
+            web.insert(_el$8, web.createComponent(solidJs.Show, {
+              get when() {
+                return chosen(entry.agent, entry.model);
+              },
+              get children() {
+                var _el$0 = _tmpl$5();
+                web.insert(_el$0, web.createComponent(ctx.ui.Icon, {
+                  name: "circle-check",
+                  size: 14
+                }));
+                return _el$0;
+              }
+            }), null);
+            web.effect((_p$) => {
+              var _v$ = chosen(entry.agent, entry.model), _v$2 = !!(active() === entry.index), _v$3 = entry.label;
+              _v$ !== _p$.e && web.setAttribute(_el$8, "aria-selected", _p$.e = _v$);
+              _v$2 !== _p$.t && _el$8.classList.toggle("dispatch-target-row-active", _p$.t = _v$2);
+              _v$3 !== _p$.a && web.setAttribute(_el$9, "title", _p$.a = _v$3);
+              return _p$;
+            }, {
+              e: void 0,
+              t: void 0,
+              a: void 0
+            });
+            return _el$8;
+          })()
+        }), null);
+        web.insert(_el$5, web.createComponent(solidJs.Show, {
+          get when() {
+            return note();
+          },
+          get children() {
+            var _el$6 = _tmpl$2();
+            web.insert(_el$6, note);
+            return _el$6;
+          }
+        }), null);
+        web.effect(() => web.setAttribute(_el$5, "aria-label", ctx.t("pill.target.title")));
+        return _el$4;
+      })();
+    };
     ctx.add(gui.ComposerPill, {
       id: "target",
       // The agent and model every forced run goes to, beside the Delegate
       // check while it is on: Auto, or a model of one of the agents here. The
-      // menu is read from the CLIs the first time a conversation needs it.
+      // capsule names the pick, and the popover searches the models the CLIs
+      // list, read the first time a conversation needs them.
       show: (input) => {
         if (!status().enabled || forced[input.session.key]?.force !== true) return void 0;
         void ensureTargets();
         const pick = forced[input.session.key];
-        const chosen = (agent, model) => pick?.agent === agent && (pick?.model || "") === model;
-        const rows = [{
-          id: "target:auto",
-          label: ctx.t("pill.target.auto.row"),
-          ...chosen("", "") ? {
-            icon: "circle-check",
-            tone: "success"
-          } : {},
-          run: () => void pickTarget(input.session, "", "")
-        }];
-        const list = targets();
-        if (!list) {
-          rows.push({
-            id: "target:loading",
-            label: targetsError() ? ctx.t("pill.target.failed", {
-              error: targetsError()
-            }) : ctx.t("pill.target.loading")
-          });
-        } else {
-          for (const agent of list) {
-            for (const model of agent.models) {
-              const on = chosen(agent.name, model);
-              rows.push({
-                id: `target:${agent.name}:${model}`,
-                label: `${agent.name} · ${model}`,
-                ...on ? {
-                  icon: "circle-check",
-                  tone: "success"
-                } : {},
-                run: () => void pickTarget(input.session, agent.name, model)
-              });
-            }
-          }
-          if (!list.length) rows.push({
-            id: "target:none",
-            label: ctx.t("pill.target.empty")
-          });
-        }
         return {
           icon: "models",
           label: pick?.agent ? pick.model ? `${pick.agent} · ${pick.model}` : pick.agent : ctx.t("pill.target.auto"),
-          title: ctx.t("pill.target.title"),
-          rows
+          title: ctx.t("pill.target.title")
         };
-      }
+      },
+      menu: (input) => web.createComponent(TargetMenu, {
+        get session() {
+          return input.session;
+        },
+        get close() {
+          return input.close;
+        }
+      })
     });
     const tab = {
       id: "runs",
@@ -6746,8 +6881,8 @@ const definition = gui.Plugin.define({
         clearTimeout(timer2);
       });
       return (() => {
-        var _el$4 = _tmpl$6(), _el$5 = _el$4.firstChild, _el$6 = _el$5.firstChild, _el$7 = _el$6.nextSibling, _el$8 = _el$7.firstChild, _el$9 = _el$8.nextSibling, _el$10 = _el$5.nextSibling;
-        web.insert(_el$5, web.createComponent(ctx.ui.Tooltip, {
+        var _el$1 = _tmpl$1(), _el$10 = _el$1.firstChild, _el$11 = _el$10.firstChild, _el$12 = _el$11.nextSibling, _el$13 = _el$12.firstChild, _el$14 = _el$13.nextSibling, _el$17 = _el$10.nextSibling;
+        web.insert(_el$10, web.createComponent(ctx.ui.Tooltip, {
           get value() {
             return ctx.t("panel.back");
           },
@@ -6764,8 +6899,8 @@ const definition = gui.Plugin.define({
               }
             });
           }
-        }), _el$6);
-        web.insert(_el$6, web.createComponent(AgentBot, {
+        }), _el$11);
+        web.insert(_el$11, web.createComponent(AgentBot, {
           get agent() {
             return props.run.agent;
           },
@@ -6779,12 +6914,12 @@ const definition = gui.Plugin.define({
             return props.run.mergedAt;
           }
         }));
-        web.insert(_el$8, () => firstLine(props.run.prompt, 120) || props.run.id);
-        web.insert(_el$9, () => runDetail({
+        web.insert(_el$13, () => firstLine(props.run.prompt, 120) || props.run.id);
+        web.insert(_el$14, () => runDetail({
           ...props.run,
           status: status2()
         }));
-        web.insert(_el$5, web.createComponent(ctx.ui.Tooltip, {
+        web.insert(_el$10, web.createComponent(ctx.ui.Tooltip, {
           get value() {
             return ctx.t("log.open");
           },
@@ -6800,70 +6935,70 @@ const definition = gui.Plugin.define({
             });
           }
         }), null);
-        web.insert(_el$4, web.createComponent(solidJs.Show, {
+        web.insert(_el$1, web.createComponent(solidJs.Show, {
           get when() {
             return props.run.error;
           },
           get children() {
-            var _el$0 = _tmpl$2();
-            web.insert(_el$0, () => props.run.error);
-            return _el$0;
+            var _el$15 = _tmpl$7();
+            web.insert(_el$15, () => props.run.error);
+            return _el$15;
           }
-        }), _el$10);
-        web.insert(_el$4, web.createComponent(solidJs.Show, {
+        }), _el$17);
+        web.insert(_el$1, web.createComponent(solidJs.Show, {
           get when() {
             return failure();
           },
           get children() {
-            var _el$1 = _tmpl$2();
-            web.insert(_el$1, () => ctx.t("log.failed", {
+            var _el$16 = _tmpl$7();
+            web.insert(_el$16, () => ctx.t("log.failed", {
               error: failure()
             }));
-            return _el$1;
+            return _el$16;
           }
-        }), _el$10);
-        web.insert(_el$10, web.createComponent(solidJs.Show, {
+        }), _el$17);
+        web.insert(_el$17, web.createComponent(solidJs.Show, {
           get when() {
             return log()?.text;
           },
           get fallback() {
             return (() => {
-              var _el$15 = _tmpl$7();
-              web.insert(_el$15, () => ctx.t(working() ? "log.empty" : "log.none"));
-              return _el$15;
+              var _el$22 = _tmpl$10();
+              web.insert(_el$22, () => ctx.t(working() ? "log.empty" : "log.none"));
+              return _el$22;
             })();
           },
           get children() {
-            var _el$11 = _tmpl$3();
-            _el$11.addEventListener("scroll", () => setFollowing(atEnd()));
-            web.use((el) => area = el, _el$11);
-            web.insert(_el$11, () => log()?.text);
-            return _el$11;
+            var _el$18 = _tmpl$8();
+            _el$18.addEventListener("scroll", () => setFollowing(atEnd()));
+            web.use((el) => area = el, _el$18);
+            web.insert(_el$18, () => log()?.text);
+            return _el$18;
           }
         }), null);
-        web.insert(_el$10, web.createComponent(solidJs.Show, {
+        web.insert(_el$17, web.createComponent(solidJs.Show, {
           get when() {
             return working() || !following();
           },
           get children() {
-            var _el$12 = _tmpl$5(), _el$13 = _el$12.firstChild;
-            web.insert(_el$13, () => ctx.t(following() ? "log.following" : "log.paused"));
-            web.insert(_el$12, web.createComponent(solidJs.Show, {
+            var _el$19 = _tmpl$0(), _el$20 = _el$19.firstChild;
+            web.insert(_el$20, () => ctx.t(following() ? "log.following" : "log.paused"));
+            web.insert(_el$19, web.createComponent(solidJs.Show, {
               get when() {
                 return !following();
               },
               get children() {
-                var _el$14 = _tmpl$4();
-                _el$14.$$click = toEnd;
-                web.insert(_el$14, () => ctx.t("log.follow"));
-                return _el$14;
+                var _el$21 = _tmpl$9();
+                _el$21.$$click = toEnd;
+                web.insert(_el$21, () => ctx.t("log.follow"));
+                return _el$21;
               }
             }), null);
-            return _el$12;
+            return _el$19;
           }
         }), null);
-        web.effect(() => web.className(_el$9, FAILED.has(status2()) ? "dispatch-danger" : "dispatch-muted"));
-        return _el$4;
+        web.effect(() => web.className(_el$14, FAILED.has(status2()) ? "dispatch-danger" : "dispatch-muted"));
+        return _el$1;
       })();
     };
     const RunsView = (props) => {
@@ -6881,8 +7016,8 @@ const definition = gui.Plugin.define({
         },
         get fallback() {
           return (() => {
-            var _el$16 = _tmpl$0(), _el$17 = _el$16.firstChild, _el$18 = _el$17.firstChild, _el$19 = _el$18.nextSibling, _el$22 = _el$19.nextSibling;
-            web.insert(_el$18, web.createComponent(ctx.ui.Tooltip, {
+            var _el$23 = _tmpl$13(), _el$24 = _el$23.firstChild, _el$25 = _el$24.firstChild, _el$26 = _el$25.nextSibling, _el$29 = _el$26.nextSibling;
+            web.insert(_el$25, web.createComponent(ctx.ui.Tooltip, {
               get value() {
                 return ctx.t(status().enabled ? "command.toggle.on" : "command.toggle.off");
               },
@@ -6898,19 +7033,19 @@ const definition = gui.Plugin.define({
                 });
               }
             }));
-            web.insert(_el$19, () => ctx.t("panel.runs"), null);
-            web.insert(_el$19, web.createComponent(solidJs.Show, {
+            web.insert(_el$26, () => ctx.t("panel.runs"), null);
+            web.insert(_el$26, web.createComponent(solidJs.Show, {
               get when() {
                 return list().length > 0;
               },
               get children() {
-                var _el$20 = _tmpl$8();
-                _el$20.firstChild;
-                web.insert(_el$20, () => list().length, null);
-                return _el$20;
+                var _el$27 = _tmpl$11();
+                _el$27.firstChild;
+                web.insert(_el$27, () => list().length, null);
+                return _el$27;
               }
             }), null);
-            web.insert(_el$22, web.createComponent(ctx.ui.Tooltip, {
+            web.insert(_el$29, web.createComponent(ctx.ui.Tooltip, {
               get value() {
                 return ctx.t("command.app");
               },
@@ -6926,45 +7061,45 @@ const definition = gui.Plugin.define({
                 });
               }
             }));
-            web.insert(_el$16, web.createComponent(solidJs.Show, {
+            web.insert(_el$23, web.createComponent(solidJs.Show, {
               get when() {
                 return error();
               },
               get children() {
-                var _el$23 = _tmpl$2();
-                web.insert(_el$23, () => ctx.t("panel.unreachable", {
+                var _el$30 = _tmpl$7();
+                web.insert(_el$30, () => ctx.t("panel.unreachable", {
                   error: error()
                 }));
-                return _el$23;
+                return _el$30;
               }
             }), null);
-            web.insert(_el$16, web.createComponent(solidJs.Show, {
+            web.insert(_el$23, web.createComponent(solidJs.Show, {
               get when() {
                 return list().length > 0;
               },
               get fallback() {
                 return (() => {
-                  var _el$25 = _tmpl$1(), _el$26 = _el$25.firstChild, _el$27 = _el$26.nextSibling;
-                  web.insert(_el$25, web.createComponent(EmptyBot, {
+                  var _el$32 = _tmpl$14(), _el$33 = _el$32.firstChild, _el$34 = _el$33.nextSibling;
+                  web.insert(_el$32, web.createComponent(EmptyBot, {
                     get mood() {
                       return status().enabled ? "sleeping" : "lost";
                     }
-                  }), _el$26);
-                  web.insert(_el$26, () => ctx.t(status().enabled ? "panel.empty.title" : "panel.empty.off.title"));
-                  web.insert(_el$27, () => ctx.t(status().enabled ? "panel.empty.on" : "panel.empty.off"));
-                  return _el$25;
+                  }), _el$33);
+                  web.insert(_el$33, () => ctx.t(status().enabled ? "panel.empty.title" : "panel.empty.off.title"));
+                  web.insert(_el$34, () => ctx.t(status().enabled ? "panel.empty.on" : "panel.empty.off"));
+                  return _el$32;
                 })();
               },
               get children() {
-                var _el$24 = _tmpl$9();
-                web.insert(_el$24, web.createComponent(solidJs.For, {
+                var _el$31 = _tmpl$12();
+                web.insert(_el$31, web.createComponent(solidJs.For, {
                   get each() {
                     return list();
                   },
                   children: (run) => (() => {
-                    var _el$28 = _tmpl$10(), _el$29 = _el$28.firstChild, _el$30 = _el$29.firstChild, _el$31 = _el$30.nextSibling, _el$32 = _el$31.firstChild, _el$33 = _el$32.nextSibling;
-                    _el$29.$$click = () => setSelected(run);
-                    web.insert(_el$30, web.createComponent(AgentBot, {
+                    var _el$35 = _tmpl$15(), _el$36 = _el$35.firstChild, _el$37 = _el$36.firstChild, _el$38 = _el$37.nextSibling, _el$39 = _el$38.firstChild, _el$40 = _el$39.nextSibling;
+                    _el$36.$$click = () => setSelected(run);
+                    web.insert(_el$37, web.createComponent(AgentBot, {
                       get agent() {
                         return run.agent;
                       },
@@ -6978,24 +7113,24 @@ const definition = gui.Plugin.define({
                         return run.mergedAt;
                       }
                     }));
-                    web.insert(_el$32, () => firstLine(run.prompt, 120) || run.id);
-                    web.insert(_el$33, () => runDetail(run));
+                    web.insert(_el$39, () => firstLine(run.prompt, 120) || run.id);
+                    web.insert(_el$40, () => runDetail(run));
                     web.effect((_p$) => {
-                      var _v$ = run.prompt, _v$2 = FAILED.has(run.status) ? "dispatch-danger" : "dispatch-muted";
-                      _v$ !== _p$.e && web.setAttribute(_el$29, "title", _p$.e = _v$);
-                      _v$2 !== _p$.t && web.className(_el$33, _p$.t = _v$2);
+                      var _v$4 = run.prompt, _v$5 = FAILED.has(run.status) ? "dispatch-danger" : "dispatch-muted";
+                      _v$4 !== _p$.e && web.setAttribute(_el$36, "title", _p$.e = _v$4);
+                      _v$5 !== _p$.t && web.className(_el$40, _p$.t = _v$5);
                       return _p$;
                     }, {
                       e: void 0,
                       t: void 0
                     });
-                    return _el$28;
+                    return _el$35;
                   })()
                 }));
-                return _el$24;
+                return _el$31;
               }
             }), null);
-            return _el$16;
+            return _el$23;
           })();
         },
         children: (run) => web.createComponent(RunLog, {
@@ -7044,9 +7179,10 @@ const helpers = {
   runLink,
   formatTokens,
   formatDuration,
+  filterTargets,
   expressionFor
 };
-web.delegateEvents(["click"]);
+web.delegateEvents(["keydown", "click"]);
 exports.Dispatch = Dispatch;
 exports.default = definition;
 exports.helpers = helpers;
