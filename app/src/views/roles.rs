@@ -22,11 +22,12 @@ use crate::client::{
 };
 use crate::models::roles::{
     GENERAL_ROLE, PaletteModel, RoleDraft, RoleListRow, RoleProfile, RoleRow, RoleSource,
-    RolesList, TIER_COLUMNS, TierBuild, TierCardInput, TierColumns, TierSlot, board_row_count,
-    build_board, compose_profile, is_build_empty, models_label, palette_card_at, palette_efforts,
-    palette_groups, parse_roles_list, parse_tier_build, place_tier_card, profile_error,
-    profile_with_board, remove_tier_card, rename_drops_previous, replace_tier_card,
-    role_board_tiers, role_list_rows, role_models_prompt, role_name_error, tier_columns,
+    RolesList, TIER_COLUMNS, TierBuild, TierCardInput, TierColumns, TierSlot, add_column,
+    board_row_count, build_board, compose_profile, is_build_empty, kept_columns, models_label,
+    palette_card_at, palette_efforts, palette_groups, parse_roles_list, parse_tier_build,
+    place_tier_card, profile_error, profile_with_board, remove_column, remove_tier_card,
+    rename_drops_previous, replace_tier_card, role_board_tiers, role_list_rows, role_models_prompt,
+    role_name_error, stored_columns, tier_column_label, tier_columns, tier_columns_in,
     tier_matches, when_display,
 };
 use crate::motion::{Animator, SpringTier, SpringValue};
@@ -38,8 +39,9 @@ use crate::ui::parts::roles::{
     build_sections, muted_note, order_mark, role_board_note, role_summary,
 };
 use crate::ui::patterns::{
-    Property, PropertyOption, PropertyPills, PropertyPillsEvent, composer_card, composer_field,
-    composer_footer, modal_layer, window_layer,
+    AnchorSlot, Property, PropertyOption, PropertyPicker, PropertyPickerEvent, PropertyPills,
+    PropertyPillsEvent, composer_card, composer_field, composer_footer, modal_layer, window_anchor,
+    window_layer,
 };
 use crate::ui::{
     Button, ButtonKind, ButtonSize, Column, DataTable, Edge, Icon, IconTile, MascotMood, Menu,
@@ -142,6 +144,9 @@ pub struct RolesView {
     build_role: String,
     build_judge: String,
     build_menu: Entity<Menu>,
+    /// Add column: the picker of the missing tiers, and the button it hangs from.
+    column_picker: Entity<PropertyPicker>,
+    column_anchor: AnchorSlot,
     drag: Option<PointerDrag>,
     motion_for: Option<String>,
     row_hover: HashMap<String, SpringValue>,
@@ -253,6 +258,17 @@ impl RolesView {
         })
         .detach();
 
+        let column_picker = cx.new(PropertyPicker::new);
+        cx.subscribe(
+            &column_picker,
+            |this, _, event: &PropertyPickerEvent, cx| {
+                if let PropertyPickerEvent::Pick(tier) = event {
+                    this.add_column(tier.to_string(), cx);
+                }
+            },
+        )
+        .detach();
+
         let tier_watch = tier_search.clone();
         cx.observe(&tier_watch, |this, input, cx| {
             let next = input.read(cx).text().to_string();
@@ -312,6 +328,8 @@ impl RolesView {
             build_role: GENERAL_ROLE.to_string(),
             build_judge: String::new(),
             build_menu: cx.new(Menu::new),
+            column_picker,
+            column_anchor: AnchorSlot::default(),
             drag: None,
             motion_for: None,
             row_hover: HashMap::new(),
@@ -489,6 +507,21 @@ impl RolesView {
             Some(name) => self
                 .role_row(name)
                 .map(|row| role_board_tiers(&row.profile))
+                .unwrap_or_default(),
+            None => Vec::new(),
+        }
+    }
+
+    /// The tier columns the open board draws: General's all three, or the role's kept ones.
+    fn open_columns(&self, cx: &Context<Self>) -> Vec<String> {
+        match self.board_name(cx).as_deref() {
+            Some(name) if name == GENERAL_ROLE => TIER_COLUMNS
+                .iter()
+                .map(|(id, _)| (*id).to_string())
+                .collect(),
+            Some(name) => self
+                .role_row(name)
+                .map(|row| kept_columns(&row.profile))
                 .unwrap_or_default(),
             None => Vec::new(),
         }
@@ -1228,6 +1261,95 @@ impl RolesView {
         self.commit_board(next, cx);
     }
 
+    /// Removes a non-General role's tier column and the models in it. The last one stays.
+    fn delete_column(&mut self, tier: String, cx: &mut Context<Self>) {
+        let Some(name) = self.board_name(cx) else {
+            return;
+        };
+        if name == GENERAL_ROLE || !self.editable(cx) {
+            return;
+        }
+        let Some(row) = self.role_row(&name) else {
+            return;
+        };
+        let kept = kept_columns(&row.profile);
+        if !kept.iter().any(|column| column == &tier) {
+            return;
+        }
+        let next_columns = remove_column(&kept, &tier);
+        if next_columns == kept {
+            return;
+        }
+        let next: Vec<DispatchTier> = self
+            .committed(cx)
+            .into_iter()
+            .filter(|card| card.name != tier)
+            .collect();
+        if let Some(row) = self.roles.iter_mut().find(|row| row.name == name) {
+            row.profile.columns = stored_columns(&next_columns);
+        }
+        self.save_role_board(name, next, cx);
+    }
+
+    /// Adds a tier column back to a non-General role, empty.
+    fn add_column(&mut self, tier: String, cx: &mut Context<Self>) {
+        let Some(name) = self.board_name(cx) else {
+            return;
+        };
+        if name == GENERAL_ROLE || !self.editable(cx) {
+            return;
+        }
+        let Some(row) = self.role_row(&name) else {
+            return;
+        };
+        let kept = kept_columns(&row.profile);
+        let next_columns = add_column(&kept, &tier);
+        if next_columns == kept {
+            return;
+        }
+        if let Some(row) = self.roles.iter_mut().find(|row| row.name == name) {
+            row.profile.columns = stored_columns(&next_columns);
+        }
+        let next = self.committed(cx);
+        self.save_role_board(name, next, cx);
+    }
+
+    /// Opens the Add column picker under its button, or closes it.
+    fn toggle_column_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(name) = self.board_name(cx) else {
+            return;
+        };
+        if name == GENERAL_ROLE || !self.editable(cx) {
+            return;
+        }
+        if self.column_picker.read(cx).is_open() {
+            self.column_picker.update(cx, |picker, cx| picker.close(cx));
+            return;
+        }
+        let kept = self
+            .role_row(&name)
+            .map(|row| kept_columns(&row.profile))
+            .unwrap_or_default();
+        let options: Vec<PropertyOption> = TIER_COLUMNS
+            .iter()
+            .filter(|(id, _)| !kept.iter().any(|column| column == id))
+            .map(|(id, label)| PropertyOption::new(*id, *label).hint("Adds an empty column"))
+            .collect();
+        if options.is_empty() {
+            return;
+        }
+        let height = self
+            .column_anchor
+            .get()
+            .map_or(28.0, |bounds| f32::from(bounds.size.height));
+        self.column_picker.update(cx, |picker, cx| {
+            picker.set_options("Column", options, None, 200.0, cx);
+            picker.set_trigger_height(height);
+            picker.open(window, cx);
+        });
+        cx.notify();
+    }
+
     fn begin_drag(&mut self, slot: TierSlot, x: f32, y: f32, cx: &mut Context<Self>) {
         if !self.editable(cx) || self.composer.is_some() || self.build_open {
             return;
@@ -1359,6 +1481,7 @@ impl RolesView {
             self.motion_for = board;
             self.drag = None;
             self.palette_slot = None;
+            self.column_picker.update(cx, |picker, cx| picker.close(cx));
         }
         let composer_on = self.composer.is_some();
         self.composer_opacity
@@ -1902,8 +2025,14 @@ impl RolesView {
     ) -> gpui::Div {
         let theme = *Theme::global(cx);
         let committed = self.committed(cx);
-        let columns = tier_columns(&committed);
+        let kept = self.open_columns(cx);
+        let columns = tier_columns_in(&committed, &kept);
         let rows = board_row_count(&columns, editable);
+        let removable =
+            editable && self.board_name(cx).as_deref() != Some(GENERAL_ROLE) && kept.len() > 1;
+        let can_add = editable
+            && self.board_name(cx).as_deref() != Some(GENERAL_ROLE)
+            && kept.len() < TIER_COLUMNS.len();
         let clear_bounds = self.cell_bounds.clone();
         let mut board = div()
             .relative()
@@ -1919,52 +2048,96 @@ impl RolesView {
                 .absolute()
                 .size_full(),
             )
-            .child(self.board_header(&columns, &theme));
+            .child(self.board_header(&columns, removable, cx));
         for row in 0..rows {
             board = board.child(self.board_row(row, &columns, editable, query, &theme, window, cx));
+        }
+        if can_add {
+            board = board.child(self.add_column_button(&theme, cx));
         }
         board
     }
 
-    /// `.pw-tier-board__head`: the tier's name in 13px semibold and its count in 11px figures,
-    /// on one baseline.
-    fn board_header(&self, columns: &TierColumns, theme: &Theme) -> gpui::Div {
+    /// `.pw-tier-board__head`: the tier's name in 13px semibold, its count in 11px figures,
+    /// and, on a role's board, the control that removes the column.
+    fn board_header(
+        &self,
+        columns: &TierColumns,
+        removable: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let theme = *Theme::global(cx);
         let mut header = div()
             .w_full()
             .flex()
             .gap(px(GAP))
             .child(div().w(px(ORDER_W)).flex_none());
-        for (id, label) in TIER_COLUMNS {
-            let count = columns.get(id).len();
-            header = header.child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .flex()
-                    .items_baseline()
-                    .justify_between()
-                    .gap(px(8.0))
-                    .px(px(4.0))
-                    .pb(px(2.0))
-                    .child(
-                        div()
-                            .text_size(px(13.0))
-                            .line_height(px(13.0 * 1.5))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.color_text_primary)
-                            .child(*label),
+        for (id, list) in &columns.columns {
+            let tier = id.clone();
+            let view = cx.entity().clone();
+            let mut head = div()
+                .flex_1()
+                .min_w(px(0.0))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(8.0))
+                .px(px(4.0))
+                .pb(px(2.0))
+                .child(
+                    div()
+                        .text_size(px(13.0))
+                        .line_height(px(13.0 * 1.5))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.color_text_primary)
+                        .child(tier_column_label(id)),
+                )
+                .child(
+                    div()
+                        .font(tabular(sans(&theme, FontWeight::NORMAL)))
+                        .text_size(px(11.0))
+                        .line_height(px(11.0 * 1.5))
+                        .text_color(theme.color_text_muted)
+                        .child(list.len().to_string()),
+                );
+            if removable {
+                head = head.child(
+                    Button::new(
+                        SharedString::from(format!("column-remove-{tier}")),
+                        ButtonKind::Ghost,
                     )
-                    .child(
-                        div()
-                            .font(tabular(sans(theme, FontWeight::NORMAL)))
-                            .text_size(px(11.0))
-                            .line_height(px(11.0 * 1.5))
-                            .text_color(theme.color_text_muted)
-                            .child(count.to_string()),
-                    ),
-            );
+                    .size(ButtonSize::Icon)
+                    .icon(Icon::Close)
+                    .tooltip(format!("Remove the {} column", tier_column_label(&tier)))
+                    .on_click(move |_, cx| {
+                        let tier = tier.clone();
+                        view.update(cx, |this, cx| this.delete_column(tier.clone(), cx));
+                    }),
+                );
+            }
+            header = header.child(head);
         }
         header
+    }
+
+    /// Add column: a ghost control under a role's board, with the picker it opens.
+    fn add_column_button(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
+        let view = cx.entity().clone();
+        let button = Button::new("role-add-column", ButtonKind::Ghost)
+            .size(ButtonSize::Sm)
+            .icon(Icon::Plus)
+            .label("Add column")
+            .on_click(move |window, cx| {
+                view.update(cx, |this, cx| this.toggle_column_picker(window, cx));
+            });
+        div()
+            .relative()
+            .w_full()
+            .flex()
+            .justify_end()
+            .pt(px(theme.space_1))
+            .child(self.column_anchor.probe())
+            .child(button)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1983,7 +2156,7 @@ impl RolesView {
             .flex()
             .gap(px(GAP))
             .child(order_mark(row, theme, cx));
-        for (id, _label) in TIER_COLUMNS {
+        for (id, _) in &columns.columns {
             let cards = columns.get(id);
             let tier = cards.get(row).cloned();
             let is_next = row == cards.len();
@@ -2834,6 +3007,16 @@ impl Render for RolesView {
                     .w(px(232.0))
                     .child(deferred(self.build_menu.clone()).with_priority(2)),
             )
+            // Under a role board's Add column button, over the rows after it.
+            .when(self.column_picker.read(cx).is_presented(), |page| {
+                let Some(anchor) = self.column_anchor.get() else {
+                    return page;
+                };
+                page.child(window_anchor(
+                    anchor,
+                    self.column_picker.clone().into_any_element(),
+                ))
+            })
     }
 }
 

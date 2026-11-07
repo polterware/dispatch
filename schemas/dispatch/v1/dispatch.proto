@@ -615,7 +615,7 @@ message SubagentsRequest {
   string dir = 2;
   // save and remove: the subagent's name.
   string name = 3;
-  // save: the profile as JSON (tier, readonly, instructions, prefer, avoid, timeout, ...).
+  // save: the profile as JSON (tier, readonly, columns, instructions, prefer, avoid, timeout, ...).
   string profile = 4;
 }
 

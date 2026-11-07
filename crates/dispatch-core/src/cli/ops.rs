@@ -41,7 +41,7 @@ pub(crate) const OPS_USAGE: &str = "       dispatch wait <id> [--timeout <dur>] 
        dispatch rename <conversation-id> <name>   (an empty name gives the conversation back its first prompt)
        dispatch recover <id>
        dispatch roles [--check] [--dir <repo>]
-       dispatch roles save <name> [--when <text>] [--tier easy|normal|hard] [--easy|--normal|--hard agent/model,...] [--readonly] [--instructions <text>] [--manual] [--prefer a,b] [--avoid a,b] [--timeout <dur>] | remove <name>
+       dispatch roles save <name> [--when <text>] [--tier easy|normal|hard] [--columns easy,normal,hard] [--easy|--normal|--hard agent/model,...] [--readonly] [--instructions <text>] [--manual] [--prefer a,b] [--avoid a,b] [--timeout <dur>] | remove <name>
        dispatch on|off|hook [--agent <name>]
        dispatch setup [--json] | link | skill [--remove] [<agent> | <folder>] | hook [<agent>] on|off | opencode [--remove | on | off]
        dispatch skill install|remove [--agent <name> | --dir <folder>] [--force] | show | refresh
@@ -1043,6 +1043,11 @@ pub(super) async fn roles(db_path: &Path, args: &[String]) -> CliResult {
         "hard",
         "",
         "save: its hard models in order, agent/model, comma separated; empty uses the tier table",
+    )
+    .string(
+        "columns",
+        "",
+        "save: the tier columns its board keeps, comma separated, such as easy,hard; empty keeps all three",
     );
     let positional = f.parse_interspersed(args)?;
     let check = f.flag("check");
@@ -1063,6 +1068,7 @@ pub(super) async fn roles(db_path: &Path, args: &[String]) -> CliResult {
                     instructions: f.str("instructions"),
                     when: f.str("when"),
                     tiers: entries,
+                    columns: role_columns(&f.str("columns"))?,
                     manual: f.flag("manual"),
                     prefer: split_list(&f.str("prefer")),
                     avoid: split_list(&f.str("avoid")),
@@ -1106,6 +1112,22 @@ pub(super) async fn roles(db_path: &Path, args: &[String]) -> CliResult {
         return Err(Fail::Exit(1));
     }
     print_op(res.ok, &res.json)
+}
+
+/// Reads the tier columns a role keeps; empty keeps all three.
+fn role_columns(list: &str) -> Result<Option<Vec<String>>, Fail> {
+    let columns = split_list(list);
+    if columns.is_empty() {
+        return Ok(None);
+    }
+    for column in &columns {
+        if !matches!(column.as_str(), "easy" | "normal" | "hard") {
+            return Err(usage_err(format!(
+                "--columns: {column:?} is not easy, normal, or hard"
+            )));
+        }
+    }
+    Ok(Some(columns))
 }
 
 /// Reads one tier's agent/model entries, comma separated, in order.

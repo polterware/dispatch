@@ -66,7 +66,7 @@ dispatch repo ls|add|rm        # the repositories Dispatch knows (same as dispat
 
 ## Roles
 
-A role is the kind of work a run does: instructions, `when` it fits, `readonly`, `timeout`, a lowest tier, and its own board of models per tier (primary first, then fallbacks; a tier with none uses the general tier table). Built in: `explorer`, `implementer`, `tester`, `reviewer`, `planner`; `roles.json` (the dispatch state dir) and `<repo>/.dispatch/roles.json` add or replace them (project wins).
+A role is the kind of work a run does: instructions, `when` it fits, `readonly`, `timeout`, a lowest tier, and its own board of models per tier (primary first, then fallbacks; a tier with none uses the general tier table). Built in: `explorer`, `implementer`, `tester`, `reviewer`, `planner`; `roles.json` (the dispatch state dir) and `<repo>/.dispatch/roles.json` add or replace them (project wins). A role keeps one, two, or three tier columns (its `columns`, and `dispatch roles save <name> --columns easy,hard`; `general` keeps all three): a task in a column it dropped routes on the nearest kept column, the next harder first, else the next easier, with a note.
 
 Role and difficulty work together: the role picks the board, the task's difficulty picks the column. On Auto with a classifier, dispatch picks the role itself from each one's `when` (Jev and the CLI classifier; not OpenAI), at P ≥ 0.5, else `general`. A picked role never changes access, so read-only still comes only from `--readonly` or `--role`. Name one yourself when you know the kind of work:
 

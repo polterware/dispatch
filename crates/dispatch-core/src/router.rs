@@ -408,6 +408,8 @@ pub struct RouteOptions {
     pub prefer: Vec<String>,
     pub avoid: Vec<String>,
     pub role_board: crate::tiers::Table,
+    /// The tier columns the role keeps; empty keeps all three.
+    pub role_columns: Vec<String>,
     pub disabled: Vec<crate::types::DisabledModel>,
 }
 
@@ -680,22 +682,37 @@ pub fn plan(
     }
     let mut table = table.clone();
     let mut policy = policy.clone();
+    let mut role_note = String::new();
     if o.filters.model.is_empty() && o.filters.provider.is_empty() {
-        let band = if o.tier == "auto" {
-            difficulty_tier(o.difficulty.unwrap_or(-1.8))
+        let mut band = if o.tier == "auto" {
+            difficulty_tier(o.difficulty.unwrap_or(-1.8)).to_owned()
         } else if matches!(o.tier.as_str(), "easy" | "normal" | "hard") {
-            &o.tier
+            o.tier.clone()
         } else {
-            "normal"
+            "normal".into()
         };
-        if let Some(entries) = o.role_board.tiers.get(band).filter(|e| !e.is_empty()) {
+        if let Some((kept, note)) = crate::roles::nearest_column(&o.role_columns, &band) {
+            band = kept;
+            role_note = note;
+        }
+        if let Some(entries) = o.role_board.tiers.get(&band).filter(|e| !e.is_empty()) {
             table.tiers.clear();
-            table.tiers.insert(band.into(), entries.clone());
-            o.tier = band.into();
+            table.tiers.insert(band.clone(), entries.clone());
+            o.tier = band;
             policy.discover = false;
+        } else {
+            role_note.clear();
         }
     }
-    let (primary, mut eliminated) = select_candidates(&table, &policy, agents, &o);
+    let (mut primary, mut eliminated) = select_candidates(&table, &policy, agents, &o);
+    if !role_note.is_empty() {
+        for c in &mut primary {
+            if !c.note.is_empty() {
+                c.note.push_str("; ");
+            }
+            c.note.push_str(&role_note);
+        }
+    }
     let mut extra = Vec::new();
     if o.filters.relax
         && crate::config::disabled_request_reason(

@@ -59,15 +59,20 @@ impl TierColumns {
 }
 
 pub fn tier_columns(tiers: &[DispatchTier]) -> TierColumns {
-    let mut columns: Vec<(String, Vec<DispatchTier>)> = TIER_COLUMNS
+    let all: Vec<String> = TIER_COLUMNS
         .iter()
-        .map(|(id, _)| ((*id).to_string(), Vec::new()))
+        .map(|(id, _)| (*id).to_string())
         .collect();
+    tier_columns_in(tiers, &all)
+}
+
+/// Candidates of the given tiers, in that order; a card in another tier is not drawn.
+pub fn tier_columns_in(tiers: &[DispatchTier], kept: &[String]) -> TierColumns {
+    let mut columns: Vec<(String, Vec<DispatchTier>)> =
+        kept.iter().map(|id| (id.clone(), Vec::new())).collect();
     for tier in tiers {
         if let Some((_, list)) = columns.iter_mut().find(|(id, _)| id == &tier.name) {
             list.push(tier.clone());
-        } else {
-            columns.push((tier.name.clone(), vec![tier.clone()]));
         }
     }
     for (_, list) in &mut columns {
@@ -152,9 +157,10 @@ pub fn remove_tier_card(tiers: &[DispatchTier], slot: &TierSlot) -> Vec<Dispatch
 
 /// How many rows the board draws: the tallest column, plus one empty row when it is editable.
 pub fn board_row_count(columns: &TierColumns, editable: bool) -> usize {
-    let tallest = TIER_COLUMNS
+    let tallest = columns
+        .columns
         .iter()
-        .map(|(id, _)| columns.get(id).len())
+        .map(|(_, list)| list.len())
         .max()
         .unwrap_or(0);
     tallest.max(1) + usize::from(editable)
@@ -256,6 +262,9 @@ pub struct RoleProfile {
     pub when: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tiers: Vec<RoleEntry>,
+    /// The tier columns the role keeps, easiest first. Absent keeps all three.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub columns: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub manual: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -385,8 +394,60 @@ fn tier_sort_key(name: &str) -> isize {
 
 pub fn profile_with_board(profile: &RoleProfile, tiers: &[DispatchTier]) -> RoleProfile {
     let mut next = profile.clone();
-    next.tiers = board_to_role_tiers(tiers);
+    let kept = kept_columns(profile);
+    next.tiers = board_to_role_tiers(tiers)
+        .into_iter()
+        .filter(|entry| kept.iter().any(|column| column == &entry.tier))
+        .collect();
     next
+}
+
+/// The tier columns a role keeps, easiest first. An absent setting keeps all three.
+pub fn kept_columns(profile: &RoleProfile) -> Vec<String> {
+    let Some(columns) = profile.columns.as_ref().filter(|c| !c.is_empty()) else {
+        return TIER_COLUMNS
+            .iter()
+            .map(|(id, _)| (*id).to_string())
+            .collect();
+    };
+    let kept: Vec<String> = TIER_COLUMNS
+        .iter()
+        .filter(|(id, _)| columns.iter().any(|c| c == id))
+        .map(|(id, _)| (*id).to_string())
+        .collect();
+    if kept.is_empty() {
+        TIER_COLUMNS
+            .iter()
+            .map(|(id, _)| (*id).to_string())
+            .collect()
+    } else {
+        kept
+    }
+}
+
+/// The columns a role stores for `kept`: none when they are all three, matching an absent field.
+pub fn stored_columns(kept: &[String]) -> Option<Vec<String>> {
+    (kept.len() < TIER_COLUMNS.len()).then(|| kept.to_vec())
+}
+
+/// `kept` without `tier`. The last remaining column stays: a role always keeps one.
+pub fn remove_column(kept: &[String], tier: &str) -> Vec<String> {
+    if kept.len() <= 1 {
+        return kept.to_vec();
+    }
+    kept.iter().filter(|c| *c != tier).cloned().collect()
+}
+
+/// `kept` with `tier`, in board order. A column it already has leaves it as it was.
+pub fn add_column(kept: &[String], tier: &str) -> Vec<String> {
+    if !TIER_COLUMNS.iter().any(|(id, _)| *id == tier) {
+        return kept.to_vec();
+    }
+    TIER_COLUMNS
+        .iter()
+        .filter(|(id, _)| *id == tier || kept.iter().any(|c| c == id))
+        .map(|(id, _)| (*id).to_string())
+        .collect()
 }
 
 /// The lowest tier a role runs at, as its card says it.
@@ -718,7 +779,11 @@ fn roles_save_command(name: &str, profile: &RoleProfile) -> String {
     if profile.manual {
         parts.push("--manual".to_string());
     }
-    for tier in ["easy", "normal", "hard"] {
+    let kept = kept_columns(profile);
+    if kept.len() < TIER_COLUMNS.len() {
+        parts.push(format!("--columns {}", kept.join(",")));
+    }
+    for tier in kept {
         parts.push(format!("--{tier} '<agent/model,…>'"));
     }
     parts.join(" ")
@@ -918,6 +983,60 @@ mod tests {
             provider: String::new(),
             position,
         }
+    }
+
+    #[test]
+    fn a_role_keeps_at_least_one_column_and_can_add_the_missing_ones() {
+        let profile = super::RoleProfile {
+            columns: Some(vec!["easy".into(), "normal".into()]),
+            ..super::RoleProfile::default()
+        };
+        assert_eq!(super::kept_columns(&profile), vec!["easy", "normal"]);
+        assert_eq!(
+            super::kept_columns(&super::RoleProfile::default()),
+            vec!["easy", "normal", "hard"]
+        );
+        assert_eq!(
+            super::remove_column(&["easy".to_string()], "easy"),
+            vec!["easy".to_string()],
+            "the last remaining column cannot be deleted"
+        );
+        assert_eq!(
+            super::remove_column(&["easy".to_string(), "hard".to_string()], "easy"),
+            vec!["hard".to_string()]
+        );
+        assert_eq!(
+            super::add_column(&["hard".to_string()], "easy"),
+            vec!["easy".to_string(), "hard".to_string()]
+        );
+        assert_eq!(
+            super::add_column(&["hard".to_string()], "hard"),
+            vec!["hard".to_string()]
+        );
+        assert_eq!(
+            super::stored_columns(&["easy".into(), "hard".into()]),
+            Some(vec!["easy".into(), "hard".into()])
+        );
+        assert_eq!(
+            super::stored_columns(&["easy".into(), "normal".into(), "hard".into()]),
+            None,
+            "all three is the absent setting"
+        );
+
+        // Deleting a column drops its models from the role.
+        let tiers = vec![
+            tier("easy", "codex", "small", 0),
+            tier("normal", "codex", "mid", 0),
+            tier("hard", "codex", "deep", 0),
+        ];
+        let kept = super::kept_columns(&profile);
+        let next = super::profile_with_board(&profile, &tiers);
+        assert!(
+            next.tiers.iter().all(|entry| entry.tier != "hard"),
+            "a deleted column's cards go: {next:?}"
+        );
+        assert_eq!(super::tier_columns_in(&tiers, &kept).columns.len(), 2);
+        assert!(super::tier_columns_in(&tiers, &kept).get("hard").is_empty());
     }
 
     #[test]
