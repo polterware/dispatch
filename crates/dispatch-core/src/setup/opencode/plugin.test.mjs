@@ -756,6 +756,16 @@ test("the panel draws a run's log as a transcript", () => {
   ].join("\n")
   assert.deepEqual(buildTranscript(tool), [{ kind: "step", text: "Reading src/main.rs", output: "line one\nline two" }])
 
+  // OpenCode names a shell call's command only in an update; the folder it
+  // gives as location first is not the step's target.
+  const update = (fields) => line({ method: "session/update", params: { update: { toolCallId: "s1", ...fields } } })
+  const shell = [
+    update({ sessionUpdate: "tool_call", name: "shell", title: "shell", kind: "execute", status: "pending", locations: [{ path: "/repo" }], rawInput: { cwd: "/repo" } }),
+    update({ sessionUpdate: "tool_call_update", kind: "execute", status: "in_progress", title: "ls vendor", locations: [{ path: "/repo" }], rawInput: { command: "ls vendor" } }),
+    update({ sessionUpdate: "tool_call_update", status: "completed", content: [{ type: "content", content: { type: "text", text: "bot-avatars\n" } }] }),
+  ].join("\n")
+  assert.deepEqual(buildTranscript(shell), [{ kind: "step", text: "Running ls vendor", output: "bot-avatars" }])
+
   // Claude Code stream-json: the reply, a tool use, and its result.
   const claude = [
     line({

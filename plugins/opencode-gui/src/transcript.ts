@@ -574,14 +574,17 @@ class Builder {
     const id = str(update.toolCallId);
     const args: Bag = { ...obj(update.rawInput), ...obj(update.args) };
     const location = str(obj(arr(update.locations)[0]).path);
-    if (!target(args) && location) args.path = location;
+    // A tool's own argument, before its location stands in: OpenCode sends a
+    // shell call's command only in a later update, with the folder as location.
+    const own = target(args);
+    if (!own && location) args.path = location;
     const tool = str(update.name) || str(update.kind) || str(update.title) || this.untargeted.get(id) || "";
     const status = str(update.status);
     const fromContent = contentText(update.content);
     const output = trimEnd(stripAnsi(fromContent || contentText(update.rawOutput)));
     const known = id ? this.items.get(id) : undefined;
     if (known !== undefined && this.entries[known]?.kind === "step") {
-      if (this.untargeted.has(id) && target(args)) {
+      if (this.untargeted.has(id) && own) {
         const built = stepFor(tool, args);
         this.mergeStep(known, { text: built.text, detail: built.detail ?? null });
         this.untargeted.delete(id);
@@ -591,7 +594,7 @@ class Builder {
     }
     const built = stepFor(tool, args);
     const step: StepUpdate = { text: built.text, detail: built.detail ?? null };
-    if (!target(args)) {
+    if (!own) {
       this.untargeted.set(id, tool);
       const title = str(update.title);
       if (title && title !== tool) step.text = title;
