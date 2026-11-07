@@ -291,6 +291,12 @@ impl DispatchClient {
         proto::SetModelEnabledResponse
     );
     unary_rpc!(
+        set_agent_enabled,
+        "SetAgentEnabled",
+        proto::SetAgentEnabledRequest,
+        proto::SetAgentEnabledResponse
+    );
+    unary_rpc!(
         replace_tiers,
         "ReplaceTiers",
         proto::ReplaceTiersRequest,

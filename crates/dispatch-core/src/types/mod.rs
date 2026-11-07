@@ -463,4 +463,12 @@ pub trait Store: Send + Sync {
     ) -> Result<(), Error> {
         Ok(())
     }
+    /// The agents turned off in Settings > Agents.
+    fn list_disabled_agents(&self) -> Result<Vec<String>, Error> {
+        Ok(Vec::new())
+    }
+    /// Enables or disables an agent.
+    fn set_agent_enabled(&self, _agent: &str, _enabled: bool) -> Result<(), Error> {
+        Ok(())
+    }
 }

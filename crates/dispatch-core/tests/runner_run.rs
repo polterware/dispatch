@@ -666,7 +666,10 @@ async fn test_rate_limit_builds_handoff_and_continues_from_it() {
 
     let handoff = &rec.attempts[0].handoff;
     assert!(!handoff.is_empty(), "attempt handoff should be recorded");
-    assert!(handoff.contains("implement extra.txt and verify"), "{handoff}");
+    assert!(
+        handoff.contains("implement extra.txt and verify"),
+        "{handoff}"
+    );
     assert!(handoff.contains("a/m1 (rate_limit)"), "{handoff}");
     assert!(handoff.contains("429 rate limit exceeded"), "{handoff}");
     assert!(handoff.contains("extra.txt (+1 -0)"), "{handoff}");
@@ -691,7 +694,10 @@ async fn test_rate_limit_builds_handoff_and_continues_from_it() {
         second_prompt.starts_with(HANDOFF_INSTRUCTION),
         "second prompt: {second_prompt}"
     );
-    assert!(second_prompt.contains(handoff), "second prompt: {second_prompt}");
+    assert!(
+        second_prompt.contains(handoff),
+        "second prompt: {second_prompt}"
+    );
     assert!(!second_prompt.contains("RAW_FIRST_TRANSCRIPT_TOOL_OUTPUT"));
 
     let handoff_file = std::path::Path::new(&rec.worktree).join(HANDOFF_FILE);

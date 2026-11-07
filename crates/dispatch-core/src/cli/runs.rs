@@ -30,6 +30,7 @@ const RUN_USAGE: &str = "usage: dispatch run [--tier <auto|easy|normal|hard>] [-
        dispatch agents [--json] [--compact]
        dispatch agents add <name> -- <command that starts its ACP server...>
        dispatch agents remove <name>
+       dispatch agents enable|disable <name>
 ";
 
 pub(crate) fn dispatch_usage() -> String {
@@ -1190,7 +1191,10 @@ fn format_spend(row: &StatsRow) -> String {
 }
 
 pub(super) async fn agents(db_path: &Path, args: &[String]) -> CliResult {
-    if matches!(args.first().map(String::as_str), Some("add" | "remove")) {
+    if matches!(
+        args.first().map(String::as_str),
+        Some("add" | "remove" | "enable" | "disable")
+    ) {
         return agents_edit(db_path, args).await;
     }
     let mut f = Flags::new("dispatch agents");
@@ -1218,6 +1222,7 @@ pub(super) async fn agents(db_path: &Path, args: &[String]) -> CliResult {
                 json!({
                     "Name": a.name, "Bin": a.bin, "Provider": a.provider,
                     "UsedPercent": a.used_percent, "CooldownUntil": cooldown,
+                    "Enabled": a.enabled,
                 })
             })
             .collect();
@@ -1232,8 +1237,9 @@ pub(super) async fn agents(db_path: &Path, args: &[String]) -> CliResult {
         let used = a
             .used_percent
             .map_or_else(|| "unknown".to_owned(), |p| format!("{p:.0}%"));
+        let state = if a.enabled { "" } else { "  disabled" };
         println!(
-            "{:<12}  {:<10}  used={used}",
+            "{:<12}  {:<10}  used={used}{state}",
             a.name,
             or_unknown(&a.provider)
         );
@@ -1245,6 +1251,23 @@ pub(super) async fn agents(db_path: &Path, args: &[String]) -> CliResult {
 /// removes one. Everything after "--" is the command, flags included, so it
 /// is read before any flag parsing.
 async fn agents_edit(db_path: &Path, args: &[String]) -> CliResult {
+    if let [action, name] = args
+        && (action == "enable" || action == "disable")
+        && !name.trim().is_empty()
+    {
+        let (c, _) = dial_workspace(db_path, "").await?;
+        let res = c
+            .dispatch
+            .set_agent_enabled(&pb::SetAgentEnabledRequest {
+                agent: name.trim().to_owned(),
+                enabled: action == "enable",
+            })
+            .await
+            .map_err(run_error)?;
+        let state = if res.enabled { "enabled" } else { "disabled" };
+        println!("{}: {state}", res.agent);
+        return Ok(());
+    }
     let mut req = pb::ConfigRequest::default();
     match args {
         [add, name, sep, command @ ..] if add == "add" && sep == "--" && !command.is_empty() => {
@@ -1258,7 +1281,7 @@ async fn agents_edit(db_path: &Path, args: &[String]) -> CliResult {
         }
         _ => {
             return Err(usage_err(
-                "usage: dispatch agents add <name> -- <command...> | dispatch agents remove <name>",
+                "usage: dispatch agents add <name> -- <command...> | dispatch agents remove <name> | dispatch agents enable|disable <name>",
             ));
         }
     }

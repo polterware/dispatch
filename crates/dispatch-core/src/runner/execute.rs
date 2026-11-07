@@ -6,7 +6,7 @@ use super::{
     classify_run, cooling, credit_key, fmt_time, go_duration, matches_model, msg, non_neg_ms,
     normalize_priority, parse_time, process_start,
     routing::{Cooldowns, candidate_provider, store_cooldowns},
-    run_difficulty,
+    run_difficulty, store_disabled_agents,
     summary::class_of,
     tier_warning, validate_options,
 };
@@ -280,6 +280,13 @@ impl Deps {
             return Err(msg(ERR_RECURSIVE));
         }
         normalize_priority(&mut o)?;
+        let reason = crate::config::disabled_agent_reason(
+            &store_disabled_agents(self.store.as_deref()),
+            &o.filters.agent,
+        );
+        if !reason.is_empty() {
+            return Err(msg(reason));
+        }
         let mut route_note = String::new();
         if o.resume.is_empty() {
             route_note = self.resolve_auto(&mut o).await?;

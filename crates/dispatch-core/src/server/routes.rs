@@ -179,6 +179,11 @@ pub(super) fn router(core: Arc<Core>) -> Router {
     );
     let r = unary!(
         r,
+        "/dispatch.v1.DispatchService/SetAgentEnabled",
+        set_agent_enabled
+    );
+    let r = unary!(
+        r,
         "/dispatch.v1.DispatchService/ReplaceTiers",
         replace_tiers
     );

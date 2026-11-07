@@ -312,6 +312,23 @@ impl Core {
         })
     }
 
+    pub(crate) async fn set_agent_enabled(
+        &self,
+        m: pb::SetAgentEnabledRequest,
+    ) -> RpcResult<pb::SetAgentEnabledResponse> {
+        let agent = m.agent.trim().to_ascii_lowercase();
+        if agent.is_empty() {
+            return Err(RpcError::invalid("agent is required"));
+        }
+        self.store
+            .set_agent_enabled(&agent, m.enabled)
+            .map_err(invalid)?;
+        Ok(pb::SetAgentEnabledResponse {
+            agent,
+            enabled: m.enabled,
+        })
+    }
+
     /// The catalog's benchmarks for every model the installed agent CLIs report.
     pub(crate) async fn list_model_benchmarks(
         &self,

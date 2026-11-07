@@ -1249,6 +1249,49 @@ fn a_core_started_from_a_background_thread_runs() {
 }
 
 #[test]
+fn disabled_agents_leave_agent_lists_and_never_route() {
+    let env = Env::new();
+    let fake_enabled = |env: &Env| {
+        let listed = env.json(&["agents", "--json"]);
+        items(&listed["agents"])
+            .iter()
+            .find(|a| a["Name"] == "fake")
+            .is_some_and(|a| a["Enabled"] == true)
+    };
+    assert!(fake_enabled(&env));
+    env.ok(&["agents", "disable", "fake"]);
+    assert!(!fake_enabled(&env));
+    let refused = env.fails(&["run", "--agent", "fake", "--readonly", "must not run"]);
+    assert!(refused.contains("agent fake is disabled"), "{refused}");
+    let route = env.output(&["route", "--agent", "fake", "--json", "hello"]);
+    assert!(!route.status.success());
+    let report: Value = serde_json::from_slice(&route.stdout).unwrap();
+    assert!(
+        report["candidates"]
+            .as_array()
+            .is_none_or(|cs| cs.is_empty()),
+        "{report}"
+    );
+    for args in [
+        ["route", "--tier", "normal", "--json", "hello"].as_slice(),
+        ["route", "--model", "fake-fast", "--json", "hello"].as_slice(),
+    ] {
+        let out = env.output(args);
+        let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert!(
+            report["candidates"]
+                .as_array()
+                .is_none_or(|cs| cs.iter().all(|c| c["agent"] != "fake")),
+            "{args:?}: {report}"
+        );
+    }
+    env.ok(&["agents", "enable", "fake"]);
+    assert!(fake_enabled(&env));
+    let id = env.run("hello", &["--readonly"]);
+    env.wait_for(&id, "COMPLETED");
+}
+
+#[test]
 fn disabled_models_and_providers_leave_list_models_and_never_run() {
     let env = Env::new();
     let clients = coreclient::new(&runstate::read_core(env.db()).unwrap(), "e2e");

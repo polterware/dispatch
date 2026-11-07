@@ -173,9 +173,9 @@ fn extract_stream_digest(log_slice: &str, result_output: &str, limit_err: &str) 
     // `result_output` or plain text), inspect `result_output` / plain text.
     if messages.is_empty() && !result_output.trim().is_empty() {
         let out_trimmed = result_output.trim();
-        let out_has_json = out_trimmed
-            .lines()
-            .any(|l| l.trim_start().starts_with('{') && serde_json::from_str::<Value>(l.trim()).is_ok());
+        let out_has_json = out_trimmed.lines().any(|l| {
+            l.trim_start().starts_with('{') && serde_json::from_str::<Value>(l.trim()).is_ok()
+        });
         if out_has_json && !log_slice.trim().is_empty() {
             for raw_line in out_trimmed.lines() {
                 let line = raw_line.trim();
@@ -206,9 +206,7 @@ fn extract_stream_digest(log_slice: &str, result_output: &str, limit_err: &str) 
     let limit_trimmed = limit_err.trim();
     messages.retain(|m| {
         let t = m.trim();
-        !t.is_empty()
-            && t != limit_trimmed
-            && super::summary::limit_notice(t).is_none()
+        !t.is_empty() && t != limit_trimmed && super::summary::limit_notice(t).is_none()
     });
 
     if plan.is_empty() {
@@ -235,11 +233,7 @@ fn flush_delta(messages: &mut Vec<String>, current_delta: &mut String) {
     current_delta.clear();
 }
 
-fn push_complete_message(
-    messages: &mut Vec<String>,
-    current_delta: &mut String,
-    text: &str,
-) {
+fn push_complete_message(messages: &mut Vec<String>, current_delta: &mut String, text: &str) {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return;
@@ -440,7 +434,15 @@ fn extract_todos_from_map(map: &Map<String, Value>) -> Option<String> {
             return Some(formatted);
         }
     }
-    for sub in ["input", "args", "arguments", "rawInput", "state", "part", "tool_call"] {
+    for sub in [
+        "input",
+        "args",
+        "arguments",
+        "rawInput",
+        "state",
+        "part",
+        "tool_call",
+    ] {
         if let Some(Value::Object(inner)) = map.get(sub)
             && let Some(found) = extract_todos_from_map(inner)
         {
@@ -575,10 +577,7 @@ mod tests {
         .join("\n");
 
         let digest = extract_stream_digest(&log, "", "429 rate limit exceeded");
-        assert_eq!(
-            digest.plan,
-            "- [x] Edit extra.txt\n- [~] Verify build"
-        );
+        assert_eq!(digest.plan, "- [x] Edit extra.txt\n- [~] Verify build");
         assert_eq!(
             digest.messages,
             "Updated extra.txt with the initial changes."

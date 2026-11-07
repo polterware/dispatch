@@ -39,6 +39,7 @@ pub fn for_policy(deps: &Deps) -> Option<Arc<dyn Classifier>> {
 /// policy's; with no easy-tier agent installed it has no agent and fails.
 pub fn cli_for(deps: &Deps) -> Cli {
     let disabled = crate::runner::store_disabled(deps.store.as_deref(), &deps.state_dir);
+    let disabled_agents = crate::runner::store_disabled_agents(deps.store.as_deref());
     // `agent` or `agent/model`; a model can hold a slash of its own (OpenCode's
     // `provider/model`), so only the first one splits.
     let picked = deps.policy.classifier_agent.trim();
@@ -49,6 +50,18 @@ pub fn cli_for(deps: &Deps) -> Cli {
             .iter()
             .find(|a| a.name() == agent && deps.is_installed(&a.binary()))
     {
+        let agent_reason = crate::config::disabled_agent_reason(&disabled_agents, agent);
+        if !agent_reason.is_empty() {
+            let agent = agent.to_string();
+            return Cli {
+                agent,
+                model: picked_model.to_owned(),
+                run: Some(Arc::new(move |_| {
+                    let reason = agent_reason.clone();
+                    Box::pin(async move { Err(crate::Error::Message(reason)) })
+                })),
+            };
+        }
         // With no model named, the agent's easy-tier model, else its CLI's default.
         let model = if picked_model.is_empty() {
             deps.table
@@ -94,7 +107,9 @@ pub fn cli_for(deps: &Deps) -> Cli {
     let mut model = deps.policy.classifier_model.clone();
     for e in deps.table.tiers.get("easy").into_iter().flatten() {
         let selected = if model.is_empty() { &e.model } else { &model };
-        if crate::config::is_model_disabled(&disabled, &e.provider, &e.agent, selected) {
+        if crate::config::is_model_disabled(&disabled, &e.provider, &e.agent, selected)
+            || crate::config::is_agent_disabled(&disabled_agents, &e.agent)
+        {
             continue;
         }
         for a in &deps.adapters {

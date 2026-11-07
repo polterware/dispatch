@@ -400,6 +400,30 @@ fn settings_switch_an_agents_hook(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn settings_switch_an_agent_on_and_off(cx: &mut TestAppContext) {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let core = Core::new();
+    let enabled = |agent: &str| {
+        core.client
+            .list_agents(&dispatch_app::client::ListAgentsRequest::default())
+            .unwrap()
+            .agents
+            .iter()
+            .any(|a| a.name == agent && a.enabled)
+    };
+    assert!(enabled("fake"));
+    let mut w = open(&core, cx);
+    w.go(Route::Settings(SettingsPage::Agents));
+
+    w.scroll_settings_to("settings-agent-fake");
+    w.click("settings-agent-fake");
+    w.until("the agent is disabled", || !enabled("fake"));
+    w.click("settings-agent-fake");
+    w.until("the agent is enabled", || enabled("fake"));
+    assert!(w.toasts().is_empty(), "{:?}", w.toasts());
+}
+
+#[gpui::test]
 fn settings_install_and_remove_a_skill(cx: &mut TestAppContext) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let core = Core::new();
