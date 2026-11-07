@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/voice-core",
+  "crates/voice-audio",
+  "crates/voice-stt",
+  "crates/voice-tts",
+  "crates/voice-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+voice-core = { path = "crates/voice-core" }
+voice-audio = { path = "crates/voice-audio" }
+voice-stt = { path = "crates/voice-stt" }
+voice-tts = { path = "crates/voice-tts" }
+
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "process", "fs", "net"] }
+directories = "6"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

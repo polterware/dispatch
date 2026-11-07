@@ -1,0 +1,12 @@
+/target
+node_modules
+dist
+*.tmp
+.DS_Store
+# Lockfiles are committed at release time; parallel development runs would
+# otherwise conflict on them.
+Cargo.lock
+bun.lock
+bun.lockb
+pnpm-lock.yaml
+package-lock.json

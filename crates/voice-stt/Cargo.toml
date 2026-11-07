@@ -1,0 +1,11 @@
+[package]
+name = "voice-stt"
+description = "Speech-to-text (whisper.cpp) and voice activity detection for the voice engine."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+voice-core.workspace = true
+thiserror.workspace = true
