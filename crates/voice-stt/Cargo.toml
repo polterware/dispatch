@@ -18,3 +18,4 @@ whisper-rs = { version = "0.16.0", features = ["metal", "tracing_backend"] }
 
 [dev-dependencies]
 hound = "3.5"
+tracing-subscriber.workspace = true

@@ -3,6 +3,10 @@ use voice_core::protocol::Language;
 use voice_stt::{SttEngine, SttOptions, Vad, VadEvent, VadOptions};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .init();
     let args: Vec<_> = env::args().collect();
     if args.get(1).is_some_and(|arg| arg == "vad") {
         if args.len() != 4 {
@@ -20,7 +24,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => return Err("language must be auto, pt, or en".into()),
     };
     let started = Instant::now();
-    let engine = SttEngine::load(Path::new(&args[1]), SttOptions::default())?;
+    let engine = SttEngine::load(Path::new(&args[1]), SttOptions { use_gpu: env::var_os("VOICE_STT_CPU").is_none(), ..SttOptions::default() })?;
     let load_ms = started.elapsed().as_millis();
     let mut reader = hound::WavReader::open(&args[2])?;
     let spec = reader.spec();
