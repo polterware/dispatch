@@ -77,22 +77,58 @@ export function makeCurve(options: {
   return { start: points[0], segments };
 }
 
-export interface VisualParams { amplitude: number; processing: number; warmth: number; dim: number }
+export interface VisualParams { intensity: number; speed: number; warmth: number; dim: number }
 export function stateParams(state: BlobState): VisualParams {
   switch (state) {
-    case "listening": return { amplitude: 0.2, processing: 0, warmth: 0, dim: 0 };
-    case "speaking": return { amplitude: 0.18, processing: 0, warmth: 0.08, dim: 0 };
-    case "processing": return { amplitude: 0.035, processing: 1, warmth: 0.2, dim: 0 };
-    case "error": return { amplitude: 0.035, processing: 0, warmth: 1, dim: 0 };
-    case "disconnected": return { amplitude: 0, processing: 0, warmth: 0, dim: 0.56 };
-    default: return { amplitude: 0.018, processing: 0, warmth: 0.05, dim: 0 };
+    case "listening": return { intensity: 0.15, speed: 0.4, warmth: 0.12, dim: 0 };
+    case "speaking": return { intensity: 0.2, speed: 0.55, warmth: 0.72, dim: 0 };
+    case "processing": return { intensity: 0.2, speed: 0.8, warmth: 0.44, dim: 0 };
+    case "error": return { intensity: 0.1, speed: 0.16, warmth: 1, dim: 0.08 };
+    case "disconnected": return { intensity: 0.05, speed: 0, warmth: 0.12, dim: 0.38 };
+    default: return { intensity: 0.18, speed: 0.25, warmth: 0, dim: 0 };
   }
 }
 
 export function blendParams(from: VisualParams, to: VisualParams, amount: number): VisualParams {
   const t = clamp(amount);
-  return { amplitude: from.amplitude + (to.amplitude - from.amplitude) * t,
-    processing: from.processing + (to.processing - from.processing) * t,
+  return { intensity: from.intensity + (to.intensity - from.intensity) * t,
+    speed: from.speed + (to.speed - from.speed) * t,
     warmth: from.warmth + (to.warmth - from.warmth) * t,
     dim: from.dim + (to.dim - from.dim) * t };
+}
+
+export function easeParams(from: VisualParams, to: VisualParams, elapsedMs: number, durationMs = 250): VisualParams {
+  const linear = clamp(elapsedMs / Math.max(1, durationMs));
+  return blendParams(from, to, linear * linear * (3 - 2 * linear));
+}
+
+export interface Icosphere { positions: Float32Array; normals: Float32Array; uvs: Float32Array; indices: Uint16Array | Uint32Array }
+
+export function createIcosphere(subdivisions = 4): Icosphere {
+  const t = (1 + Math.sqrt(5)) / 2;
+  let vertices: [number, number, number][] = [[-1,t,0],[1,t,0],[-1,-t,0],[1,-t,0],[0,-1,t],[0,1,t],[0,-1,-t],[0,1,-t],[t,0,-1],[t,0,1],[-t,0,-1],[-t,0,1]];
+  let faces: [number, number, number][] = [[0,11,5],[0,5,1],[0,1,7],[0,7,10],[0,10,11],[1,5,9],[5,11,4],[11,10,2],[10,7,6],[7,1,8],[3,9,4],[3,4,2],[3,2,6],[3,6,8],[3,8,9],[4,9,5],[2,4,11],[6,2,10],[8,6,7],[9,8,1]];
+  const norm = (v: [number,number,number]): [number,number,number] => { const l=Math.hypot(...v); return [v[0]/l,v[1]/l,v[2]/l]; };
+  vertices = vertices.map(norm);
+  for (let level=0; level<Math.max(0,Math.floor(subdivisions)); level++) {
+    const cache = new Map<string,number>();
+    const midpoint = (a:number,b:number) => { const key=a<b?`${a}:${b}`:`${b}:${a}`; const hit=cache.get(key); if(hit!==undefined)return hit; const p=norm([(vertices[a][0]+vertices[b][0])/2,(vertices[a][1]+vertices[b][1])/2,(vertices[a][2]+vertices[b][2])/2]); const i=vertices.push(p)-1; cache.set(key,i); return i; };
+    const next: [number,number,number][]=[];
+    for(const [a,b,c] of faces){const ab=midpoint(a,b),bc=midpoint(b,c),ca=midpoint(c,a);next.push([a,ab,ca],[b,bc,ab],[c,ca,bc],[ab,bc,ca]);}
+    faces=next;
+  }
+  const positions = new Float32Array(vertices.flat());
+  const normals = new Float32Array(positions);
+  const uvs = new Float32Array(vertices.length*2);
+  vertices.forEach(([x,y,z],i)=>{uvs[i*2]=Math.atan2(z,x)/(2*Math.PI)+0.5;uvs[i*2+1]=Math.asin(Math.max(-1,Math.min(1,y)))/Math.PI+0.5;});
+  const flat=faces.flat(); const indices=vertices.length>65535?new Uint32Array(flat):new Uint16Array(flat);
+  return {positions,normals,uvs,indices};
+}
+
+export interface BlobMatrices { projection: Float32Array; view: Float32Array }
+export function createBlobMatrices(aspect: number): BlobMatrices {
+  const safeAspect=Math.max(0.0001,Number.isFinite(aspect)?aspect:1), f=1/Math.tan(Math.PI/8), near=0.1, far=100;
+  const projection=new Float32Array([f/safeAspect,0,0,0, 0,f,0,0, 0,0,(far+near)/(near-far),-1, 0,0,(2*far*near)/(near-far),0]);
+  const view=new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,-3.15,1]);
+  return {projection,view};
 }
