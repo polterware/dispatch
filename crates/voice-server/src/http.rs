@@ -6,14 +6,14 @@ use crate::{
     rss,
 };
 use axum::{
-    Json, Router,
     extract::{
-        Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
+        Query, State,
     },
-    http::{HeaderMap, StatusCode, header},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
+    Json, Router,
 };
 use futures_util::{SinkExt, StreamExt};
 use rand::RngCore;
@@ -300,7 +300,13 @@ pub async fn serve(port: Option<u16>, if_not_running: bool) -> anyhow::Result<()
     discovery::write(&file, &info)?;
     let models = ModelManager::new(cfg.clone(), paths::models_dir());
     models.idle_unloader();
-    let mic: Arc<dyn MicSource> = Arc::new(backends::RealMicSource(cfg.input_device.clone()));
+    let mic: Arc<dyn MicSource> = match std::env::var_os("VOICE_ENGINE_TEST_INPUT") {
+        Some(wav) => {
+            tracing::warn!("test input enabled: microphone replaced by {wav:?}");
+            Arc::new(backends::WavMicSource(wav.into()))
+        }
+        None => Arc::new(backends::RealMicSource(cfg.input_device.clone())),
+    };
     let speaker: Arc<dyn Speaker> = Arc::new(backends::RealSpeaker(cfg.output_device.clone()));
     let vad: Arc<dyn VadFactory> = Arc::new(backends::RealVadFactory {
         model: {
@@ -335,7 +341,7 @@ fn healthy() -> Option<EngineInfo> {
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{SignalKind, signal};
+        use tokio::signal::unix::{signal, SignalKind};
         if let Ok(mut sig) = signal(SignalKind::terminate()) {
             tokio::select! {_=tokio::signal::ctrl_c()=>{},_=sig.recv()=>{}}
         }
@@ -378,10 +384,30 @@ pub fn doctor() -> anyhow::Result<()> {
             "not running"
         }
     );
-    use cpal::traits::{DeviceTrait,HostTrait};
-    let host=cpal::default_host();
-    match host.input_devices(){Ok(devices)=>for device in devices{println!("input: {}",device.name().unwrap_or_else(|_|"unknown device".into()));},Err(error)=>println!("input devices unavailable: {error}")}
-    match host.output_devices(){Ok(devices)=>for device in devices{println!("output: {}",device.name().unwrap_or_else(|_|"unknown device".into()));},Err(error)=>println!("output devices unavailable: {error}")}
+    use cpal::traits::{DeviceTrait, HostTrait};
+    let host = cpal::default_host();
+    match host.input_devices() {
+        Ok(devices) => {
+            for device in devices {
+                println!(
+                    "input: {}",
+                    device.name().unwrap_or_else(|_| "unknown device".into())
+                );
+            }
+        }
+        Err(error) => println!("input devices unavailable: {error}"),
+    }
+    match host.output_devices() {
+        Ok(devices) => {
+            for device in devices {
+                println!(
+                    "output: {}",
+                    device.name().unwrap_or_else(|_| "unknown device".into())
+                );
+            }
+        }
+        Err(error) => println!("output devices unavailable: {error}"),
+    }
     Ok(())
 }
 
@@ -397,11 +423,11 @@ mod tests {
     };
     use futures_util::{SinkExt, StreamExt};
     use std::sync::{
-        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
     };
-    use tokio_tungstenite::tungstenite::Message as ClientMessage;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::Message as ClientMessage;
 
     struct FakeMic;
     struct FakeMicHandle;

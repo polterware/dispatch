@@ -112,7 +112,12 @@ impl ModelManager {
             backend,
         )
     }
-    pub fn loaded_flags(&self)->(Option<bool>,Option<bool>){(self.stt.try_lock().ok().map(|slot|slot.is_some()),self.tts.try_lock().ok().map(|slot|slot.is_some()))}
+    pub fn loaded_flags(&self) -> (Option<bool>, Option<bool>) {
+        (
+            self.stt.try_lock().ok().map(|slot| slot.is_some()),
+            self.tts.try_lock().ok().map(|slot| slot.is_some()),
+        )
+    }
     pub fn idle_unloader(self: &Arc<Self>) {
         let this = self.clone();
         tokio::spawn(async move {

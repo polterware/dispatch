@@ -7,7 +7,10 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
     }
-    let Ok(out) = std::process::Command::new("clang").arg("--print-resource-dir").output() else {
+    let Ok(out) = std::process::Command::new("clang")
+        .arg("--print-resource-dir")
+        .output()
+    else {
         println!("cargo:warning=clang not found; linking may miss __isPlatformVersionAtLeast");
         return;
     };

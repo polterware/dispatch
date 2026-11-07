@@ -54,6 +54,72 @@ impl MicSource for RealMicSource {
         )?)))
     }
 }
+/// Test-only microphone: plays a 16 kHz mono 16-bit WAV in real time, then
+/// silence, so end-to-end tests run without a device or a permission prompt.
+/// Selected with `VOICE_ENGINE_TEST_INPUT=<wav>`; never used otherwise.
+pub struct WavMicSource(pub PathBuf);
+struct WavMicHandle {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    muted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+impl MicHandle for WavMicHandle {
+    fn set_muted(&self, muted: bool) {
+        self.muted.store(muted, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn stop(self: Box<Self>) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+impl Drop for WavMicHandle {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+impl MicSource for WavMicSource {
+    fn start(&self, mut callback: CaptureCallback) -> Result<Box<dyn MicHandle>> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let bytes = std::fs::read(&self.0)?;
+        // Canonical PCM WAV: find the "data" chunk and read i16 samples.
+        let data = bytes
+            .windows(4)
+            .position(|w| w == b"data")
+            .ok_or_else(|| anyhow::anyhow!("not a PCM WAV: {}", self.0.display()))?;
+        let samples: Vec<f32> = bytes[data + 8..]
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+            .collect();
+        tracing::info!(samples = samples.len(), "test input started");
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let muted = std::sync::Arc::new(AtomicBool::new(false));
+        let (thread_stop, thread_muted) = (stop.clone(), muted.clone());
+        std::thread::spawn(move || {
+            let chunk = voice_audio::CAPTURE_CHUNK;
+            let period = std::time::Duration::from_micros(
+                (chunk as u64 * 1_000_000) / voice_audio::CAPTURE_RATE as u64,
+            );
+            let silence = vec![0.0f32; chunk];
+            let mut offset = 0;
+            let mut next = std::time::Instant::now();
+            while !thread_stop.load(Ordering::Relaxed) {
+                let frame: Vec<f32> = if offset + chunk <= samples.len() {
+                    samples[offset..offset + chunk].to_vec()
+                } else {
+                    silence.clone()
+                };
+                offset += chunk;
+                if thread_muted.load(Ordering::Relaxed) {
+                    callback(&silence);
+                } else {
+                    callback(&frame);
+                }
+                next += period;
+                std::thread::sleep(next.saturating_duration_since(std::time::Instant::now()));
+            }
+        });
+        Ok(Box::new(WavMicHandle { stop, muted }))
+    }
+}
+
 pub struct RealSpeaker(pub Option<String>);
 struct RealSpeakerHandle(voice_audio::PlaybackHandle);
 impl SpeakerHandle for RealSpeakerHandle {

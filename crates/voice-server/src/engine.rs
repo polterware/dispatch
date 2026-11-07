@@ -6,8 +6,8 @@ use crate::{
 use std::{
     collections::{HashMap, VecDeque},
     sync::{
-        Arc,
         atomic::{AtomicU64, Ordering},
+        Arc,
     },
     time::{Duration, Instant},
 };
@@ -855,9 +855,15 @@ impl Actor {
         }
     }
     async fn on_tick(&mut self) {
-        let (stt_loaded,tts_loaded)=self.models.loaded_flags();
-        if stt_loaded==Some(false)&&self.state.stt==SttState::Ready{self.state.stt=SttState::Unloaded;self.changed();}
-        if tts_loaded==Some(false)&&self.state.tts==TtsState::Ready{self.state.tts=TtsState::Unloaded;self.changed();}
+        let (stt_loaded, tts_loaded) = self.models.loaded_flags();
+        if stt_loaded == Some(false) && self.state.stt == SttState::Ready {
+            self.state.stt = SttState::Unloaded;
+            self.changed();
+        }
+        if tts_loaded == Some(false) && self.state.tts == TtsState::Ready {
+            self.state.tts = TtsState::Unloaded;
+            self.changed();
+        }
         if self.config.partials
             && self.partial_at.elapsed() >= Duration::from_millis(800)
             && !self.partial_busy
@@ -1227,20 +1233,18 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), async {
-                loop {
-                    if matches!(
-                        rx1.recv().await,
-                        Some(EngineMessage::TranscriptFinal { .. })
-                    ) {
-                        return true;
-                    }
+        assert!(tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                if matches!(
+                    rx1.recv().await,
+                    Some(EngineMessage::TranscriptFinal { .. })
+                ) {
+                    return true;
                 }
-            })
-            .await
-            .is_err()
-        );
+            }
+        })
+        .await
+        .is_err());
         handle.tx.send(Input::Shutdown).await.unwrap();
         let _ = std::fs::remove_dir_all(root);
     }
