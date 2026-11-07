@@ -739,7 +739,10 @@ impl TranscriptBuilder {
         let location = json_str(
             obj_val(arr(update.get("locations")).first().unwrap_or(&Value::Null)).get("path"),
         );
-        if target(&args).is_empty() && !location.is_empty() {
+        // A tool's own argument, before its location stands in: OpenCode sends a shell call's
+        // command only in a later update, with the folder as its location.
+        let own = !target(&args).is_empty();
+        if !own && !location.is_empty() {
             args.insert("path".to_string(), Value::String(location));
         }
         let known = self.items.get(&id).copied();
@@ -772,7 +775,7 @@ impl TranscriptBuilder {
         if let Some(index) = known
             && matches!(self.entries.get(index), Some(TranscriptEntry::Step { .. }))
         {
-            if self.untargeted.contains_key(&id) && !target(&args).is_empty() {
+            if self.untargeted.contains_key(&id) && own {
                 let (text, detail) = step_for(&tool, &args);
                 if let Some(TranscriptEntry::Step {
                     text: slot,
@@ -809,8 +812,10 @@ impl TranscriptBuilder {
         } else if !verb_matched(&tool) {
             update_step = update_step.detail(None);
         }
-        if target(&args).is_empty() {
+        if !own {
             self.untargeted.insert(id.clone(), tool.clone());
+        }
+        if target(&args).is_empty() {
             let title = json_str(update.get("title"));
             if !title.is_empty() && tool != title {
                 text = title;
@@ -2014,6 +2019,19 @@ mod tests {
                 step("Running rm -rf x", Some(true), None, Some("denied")),
                 message("It holds a probe heading."),
             ]
+        );
+
+        // OpenCode names a shell call's command only in an update; the folder it gives as
+        // location first is not the step's target.
+        let shell = [
+            update(serde_json::json!({"sessionUpdate": "tool_call", "toolCallId": "s1", "name": "shell", "title": "shell", "kind": "execute", "status": "pending", "locations": [{"path": "/repo"}], "rawInput": {"cwd": "/repo"}})),
+            update(serde_json::json!({"sessionUpdate": "tool_call_update", "toolCallId": "s1", "kind": "execute", "status": "in_progress", "title": "ls vendor", "locations": [{"path": "/repo"}], "rawInput": {"command": "ls vendor"}})),
+            update(serde_json::json!({"sessionUpdate": "tool_call_update", "toolCallId": "s1", "status": "completed", "content": [{"type": "content", "content": {"type": "text", "text": "bot-avatars\n"}}]})),
+        ]
+        .join("\n");
+        assert_eq!(
+            build_transcript(&shell, ""),
+            vec![step("Running ls vendor", None, None, Some("bot-avatars"))]
         );
     }
 

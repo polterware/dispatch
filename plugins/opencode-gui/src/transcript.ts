@@ -594,8 +594,8 @@ class Builder {
     }
     const built = stepFor(tool, args);
     const step: StepUpdate = { text: built.text, detail: built.detail ?? null };
-    if (!own) {
-      this.untargeted.set(id, tool);
+    if (!own) this.untargeted.set(id, tool);
+    if (!target(args)) {
       const title = str(update.title);
       if (title && title !== tool) step.text = title;
     }
