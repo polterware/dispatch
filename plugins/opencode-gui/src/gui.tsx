@@ -497,7 +497,7 @@ const definition = Plugin.define({
                     </span>
                     <Show when={chosen(entry.agent, entry.model)}>
                       <span class="dispatch-target-check">
-                        <ctx.ui.Icon name="circle-check" size={14} />
+                        <ctx.ui.Icon name="circle-check" size="small" />
                       </span>
                     </Show>
                   </button>

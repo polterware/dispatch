@@ -6770,7 +6770,7 @@ const definition = gui.Plugin.define({
                 var _el$0 = _tmpl$5();
                 web.insert(_el$0, web.createComponent(ctx.ui.Icon, {
                   name: "circle-check",
-                  size: 14
+                  size: "small"
                 }));
                 return _el$0;
               }
