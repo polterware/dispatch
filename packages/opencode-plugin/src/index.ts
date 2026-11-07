@@ -5,7 +5,7 @@ import { LocalVoice } from "./rpc.ts"
 export default Plugin.define({
   id: "local-voice",
   async setup(ctx) {
-    return await ctx.rpc.register(LocalVoice, {
+    const registration = await ctx.rpc.register(LocalVoice, {
       engine: async () => {
         const info = await readEngineInfo().catch(() => undefined)
         const healthy = info && await healthCheck(info)
@@ -16,5 +16,6 @@ export default Plugin.define({
         return { running: true, port: info.port, version: info.engine_version }
       },
     })
+    return () => registration.dispose()
   },
 })

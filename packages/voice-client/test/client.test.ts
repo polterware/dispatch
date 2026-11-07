@@ -2,10 +2,19 @@ import { describe, expect, test } from "bun:test"
 import { connect } from "../src/client.ts"
 import { discoveryPath } from "../src/discovery.ts"
 
+let loopbackAvailable = true
+try {
+  const probe = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("ok") })
+  probe.stop(true)
+} catch (error) {
+  loopbackAvailable = false
+  console.warn(`Skipping fake WebSocket server test; loopback bind is unavailable: ${String(error)}`)
+}
+
 describe("voice client", () => {
-  test("uses token query and dispatches typed messages from a fake server", async () => {
+  test.skipIf(!loopbackAvailable)("uses token query and dispatches typed messages from a fake server", async () => {
     let seenUrl = ""
-    const server = Bun.serve({ port: 0, fetch(request, server) {
+    const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch(request, server) {
       if (new URL(request.url).pathname === "/v1/ws") {
         seenUrl = request.url
         if (server.upgrade(request)) return

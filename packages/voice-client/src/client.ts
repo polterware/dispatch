@@ -8,10 +8,12 @@ type Handler<K extends keyof EngineEventMap> = (message: EngineEventMap[K]) => v
 export class VoiceClient {
   private socket?: WebSocketLike
   private handlers = new Map<string, Set<(message: EngineMessage) => void>>()
+  private connectionHandlers = new Set<(connected: boolean) => void>()
   private closed = false
   private retry = 0
   private timer?: ReturnType<typeof setTimeout>
   private generation = 0
+  private pending: ClientMessage[] = []
   private constructor(private url: string, private token: string, private WebSocketCtor: Constructor) {}
 
   static connect(url: string, token: string): VoiceClient {
@@ -29,8 +31,14 @@ export class VoiceClient {
     return () => set?.delete(handler as (message: EngineMessage) => void)
   }
 
+  onConnectionChange(handler: (connected: boolean) => void): () => void {
+    this.connectionHandlers.add(handler)
+    return () => this.connectionHandlers.delete(handler)
+  }
+
   send(message: ClientMessage): void {
-    if (this.socket?.readyState !== 1) throw new Error("Voice engine WebSocket is not connected")
+    if (this.closed) throw new Error("Voice engine WebSocket is closed")
+    if (this.socket?.readyState !== 1) { this.pending.push(message); return }
     this.socket.send(JSON.stringify(message))
   }
 
@@ -49,7 +57,12 @@ export class VoiceClient {
     url.searchParams.set("token", this.token)
     const socket = new this.WebSocketCtor(url.toString())
     this.socket = socket
-    socket.addEventListener("open", () => { if (generation === this.generation) this.retry = 0 })
+    socket.addEventListener("open", () => {
+      if (generation !== this.generation) return
+      this.retry = 0
+      for (const handler of this.connectionHandlers) handler(true)
+      for (const message of this.pending.splice(0)) socket.send(JSON.stringify(message))
+    })
     socket.addEventListener("message", event => {
       if (generation !== this.generation) return
       try {
@@ -57,7 +70,11 @@ export class VoiceClient {
         for (const handler of this.handlers.get(parsed.type) ?? []) handler(parsed)
       } catch { /* malformed frames are ignored */ }
     })
-    socket.addEventListener("close", () => this.reconnect(generation))
+    socket.addEventListener("close", () => {
+      if (generation !== this.generation) return
+      for (const handler of this.connectionHandlers) handler(false)
+      this.reconnect(generation)
+    })
     socket.addEventListener("error", () => { /* close event schedules reconnect */ })
   }
 
