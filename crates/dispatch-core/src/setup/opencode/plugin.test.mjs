@@ -85,7 +85,7 @@ function calls() {
   return fs.readFileSync(process.env.FAKE_DISPATCH_LOG, "utf8").trim().split("\n").map((line) => JSON.parse(line))
 }
 
-async function loadServer() {
+async function loadServer(options = {}) {
   const { default: plugin } = await import(path.join(here, "server.js"))
   const tools = {}
   const hooks = {}
@@ -95,7 +95,8 @@ async function loadServer() {
     child: { id: "child", parentID: "root", location: { directory: path.join(tmp, "repo") } },
     root: { id: "root", location: { directory: path.join(tmp, "repo") } },
   }
-  const stored = new Map()
+  // A second server part over the same storage reads what the first persisted.
+  const stored = options.storage || new Map()
   const ctx = {
     options: { binary: path.join(tmp, "dispatch"), state: path.join(tmp, "state", "opencode-plugin.json") },
     storage: {
@@ -131,8 +132,20 @@ async function loadServer() {
 
 function contextEvent() {
   return {
+    sessionID: "child",
     system: [],
-    tools: { read: {}, subagent: {}, dispatch_run: {}, dispatch_wait: {}, dispatch_merge: {} },
+    // The tools a build agent has: reads, the editor, the shell, OpenCode's
+    // subagent, and Dispatch's three.
+    tools: {
+      read: {},
+      edit: {},
+      write: {},
+      bash: {},
+      subagent: {},
+      dispatch_run: {},
+      dispatch_wait: {},
+      dispatch_merge: {},
+    },
   }
 }
 
@@ -141,8 +154,8 @@ test("delegation on swaps the subagent tool for Dispatch's", async () => {
   assert.equal(plugin.id, "dispatch")
   assert.deepEqual(Object.keys(tools).sort(), ["dispatch_merge", "dispatch_run", "dispatch_wait"])
   const event = contextEvent()
-  hooks.context(event)
-  assert.deepEqual(Object.keys(event.tools).sort(), ["dispatch_merge", "dispatch_run", "dispatch_wait", "read"])
+  await hooks.context(event)
+  assert.deepEqual(Object.keys(event.tools).sort(), ["bash", "dispatch_merge", "dispatch_run", "dispatch_wait", "edit", "read", "write"])
   assert.match(event.system[0].text, /dispatch_run/)
 })
 
@@ -153,15 +166,65 @@ test("delegation off keeps OpenCode's subagents and hides Dispatch's tools", asy
   assert.equal(answer.available, true)
   assert.deepEqual(emitted.at(-1), { name: "changed", data: { enabled: false } })
   const event = contextEvent()
-  hooks.context(event)
-  assert.deepEqual(Object.keys(event.tools).sort(), ["read", "subagent"])
+  await hooks.context(event)
+  assert.deepEqual(Object.keys(event.tools).sort(), ["bash", "edit", "read", "subagent", "write"])
   assert.equal(event.system.length, 0)
   assert.equal(JSON.parse(fs.readFileSync(path.join(tmp, "state", "opencode-plugin.json"), "utf8")).enabled, false)
 
   await impl().setEnabled({ enabled: true })
   const again = contextEvent()
-  hooks.context(again)
+  await hooks.context(again)
   assert.equal("subagent" in again.tools, false)
+})
+
+test("the Delegate check round-trips for the root conversation and persists", async () => {
+  const { impl, emitted, stored } = await loadServer()
+  assert.deepEqual(await impl().force({ sessionID: "child" }), { force: false })
+  assert.deepEqual(await impl().setForce({ sessionID: "child", directory: "", force: true }), { force: true })
+  // The conversation is the root session, so a child session's check is the chat's.
+  assert.deepEqual(emitted.at(-1), { name: "forced", data: { sessionID: "root", force: true } })
+  assert.deepEqual(await impl().force({ sessionID: "root" }), { force: true })
+  assert.equal(stored.get("force/root"), true)
+
+  // A server part started again over the same storage reads the flag back.
+  const restarted = await loadServer({ storage: stored })
+  assert.deepEqual(await restarted.impl().force({ sessionID: "child" }), { force: true })
+  assert.deepEqual(await restarted.impl().setForce({ sessionID: "root", force: false }), { force: false })
+  assert.equal(stored.get("force/root"), false)
+})
+
+test("a forced conversation is told to delegate and loses the work tools", async () => {
+  const { hooks, impl } = await loadServer()
+  const plain = contextEvent()
+  await hooks.context(plain)
+  assert.equal(plain.system.some((part) => /MUST go through dispatch_run/.test(part.text)), false)
+
+  await impl().setForce({ sessionID: "child", force: true })
+  const event = contextEvent()
+  await hooks.context(event)
+  assert.ok(event.system.some((part) => /forced to delegate/.test(part.text)))
+  assert.ok(event.system.some((part) => /MUST go through dispatch_run/.test(part.text)))
+  // The editor and the shell go; planning keeps its reads.
+  for (const name of ["edit", "write", "bash"]) assert.equal(name in event.tools, false, name)
+  assert.equal("read" in event.tools, true)
+  assert.equal("dispatch_run" in event.tools, true)
+
+  await impl().setForce({ sessionID: "root", force: false })
+  const again = contextEvent()
+  await hooks.context(again)
+  assert.equal(again.system.length, 1)
+  assert.ok("write" in again.tools)
+})
+
+test("a forced conversation is left alone while delegation is off", async () => {
+  const { hooks, impl } = await loadServer()
+  await impl().setForce({ sessionID: "root", force: true })
+  await impl().setEnabled({ enabled: false })
+  const event = contextEvent()
+  await hooks.context(event)
+  assert.equal(event.system.length, 0)
+  assert.ok("bash" in event.tools)
+  assert.ok("subagent" in event.tools)
 })
 
 test("dispatch_run starts a run under the root conversation and waits for it", async () => {
@@ -262,7 +325,7 @@ test("with no dispatch to run, delegation keeps OpenCode's subagents", async () 
   process.env.HOME = tmp
   try {
     const event = contextEvent()
-    hooks.context(event)
+    await hooks.context(event)
     assert.equal("subagent" in event.tools, true)
     assert.equal(event.system.length, 0)
   } finally {
@@ -369,6 +432,8 @@ test("the GUI adds the switch, the runs pill, and the panel", async () => {
         state: async () => (rpcCalls.push("state"), { enabled: true, binary: "/bin/dispatch", available: true }),
         setEnabled: async ({ enabled }) => (rpcCalls.push(`set:${enabled}`), { enabled, binary: "/bin/dispatch", available: true }),
         runs: async () => ({ runs: [] }),
+        force: async () => ({ force: false }),
+        setForce: async ({ force }) => (rpcCalls.push(`force:${force}`), { force }),
         open: async ({ url }) => (opened.push(url), { opened: true }),
         events: { on: () => () => {} },
       }),
@@ -401,6 +466,25 @@ test("the GUI adds the switch, the runs pill, and the panel", async () => {
     // The pill opens the runs panel; the switch lives in the panel's header.
     assert.deepEqual(panels, [["dispatch:runs", session]])
     assert.equal(rpcCalls.filter((call) => call === "set:true").length, 0)
+    assert.equal(added.some((entry) => entry.registry === "slot"), false)
+
+    // The Delegate check beside it goes with delegation: hidden while off.
+    const pills = added.filter((entry) => entry.registry === "composer-pill").map((entry) => entry.item)
+    assert.deepEqual(pills.map((item) => item.id), ["runs", "force"])
+    const force = pills.find((item) => item.id === "force")
+    assert.equal(force.show({ session }), undefined)
+    await toggle.run()
+    const off = force.show({ session })
+    assert.equal(off.label, "pill.force.off")
+    assert.equal(off.icon, undefined)
+    assert.equal(off.title, "pill.force.title")
+    off.run()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    assert.ok(rpcCalls.includes("force:true"))
+    const on = force.show({ session })
+    assert.equal(on.label, "pill.force.on")
+    assert.equal(on.icon, "circle-check")
+    assert.equal(on.tone, "success")
     assert.equal(added.some((entry) => entry.registry === "slot"), false)
 
     commands.find((command) => command.id === "app").run()

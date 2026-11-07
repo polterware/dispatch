@@ -58,6 +58,40 @@ const Dispatch = {
         additionalProperties: false
       }
     },
+    // The Delegate check beside the composer pill, per conversation; directory
+    // is taken for symmetry with runs and not needed to resolve the root.
+    force: {
+      input: {
+        type: "object",
+        properties: { sessionID: { type: "string" }, directory: { type: "string" } },
+        required: ["sessionID"],
+        additionalProperties: false
+      },
+      output: {
+        type: "object",
+        properties: { force: { type: "boolean" } },
+        required: ["force"],
+        additionalProperties: false
+      }
+    },
+    setForce: {
+      input: {
+        type: "object",
+        properties: {
+          sessionID: { type: "string" },
+          directory: { type: "string" },
+          force: { type: "boolean" }
+        },
+        required: ["sessionID", "force"],
+        additionalProperties: false
+      },
+      output: {
+        type: "object",
+        properties: { force: { type: "boolean" } },
+        required: ["force"],
+        additionalProperties: false
+      }
+    },
     // The run's output so far, and the status the panel polls on: the Desktop
     // part shows it in place instead of only opening the run in the app.
     log: {
@@ -98,6 +132,15 @@ const Dispatch = {
         type: "object",
         properties: { sessionID: { type: "string" }, runID: { type: "string" } },
         required: ["sessionID", "runID"],
+        additionalProperties: false
+      }
+    },
+    // The conversation's Delegate check changed, from this window or another.
+    forced: {
+      schema: {
+        type: "object",
+        properties: { sessionID: { type: "string" }, force: { type: "boolean" } },
+        required: ["sessionID", "force"],
         additionalProperties: false
       }
     }
@@ -6167,6 +6210,11 @@ const definition = gui.Plugin.define({
       "log.open": "Open in Dispatch",
       "pill.on": "Dispatch",
       "pill.off": "Dispatch off",
+      // The check beside the runs pill: the label stays Delegate, and the check
+      // and the success tone say whether this conversation must delegate.
+      "pill.force.on": "Delegate",
+      "pill.force.off": "Delegate",
+      "pill.force.title": "Force delegation: this conversation must hand its work to Dispatch",
       "runs.one": "{{count}} run",
       "runs.other": "{{count}} runs",
       "runs.running": "{{count}} running",
@@ -6184,6 +6232,7 @@ const definition = gui.Plugin.define({
     });
     const [runs, setRuns] = store.createStore({});
     const [errors, setErrors] = store.createStore({});
+    const [forced, setForced] = store.createStore({});
     const loadState = async () => {
       try {
         setStatus({
@@ -6221,16 +6270,37 @@ const definition = gui.Plugin.define({
     const refresh = async (session) => {
       if (!session || session.pending) return;
       try {
-        const answer = await rpc().runs({
+        const [answer, flag] = await Promise.all([rpc().runs({
           sessionID: session.id,
           directory: session.directory || ""
-        });
+        }), rpc().force({
+          sessionID: session.id,
+          directory: session.directory || ""
+        }).catch(() => void 0)]);
         setRuns(session.key, store.reconcile(answer.runs || [], {
           key: "id"
         }));
         setErrors(session.key, answer.error || "");
+        if (flag) setForced(session.key, flag.force === true);
       } catch (error) {
         setErrors(session.key, String(error?.message || error));
+      }
+    };
+    const toggleForce = async (session) => {
+      const force = !forced[session.key];
+      try {
+        const answer = await rpc().setForce({
+          sessionID: session.id,
+          directory: session.directory || "",
+          force
+        });
+        setForced(session.key, answer.force === true);
+      } catch (error) {
+        ctx.toast.show({
+          variant: "error",
+          title: ctx.t("title"),
+          description: String(error?.message || error)
+        });
       }
     };
     const sessionRuns = (session) => session ? runs[session.key] || [] : [];
@@ -6277,12 +6347,15 @@ const definition = gui.Plugin.define({
     };
     let offStarted = () => {
     };
+    let offForced = () => {
+    };
     try {
       offChanged = rpc().events.on("changed", (event) => setStatus((prev) => ({
         ...prev,
         enabled: event.data.enabled
       })));
       offStarted = rpc().events.on("started", () => void tick());
+      offForced = rpc().events.on("forced", () => void tick());
     } catch {
     }
     ctx.add(gui.Style, CSS);
@@ -6394,6 +6467,23 @@ const definition = gui.Plugin.define({
           tone: on ? "success" : void 0,
           title: ctx.t("command.panel"),
           run: () => openPanel(input.session)
+        };
+      }
+    });
+    ctx.add(gui.ComposerPill, {
+      id: "force",
+      // The Delegate check beside it: ticked, the conversation must hand its
+      // work to Dispatch. It goes with delegation, so it is hidden while no
+      // dispatch_run can take the work.
+      show: (input) => {
+        if (!status().enabled) return void 0;
+        const on = forced[input.session.key] === true;
+        return {
+          icon: on ? "circle-check" : void 0,
+          label: ctx.t(on ? "pill.force.on" : "pill.force.off"),
+          tone: on ? "success" : void 0,
+          title: ctx.t("pill.force.title"),
+          run: () => void toggleForce(input.session)
         };
       }
     });
@@ -6731,6 +6821,7 @@ const definition = gui.Plugin.define({
       clearTimeout(timer);
       offChanged();
       offStarted();
+      offForced();
     };
   }
 });

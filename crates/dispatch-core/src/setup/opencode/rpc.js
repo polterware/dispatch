@@ -58,6 +58,40 @@ export const Dispatch = {
         additionalProperties: false,
       },
     },
+    // The Delegate check beside the composer pill, per conversation; directory
+    // is taken for symmetry with runs and not needed to resolve the root.
+    force: {
+      input: {
+        type: "object",
+        properties: { sessionID: { type: "string" }, directory: { type: "string" } },
+        required: ["sessionID"],
+        additionalProperties: false,
+      },
+      output: {
+        type: "object",
+        properties: { force: { type: "boolean" } },
+        required: ["force"],
+        additionalProperties: false,
+      },
+    },
+    setForce: {
+      input: {
+        type: "object",
+        properties: {
+          sessionID: { type: "string" },
+          directory: { type: "string" },
+          force: { type: "boolean" },
+        },
+        required: ["sessionID", "force"],
+        additionalProperties: false,
+      },
+      output: {
+        type: "object",
+        properties: { force: { type: "boolean" } },
+        required: ["force"],
+        additionalProperties: false,
+      },
+    },
     // The run's output so far, and the status the panel polls on: the Desktop
     // part shows it in place instead of only opening the run in the app.
     log: {
@@ -98,6 +132,15 @@ export const Dispatch = {
         type: "object",
         properties: { sessionID: { type: "string" }, runID: { type: "string" } },
         required: ["sessionID", "runID"],
+        additionalProperties: false,
+      },
+    },
+    // The conversation's Delegate check changed, from this window or another.
+    forced: {
+      schema: {
+        type: "object",
+        properties: { sessionID: { type: "string" }, force: { type: "boolean" } },
+        required: ["sessionID", "force"],
         additionalProperties: false,
       },
     },
