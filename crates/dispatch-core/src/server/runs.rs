@@ -1364,6 +1364,47 @@ impl Core {
         Ok(convert::stats(&report))
     }
 
+    /// What one conversation used: its runs' stored usage and the calling agent's own
+    /// session, when this build can read that agent's local transcript.
+    pub(crate) async fn conversation_usage(
+        &self,
+        m: pb::GetConversationUsageRequest,
+    ) -> RpcResult<pb::GetConversationUsageResponse> {
+        let conversation = required(&m.conversation_id, "conversation id")?;
+        let runs = self
+            .store
+            .list_runs("", 0, 0, &conversation)
+            .map_err(RpcError::internal)?;
+        let catalog = self.deps().map_err(RpcError::internal)?.catalog();
+        // A session transcript can be large, so it is read off the async workers.
+        let id = conversation.clone();
+        let caller = tokio::task::spawn_blocking(move || crate::usage::caller_usage(&id, &catalog))
+            .await
+            .map_err(|e| RpcError::internal(e.to_string()))?;
+        let runs_slices = crate::usage::from_runs(&runs);
+        let run_totals = crate::usage::total(&runs_slices);
+        let caller_totals = crate::usage::total(&caller.slices);
+        let total = crate::usage::plus(&run_totals, &caller_totals);
+        let caller_agent = runs
+            .iter()
+            .map(|run| run.caller_agent.trim())
+            .find(|agent| !agent.is_empty())
+            .unwrap_or(&caller.agent)
+            .to_string();
+        Ok(pb::GetConversationUsageResponse {
+            conversation_id: conversation,
+            caller_agent,
+            caller_session: caller.session,
+            caller_measured: caller.measured,
+            caller_note: caller.note,
+            runs: runs_slices.iter().map(convert::usage_slice).collect(),
+            caller: caller.slices.iter().map(convert::usage_slice).collect(),
+            run_totals: Some(convert::usage_slice(&run_totals)),
+            caller_totals: Some(convert::usage_slice(&caller_totals)),
+            total: Some(convert::usage_slice(&total)),
+        })
+    }
+
     pub(crate) async fn capacity(&self, m: pb::CapacityRequest) -> RpcResult<pb::CapacityResponse> {
         let now = Utc::now();
         let since = parse_quota_since(&m.since, now)?;

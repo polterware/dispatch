@@ -1112,6 +1112,51 @@ fn a_conversation_is_renamed_and_named_by_its_prompt_again() {
 }
 
 #[test]
+fn a_conversations_usage_reads_its_runs_and_calling_session() {
+    let env = Env::new();
+    // The calling agent's own transcript, in the fake home the core resolves.
+    let projects = env.home.join(".claude/projects/-e2e");
+    std::fs::create_dir_all(&projects).expect("projects");
+    std::fs::write(
+        projects.join(format!("{}.jsonl", env.session)),
+        include_str!("fixtures/usage/claude.jsonl"),
+    )
+    .expect("transcript");
+    let id = env.run("say hi", &["--readonly"]);
+    env.wait_for(&id, "COMPLETED");
+
+    let conversation = format!("claude:{}", env.session);
+    let usage = env.json(&["usage", "--conversation", &conversation, "--json"]);
+    assert_eq!(usage["conversationId"], conversation);
+    assert_eq!(usage["callerMeasured"], true, "{usage}");
+    let runs = items(&usage["runs"]);
+    assert_eq!(runs.len(), 1, "{usage}");
+    assert_eq!(runs[0]["agent"], "fake");
+    assert_eq!(runs[0]["runs"], 1);
+    // The fake ACP agent reports 100 input and 10 output tokens.
+    assert_eq!(runs[0]["inputTokens"], 100);
+    // The calling session's two models, the repeated message counted once.
+    assert_eq!(items(&usage["caller"]).len(), 2, "{usage}");
+    let total = &usage["total"];
+    assert_eq!(total["inputTokens"], 122);
+    assert_eq!(total["runs"], 1);
+
+    // An agent this build cannot read says so rather than guessing.
+    let unknown = env.json(&["usage", "--conversation", "other:abc", "--json"]);
+    assert_eq!(unknown["callerMeasured"], false);
+    assert!(
+        unknown["callerNote"]
+            .as_str()
+            .is_some_and(|note| note.contains("Not measured")),
+        "{unknown}"
+    );
+
+    let text = env.ok(&["usage", "--conversation", &conversation]);
+    assert!(text.contains("Calling agent"), "{text}");
+    assert!(text.contains("API-equivalent"), "{text}");
+}
+
+#[test]
 fn added_agents_are_listed_at_once() {
     let env = Env::new();
     let names = || -> Vec<String> {

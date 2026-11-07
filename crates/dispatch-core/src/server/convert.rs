@@ -246,6 +246,22 @@ fn stat_rank(r: &StatRank) -> pb::DispatchStatRank {
     }
 }
 
+/// One agent and model's share of a conversation, as the wire carries it.
+pub fn usage_slice(slice: &crate::usage::Slice) -> pb::DispatchUsageSlice {
+    pb::DispatchUsageSlice {
+        agent: slice.agent.clone(),
+        model: slice.model.clone(),
+        runs: i32_of(slice.runs),
+        input_tokens: slice.input_tokens,
+        cache_read_tokens: slice.cache_read_tokens,
+        cache_write_tokens: slice.cache_write_tokens,
+        output_tokens: slice.output_tokens,
+        reasoning_tokens: slice.reasoning_tokens,
+        cost_usd: slice.cost_usd,
+        cost_partial: slice.cost_partial,
+    }
+}
+
 pub fn stats(report: &Report) -> pb::StatsResponse {
     pb::StatsResponse {
         by: report.by.clone(),
