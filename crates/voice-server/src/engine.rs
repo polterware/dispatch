@@ -81,7 +81,10 @@ impl EngineHandle {
         vad: Arc<dyn VadFactory>,
         models: Arc<ModelManager>,
     ) -> Self {
-        let (tx, rx) = mpsc::channel(256);
+        let mic_buffer = (voice_audio::CAPTURE_RATE / voice_audio::CAPTURE_CHUNK as u32)
+            .saturating_mul(2)
+            .max(256) as usize;
+        let (tx, rx) = mpsc::channel(mic_buffer);
         let (events, _) = broadcast::channel(256);
         let initial = EngineState {
             mic: MicState::Idle,
@@ -117,6 +120,7 @@ struct Listening {
     id: String,
     language: Language,
     pcm: Vec<f32>,
+    chunk_count: u64,
     started: Instant,
     vad: Option<voice_stt::Vad>,
     speech_started: bool,
@@ -431,6 +435,7 @@ impl Actor {
                     id: id.clone(),
                     language,
                     pcm: Vec::new(),
+                    chunk_count: 0,
                     started: Instant::now(),
                     vad,
                     speech_started: false,
@@ -639,6 +644,7 @@ impl Actor {
                 .await;
         });
     }
+    #[allow(clippy::too_many_arguments)]
     fn first_synthesized(
         &mut self,
         generation: u64,
@@ -776,6 +782,9 @@ impl Actor {
             return;
         }
         let s = self.listening.take().unwrap();
+        if s.pcm.is_empty() {
+            tracing::warn!(listen_id = %s.id, elapsed_ms = s.started.elapsed().as_millis() as u64, chunk_count = s.chunk_count, "stopping an utterance with an empty PCM buffer");
+        }
         self.close_mic();
         self.state.mic = MicState::Idle;
         self.state.listen_id = None;
@@ -828,6 +837,7 @@ impl Actor {
                 return;
             };
             s.pcm.extend_from_slice(&chunk);
+            s.chunk_count += 1;
             if let Some(vad) = s.vad.as_mut() {
                 if let Some(event) = vad.push(&chunk) {
                     match event {
@@ -1193,6 +1203,18 @@ mod tests {
         .unwrap();
         handle
             .tx
+            .send(Input::Message(1, ClientMessage::MicMute { muted: true }))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.state().mic != MicState::Muted {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        handle
+            .tx
             .send(Input::Message(
                 2,
                 ClientMessage::ListenStart {
@@ -1245,7 +1267,53 @@ mod tests {
         })
         .await
         .is_err());
+        handle
+            .tx
+            .send(Input::Message(
+                1,
+                ClientMessage::ListenStart {
+                    id: "disconnect-listen".into(),
+                    language: Language::Auto,
+                    mode: ListenMode::PushToTalk,
+                },
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.state().listen_id.as_deref() != Some("disconnect-listen") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        handle.tx.send(Input::Disconnected(1)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.state().listen_id.is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         handle.tx.send(Input::Shutdown).await.unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn actor_exits_after_configured_idle_period() {
+        let root = std::env::temp_dir().join(format!("voice-server-idle-{}", std::process::id()));
+        let handle = EngineHandle::spawn(
+            Config {
+                exit_after_idle_secs: 1,
+                ..Config::default()
+            },
+            Arc::new(FakeMic),
+            Arc::new(FakeSpeaker),
+            Arc::new(FakeVad),
+            ModelManager::new(Config::default(), root.clone()),
+        );
+        tokio::time::timeout(Duration::from_secs(3), handle.tx.closed())
+            .await
+            .expect("idle actor did not exit");
         let _ = std::fs::remove_dir_all(root);
     }
 }
