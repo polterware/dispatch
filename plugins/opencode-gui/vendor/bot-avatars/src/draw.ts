@@ -7,7 +7,7 @@
    lives on the front cap and follows it. */
 
 import type { Pose } from './engine';
-import type { BotAvatarFace, BotAvatarShading } from './types';
+import type { BotAvatarExpression, BotAvatarFace, BotAvatarShading } from './types';
 import { shade } from './color';
 import { drawPlasticCap, mulAffine, surfaceAt, type FurStyle } from './plastic';
 import { drawGlasses, drawWearBehind, drawWearFront, type EyeSpot, type Wear, type WearRig } from './wear';
@@ -15,6 +15,8 @@ import { drawGlasses, drawWearBehind, drawWearFront, type EyeSpot, type Wear, ty
 export interface DrawConfig {
   path: Path2D;
   face: BotAvatarFace;
+  /** a face held over the state's own, for a still bot that says how its run is doing */
+  expression?: BotAvatarExpression;
   faceX: number;
   faceY: number;
   faceScale: number;
@@ -585,6 +587,38 @@ function mouthPath(m: Mouth): Path2D {
   return p;
 }
 
+/* One eye of a held expression, in the numbers drawFace blends: a droop
+   and a tired lid keep the same stroked curve, the confused face makes one
+   eye larger and the other smaller, and a cancelled one crosses two lines. */
+interface ExpressionEye {
+  x0: number;
+  y0: number;
+  cy: number;
+  w: number;
+  dy: number;
+  tilt: number;
+  cross: boolean;
+}
+
+function expressionEye(expression: BotAvatarExpression, side: -1 | 1): ExpressionEye {
+  const eye = { x0: 0.01, y0: 1.1, cy: -3.3, w: EYE_RX * 2, dy: 0, tilt: 0, cross: false };
+  switch (expression) {
+    case 'happy':
+    case 'celebrate':
+      return { ...eye, x0: 6.2, y0: 2.2, cy: -11.4, w: 4.4 };
+    case 'sad':
+      return { ...eye, x0: 5.6, y0: 1.4, cy: -5.6, w: 4.2, dy: 1, tilt: side * 0.32 };
+    case 'tired':
+      return { ...eye, x0: 6, y0: -0.9, cy: 6.4, w: 4, dy: 0.8 };
+    case 'cancelled':
+      return { ...eye, w: 5, cross: true };
+    case 'confused':
+      return side < 0
+        ? { ...eye, y0: 1.4, cy: -4.2, w: 11.4 }
+        : { ...eye, x0: 5.2, y0: 0.4, cy: 0.4, w: 4.6, dy: -1.8, tilt: 0.26 };
+  }
+}
+
 function drawFace(ctx: CanvasRenderingContext2D, pose: Pose, cfg: DrawConfig): [EyeSpot, EyeSpot] {
   const [wd, ww, ws] = pose.w;
   const ink = cfg.ink;
@@ -626,6 +660,26 @@ function drawFace(ctx: CanvasRenderingContext2D, pose: Pose, cfg: DrawConfig): [
   const lift = Math.max(0, -pose.y) / 26;
   const sag = 0.5 + 0.5 * pose.breath;
   for (const side of [-1, 1] as const) {
+    const held = cfg.expression ? expressionEye(cfg.expression, side) : null;
+    if (held) {
+      at(side * half + lx * 0.5, ey + held.dy + ly * 0.5, () => {
+        ctx.strokeStyle = ink;
+        if (held.cross) {
+          ctx.lineWidth = 2.8;
+          ctx.beginPath();
+          ctx.moveTo(-held.w, -held.w);
+          ctx.lineTo(held.w, held.w);
+          ctx.moveTo(-held.w, held.w);
+          ctx.lineTo(held.w, -held.w);
+          ctx.stroke();
+          return;
+        }
+        ctx.lineWidth = held.w;
+        if (held.tilt) ctx.rotate(held.tilt);
+        ctx.stroke(eyePath(held.x0, held.y0, held.cy));
+      });
+      continue;
+    }
     const lid = side < 0 ? pose.blinkL : pose.blinkR;
     const e = Math.max(0, Math.min(1, pose.eyeOpen * (1 - lid)));
     const kOpen = open * e, kShut = open * (1 - e), kLaugh = laugh, kSleep = ws;

@@ -30,6 +30,11 @@ export type BotAvatarFace = 'eyes' | 'mouth';
 /** What the bot is doing. Each state is a pose plus its own motion. */
 export type BotAvatarState = 'default' | 'working' | 'sleeping';
 
+/** A face a still bot can hold, whatever its state: closed happy arcs, a merge's
+    closed arcs with a party hat (`celebrate`), drooping eyes, x eyes, half-shut
+    tired eyes, or a tilt with one bigger eye. */
+export type BotAvatarExpression = 'happy' | 'celebrate' | 'sad' | 'cancelled' | 'tired' | 'confused';
+
 /** How the landing squash of a jump plays out. */
 export type BotAvatarSquashEase = 'sharp' | 'pulse' | 'soft' | 'bouncy';
 
@@ -84,6 +89,8 @@ export interface BotAvatarProps extends Omit<JSX.CanvasHTMLAttributes<HTMLCanvas
   face?: BotAvatarFace;
   /** What the bot is doing: `default` (idle), `working` (hopping, spinning) or `sleeping`. */
   state?: BotAvatarState;
+  /** A face to hold over the state's own, for a still bot that says how its run is doing. */
+  expression?: BotAvatarExpression;
   /** Rendered size in px, or any CSS length. Default `64`. */
   size?: number | string;
   /** Body colour. Defaults to the type's palette colour. */

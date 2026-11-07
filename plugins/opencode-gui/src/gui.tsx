@@ -10,6 +10,7 @@ import { For, Show, createSignal, onCleanup, onMount } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
 import { Dispatch } from "../../../crates/dispatch-core/src/setup/opencode/rpc.js";
 import { AgentBot, EmptyBot } from "./avatars";
+import { expressionFor } from "./expressions";
 import { ACTIVE, FAILED, firstLine, formatDuration, formatTokens, runDetail, runLink, statusLabel, type LogView, type RunView } from "./runs";
 
 // The app's context; its types live in @opencode/plugin/gui.
@@ -504,7 +505,7 @@ const definition = Plugin.define({
               <ctx.ui.IconButton icon="arrow-left" variant="ghost" size="small" label={ctx.t("panel.back")} onClick={props.onBack} />
             </ctx.ui.Tooltip>
             <span class="dispatch-run-bot">
-              <AgentBot agent={props.run.agent} seed={props.run.id} status={status()} />
+              <AgentBot agent={props.run.agent} seed={props.run.id} status={status()} mergedAt={props.run.mergedAt} />
             </span>
             <span class="dispatch-run-body">
               <span class="dispatch-run-title">{firstLine(props.run.prompt, 120) || props.run.id}</span>
@@ -597,7 +598,7 @@ const definition = Plugin.define({
                       <li>
                         <button class="dispatch-run" type="button" title={run.prompt} onClick={() => setSelected(run)}>
                           <span class="dispatch-run-bot">
-                            <AgentBot agent={run.agent} seed={run.id} status={run.status} />
+                            <AgentBot agent={run.agent} seed={run.id} status={run.status} mergedAt={run.mergedAt} />
                           </span>
                           <span class="dispatch-run-body">
                             <span class="dispatch-run-title">{firstLine(run.prompt, 120) || run.id}</span>
@@ -645,4 +646,4 @@ const definition = Plugin.define({
 
 export default definition;
 export { Dispatch };
-export const helpers = { firstLine, statusLabel, runDetail, runLink, formatTokens, formatDuration };
+export const helpers = { firstLine, statusLabel, runDetail, runLink, formatTokens, formatDuration, expressionFor };

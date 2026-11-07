@@ -4803,6 +4803,22 @@ function mouthPath(m) {
   mouthPaths.set(key, p);
   return p;
 }
+function expressionEye(expression, side) {
+  const eye = { x0: 0.01, y0: 1.1, cy: -3.3, w: EYE_RX * 2, dy: 0, tilt: 0, cross: false };
+  switch (expression) {
+    case "happy":
+    case "celebrate":
+      return { ...eye, x0: 6.2, y0: 2.2, cy: -11.4, w: 4.4 };
+    case "sad":
+      return { ...eye, x0: 5.6, y0: 1.4, cy: -5.6, w: 4.2, dy: 1, tilt: side * 0.32 };
+    case "tired":
+      return { ...eye, x0: 6, y0: -0.9, cy: 6.4, w: 4, dy: 0.8 };
+    case "cancelled":
+      return { ...eye, w: 5, cross: true };
+    case "confused":
+      return side < 0 ? { ...eye, y0: 1.4, cy: -4.2, w: 11.4 } : { ...eye, x0: 5.2, y0: 0.4, cy: 0.4, w: 4.6, dy: -1.8, tilt: 0.26 };
+  }
+}
 function drawFace(ctx, pose, cfg) {
   const [wd, ww, ws] = pose.w;
   const ink = cfg.ink;
@@ -4831,6 +4847,26 @@ function drawFace(ctx, pose, cfg) {
   const lift = Math.max(0, -pose.y) / 26;
   const sag = 0.5 + 0.5 * pose.breath;
   for (const side2 of [-1, 1]) {
+    const held = cfg.expression ? expressionEye(cfg.expression, side2) : null;
+    if (held) {
+      at(side2 * half + lx * 0.5, ey + held.dy + ly * 0.5, () => {
+        ctx.strokeStyle = ink;
+        if (held.cross) {
+          ctx.lineWidth = 2.8;
+          ctx.beginPath();
+          ctx.moveTo(-held.w, -held.w);
+          ctx.lineTo(held.w, held.w);
+          ctx.moveTo(-held.w, held.w);
+          ctx.lineTo(held.w, -held.w);
+          ctx.stroke();
+          return;
+        }
+        ctx.lineWidth = held.w;
+        if (held.tilt) ctx.rotate(held.tilt);
+        ctx.stroke(eyePath(held.x0, held.y0, held.cy));
+      });
+      continue;
+    }
     const lid = side2 < 0 ? pose.blinkL : pose.blinkR;
     const e = Math.max(0, Math.min(1, pose.eyeOpen * (1 - lid)));
     const kOpen = open * e, kShut = open * (1 - e), kLaugh = laugh, kSleep = ws;
@@ -5562,7 +5598,7 @@ function shadingModeOf(shading) {
   return shading ?? "fabric";
 }
 function BotAvatar(props) {
-  const [local, rest] = solidJs.splitProps(props, ["type", "path", "face", "state", "size", "color", "ink", "brightness", "saturation", "speed", "paused", "seed", "shading", "hat", "glasses", "headphones", "bowTie", "accessoryColor", "shadow", "highlight", "depth", "roundness", "furLength", "furDensity", "furFuzz", "furClumps", "furCurl", "furGravity", "light", "rim", "spread", "backLight", "lightFront", "shine", "sheen", "backSoftness", "pose", "interactive", "turn", "theme", "whirl", "whirlSize", "whirlWidth", "whirlLength", "whirlTilt", "jumpHeight", "jumpTime", "jumpStretch", "jumpSpin", "jumpLean", "jumpEvery", "jumpLand", "jumpSquash", "jumpSquashTime", "jumpSquashEase", "jumpGroundTime", "jumpGroundEase", "jumpRiseTime", "jumpRiseEase", "jumpClickSquashTime", "class", "className", "style", "aria-label", "ref", "onClick"]);
+  const [local, rest] = solidJs.splitProps(props, ["type", "path", "face", "state", "expression", "size", "color", "ink", "brightness", "saturation", "speed", "paused", "seed", "shading", "hat", "glasses", "headphones", "bowTie", "accessoryColor", "shadow", "highlight", "depth", "roundness", "furLength", "furDensity", "furFuzz", "furClumps", "furCurl", "furGravity", "light", "rim", "spread", "backLight", "lightFront", "shine", "sheen", "backSoftness", "pose", "interactive", "turn", "theme", "whirl", "whirlSize", "whirlWidth", "whirlLength", "whirlTilt", "jumpHeight", "jumpTime", "jumpStretch", "jumpSpin", "jumpLean", "jumpEvery", "jumpLand", "jumpSquash", "jumpSquashTime", "jumpSquashEase", "jumpGroundTime", "jumpGroundEase", "jumpRiseTime", "jumpRiseEase", "jumpClickSquashTime", "class", "className", "style", "aria-label", "ref", "onClick"]);
   const instanceId = solidJs.createUniqueId();
   const startsShown = !isMaterial(shadingModeOf(local.shading));
   const [shown, setShown] = solidJs.createSignal(startsShown);
@@ -5596,6 +5632,7 @@ function BotAvatar(props) {
     const faceKind = local.face ?? preset.face;
     const state2 = local.state ?? "default";
     const stateKeyNow = state2 in stateLabels ? state2 : "default";
+    const expression = local.expression;
     const size = local.size ?? 64;
     const picked = local.color ?? preset.color;
     const brightness = local.brightness ?? preset.brightness ?? 1;
@@ -5623,6 +5660,7 @@ function BotAvatar(props) {
     const drawCfg = {
       path: typeof Path2D === "undefined" ? null : bodyPath(customPath ?? SHAPE_PATHS[type] ?? SHAPE_PATHS.clover),
       face: faceKind,
+      expression,
       faceX: preset.faceX,
       faceY: preset.faceY,
       faceScale: preset.faceScale,
@@ -5686,6 +5724,7 @@ function BotAvatar(props) {
       preset,
       faceKind,
       stateKey: stateKeyNow,
+      expression,
       size,
       seedValue: Math.min(1, Math.max(0, local.seed ?? hashSeed(instanceId))),
       speed,
@@ -6021,6 +6060,9 @@ function BotAvatar(props) {
       get ["data-state"]() {
         return model().stateKey;
       },
+      get ["data-expression"]() {
+        return model().expression ?? "none";
+      },
       "role": "img",
       get ["aria-label"]() {
         return local["aria-label"] ?? `${model().preset.label} bot, ${stateLabels[model().stateKey]}`;
@@ -6076,6 +6118,24 @@ function agentMarkFor(label) {
   }
   return null;
 }
+function expressionFor(status, mergedAt) {
+  switch (String(status || "").trim().toUpperCase()) {
+    case "COMPLETED":
+    case "SUCCEEDED":
+      return String(mergedAt || "").trim() ? "celebrate" : "happy";
+    case "FAILED":
+      return "sad";
+    case "CANCELLED":
+    case "CANCELED":
+      return "cancelled";
+    case "TIMED_OUT":
+      return "tired";
+    case "ORPHANED":
+      return "confused";
+    default:
+      return null;
+  }
+}
 function hash32(id) {
   let h = 2166136261;
   for (let i = 0; i < id.length; i++) h = Math.imul(h ^ id.charCodeAt(i), 16777619);
@@ -6109,7 +6169,7 @@ function AgentBot(props) {
   const mark = () => agentMarkFor(key());
   const type = () => mark()?.type ?? botAvatarTypes[hash32(key()) % botAvatarTypes.length] ?? "clover";
   const working = () => props.status === "PENDING" || props.status === "RUNNING";
-  const failed = () => ["FAILED", "CANCELLED", "TIMED_OUT"].includes(props.status);
+  const expression = () => expressionFor(props.status, props.mergedAt);
   return web.createComponent(BotAvatar, web.mergeProps(FABRIC, {
     get type() {
       return type();
@@ -6118,7 +6178,13 @@ function AgentBot(props) {
       return mark()?.color;
     },
     get state() {
-      return web.memo(() => !!working())() ? "working" : failed() ? "sleeping" : "default";
+      return working() ? "working" : "default";
+    },
+    get expression() {
+      return expression() ?? void 0;
+    },
+    get hat() {
+      return expression() === "celebrate" ? "party" : void 0;
     },
     get size() {
       return props.size ?? 28;
@@ -6708,6 +6774,9 @@ const definition = gui.Plugin.define({
           },
           get status() {
             return status2();
+          },
+          get mergedAt() {
+            return props.run.mergedAt;
           }
         }));
         web.insert(_el$8, () => firstLine(props.run.prompt, 120) || props.run.id);
@@ -6904,6 +6973,9 @@ const definition = gui.Plugin.define({
                       },
                       get status() {
                         return run.status;
+                      },
+                      get mergedAt() {
+                        return run.mergedAt;
                       }
                     }));
                     web.insert(_el$32, () => firstLine(run.prompt, 120) || run.id);
@@ -6971,7 +7043,8 @@ const helpers = {
   runDetail,
   runLink,
   formatTokens,
-  formatDuration
+  formatDuration,
+  expressionFor
 };
 web.delegateEvents(["click"]);
 exports.Dispatch = Dispatch;

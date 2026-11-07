@@ -26,6 +26,8 @@ pub struct RunRow {
     pub title: String,
     pub prompt: String,
     pub status: String,
+    /// When the run merged, or empty: with `status` it says whether the bot celebrates.
+    pub merged_at: String,
     pub agent: String,
     pub model: String,
     pub tier: String,
@@ -92,6 +94,7 @@ impl RunRow {
             },
             prompt: run.prompt.clone(),
             status: run.status.clone(),
+            merged_at: run.merged_at.clone(),
             agent: run.agent.clone(),
             model: run.model.clone(),
             tier: run.tier.clone(),

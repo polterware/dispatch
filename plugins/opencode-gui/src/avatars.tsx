@@ -1,9 +1,12 @@
 import { BotAvatar, agentMarkFor, botAvatarTypes, type BotAvatarType } from "@polterware/bot-avatars";
+import { expressionFor } from "./expressions";
 
 // The same bots the Dispatch app draws: the Polterware ghost for an empty
 // page, and each agent's own bot, which moves while its run works. A bot that
-// is not working is paused: it paints once and leaves the frame loop, as the
-// app's bots are still by default, so an idle panel draws nothing.
+// is not working is paused: it paints once with the face of the run's status
+// (happy, celebrating a merge, sad, cancelled, tired, confused), leaves the
+// frame loop, as the app's bots are still by default, so an idle panel draws
+// nothing.
 
 function hash32(id: string) {
   let h = 2166136261;
@@ -30,18 +33,26 @@ export function EmptyBot(props: { mood: "sleeping" | "lost"; size?: number }) {
 }
 
 /** An agent's bot: its mark when it has one, else a body from its name. */
-export function AgentBot(props: { agent?: string; seed: string; status: string; size?: number }) {
+export function AgentBot(props: {
+  agent?: string;
+  seed: string;
+  status: string;
+  mergedAt?: string;
+  size?: number;
+}) {
   const key = () => props.agent?.trim() || "agent";
   const mark = () => agentMarkFor(key());
   const type = (): BotAvatarType => mark()?.type ?? botAvatarTypes[hash32(key()) % botAvatarTypes.length] ?? "clover";
   const working = () => props.status === "PENDING" || props.status === "RUNNING";
-  const failed = () => ["FAILED", "CANCELLED", "TIMED_OUT"].includes(props.status);
+  const expression = () => expressionFor(props.status, props.mergedAt);
   return (
     <BotAvatar
       {...FABRIC}
       type={type()}
       color={mark()?.color}
-      state={working() ? "working" : failed() ? "sleeping" : "default"}
+      state={working() ? "working" : "default"}
+      expression={expression() ?? undefined}
+      hat={expression() === "celebrate" ? "party" : undefined}
       size={props.size ?? 28}
       seed={(hash32(props.seed) % 1000) / 1000}
       aria-hidden="true"
