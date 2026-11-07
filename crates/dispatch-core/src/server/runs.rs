@@ -546,6 +546,10 @@ impl Core {
         if !reason.is_empty() {
             return Err(RpcError::invalid(reason));
         }
+        let reason = crate::config::disabled_agent_reason(&self.disabled_agents(), &prev.agent);
+        if !reason.is_empty() {
+            return Err(RpcError::invalid(reason));
+        }
         let project_id = if m.project_id.trim().is_empty() {
             prev.project_id.clone()
         } else {
@@ -1181,13 +1185,14 @@ impl Core {
                     } else {
                         Vec::new()
                     };
-                    out.models.extend(models.into_iter().map(|m| pb::DispatchModel {
-                        agent: a.name(),
-                        provider: provider_of(&a.name(), &m.id),
-                        model: m.id,
-                        tier: m.tier,
-                        efforts: efforts.clone(),
-                    }));
+                    out.models
+                        .extend(models.into_iter().map(|m| pb::DispatchModel {
+                            agent: a.name(),
+                            provider: provider_of(&a.name(), &m.id),
+                            model: m.id,
+                            tier: m.tier,
+                            efforts: efforts.clone(),
+                        }));
                 }
                 Err(e) => out.problems.push(format!("{}: {e}", a.name())),
             }
@@ -1230,12 +1235,14 @@ impl Core {
             .iter()
             .map(|a| (a.name(), installed(a.as_ref())))
             .collect();
+        let disabled = self.disabled_agents();
         Ok(pb::ListAgentsResponse {
             agents: agents
                 .iter()
                 .map(|a| {
                     let mut row = convert::agent(a);
                     row.installed = installed.get(&a.name).copied().unwrap_or(false);
+                    row.enabled = !crate::config::is_agent_disabled(&disabled, &a.name);
                     row
                 })
                 .collect(),

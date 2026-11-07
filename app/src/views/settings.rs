@@ -14,10 +14,10 @@ use gpui::{
 
 use crate::avatar::agent_avatar;
 use crate::client::{
-    ApplyAgentSetupRequest, ClassifyRequest, ConfigRequest, CoreClient, CoreError,
+    ApplyAgentSetupRequest, ClassifyRequest, ConfigRequest, CoreClient, CoreError, DispatchAgent,
     DispatchProviderModels, GetAgentSetupRequest, ListAgentsRequest, ListModelSettingsRequest,
     ListModelsRequest, ListWorktreeFoldersRequest, PruneWorktreeFoldersRequest,
-    SetModelEnabledRequest, WorktreeFolder, at_once,
+    SetAgentEnabledRequest, SetModelEnabledRequest, WorktreeFolder, at_once,
 };
 use crate::models::settings::{
     CLASSIFIERS, CliState, InstallState, ListedModel, Policy, SAMPLE_TASK, agent_label, bool_wire,
@@ -73,6 +73,10 @@ pub struct SettingsView {
     keys_inflight: bool,
     cli_model: Option<crate::models::settings::CliModel>,
     agents: Vec<String>,
+    /// The agents as last listed, with whether Settings > Agents routes to them.
+    agent_rows: Vec<DispatchAgent>,
+    agent_switches: BTreeMap<String, Entity<Switch>>,
+    agents_saving: bool,
     models: Vec<ListedModel>,
     setup: Option<crate::models::settings::AgentSetup>,
     setup_ticket: u64,
@@ -162,6 +166,9 @@ impl SettingsView {
             keys_inflight: false,
             cli_model: None,
             agents: Vec::new(),
+            agent_rows: Vec::new(),
+            agent_switches: BTreeMap::new(),
+            agents_saving: false,
             models: Vec::new(),
             setup: None,
             setup_ticket: 0,
@@ -441,12 +448,17 @@ impl SettingsView {
                     return;
                 }
                 if let Some(response) = listed.0 {
-                    view.agents = response
+                    view.agent_rows = response
                         .agents
                         .into_iter()
-                        .map(|agent| agent.name)
-                        .filter(|name| !name.is_empty())
+                        .filter(|agent| !agent.name.is_empty())
                         .collect();
+                    view.agents = view
+                        .agent_rows
+                        .iter()
+                        .map(|agent| agent.name.clone())
+                        .collect();
+                    view.sync_agent_switches(cx);
                 }
                 if let Some(response) = listed.1 {
                     view.models = response
@@ -495,6 +507,68 @@ impl SettingsView {
                         cx,
                     ),
                 }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn sync_agent_switches(&mut self, cx: &mut Context<Self>) {
+        let view = cx.entity().downgrade();
+        for agent in &self.agent_rows {
+            let name = agent.name.clone();
+            let enabled = agent.enabled;
+            let toggle = self.agent_switches.entry(name.clone()).or_insert_with(|| {
+                let name = name.clone();
+                switch(enabled, view.clone(), cx, move |this, on, cx| {
+                    this.set_agent_enabled(&name, on, cx);
+                })
+            });
+            toggle.update(cx, |toggle, _| toggle.set_on(enabled));
+        }
+    }
+
+    fn set_agent_enabled(&mut self, agent: &str, enabled: bool, cx: &mut Context<Self>) {
+        if self.agents_saving {
+            self.sync_agent_switches(cx);
+            return;
+        }
+        let Some(client) = self.client(cx) else {
+            self.sync_agent_switches(cx);
+            return;
+        };
+        let previous = self.agent_rows.clone();
+        if let Some(row) = self.agent_rows.iter_mut().find(|row| row.name == agent) {
+            row.enabled = enabled;
+        }
+        self.agents_saving = true;
+        let request = SetAgentEnabledRequest {
+            agent: agent.to_string(),
+            enabled,
+        };
+        self.sync_agent_switches(cx);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { client.set_agent_enabled(&request) })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                view.agents_saving = false;
+                if let Err(err) = result {
+                    view.agent_rows = previous;
+                    view.toast(
+                        core_message(&err, "Could not save agent settings."),
+                        ToastTone::Danger,
+                        cx,
+                    );
+                } else {
+                    view.load_lists(cx);
+                    view.state.update(cx, |state, cx| {
+                        state.models_changed(cx);
+                        state.reload_all(cx);
+                        cx.notify();
+                    });
+                }
+                view.sync_agent_switches(cx);
                 cx.notify();
             });
         })
@@ -1421,6 +1495,38 @@ impl SettingsView {
             .flex()
             .flex_col()
             .gap(px(SETTINGS_SECTION_GAP));
+        let mut agent_body = div().flex().flex_col();
+        if self.agent_rows.is_empty() {
+            agent_body = agent_body.child(settings_row("No agents to show", None, div(), cx));
+        }
+        for agent in &self.agent_rows {
+            if let Some(toggle) = self.agent_switches.get(&agent.name) {
+                let selector = format!("settings-agent-{}", agent.name);
+                agent_body = agent_body.child(settings_row(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(theme.space_2))
+                        .child(agent_avatar(&agent.name, "", 20.0))
+                        .child(agent_label(&agent.name)),
+                    text_or_none(if agent.installed { "" } else { "Not installed" }),
+                    div()
+                        .debug_selector(move || selector)
+                        .when(!enabled, |row| row.opacity(0.45))
+                        .child(toggle.clone()),
+                    cx,
+                ));
+            }
+        }
+        column = column.child(settings_section(
+            Icon::Bot,
+            TileTone::Identity,
+            "Agents",
+            "Turn off an agent to keep Dispatch from routing runs to it.",
+            None,
+            agent_body,
+            cx,
+        ));
         let cli_tone = cli_tone(setup.cli.state);
         let mut cli_trailing = div()
             .flex()

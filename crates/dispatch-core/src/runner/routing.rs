@@ -76,6 +76,11 @@ pub fn store_cooldowns(st: Option<&dyn Store>, now: DateTime<Utc>) -> Cooldowns 
     out
 }
 
+pub fn store_disabled_agents(st: Option<&dyn Store>) -> Vec<String> {
+    st.map(|s| s.list_disabled_agents().unwrap_or_default())
+        .unwrap_or_default()
+}
+
 pub fn store_disabled(st: Option<&dyn Store>, state_dir: &str) -> Vec<DisabledModel> {
     let Some(st) = st else {
         return Vec::new();
@@ -316,6 +321,7 @@ impl Deps {
             });
         }
         let disabled = store_disabled(self.store.as_deref(), &self.state_dir);
+        let disabled_agents = store_disabled_agents(self.store.as_deref());
         let ro = router::RouteOptions {
             tier: o.tier.clone(),
             difficulty: None,
@@ -325,6 +331,7 @@ impl Deps {
             avoid: o.avoid.clone(),
             role_board: Table::default(),
             disabled,
+            disabled_agents,
         };
         let table = self.agent_table(o, &mut agents, &ro.disabled).await;
         let (cs, mut rejected) = router::select_candidates(&table, &self.policy, &agents, &ro);
@@ -499,7 +506,11 @@ impl Deps {
         let (primary, mut rejected) = d.select_candidates_cool(&o, cool).await;
         let mut extra = Vec::new();
         let disabled = store_disabled(d.store.as_deref(), &d.state_dir);
-        if o.filters.relax && disabled_request_reason(&disabled, &o.filters).is_empty() {
+        let disabled_agents = store_disabled_agents(d.store.as_deref());
+        if o.filters.relax
+            && disabled_request_reason(&disabled, &o.filters).is_empty()
+            && crate::config::disabled_agent_reason(&disabled_agents, &o.filters.agent).is_empty()
+        {
             let mut fb = o.clone();
             fb.filters = Filters {
                 priority: o.filters.priority.clone(),

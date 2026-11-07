@@ -203,6 +203,7 @@ pub fn agent(a: &Agent) -> pb::DispatchAgent {
             .map(wire_time)
             .unwrap_or_default(),
         installed: false,
+        enabled: true,
     }
 }
 

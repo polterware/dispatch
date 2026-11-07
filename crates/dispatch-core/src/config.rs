@@ -223,6 +223,19 @@ pub fn is_model_disabled(
     !disabled_reason(disabled, provider, agent, model).is_empty()
 }
 
+pub fn is_agent_disabled(disabled: &[String], agent: &str) -> bool {
+    let a = agent.trim();
+    !a.is_empty() && disabled.iter().any(|d| d.eq_ignore_ascii_case(a))
+}
+
+/// Why `agent` is disabled, or empty when enabled.
+pub fn disabled_agent_reason(disabled: &[String], agent: &str) -> String {
+    if is_agent_disabled(disabled, agent) {
+        return format!("agent {} is disabled", agent.trim().to_ascii_lowercase());
+    }
+    String::new()
+}
+
 /// Why `provider` or `model` is disabled, or empty when enabled.
 pub fn disabled_reason(
     disabled: &[DisabledModel],

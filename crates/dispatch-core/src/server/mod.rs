@@ -206,6 +206,10 @@ impl Core {
         types::Store::list_disabled_models(self.store.as_ref()).unwrap_or_default()
     }
 
+    pub(crate) fn disabled_agents(&self) -> Vec<String> {
+        types::Store::list_disabled_agents(self.store.as_ref()).unwrap_or_default()
+    }
+
     /// Marks RUNNING and PENDING runs whose runner died with the previous
     /// core as ORPHANED, before the server accepts work.
     async fn reconcile_on_boot(&self) {

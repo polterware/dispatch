@@ -1094,6 +1094,37 @@ impl types::Store for Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(db)
     }
 
+    fn list_disabled_agents(&self) -> Result<Vec<String>, Error> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare("SELECT name FROM dispatch_disabled_agents ORDER BY name ASC")
+            .map_err(db)?;
+        let rows = stmt.query_map([], |r| r.get(0)).map_err(db)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db)
+    }
+
+    fn set_agent_enabled(&self, agent: &str, enabled: bool) -> Result<(), Error> {
+        let agent = agent.trim().to_ascii_lowercase();
+        if agent.is_empty() {
+            return Err(Error::Message("agent is required".into()));
+        }
+        let conn = self.conn();
+        if enabled {
+            conn.execute(
+                "DELETE FROM dispatch_disabled_agents WHERE lower(name) = lower(?1)",
+                params![agent],
+            )
+            .map_err(db)?;
+        } else {
+            conn.execute(
+                "INSERT OR IGNORE INTO dispatch_disabled_agents (name) VALUES (?1)",
+                params![agent],
+            )
+            .map_err(db)?;
+        }
+        Ok(())
+    }
+
     fn set_model_enabled(&self, provider: &str, model: &str, enabled: bool) -> Result<(), Error> {
         let provider = provider.trim().to_ascii_lowercase();
         let model = model.trim();

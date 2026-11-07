@@ -257,6 +257,7 @@ pub struct DispatchAgent {
     pub used_percent: Option<f64>,
     pub cooldown_until: String,
     pub installed: bool,
+    pub enabled: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -647,6 +648,20 @@ pub struct SetModelEnabledRequest {
 pub struct SetModelEnabledResponse {
     pub provider: String,
     pub model: String,
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SetAgentEnabledRequest {
+    pub agent: String,
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SetAgentEnabledResponse {
+    pub agent: String,
     pub enabled: bool,
 }
 
@@ -1626,6 +1641,13 @@ impl CoreClient {
         request: &SetModelEnabledRequest,
     ) -> Result<SetModelEnabledResponse, CoreError> {
         self.rpc("dispatch.v1.DispatchService/SetModelEnabled", request)
+    }
+
+    pub fn set_agent_enabled(
+        &self,
+        request: &SetAgentEnabledRequest,
+    ) -> Result<SetAgentEnabledResponse, CoreError> {
+        self.rpc("dispatch.v1.DispatchService/SetAgentEnabled", request)
     }
 
     pub fn replace_tiers(

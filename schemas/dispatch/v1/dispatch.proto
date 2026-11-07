@@ -138,6 +138,8 @@ message DispatchAgent {
   string cooldown_until = 8;
   // Whether the agent's CLI is on this machine now.
   bool installed = 9;
+  // Whether Settings > Agents lets Dispatch route runs to it.
+  bool enabled = 10;
 }
 
 message ListRunsRequest {
@@ -419,6 +421,16 @@ message SetModelEnabledResponse {
   string provider = 1;
   string model = 2;
   bool enabled = 3;
+}
+
+message SetAgentEnabledRequest {
+  string agent = 1;
+  bool enabled = 2;
+}
+
+message SetAgentEnabledResponse {
+  string agent = 1;
+  bool enabled = 2;
 }
 
 // Replaces the whole tier table. Rows keep their order within each tier; position is recomputed.
@@ -799,6 +811,7 @@ service DispatchService {
   rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
   rpc ListModelSettings(ListModelSettingsRequest) returns (ListModelSettingsResponse);
   rpc SetModelEnabled(SetModelEnabledRequest) returns (SetModelEnabledResponse);
+  rpc SetAgentEnabled(SetAgentEnabledRequest) returns (SetAgentEnabledResponse);
   rpc ReplaceTiers(ReplaceTiersRequest) returns (ReplaceTiersResponse);
   rpc Stats(StatsRequest) returns (StatsResponse);
   rpc GetRouteDecision(GetRouteDecisionRequest) returns (GetRouteDecisionResponse);

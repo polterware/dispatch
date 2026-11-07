@@ -197,7 +197,7 @@ fn conversation_migration_from_0005() {
     assert_eq!(old.session_id, "worker-session");
     assert_eq!(old.conversation_id, "");
     assert_eq!(old.caller_agent, "");
-    assert_eq!(count(&s, "PRAGMA user_version"), 11);
+    assert_eq!(count(&s, "PRAGMA user_version"), 12);
     assert_eq!(
         count(
             &s,
@@ -237,7 +237,7 @@ fn tier_speed_strength_migration_keeps_rows() {
         .unwrap();
     }
     let s = Store::new(path.to_str().unwrap()).unwrap();
-    assert_eq!(count(&s, "PRAGMA user_version"), 11);
+    assert_eq!(count(&s, "PRAGMA user_version"), 12);
     assert_eq!(
         count(
             &s,

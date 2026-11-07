@@ -29,7 +29,8 @@ pub use lifecycle::{pid_alive, process_start};
 pub use ops::MergeResult;
 pub use routing::{
     FiltersJson, RouteCandidate, RouteReport, cooling, credit_key, disabled_request_reason, linear,
-    matches_model, normalize_priority, store_cooldowns, store_disabled, validate_options,
+    matches_model, normalize_priority, store_cooldowns, store_disabled, store_disabled_agents,
+    validate_options,
 };
 pub use summary::{
     RunSummary, SUMMARY_SCHEMA, class_of, classify_run, go_duration, limit_notice, observed_ms,

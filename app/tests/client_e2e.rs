@@ -267,6 +267,38 @@ fn settings_change_the_policy_hooks_and_skills() {
             enabled: true,
         })
         .unwrap();
+    let disabled = core
+        .client
+        .set_agent_enabled(&dispatch_app::client::SetAgentEnabledRequest {
+            agent: "fake".into(),
+            enabled: false,
+        })
+        .unwrap();
+    assert!(!disabled.enabled);
+    let agents = core
+        .client
+        .list_agents(&ListAgentsRequest::default())
+        .unwrap()
+        .agents;
+    assert!(
+        agents.iter().any(|a| a.name == "fake" && !a.enabled),
+        "{agents:?}"
+    );
+    core.client
+        .set_agent_enabled(&dispatch_app::client::SetAgentEnabledRequest {
+            agent: "fake".into(),
+            enabled: true,
+        })
+        .unwrap();
+    let agents = core
+        .client
+        .list_agents(&ListAgentsRequest::default())
+        .unwrap()
+        .agents;
+    assert!(
+        agents.iter().any(|a| a.name == "fake" && a.enabled),
+        "{agents:?}"
+    );
     let keys = core.config("get", "classifier_keys", &[]);
     assert!(keys.get("jev").is_some(), "{keys}");
 

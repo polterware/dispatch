@@ -409,6 +409,7 @@ pub struct RouteOptions {
     pub avoid: Vec<String>,
     pub role_board: crate::tiers::Table,
     pub disabled: Vec<crate::types::DisabledModel>,
+    pub disabled_agents: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -538,6 +539,9 @@ pub fn select_candidates(
         };
         let mut reason =
             crate::config::disabled_reason(&options.disabled, &provider, &e.agent, &e.model);
+        if reason.is_empty() {
+            reason = crate::config::disabled_agent_reason(&options.disabled_agents, &e.agent);
+        }
         if reason.is_empty() {
             reason = if !f.provider.is_empty() && f.provider != provider {
                 format!("provider filter requires {}", f.provider)
@@ -705,6 +709,7 @@ pub fn plan(
             &o.filters.model,
         )
         .is_empty()
+        && crate::config::disabled_agent_reason(&o.disabled_agents, &o.filters.agent).is_empty()
     {
         let mut fallback = o.clone();
         if fallback.tier.is_empty() {
