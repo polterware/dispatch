@@ -1,7 +1,15 @@
 //! Audio I/O for the voice engine.
+//!
+//! Capture and playback streams are owned by worker threads and exist only while
+//! their handles are active. Realtime CPAL callbacks must not allocate or lock;
+//! they exchange samples with workers through bounded lock-free ring buffers.
+//! Capture start returns after its stream is playing. Playback emits `Started`
+//! when its first non-silent sample reaches the output callback, then zero or
+//! more `Level` events, and exactly one `Ended`. Playback cancellation fades
+//! output before `Ended`; the output stream is released before that event is
+//! delivered. Dropping either handle stops and joins its worker.
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::Sample;
 use ringbuf::{
     traits::{Consumer, Observer, Producer, Split},
     HeapRb,
@@ -210,7 +218,7 @@ fn setup_capture(
     let (mut prod, cons) = HeapRb::<f32>::new((rate as usize * channels).max(8192)).split();
     let error_callback = |_| {};
     let stream = match supported.sample_format() {
-        cpal::SampleFormat::F32 => build_input::<f32>(
+        cpal::SampleFormat::F32 => build_input::<f32, _>(
             &device,
             &config,
             move |data| {
@@ -220,7 +228,7 @@ fn setup_capture(
             },
             error_callback,
         ),
-        cpal::SampleFormat::I16 => build_input::<i16>(
+        cpal::SampleFormat::I16 => build_input::<i16, _>(
             &device,
             &config,
             move |data| {
@@ -230,7 +238,7 @@ fn setup_capture(
             },
             error_callback,
         ),
-        cpal::SampleFormat::U16 => build_input::<u16>(
+        cpal::SampleFormat::U16 => build_input::<u16, _>(
             &device,
             &config,
             move |data| {
@@ -240,7 +248,7 @@ fn setup_capture(
             },
             error_callback,
         ),
-        cpal::SampleFormat::I8 => build_input::<i8>(
+        cpal::SampleFormat::I8 => build_input::<i8, _>(
             &device,
             &config,
             move |data| {
@@ -250,7 +258,7 @@ fn setup_capture(
             },
             error_callback,
         ),
-        cpal::SampleFormat::U8 => build_input::<u8>(
+        cpal::SampleFormat::U8 => build_input::<u8, _>(
             &device,
             &config,
             move |data| {
@@ -260,7 +268,7 @@ fn setup_capture(
             },
             error_callback,
         ),
-        cpal::SampleFormat::I32 => build_input::<i32>(
+        cpal::SampleFormat::I32 => build_input::<i32, _>(
             &device,
             &config,
             move |data| {
@@ -270,7 +278,7 @@ fn setup_capture(
             },
             error_callback,
         ),
-        cpal::SampleFormat::U32 => build_input::<u32>(
+        cpal::SampleFormat::U32 => build_input::<u32, _>(
             &device,
             &config,
             move |data| {
@@ -280,7 +288,7 @@ fn setup_capture(
             },
             error_callback,
         ),
-        cpal::SampleFormat::I64 => build_input::<i64>(
+        cpal::SampleFormat::I64 => build_input::<i64, _>(
             &device,
             &config,
             move |data| {
@@ -290,7 +298,7 @@ fn setup_capture(
             },
             error_callback,
         ),
-        cpal::SampleFormat::U64 => build_input::<u64>(
+        cpal::SampleFormat::U64 => build_input::<u64, _>(
             &device,
             &config,
             move |data| {
@@ -303,7 +311,7 @@ fn setup_capture(
             },
             error_callback,
         ),
-        cpal::SampleFormat::F64 => build_input::<f64>(
+        cpal::SampleFormat::F64 => build_input::<f64, _>(
             &device,
             &config,
             move |data| {
@@ -401,6 +409,30 @@ enum PlayCommand {
     Push(Vec<f32>),
     Finish,
     Cancel,
+}
+
+#[derive(Default)]
+struct PlaybackState {
+    started: bool,
+    finished: bool,
+    cancelled: bool,
+}
+
+impl PlaybackState {
+    fn cancel(&mut self) {
+        self.cancelled = true;
+        self.finished = true;
+    }
+
+    fn should_end(&self, queues_drained: bool, fade_drained: bool) -> bool {
+        self.finished && queues_drained && fade_drained
+    }
+
+    fn ended_event(&self) -> PlaybackEvent {
+        PlaybackEvent::Ended {
+            cancelled: self.cancelled,
+        }
+    }
 }
 pub struct PlaybackHandle {
     tx: mpsc::Sender<PlayCommand>,
@@ -549,12 +581,9 @@ fn run_playback<F: FnMut(PlaybackEvent)>(
         let _ = ready.send(Err(AudioError::Device(e.to_string())));
         return;
     }
-    let _stream = stream;
     let _ = ready.send(Ok(()));
     let mut meter = LevelMeter::new(rate);
-    let mut started = false;
-    let mut finished = false;
-    let mut cancelled = false;
+    let mut state = PlaybackState::default();
     let mut input = VecDeque::<f32>::new();
     let mut resampled = VecDeque::<f32>::new();
     let mut phase = 0.0f64;
@@ -563,18 +592,16 @@ fn run_playback<F: FnMut(PlaybackEvent)>(
     loop {
         match rx.recv_timeout(Duration::from_millis(4)) {
             Ok(PlayCommand::Push(data)) => input.extend(data),
-            Ok(PlayCommand::Finish) => finished = true,
+            Ok(PlayCommand::Finish) => state.finished = true,
             Ok(PlayCommand::Cancel) => {
-                cancelled = true;
-                finished = true;
+                state.cancel();
                 input.clear();
                 resampled.clear();
                 cancelling.store(true, Ordering::Relaxed);
                 fade.store(fade_total, Ordering::Relaxed);
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                cancelled = true;
-                finished = true;
+                state.cancel();
                 input.clear();
                 resampled.clear();
                 cancelling.store(true, Ordering::Relaxed);
@@ -606,24 +633,21 @@ fn run_playback<F: FnMut(PlaybackEvent)>(
         while let Some(sample) = played_cons.try_pop() {
             meter_samples.push(sample);
         }
-        if meter_samples.iter().any(|s| *s != 0.0) && !started {
-            started = true;
+        if meter_samples.iter().any(|s| *s != 0.0) && !state.started {
+            state.started = true;
             on_event(PlaybackEvent::Started);
         }
         for level in meter.push(&meter_samples) {
             on_event(PlaybackEvent::Level(level));
         }
-        if finished
-            && input.is_empty()
-            && resampled.is_empty()
-            && prod.is_empty()
-            && played_cons.is_empty()
-            && fade.load(Ordering::Relaxed) == 0
-        {
-            on_event(PlaybackEvent::Ended { cancelled });
+        let queues_drained =
+            input.is_empty() && resampled.is_empty() && prod.is_empty() && played_cons.is_empty();
+        if state.should_end(queues_drained, fade.load(Ordering::Relaxed) == 0) {
             break;
         }
     }
+    drop(stream);
+    on_event(state.ended_event());
 }
 
 fn output_callback<T>(
@@ -678,6 +702,31 @@ mod tests {
             }]
         );
     }
+
+    #[test]
+    fn playback_state_ends_after_drain_or_cancel_fade() {
+        let drained = PlaybackState {
+            finished: true,
+            ..PlaybackState::default()
+        };
+        assert!(!drained.should_end(false, true));
+        assert!(!drained.should_end(true, false));
+        assert!(drained.should_end(true, true));
+        assert_eq!(
+            drained.ended_event(),
+            PlaybackEvent::Ended { cancelled: false }
+        );
+
+        let mut cancelled = PlaybackState::default();
+        cancelled.cancel();
+        assert!(!cancelled.should_end(true, false));
+        assert!(cancelled.should_end(true, true));
+        assert_eq!(
+            cancelled.ended_event(),
+            PlaybackEvent::Ended { cancelled: true }
+        );
+    }
+
     #[test]
     fn resampling_downmix_and_chunking_contract() {
         assert_eq!(downmix_frame(&[0.25, 0.75]), 0.5);
