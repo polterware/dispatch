@@ -1,0 +1,9 @@
+.local-voice-panel{display:flex;flex-direction:column;align-items:center;gap:16px;padding:24px;color:var(--text-base)}
+.local-voice-panel__status{font-size:13px;color:var(--text-weak)}
+.local-voice-panel__transcript{width:100%;min-height:56px;max-height:180px;overflow:auto;white-space:pre-wrap;font-size:13px}
+.local-voice-panel__controls{display:flex;flex-wrap:wrap;justify-content:center;gap:8px}
+.local-voice-panel button,.local-voice-header{border:1px solid var(--border-base);border-radius:8px;background:var(--surface-base);color:inherit;padding:8px 12px;cursor:pointer}
+.local-voice-panel button:disabled{opacity:.5;cursor:default}
+.local-voice-panel__talk{width:100%;min-height:54px;font-weight:600}
+.local-voice-panel__hint{font-size:12px;color:var(--text-weak);text-align:center}
+.local-voice-header{display:flex;align-items:center;gap:5px;padding:2px 7px;border:0;font-size:12px}

@@ -1,2 +1,2 @@
-export { VoiceBlob } from "./blob-fallback.tsx"
-export type { BlobState, BlobProps } from "./blob-fallback.tsx"
+export { VoiceBlob } from "@local-voice/blob"
+export type { BlobState, BlobLevels } from "@local-voice/blob"
