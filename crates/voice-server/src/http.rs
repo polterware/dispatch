@@ -554,6 +554,39 @@ mod tests {
         assert!(origin_allowed(&headers));
     }
 
+    #[test]
+    fn discovery_file_uses_test_home_owner_permissions_and_is_removed() {
+        let home = std::env::temp_dir().join(format!("voice-server-home-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let old_home = std::env::var_os("VOICE_ENGINE_HOME");
+        std::env::set_var("VOICE_ENGINE_HOME", &home);
+        let path = paths::discovery_file();
+        let info = EngineInfo {
+            protocol: PROTOCOL_VERSION,
+            engine_version: env!("CARGO_PKG_VERSION").into(),
+            pid: std::process::id(),
+            port: 49152,
+            token: "fake-token".into(),
+        };
+        discovery::write(&path, &info).unwrap();
+        assert_eq!(discovery::read(&path).unwrap(), info);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        discovery::remove_if_owned(&path, std::process::id()).unwrap();
+        assert!(!path.exists());
+        match old_home {
+            Some(value) => std::env::set_var("VOICE_ENGINE_HOME", value),
+            None => std::env::remove_var("VOICE_ENGINE_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(home);
+    }
+
     #[tokio::test]
     async fn websocket_auth_hello_busy_and_cancel() {
         let listener = match tokio::net::TcpListener::bind(("127.0.0.1", 0)).await {
@@ -588,12 +621,26 @@ mod tests {
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, router(app)).await;
         });
+        let health_addr = addr;
+        let health = tokio::task::spawn_blocking(move || {
+            ureq::get(&format!("http://{health_addr}/v1/health")).call()
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(health.status(), 200);
         let endpoint = format!("ws://{addr}/v1/ws");
         let unauth = tokio_tungstenite::connect_async(&endpoint)
             .await
             .unwrap_err();
         assert!(
             matches!(unauth,tokio_tungstenite::tungstenite::Error::Http(ref response) if response.status()==StatusCode::UNAUTHORIZED)
+        );
+        let wrong_token = tokio_tungstenite::connect_async(format!("{endpoint}?token=wrong"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(wrong_token,tokio_tungstenite::tungstenite::Error::Http(ref response) if response.status()==StatusCode::UNAUTHORIZED)
         );
         let mut foreign = endpoint.clone().into_client_request().unwrap();
         foreign
@@ -852,6 +899,28 @@ mod tests {
         let ended=got.iter().position(|m|matches!(m,EngineMessage::SpeakEnded{id,reason:SpeakEndReason::Done} if id=="speech")).unwrap();
         assert!(started < level && level < ended);
         assert_eq!(synthesized.lock().unwrap().len(), 3);
+        for id in ["fifo-1", "fifo-2"] {
+            socket.send(ClientMessage::Text(format!(r#"{{"type":"speak","id":"{id}","text":"One sentence.","format":"plain","language":"en"}}"#))).await.unwrap();
+        }
+        let fifo_ended = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut ended = Vec::new();
+            while ended.len() < 2 {
+                let msg = socket.next().await.unwrap().unwrap();
+                if let Ok(EngineMessage::SpeakEnded {
+                    id,
+                    reason: SpeakEndReason::Done,
+                }) = serde_json::from_str(msg.to_text().unwrap())
+                {
+                    if id.starts_with("fifo-") {
+                        ended.push(id);
+                    }
+                }
+            }
+            ended
+        })
+        .await
+        .unwrap();
+        assert_eq!(fifo_ended, ["fifo-1", "fifo-2"]);
         speaker_state.manual_end.store(true, Ordering::Relaxed);
         socket.send(ClientMessage::Text(r#"{"type":"speak","id":"cancel-me","text":"Cancel this item.","format":"plain","language":"en"}"#.into())).await.unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -889,6 +958,43 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(canceled,EngineMessage::SpeakEnded{id,..} if id=="cancel-me"));
+        socket.send(ClientMessage::Text(r#"{"type":"speak","id":"barge-speak","text":"Wait here.","format":"plain","language":"en"}"#.into())).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while engine.state().speak_id.as_deref() != Some("barge-speak") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        socket
+            .send(ClientMessage::Text(
+                r#"{"type":"listen.start","id":"barge-listen","language":"en"}"#.into(),
+            ))
+            .await
+            .unwrap();
+        let barge_end = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let msg = socket.next().await.unwrap().unwrap();
+                if let Ok(EngineMessage::SpeakEnded {
+                    id,
+                    reason: SpeakEndReason::Cancelled,
+                }) = serde_json::from_str(msg.to_text().unwrap())
+                {
+                    if id == "barge-speak" {
+                        break id;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(barge_end, "barge-speak");
+        socket
+            .send(ClientMessage::Text(
+                r#"{"type":"listen.cancel","id":"barge-listen"}"#.into(),
+            ))
+            .await
+            .unwrap();
         let _ = engine.tx.send(Input::Shutdown).await;
         server.abort();
     }
