@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { AdaptiveNormalizer, blendParams, makeCurve, stateParams } from "./math";
+import { AdaptiveNormalizer, blendParams, createBlobMatrices, createIcosphere, easeParams, makeCurve, stateParams } from "./math";
 
 describe("adaptive level normalization", () => {
   test("tracks quiet and loud input with a decaying peak", () => {
@@ -27,10 +27,46 @@ describe("state blending", () => {
   test("interpolates and exposes distinct state targets", () => {
     const idle = stateParams("idle");
     const listening = stateParams("listening");
-    expect(blendParams(idle, listening, 0.5).amplitude).toBeCloseTo((idle.amplitude + listening.amplitude) / 2);
-    expect(stateParams("processing").processing).toBeGreaterThan(stateParams("idle").processing);
+    expect(blendParams(idle, listening, 0.5).intensity).toBeCloseTo((idle.intensity + listening.intensity) / 2);
+    expect(stateParams("processing").speed).toBeGreaterThan(stateParams("idle").speed);
     expect(stateParams("disconnected").dim).toBeGreaterThan(0);
     expect(stateParams("error").warmth).toBe(1);
+    expect(stateParams("idle").intensity).toBe(0.18);
+    expect(stateParams("processing").intensity).toBe(0.2);
+    expect(stateParams("disconnected").speed).toBe(0);
+    expect(easeParams(idle, listening, 0).intensity).toBe(idle.intensity);
+    expect(easeParams(idle, listening, 250).intensity).toBe(listening.intensity);
+    expect(easeParams(idle, listening, 125).intensity).toBeCloseTo((idle.intensity + listening.intensity) / 2);
+  });
+});
+
+describe("WebGL geometry and camera", () => {
+  test("creates a closed subdivided unit icosphere with in-range indices", () => {
+    const sphere = createIcosphere(4);
+    expect(sphere.positions.length / 3).toBeGreaterThanOrEqual(2500);
+    expect(sphere.positions.length / 3).toBeLessThanOrEqual(10000);
+    expect(sphere.indices.length).toBe(20 * 256 * 3);
+    const edgeUse = new Map<string, number>();
+    for (let i = 0; i < sphere.indices.length; i += 3) {
+      const face = [sphere.indices[i], sphere.indices[i + 1], sphere.indices[i + 2]];
+      for (let edge = 0; edge < 3; edge++) {
+        const a = face[edge], b = face[(edge + 1) % 3], key = a < b ? `${a}:${b}` : `${b}:${a}`;
+        edgeUse.set(key, (edgeUse.get(key) ?? 0) + 1);
+      }
+    }
+    expect([...edgeUse.values()].every((uses) => uses === 2)).toBe(true);
+    for (let i = 0; i < sphere.positions.length; i += 3) {
+      expect(Math.hypot(sphere.positions[i], sphere.positions[i + 1], sphere.positions[i + 2])).toBeCloseTo(1, 5);
+    }
+    for (const index of sphere.indices) expect(index).toBeLessThan(sphere.positions.length / 3);
+  });
+  test("produces finite perspective and fixed view matrices for aspect ratios", () => {
+    for (const aspect of [0.5, 1, 2]) {
+      const matrices = createBlobMatrices(aspect);
+      expect([...matrices.projection, ...matrices.view].every(Number.isFinite)).toBe(true);
+      expect(matrices.projection[0] / matrices.projection[5]).toBeCloseTo(1 / aspect);
+      expect(matrices.view[14]).toBeCloseTo(-3.15);
+    }
   });
 });
 

@@ -64,7 +64,7 @@ function Demo() {
 
   const choose = (next: BlobState) => { setState(next); if (next !== "listening") stopMic(); };
   return <main class={light() ? "app app--light" : "app"}>
-    <header><div><span class="eyebrow">LOCAL VOICE · CANVAS STUDY</span><h1>Voice, in motion.</h1><p>A quiet, responsive surface for a voice that lives on your device.</p></div><button class="theme" onClick={() => setLight(!light())}>{light() ? "Dark theme" : "Light theme"}</button></header>
+    <header><div><span class="eyebrow">LOCAL VOICE · SHADER STUDY</span><h1>Voice, in motion.</h1><p>A quiet, responsive surface for a voice that lives on your device.</p></div><button class="theme" onClick={() => setLight(!light())}>{light() ? "Dark theme" : "Light theme"}</button></header>
     <section class="showcase">
       <div class="blob-panel"><VoiceBlob state={state} levels={levels} theme={light() ? "light" : "dark"} mode="expanded" label={`Voice interface: ${state()}`} /><div class="readout"><span class={`status-dot status-dot--${state()}`}></span>{state()}</div><small>Expanded · 220 px</small></div>
       <div class="blob-panel compact-panel"><VoiceBlob state={state} levels={levels} theme={light() ? "light" : "dark"} mode="compact" /><div class="readout"><span class={`status-dot status-dot--${state()}`}></span>{state()}</div><small>Compact · 20 px</small></div>

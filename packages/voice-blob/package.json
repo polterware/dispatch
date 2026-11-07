@@ -7,7 +7,7 @@
   },
   "scripts": {
     "dev": "vite --host 127.0.0.1",
-    "build:demo": "vite build --config vite.config.ts",
+    "build:demo": "vite build --config vite.config.ts --configLoader runner",
     "test": "bun test",
     "typecheck": "tsc --noEmit"
   },
