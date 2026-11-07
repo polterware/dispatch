@@ -6,7 +6,7 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
-use ort::{session::Session, value::Tensor};
+use ort::{ep::CPU, session::Session, value::Tensor};
 use serde_json::Value;
 use voice_core::protocol::Language;
 
@@ -92,6 +92,12 @@ pub(super) fn load(options: KokoroOptions) -> Result<KokoroTts> {
         .map_err(load_err)?
         .with_intra_threads(threads)
         .map_err(load_err)?
+        .with_inter_threads(1)
+        .map_err(load_err)?
+        .with_memory_pattern(false)
+        .map_err(load_err)?
+        .with_execution_providers([CPU::default().with_arena_allocator(false).build()])
+        .map_err(load_err)?
         .commit_from_file(&model)
         .map_err(load_err)?;
     let inputs = session
@@ -104,7 +110,7 @@ pub(super) fn load(options: KokoroOptions) -> Result<KokoroTts> {
         .iter()
         .map(|value| format!("{}: {:?}", value.name(), value.dtype()))
         .collect::<Vec<_>>();
-    eprintln!("Kokoro ONNX inputs: {inputs:?}; outputs: {outputs:?}");
+    tracing::debug!(?inputs, ?outputs, "Kokoro ONNX model tensors");
     tracing::info!(model = %model.display(), threads, ?inputs, ?outputs, "loaded Kokoro ONNX model");
     Ok(KokoroTts {
         session: Mutex::new(session),

@@ -1,59 +1,48 @@
 # Voice TTS benchmarks
 
-Date: 2026-11-07  
-Machine: Apple M1, 16 GB RAM  
-Runtime: release build, ONNX Runtime CPU execution, 4 intra-op threads  
-Kokoro sample rate: 24 kHz mono  
+Date: 2026-11-07
 
-Each cold/warm measurement synthesizes the first sentence twice in one process. `audio` is the duration of the second WAV; RTF is synthesis time divided by that duration. Peak is the absolute float sample peak before WAV quantization.
+Machine: Apple M1 Pro, 16 GB RAM
 
-## Results
+Model: Kokoro quantized ONNX, pt-BR `pf_dora`, ORT CPU, 4 intra-op threads
 
-| Model/backend | Language / voice | Load ms | Cold synth ms | Warm synth ms | Audio ms | Cold / warm RTF | Peak |
-|---|---|---:|---:|---:|---:|---:|---:|
-| Kokoro quantized | pt-BR / `pf_dora` | 2314.5 | 633.4 | 482.5 | 2830.7 | 0.224 / 0.170 | 0.5822 |
-| Kokoro quantized | pt-BR / `pm_alex` | 2414.9 | 684.7 | 595.1 | 2937.6 | 0.233 / 0.203 | 0.6467 |
-| Kokoro quantized | English / `af_heart` | 2224.0 | 576.3 | 472.9 | 2202.2 | 0.262 / 0.215 | 0.5187 |
-| Kokoro fp16 | pt-BR / `pf_dora` | 1127.5 | 894.6 | 901.4 | 2921.9 | 0.306 / 0.308 | 0.6021 |
-| Kokoro fp16 | pt-BR / `pm_alex` | 1128.5 | 892.8 | 929.2 | 2912.9 | 0.306 / 0.319 | 0.6528 |
-| Kokoro fp16 | English / `af_heart` | 1016.0 | 743.9 | 742.3 | 2202.0 | 0.338 / 0.337 | 0.5234 |
-| macOS `say` | pt-BR / default | 0.0 | 999.2* | 850.6* | 0.0* | n/a | 0.0000* |
+RSS: Mach `task_info(MACH_TASK_BASIC_INFO)` in the benchmark process. Synthesis timings vary with host load.
 
-`*` The sandboxed `say` command exited successfully but wrote a 44-byte WAV header with zero frames. These timings and peak describe the failed empty-audio attempt, not valid speech; the backend now returns `say returned an empty audio file` for this condition.
+## First-piece latency
 
-## Phonemes and WAV checks
+Input: `Pronto, criei o arquivo e todos os testes passaram.` Before the split, `text::sentences` returned the entire sentence as piece one. The updated splitter emits `Pronto,` first, then the remainder. The first piece produced 602.7 ms of audio.
 
-pt-BR text: `Pronto, criei o arquivo e todos os testes passaram.`  
-Phonemes (both Kokoro models and both pt-BR voices): `prˈoŋtʃ , kriˈeɪ u ˌaɾəkˈivw i tˈodʊz ʊs tˈɛstʃys pˌasˈaɾæ .`
+| Measure | Before: whole sentence | After: first piece `Pronto,` |
+|---|---:|---:|
+| Cold synthesis | 4457 ms | 361 ms median (3 runs: 490, 312, 361) |
+| Warm synthesis | 4080 ms | 205 ms median (3 runs: 294, 191, 205) |
+| Audio duration | 2831 ms | 603 ms |
+| First-piece text | `Pronto, criei o arquivo e todos os testes passaram.` | `Pronto,` |
 
-English text: `The file is ready and all tests passed.`  
-Phonemes (both Kokoro models): `ðə fˈaɪl ɪz ɹˈɛdi ænd ˈɔːl tˈɛsts pˈæs .`
+The input is intentionally shorter after the change; the numbers measure first-piece synthesis time, not full-reply completion.
 
-All six Kokoro WAVs were nonempty, mono 16-bit PCM at 24 kHz, with durations 2.202–2.938 s. A sample scan found 98%+ nonzero samples and maximum peaks from 0.5187 to 0.6467; no clipping or silence was found. The English clips are about 2.20 s; pt-BR clips are about 2.83–2.94 s.
+## RSS and ORT session settings
 
-The tokenizer JSON contains a `model.vocab` character-to-ID map, including the `$` special token with ID 0. The graph reported inputs `input_ids` (int64), `style` (float32), `speed` (float32), and output `waveform` (float32). The style vector row follows kokoro-onnx's `_style_for`: for `n` phoneme tokens use row `n - 1` (clamped to available rows); input IDs separately wrap those tokens with BOS/EOS. See [kokoro-onnx reference](https://github.com/thewh1teagle/kokoro-onnx/blob/main/src/kokoro_onnx/__init__.py#L1234-L1242).
+The configured session uses 4 intra-op threads, 1 inter-op thread, memory pattern off, and the CPU EP arena allocator off. The table compares the original session builder with the configured builder, using the same first-piece text and three syntheses. One paired run showed essentially unchanged RSS; a repeat configured run was higher, so this is not a demonstrated resident-memory reduction. Sampling is sensitive to host pressure and allocator behavior.
 
-## Commands
+| Session | RSS after load | RSS after synthesis 1 | RSS after synthesis 2 | RSS after synthesis 3 |
+|---|---:|---:|---:|---:|
+| Before: original ORT defaults | 112.8 MiB | 105.8 MiB | 193.6 MiB | 209.5 MiB |
+| After: arena/pattern off, 4/1 threads (paired run) | 112.9 MiB | 196.2 MiB | 225.2 MiB | 209.0 MiB |
+| After: repeat | 170.8 MiB | 251.1 MiB | 251.7 MiB | 252.0 MiB |
 
-The cached ONNX Runtime static library needs macOS 13.4 symbols when linking this release binary, so the build sets the deployment target and links Clang's OS runtime archive:
+## Reproduction
 
 ```sh
 TMPDIR="$PWD/crates/voice-tts/.tmp" \
 MACOSX_DEPLOYMENT_TARGET=13.4 \
 RUSTFLAGS="-C link-arg=$(clang --print-resource-dir)/lib/darwin/libclang_rt.osx.a" \
-cargo build -p voice-tts --example say --release --offline
+cargo build --release --offline -p voice-tts --example say
+
+TMPDIR="$PWD/crates/voice-tts/.tmp" \
+VOICE_KOKORO_DIR="$HOME/Library/Application Support/voice-engine/models/kokoro" \
+target/release/examples/say --model-file model_quantized.onnx --lang pt-br --voice pf_dora \
+  "Pronto, criei o arquivo e todos os testes passaram." crates/voice-tts/.tmp/tts.wav
 ```
 
-The six Kokoro commands used the same executable and model directory:
-
-```sh
-VOICE_KOKORO_DIR="$HOME/Library/Application Support/voice-engine/models/kokoro" target/release/examples/say --model-file model_quantized.onnx --lang pt-br --voice pf_dora "Pronto, criei o arquivo e todos os testes passaram." crates/voice-tts/.tmp/q-dora.wav
-VOICE_KOKORO_DIR="$HOME/Library/Application Support/voice-engine/models/kokoro" target/release/examples/say --model-file model_quantized.onnx --lang pt-br --voice pm_alex "Pronto, criei o arquivo e todos os testes passaram." crates/voice-tts/.tmp/q-alex.wav
-VOICE_KOKORO_DIR="$HOME/Library/Application Support/voice-engine/models/kokoro" target/release/examples/say --model-file model_quantized.onnx --lang en --voice af_heart "The file is ready and all tests passed." crates/voice-tts/.tmp/q-heart.wav
-VOICE_KOKORO_DIR="$HOME/Library/Application Support/voice-engine/models/kokoro" target/release/examples/say --model-file model_fp16.onnx --lang pt-br --voice pf_dora "Pronto, criei o arquivo e todos os testes passaram." crates/voice-tts/.tmp/f16-dora.wav
-VOICE_KOKORO_DIR="$HOME/Library/Application Support/voice-engine/models/kokoro" target/release/examples/say --model-file model_fp16.onnx --lang pt-br --voice pm_alex "Pronto, criei o arquivo e todos os testes passaram." crates/voice-tts/.tmp/f16-alex.wav
-VOICE_KOKORO_DIR="$HOME/Library/Application Support/voice-engine/models/kokoro" target/release/examples/say --model-file model_fp16.onnx --lang en --voice af_heart "The file is ready and all tests passed." crates/voice-tts/.tmp/f16-heart.wav
-target/release/examples/say --backend system --lang pt-br "Pronto, criei o arquivo e todos os testes passaram." crates/voice-tts/.tmp/system-pt.wav
-```
-
-The optional intelligibility command was attempted with `ggml-small-q5_1.bin`, but `voice-stt` does not compile against the workspace's current `ort` rc.15 and `whisper-rs` 0.16 APIs. It reports six compile errors in `crates/voice-stt`; no transcript is available from this run.
+The example prints load RSS, RSS after each of three syntheses, each synthesis duration, audio duration, peak, and phonemes. The Kokoro tensor names and types are available at `debug` log level; loading no longer writes model diagnostics to stdout or stderr by default.
