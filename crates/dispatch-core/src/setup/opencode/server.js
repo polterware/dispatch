@@ -28,6 +28,8 @@ const PROMPT_PREVIEW = 400
 // The tail of a run's output the panel holds: enough to read, little to carry.
 const LOG_LINES = 2000
 const LOG_BYTES = 256 * 1024
+// A Dispatch from before `dispatch events` refuses the command by name.
+const UNKNOWN_EVENTS = /unknown command "events"/
 // The app's own link, or a run in it.
 const RUN_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/
 const DISPATCH_LINK = /^dispatch:\/\/(run\/[A-Za-z0-9_-]{1,128})?$/
@@ -174,6 +176,30 @@ const ANSI_OSC = /\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g
 
 function stripAnsi(text) {
   return String(text).replace(ANSI_OSC, "").replace(ANSI_CSI, "").replace(/\r\n/g, "\n")
+}
+
+// eventsText draws a run's events as the CLI's own output: an agent's output as
+// it came, any other kind as one `[kind] text` line, and `started`, which
+// repeats the prompt, not at all. A page cut inside its first event starts at
+// its first whole line, as the CLI's does.
+function eventsText(events) {
+  let text = ""
+  events.forEach((raw, index) => {
+    const kind = asString(raw?.kind)
+    if (kind === "started") return
+    let body = asString(raw?.text)
+    if (kind === "output" || kind === "agent") {
+      if (index === 0 && Number(raw?.offset) > 0) {
+        const newline = body.indexOf("\n")
+        body = newline >= 0 ? body.slice(newline + 1) : ""
+      }
+      text += body
+      return
+    }
+    const line = body.trim()
+    if (line) text += `[${kind}] ${line}\n`
+  })
+  return text
 }
 
 // logText keeps the end of the output: its last lines inside the byte cap.
@@ -338,6 +364,11 @@ export default {
       return value
     }
 
+    // Whether the binary here knows `dispatch events`, by its path: a Dispatch
+    // from before it answers `unknown command "events"`, and the log falls back
+    // to the output the run ended with, as it always read it.
+    const eventsKnown = new Map()
+
     const registration = await ctx.rpc.register(Dispatch, {
       state: async () => state(),
       setEnabled: async (input) => {
@@ -394,36 +425,55 @@ export default {
       },
       // The agents and models a forced conversation can send its runs to.
       targets: async () => targets(),
-      // log answers the end of a run's output for the panel's log view, with
-      // the run's status so the view knows when to stop asking.
+      // log answers the end of a run's log for the panel's view, with the run's
+      // status so the view knows when to stop asking: `dispatch events` has it
+      // while the run works, one source for a running run and an ended one.
       log: async (input) => {
         const id = asString(input.runID)
         if (!RUN_ID.test(id)) return { status: "", text: "", lines: 0, error: "not a run id" }
         const cwd = asString(input.directory)
-        const read = async (offset, limit) => {
-          const out = await exec(
-            binary(),
-            ["result", id, "--section", "output", "--json", "--offset", String(offset), "--limit", String(limit)],
-            { cwd, timeout: READ_TIMEOUT_MS },
-          )
+        const file = binary()
+        const read = async (args) => {
+          const out = await exec(file, args, { cwd, timeout: READ_TIMEOUT_MS })
           const body = parseJSON(out.stdout)
-          if (out.code !== 0 || !body) return { error: out.stderr || `dispatch result exited ${out.code}` }
+          if (out.code !== 0 || !body) return { error: out.stderr || `dispatch ${args[0]} exited ${out.code}`, out }
           return { body }
         }
-        const offset = Number.isInteger(input.offset) && input.offset > 0 ? input.offset : 0
-        const first = await read(offset, LOG_LINES)
+        const view = (status, raw) => {
+          const text = logText(raw)
+          const rows = text ? text.split("\n") : []
+          if (rows.length && !rows[rows.length - 1]) rows.pop()
+          return { status: asString(status), text, lines: rows.length }
+        }
+        // A binary from before `dispatch events` answers `unknown command
+        // "events"`; it reads the output the run ended with instead. The answer
+        // is kept until the binary changes.
+        if (eventsKnown.get(file) !== false) {
+          const page = await read(["events", id, "--json", "--tail-bytes", String(LOG_BYTES)])
+          if (!page.error) {
+            eventsKnown.set(file, true)
+            return view(page.body.status, eventsText(Array.isArray(page.body.events) ? page.body.events : []))
+          }
+          if (!(page.out.code === 2 && UNKNOWN_EVENTS.test(page.out.stderr))) {
+            return { status: "", text: "", lines: 0, error: page.error }
+          }
+          eventsKnown.set(file, false)
+        }
+        const output = async (offset, limit) => {
+          const page = await read(["result", id, "--section", "output", "--json", "--offset", String(offset), "--limit", String(limit)])
+          if (page.error) return page
+          return { body: page.body }
+        }
+        const first = await output(0, LOG_LINES)
         if (first.error) return { status: "", text: "", lines: 0, error: first.error }
         const total = typeof first.body.total_lines === "number" ? first.body.total_lines : 0
         // The end of a longer output, which the first read ends short of.
         let page = first
-        if (!offset && total > LOG_LINES) {
-          page = await read(total - LOG_LINES, LOG_LINES)
+        if (total > LOG_LINES) {
+          page = await output(total - LOG_LINES, LOG_LINES)
           if (page.error) return { status: "", text: "", lines: 0, error: page.error }
         }
-        const text = logText(asString(page.body.content))
-        const rows = text ? text.split("\n") : []
-        if (rows.length && !rows[rows.length - 1]) rows.pop()
-        return { status: asString(page.body.status), text, lines: rows.length }
+        return view(page.body.status, asString(page.body.content))
       },
     })
 
