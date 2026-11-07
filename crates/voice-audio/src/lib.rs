@@ -1,23 +1,20 @@
-//! Audio I/O for the voice engine: microphone capture, playback, and level
-//! metering, on CPAL.
-//!
-//! CONTRACT (owned by the architect; implementations may add private items and
-//! extra public helpers, but must keep these signatures):
-//!
-//! - CPAL streams are `!Send` on macOS, so each stream lives on a dedicated OS
-//!   thread owned by its handle. Handles are `Send + Sync` and stop their
-//!   thread on `stop()`/`Drop`. Nothing here touches tokio.
-//! - Capture delivers mono `f32` frames at 16 kHz (whisper's rate), resampled
-//!   from the device's native rate and format, in chunks of `CAPTURE_CHUNK`
-//!   samples (32 ms). The callback runs on the audio thread side: it must not
-//!   block (use it to push into a channel).
-//! - Playback accepts mono `f32` at any sample rate and resamples to the
-//!   device. Audio is streamed: `PlaybackHandle::push` appends samples while
-//!   it plays, so TTS can start before synthesis ends.
-//! - The device is opened only while capturing or playing: no background audio
-//!   work when idle.
+//! Audio I/O for the voice engine.
 
-use std::time::Duration;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::Sample;
+use ringbuf::{
+    traits::{Consumer, Observer, Producer, Split},
+    HeapRb,
+};
+use std::{
+    collections::VecDeque,
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc, Arc,
+    },
+    thread,
+    time::{Duration, Instant},
+};
 
 /// Capture sample rate delivered to callers.
 pub const CAPTURE_RATE: u32 = 16_000;
@@ -30,7 +27,6 @@ pub const LEVEL_INTERVAL: Duration = Duration::from_millis(33);
 pub enum AudioError {
     #[error("no {0} audio device")]
     NoDevice(&'static str),
-    /// macOS refused microphone access (or delivered only silence because of it).
     #[error("microphone permission denied")]
     PermissionDenied,
     #[error("audio device error: {0}")]
@@ -46,105 +42,688 @@ pub struct Level {
     pub peak: f32,
 }
 
-/// Accumulates samples and yields a `Level` every `LEVEL_INTERVAL` worth of
-/// audio at `sample_rate`.
+/// Accumulates samples and yields a `Level` every `LEVEL_INTERVAL` worth of audio at `sample_rate`.
 pub struct LevelMeter {
-    _private: (),
+    window: usize,
+    sum_sq: f64,
+    peak: f32,
+    count: usize,
 }
 
 impl LevelMeter {
     pub fn new(sample_rate: u32) -> Self {
-        let _ = sample_rate;
-        unimplemented!("voice-audio: LevelMeter::new")
+        Self {
+            window: ((sample_rate as u64 * LEVEL_INTERVAL.as_nanos() as u64) / 1_000_000_000).max(1)
+                as usize,
+            sum_sq: 0.0,
+            peak: 0.0,
+            count: 0,
+        }
     }
-
-    /// Feeds samples; returns the levels completed by them (usually 0 or 1).
     pub fn push(&mut self, samples: &[f32]) -> Vec<Level> {
-        let _ = samples;
-        unimplemented!("voice-audio: LevelMeter::push")
+        let mut levels = Vec::new();
+        for &sample in samples {
+            let value = sample.clamp(-1.0, 1.0);
+            self.sum_sq += f64::from(value) * f64::from(value);
+            self.peak = self.peak.max(value.abs());
+            self.count += 1;
+            if self.count == self.window {
+                levels.push(Level {
+                    rms: (self.sum_sq / self.count as f64).sqrt() as f32,
+                    peak: self.peak,
+                });
+                self.sum_sq = 0.0;
+                self.peak = 0.0;
+                self.count = 0;
+            }
+        }
+        levels
     }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct CaptureConfig {
-    /// Device name; `None` is the system default input.
     pub device: Option<String>,
 }
 
-/// A running capture. Dropping it stops the stream and releases the device.
 pub struct CaptureHandle {
-    _private: (),
+    stop: mpsc::Sender<()>,
+    muted: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
 }
-
 impl CaptureHandle {
-    /// Mutes delivery: the callback receives zeros while muted.
     pub fn set_muted(&self, muted: bool) {
-        let _ = muted;
-        unimplemented!("voice-audio: CaptureHandle::set_muted")
+        self.muted.store(muted, Ordering::Relaxed);
     }
-
-    pub fn stop(self) {}
+    pub fn stop(mut self) {
+        self.shutdown();
+    }
+    fn shutdown(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+impl Drop for CaptureHandle {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
 }
 
-/// Opens the input device and calls `on_chunk` with 16 kHz mono chunks of
-/// `CAPTURE_CHUNK` samples until the handle is stopped or dropped. Returns
-/// once the stream is actually running (or failed to start).
-pub fn start_capture<F>(config: CaptureConfig, on_chunk: F) -> Result<CaptureHandle>
+pub fn start_capture<F>(config: CaptureConfig, mut on_chunk: F) -> Result<CaptureHandle>
 where
     F: FnMut(&[f32]) + Send + 'static,
 {
-    let _ = (config, on_chunk);
-    unimplemented!("voice-audio: start_capture")
+    let (stop_tx, stop_rx) = mpsc::channel();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let muted = Arc::new(AtomicBool::new(false));
+    let muted_worker = muted.clone();
+    let worker = thread::Builder::new().name("voice-audio-capture".into()).spawn(move || {
+        let setup = setup_capture(config, ready_tx);
+        let (stream, mut samples, channels, rate) = match setup { Ok(v) => v, Err(()) => return };
+        let _stream = stream;
+        let mut chunk = Vec::with_capacity(CAPTURE_CHUNK);
+        let mut pending = Vec::new();
+        let mut phase = 0.0f64;
+        let mut previous_mono = None;
+        let started_at = Instant::now();
+        let mut had_nonzero = false;
+        loop {
+            if stop_rx.try_recv().is_ok() { break; }
+            while let Some(sample) = samples.try_pop() {
+                if started_at.elapsed() < Duration::from_millis(1500) && sample != 0.0 { had_nonzero = true; }
+                pending.push(sample);
+            }
+            let frames = pending.len() / channels;
+            if frames > 1 {
+                for frame in 0..frames {
+                    let base = frame * channels;
+                    let mono = downmix_frame(&pending[base..base + channels]);
+                    resample_frame(previous_mono, mono, &mut phase, CAPTURE_RATE, rate, |sample| {
+                        chunk.push(if muted_worker.load(Ordering::Relaxed) { 0.0 } else { sample });
+                    });
+                    previous_mono = Some(mono);
+                    if chunk.len() == CAPTURE_CHUNK { on_chunk(&chunk); chunk.clear(); }
+                }
+                pending.drain(..(frames * channels));
+            }
+            if started_at.elapsed() >= Duration::from_millis(1500) && !had_nonzero {
+                tracing::warn!("microphone input has produced only zeros for 1.5 seconds; check microphone permission");
+                had_nonzero = true;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    }).map_err(|e| AudioError::Device(e.to_string()))?;
+    match ready_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(())) => Ok(CaptureHandle {
+            stop: stop_tx,
+            muted,
+            thread: Some(worker),
+        }),
+        Ok(Err(err)) => {
+            let _ = worker.join();
+            Err(err)
+        }
+        Err(_) => {
+            let _ = stop_tx.send(());
+            let _ = worker.join();
+            Err(AudioError::Device(
+                "timed out starting capture stream".into(),
+            ))
+        }
+    }
+}
+
+fn setup_capture(
+    config: CaptureConfig,
+    ready: mpsc::SyncSender<Result<()>>,
+) -> std::result::Result<(cpal::Stream, ringbuf::HeapCons<f32>, usize, u32), ()> {
+    let host = cpal::default_host();
+    let device = match config.device {
+        Some(name) => host
+            .input_devices()
+            .ok()
+            .and_then(|mut ds| ds.find(|d| d.name().is_ok_and(|n| n == name)))
+            .ok_or(AudioError::NoDevice("input")),
+        None => host
+            .default_input_device()
+            .ok_or(AudioError::NoDevice("input")),
+    };
+    let device = match device {
+        Ok(d) => d,
+        Err(e) => {
+            let _ = ready.send(Err(e));
+            return Err(());
+        }
+    };
+    let supported = match device.default_input_config() {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = ready.send(Err(map_device_error(e.to_string())));
+            return Err(());
+        }
+    };
+    let channels = supported.channels() as usize;
+    let rate = supported.sample_rate().0;
+    let config = supported.config();
+    let (mut prod, cons) = HeapRb::<f32>::new((rate as usize * channels).max(8192)).split();
+    let error_callback = |_| {};
+    let stream = match supported.sample_format() {
+        cpal::SampleFormat::F32 => build_input::<f32>(
+            &device,
+            &config,
+            move |data| {
+                for &v in data {
+                    let _ = prod.try_push(v);
+                }
+            },
+            error_callback,
+        ),
+        cpal::SampleFormat::I16 => build_input::<i16>(
+            &device,
+            &config,
+            move |data| {
+                for &v in data {
+                    let _ = prod.try_push(v as f32 / 32768.0);
+                }
+            },
+            error_callback,
+        ),
+        cpal::SampleFormat::U16 => build_input::<u16>(
+            &device,
+            &config,
+            move |data| {
+                for &v in data {
+                    let _ = prod.try_push((v as f32 - 32768.0) / 32768.0);
+                }
+            },
+            error_callback,
+        ),
+        cpal::SampleFormat::I8 => build_input::<i8>(
+            &device,
+            &config,
+            move |data| {
+                for &v in data {
+                    let _ = prod.try_push(v as f32 / 128.0);
+                }
+            },
+            error_callback,
+        ),
+        cpal::SampleFormat::U8 => build_input::<u8>(
+            &device,
+            &config,
+            move |data| {
+                for &v in data {
+                    let _ = prod.try_push((v as f32 - 128.0) / 128.0);
+                }
+            },
+            error_callback,
+        ),
+        cpal::SampleFormat::I32 => build_input::<i32>(
+            &device,
+            &config,
+            move |data| {
+                for &v in data {
+                    let _ = prod.try_push(v as f32 / 2_147_483_648.0);
+                }
+            },
+            error_callback,
+        ),
+        cpal::SampleFormat::U32 => build_input::<u32>(
+            &device,
+            &config,
+            move |data| {
+                for &v in data {
+                    let _ = prod.try_push((v as f32 - 2_147_483_648.0) / 2_147_483_648.0);
+                }
+            },
+            error_callback,
+        ),
+        cpal::SampleFormat::I64 => build_input::<i64>(
+            &device,
+            &config,
+            move |data| {
+                for &v in data {
+                    let _ = prod.try_push(v as f64 as f32 / 9_223_372_036_854_775_808.0);
+                }
+            },
+            error_callback,
+        ),
+        cpal::SampleFormat::U64 => build_input::<u64>(
+            &device,
+            &config,
+            move |data| {
+                for &v in data {
+                    let _ = prod.try_push(
+                        ((v as f64 - 9_223_372_036_854_775_808.0) / 9_223_372_036_854_775_808.0)
+                            as f32,
+                    );
+                }
+            },
+            error_callback,
+        ),
+        cpal::SampleFormat::F64 => build_input::<f64>(
+            &device,
+            &config,
+            move |data| {
+                for &v in data {
+                    let _ = prod.try_push(v as f32);
+                }
+            },
+            error_callback,
+        ),
+        fmt => {
+            let _ = ready.send(Err(AudioError::Device(format!(
+                "unsupported input sample format: {fmt:?}"
+            ))));
+            return Err(());
+        }
+    };
+    let stream = match stream {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = ready.send(Err(map_device_error(e.to_string())));
+            return Err(());
+        }
+    };
+    if let Err(e) = stream.play() {
+        let _ = ready.send(Err(map_device_error(e.to_string())));
+        return Err(());
+    }
+    let _ = ready.send(Ok(()));
+    Ok((stream, cons, channels, rate))
+}
+
+fn build_input<T, F>(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    mut convert: F,
+    error: impl FnMut(cpal::StreamError) + Send + 'static,
+) -> std::result::Result<cpal::Stream, cpal::BuildStreamError>
+where
+    T: cpal::SizedSample,
+    F: FnMut(&[T]) + Send + 'static,
+{
+    device.build_input_stream(config, move |data: &[T], _| convert(data), error, None)
+}
+fn map_device_error(message: String) -> AudioError {
+    let lower = message.to_lowercase();
+    if lower.contains("permission") || lower.contains("not authorized") || lower.contains("denied")
+    {
+        AudioError::PermissionDenied
+    } else {
+        AudioError::Device(message)
+    }
+}
+
+fn downmix_frame(frame: &[f32]) -> f32 {
+    if frame.is_empty() {
+        0.0
+    } else {
+        frame.iter().copied().sum::<f32>() / frame.len() as f32
+    }
+}
+
+fn resample_frame(
+    previous: Option<f32>,
+    current: f32,
+    phase: &mut f64,
+    output_rate: u32,
+    input_rate: u32,
+    mut emit: impl FnMut(f32),
+) -> usize {
+    let step = f64::from(output_rate) / f64::from(input_rate.max(1));
+    *phase += step;
+    let mut emitted = 0;
+    while *phase >= 1.0 - 1e-12 {
+        *phase = (*phase - 1.0).max(0.0);
+        let fraction = (1.0 - *phase / step).clamp(0.0, 1.0) as f32;
+        let sample = previous.map_or(current, |last| last + (current - last) * fraction);
+        emit(sample);
+        emitted += 1;
+    }
+    emitted
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct PlaybackConfig {
-    /// Device name; `None` is the system default output.
     pub device: Option<String>,
 }
-
-/// Events a playback reports from its audio thread.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PlaybackEvent {
-    /// The first non-silent buffer reached the device.
     Started,
-    /// Output level of what is being heard, every `LEVEL_INTERVAL`.
     Level(Level),
-    /// Everything pushed before `finish()` has played, or `cancel()` ran.
     Ended { cancelled: bool },
 }
 
-/// One playback stream.
+enum PlayCommand {
+    Push(Vec<f32>),
+    Finish,
+    Cancel,
+}
 pub struct PlaybackHandle {
-    _private: (),
+    tx: mpsc::Sender<PlayCommand>,
+    thread: Option<thread::JoinHandle<()>>,
 }
-
 impl PlaybackHandle {
-    /// Appends mono samples at the stream's input rate.
     pub fn push(&self, samples: &[f32]) {
-        let _ = samples;
-        unimplemented!("voice-audio: PlaybackHandle::push")
+        let _ = self.tx.send(PlayCommand::Push(samples.to_vec()));
     }
-
-    /// No more samples will come; `Ended { cancelled: false }` follows once the
-    /// buffer drains.
     pub fn finish(&self) {
-        unimplemented!("voice-audio: PlaybackHandle::finish")
+        let _ = self.tx.send(PlayCommand::Finish);
     }
-
-    /// Stops at once (with a ~5 ms fade to avoid a click) and drops the buffer.
     pub fn cancel(&self) {
-        unimplemented!("voice-audio: PlaybackHandle::cancel")
+        let _ = self.tx.send(PlayCommand::Cancel);
+    }
+}
+impl Drop for PlaybackHandle {
+    fn drop(&mut self) {
+        let _ = self.tx.send(PlayCommand::Cancel);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
     }
 }
 
-/// Opens the output device for samples at `input_rate` and reports events
-/// through `on_event` (called from a non-realtime thread; it may block
-/// briefly). The device is released after `Ended`.
-pub fn start_playback<F>(config: PlaybackConfig, input_rate: u32, on_event: F) -> Result<PlaybackHandle>
+pub fn start_playback<F>(
+    config: PlaybackConfig,
+    input_rate: u32,
+    on_event: F,
+) -> Result<PlaybackHandle>
 where
     F: FnMut(PlaybackEvent) + Send + 'static,
 {
-    let _ = (config, input_rate, on_event);
-    unimplemented!("voice-audio: start_playback")
+    if input_rate == 0 {
+        return Err(AudioError::Device(
+            "input sample rate must be greater than zero".into(),
+        ));
+    }
+    let (tx, rx) = mpsc::channel();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let worker = thread::Builder::new()
+        .name("voice-audio-playback".into())
+        .spawn(move || run_playback(config, input_rate, rx, ready_tx, on_event))
+        .map_err(|e| AudioError::Device(e.to_string()))?;
+    match ready_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(())) => Ok(PlaybackHandle {
+            tx,
+            thread: Some(worker),
+        }),
+        Ok(Err(e)) => {
+            let _ = worker.join();
+            Err(e)
+        }
+        Err(_) => {
+            let _ = tx.send(PlayCommand::Cancel);
+            let _ = worker.join();
+            Err(AudioError::Device(
+                "timed out starting playback stream".into(),
+            ))
+        }
+    }
+}
+
+fn run_playback<F: FnMut(PlaybackEvent)>(
+    config: PlaybackConfig,
+    input_rate: u32,
+    rx: mpsc::Receiver<PlayCommand>,
+    ready: mpsc::SyncSender<Result<()>>,
+    mut on_event: F,
+) {
+    let host = cpal::default_host();
+    let device = match config.device {
+        Some(name) => host
+            .output_devices()
+            .ok()
+            .and_then(|mut ds| ds.find(|d| d.name().is_ok_and(|n| n == name))),
+        None => host.default_output_device(),
+    };
+    let Some(device) = device else {
+        let _ = ready.send(Err(AudioError::NoDevice("output")));
+        return;
+    };
+    let supported = match device.default_output_config() {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = ready.send(Err(AudioError::Device(e.to_string())));
+            return;
+        }
+    };
+    let channels = supported.channels() as usize;
+    let rate = supported.sample_rate().0;
+    let config = supported.config();
+    let (mut prod, mut cons) = HeapRb::<f32>::new((rate as usize * channels).max(8192)).split();
+    let (mut played_prod, mut played_cons) = HeapRb::<f32>::new((rate as usize).max(8192)).split();
+    let fade = Arc::new(AtomicUsize::new(0));
+    let cancelling = Arc::new(AtomicBool::new(false));
+    let fade_cb = fade.clone();
+    let cancelling_cb = cancelling.clone();
+    let fade_total = (rate as usize / 200).max(1);
+    macro_rules! output_stream {
+        ($sample:ty) => {
+            device.build_output_stream::<$sample, _, _>(
+                &config,
+                move |data, _| {
+                    output_callback(
+                        data,
+                        channels,
+                        &mut cons,
+                        &mut played_prod,
+                        &fade_cb,
+                        &cancelling_cb,
+                        fade_total,
+                    )
+                },
+                |_| {},
+                None,
+            )
+        };
+    }
+    let stream = match supported.sample_format() {
+        cpal::SampleFormat::F32 => output_stream!(f32),
+        cpal::SampleFormat::I16 => output_stream!(i16),
+        cpal::SampleFormat::U16 => output_stream!(u16),
+        cpal::SampleFormat::I8 => output_stream!(i8),
+        cpal::SampleFormat::U8 => output_stream!(u8),
+        cpal::SampleFormat::I32 => output_stream!(i32),
+        cpal::SampleFormat::U32 => output_stream!(u32),
+        cpal::SampleFormat::I64 => output_stream!(i64),
+        cpal::SampleFormat::U64 => output_stream!(u64),
+        cpal::SampleFormat::F64 => output_stream!(f64),
+        fmt => {
+            let _ = ready.send(Err(AudioError::Device(format!(
+                "unsupported output sample format: {fmt:?}"
+            ))));
+            return;
+        }
+    };
+    let stream = match stream {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = ready.send(Err(AudioError::Device(e.to_string())));
+            return;
+        }
+    };
+    if let Err(e) = stream.play() {
+        let _ = ready.send(Err(AudioError::Device(e.to_string())));
+        return;
+    }
+    let _stream = stream;
+    let _ = ready.send(Ok(()));
+    let mut meter = LevelMeter::new(rate);
+    let mut started = false;
+    let mut finished = false;
+    let mut cancelled = false;
+    let mut input = VecDeque::<f32>::new();
+    let mut resampled = VecDeque::<f32>::new();
+    let mut phase = 0.0f64;
+    let mut previous_input = None;
+    let mut meter_samples = Vec::with_capacity(rate as usize / 15);
+    loop {
+        match rx.recv_timeout(Duration::from_millis(4)) {
+            Ok(PlayCommand::Push(data)) => input.extend(data),
+            Ok(PlayCommand::Finish) => finished = true,
+            Ok(PlayCommand::Cancel) => {
+                cancelled = true;
+                finished = true;
+                input.clear();
+                resampled.clear();
+                cancelling.store(true, Ordering::Relaxed);
+                fade.store(fade_total, Ordering::Relaxed);
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                cancelled = true;
+                finished = true;
+                input.clear();
+                resampled.clear();
+                cancelling.store(true, Ordering::Relaxed);
+                fade.store(fade_total, Ordering::Relaxed);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        while resampled.len() < 2048 {
+            let Some(current) = input.pop_front() else {
+                break;
+            };
+            resample_frame(
+                previous_input,
+                current,
+                &mut phase,
+                rate,
+                input_rate,
+                |sample| resampled.push_back(sample),
+            );
+            previous_input = Some(current);
+        }
+        while !prod.is_full() {
+            let Some(sample) = resampled.pop_front() else {
+                break;
+            };
+            let _ = prod.try_push(sample);
+        }
+        meter_samples.clear();
+        while let Some(sample) = played_cons.try_pop() {
+            meter_samples.push(sample);
+        }
+        if meter_samples.iter().any(|s| *s != 0.0) && !started {
+            started = true;
+            on_event(PlaybackEvent::Started);
+        }
+        for level in meter.push(&meter_samples) {
+            on_event(PlaybackEvent::Level(level));
+        }
+        if finished
+            && input.is_empty()
+            && resampled.is_empty()
+            && prod.is_empty()
+            && played_cons.is_empty()
+            && fade.load(Ordering::Relaxed) == 0
+        {
+            on_event(PlaybackEvent::Ended { cancelled });
+            break;
+        }
+    }
+}
+
+fn output_callback<T>(
+    data: &mut [T],
+    channels: usize,
+    consumer: &mut impl Consumer<Item = f32>,
+    played: &mut impl Producer<Item = f32>,
+    fade: &AtomicUsize,
+    cancelling: &AtomicBool,
+    fade_total: usize,
+) where
+    T: cpal::SizedSample + cpal::FromSample<f32>,
+{
+    for frame in data.chunks_mut(channels) {
+        let mut sample = consumer.try_pop().unwrap_or(0.0);
+        let remaining = fade.load(Ordering::Relaxed);
+        if cancelling.load(Ordering::Relaxed) && remaining > 0 {
+            sample *= remaining as f32 / fade_total as f32;
+            fade.fetch_sub(1, Ordering::Relaxed);
+        } else if cancelling.load(Ordering::Relaxed) {
+            sample = 0.0;
+        }
+        let _ = played.try_push(sample);
+        let output = T::from_sample(sample);
+        for out in frame {
+            *out = output;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handles_are_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<CaptureHandle>();
+        assert_send_sync::<PlaybackHandle>();
+    }
+
+    #[test]
+    fn level_meter_reports_window_rms_and_peak() {
+        let mut meter = LevelMeter::new(1000);
+        assert!(meter.push(&[0.5; 32]).is_empty());
+        let levels = meter.push(&[0.5; 1]);
+        assert_eq!(
+            levels,
+            vec![Level {
+                rms: 0.5,
+                peak: 0.5
+            }]
+        );
+    }
+    #[test]
+    fn resampling_downmix_and_chunking_contract() {
+        assert_eq!(downmix_frame(&[0.25, 0.75]), 0.5);
+        let mut phase = 0.0;
+        let mut samples = Vec::new();
+        let mut previous = None;
+        for _ in 0..48_000 {
+            resample_frame(previous, 0.25, &mut phase, CAPTURE_RATE, 48_000, |sample| {
+                samples.push(sample)
+            });
+            previous = Some(0.25);
+        }
+        assert_eq!(samples.len(), 16_000);
+        assert_eq!(samples.chunks_exact(CAPTURE_CHUNK).len(), 31);
+        assert!(samples
+            .chunks_exact(CAPTURE_CHUNK)
+            .all(|chunk| chunk.iter().all(|v| *v == 0.25)));
+
+        let mut interpolated = Vec::new();
+        let mut phase = 0.0;
+        resample_frame(Some(0.0), 1.0, &mut phase, 2, 1, |sample| {
+            interpolated.push(sample)
+        });
+        assert_eq!(interpolated, vec![0.5, 1.0]);
+    }
+
+    #[test]
+    #[ignore = "requires a microphone device and permission"]
+    fn capture_device_available() {
+        start_capture(CaptureConfig::default(), |_| {})
+            .unwrap()
+            .stop();
+    }
+
+    #[test]
+    #[ignore = "requires an output device"]
+    fn playback_device_available() {
+        let (ended_tx, ended_rx) = mpsc::channel();
+        let playback = start_playback(PlaybackConfig::default(), CAPTURE_RATE, move |event| {
+            if matches!(event, PlaybackEvent::Ended { cancelled: false }) {
+                let _ = ended_tx.send(());
+            }
+        })
+        .unwrap();
+        playback.push(&[0.1; 1600]);
+        playback.finish();
+        ended_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    }
 }
