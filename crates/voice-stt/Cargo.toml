@@ -10,7 +10,7 @@ rust-version.workspace = true
 voice-core.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-ort = { version = "2.0.0-rc.15", default-features = false, features = ["std", "ndarray", "download-binaries", "api-22"] }
+ort.workspace = true
 whisper-rs = { version = "0.16.0", features = ["tracing_backend"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
