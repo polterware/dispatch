@@ -321,6 +321,69 @@ fn a_read_only_run_answers_and_is_listed() {
 }
 
 #[test]
+fn events_show_a_running_runs_log_and_an_ended_ones() {
+    let env = Env::new();
+    // A run still working shows what it holds so far: its prompt, and the events the
+    // app would draw, without waiting for it to end.
+    let slow = env.run("SLOW events", &["--readonly"]);
+    env.wait_for(&slow, "RUNNING");
+    let live = env.json(&["events", &slow[..8], "--json"]);
+    assert_eq!(live["status"], "RUNNING", "{live}");
+    let events = items(&live["events"]);
+    assert!(!events.is_empty(), "a running run has no events: {live}");
+    assert!(
+        events.iter().any(|e| e["text"]
+            .as_str()
+            .is_some_and(|t| t.contains("SLOW events"))),
+        "the running run's prompt is missing: {live}"
+    );
+    assert!(live["more"].is_boolean(), "{live}");
+    env.ok(&["cancel", &slow]);
+    env.wait_for(&slow, "CANCELLED");
+
+    // A run that ended before anyone watched it still has its agent's log: reading it is
+    // a snapshot of what the agent printed, as the app draws it.
+    let id = env.run("say hi", &["--readonly"]);
+    env.wait_for(&id, "COMPLETED");
+    let done = env.json(&["events", &id, "--json"]);
+    assert_eq!(done["status"], "COMPLETED", "{done}");
+    let events = items(&done["events"]);
+    assert!(
+        events.iter().any(|e| e["kind"] == "output"
+            && e["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("Fake agent done."))),
+        "the ended run's agent log is missing: {done}"
+    );
+    let first = &events[0];
+    assert!(first["seq"].as_i64().is_some_and(|n| n > 0), "{done}");
+    assert!(first["offset"].as_i64().is_some(), "{done}");
+    assert!(
+        env.ok(&["events", &id]).contains("Fake agent done."),
+        "the human output is not the log"
+    );
+
+    // A page from before an event reads further back, and a huge tail is still bounded.
+    let last = events.last().expect("events");
+    let earlier = env.json(&[
+        "events",
+        &id,
+        "--before-seq",
+        &last["seq"].as_i64().unwrap_or(0).to_string(),
+        "--before-offset",
+        &last["offset"].as_i64().unwrap_or(0).to_string(),
+        "--json",
+    ]);
+    assert!(earlier["events"].is_array(), "{earlier}");
+    assert!(
+        env.json(&["events", &id, "--tail-bytes", "1", "--json"])["events"]
+            .as_array()
+            .is_some(),
+        "a one-byte tail has no page"
+    );
+}
+
+#[test]
 fn a_write_run_lands_on_its_branch_and_merges() {
     let env = Env::new();
     let id = env.run("WRITE a file", &[]);

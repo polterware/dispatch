@@ -23,6 +23,7 @@ const RUN_USAGE: &str = "usage: dispatch run [--tier <auto|easy|normal|hard>] [-
        dispatch runs [--conversation <id>] [--project <id>] [--json] [--compact]
        dispatch status <id> [--json] [--compact]
        dispatch result <id> [--section summary|agent|files|attempts|meta|output] [--offset <n>] [--limit <n>] [--json] [--compact]
+       dispatch events <id> [--tail-bytes <n>] [--before-seq <n> --before-offset <n>] [--json] [--compact]
        dispatch cancel <id> [--json] [--compact]
        dispatch tiers [--check] [--json] [--compact]
        dispatch tiers build [--agent <a>] [--apply] [--json]
@@ -42,6 +43,9 @@ fn usage() -> Fail {
 }
 
 const PROJECT_USAGE: &str = "workspace id (default: the workspace holding the cwd)";
+
+/// How much of a run's log `dispatch events` reads by default, from its end.
+const DEFAULT_EVENT_BYTES: i64 = 256 * 1024;
 
 /// The flags most run commands share.
 fn common(f: &mut Flags) {
@@ -890,6 +894,157 @@ pub(super) async fn result(db_path: &Path, args: &[String]) -> CliResult {
     }
 }
 
+pub(super) async fn events(db_path: &Path, args: &[String]) -> CliResult {
+    let mut f = Flags::new("dispatch events");
+    f.int(
+        "tail-bytes",
+        DEFAULT_EVENT_BYTES,
+        "bytes of the run's log to read, from its end",
+    )
+    .int(
+        "before-seq",
+        0,
+        "read the page before this event's seq (0 reads the run's end)",
+    )
+    .int("before-offset", 0, "bytes into that event's text");
+    common(&mut f);
+    let positional = f.parse_interspersed(args)?;
+    let id = one_id(&positional)?;
+    let (c, _) = dial_workspace(db_path, &f.str("project")).await?;
+    let run = get_run(&c, &id).await?;
+    let res = c
+        .dispatch
+        .read_run_events(&pb::ReadRunEventsRequest {
+            id: run.id.clone(),
+            before_seq: f.int_value("before-seq"),
+            before_offset: f.int_value("before-offset"),
+            max_bytes: f.int_value("tail-bytes"),
+        })
+        .await
+        .map_err(run_error)?;
+    if f.flag("json") {
+        let events: Vec<Value> = res
+            .events
+            .iter()
+            .map(|e| {
+                json!({
+                    "seq": e.seq,
+                    "offset": e.text_offset,
+                    "kind": e.kind,
+                    "text": e.text,
+                })
+            })
+            .collect();
+        let payload = json!({
+            "status": run.status,
+            "events": events,
+            "more": res.more,
+        });
+        write_json_compact(&payload, f.flag("compact"))?;
+        return Ok(());
+    }
+    let text = events_text(&res.events);
+    if !text.is_empty() {
+        print!("{text}");
+        if !text.ends_with('\n') {
+            println!();
+        }
+    }
+    Ok(())
+}
+
+/// A run's events as the app draws them: output as it came, any other kind as one
+/// `[kind] text` line, and the `started` event, which repeats the prompt, not at all. A page
+/// cut inside the first event starts at its first whole line, as the transcript's does.
+fn events_text(events: &[pb::WatchRunResponse]) -> String {
+    let mut text = String::new();
+    for (index, event) in events.iter().enumerate() {
+        if event.kind == "started" {
+            continue;
+        }
+        if event.kind == "output" || event.kind == "agent" {
+            let body = if index == 0 && event.text_offset > 0 {
+                match event.text.find('\n') {
+                    Some(newline) => &event.text[newline + 1..],
+                    None => "",
+                }
+            } else {
+                &event.text
+            };
+            text.push_str(body);
+            continue;
+        }
+        let line = event.text.trim();
+        if !line.is_empty() {
+            text.push('[');
+            text.push_str(&event.kind);
+            text.push_str("] ");
+            text.push_str(line);
+            text.push('\n');
+        }
+    }
+    strip_ansi(&text)
+}
+
+/// Drops terminal escapes and keeps what a carriage return left visible, as the app does.
+fn strip_ansi(text: &str) -> String {
+    let mut cleaned = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            cleaned.push(ch);
+            continue;
+        }
+        match chars.peek().copied() {
+            Some('[') => {
+                chars.next();
+                let mut params = true;
+                for next in chars.by_ref() {
+                    if params && matches!(next, '0'..='9' | ';' | '?') {
+                        continue;
+                    }
+                    params = false;
+                    if ('\u{20}'..='\u{2f}').contains(&next) {
+                        continue;
+                    }
+                    if ('\u{40}'..='\u{7e}').contains(&next) {
+                        break;
+                    }
+                    cleaned.push(next);
+                    break;
+                }
+            }
+            Some(']') => {
+                chars.next();
+                while let Some(next) = chars.next() {
+                    if next == '\u{7}' {
+                        break;
+                    }
+                    if next == '\u{1b}' && chars.peek() == Some(&'\\') {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            Some(next) if ('@'..='Z').contains(&next) || matches!(next, '\\' | '_' | '-') => {
+                chars.next();
+            }
+            _ => {}
+        }
+    }
+    cleaned
+        .split('\n')
+        .map(|line| {
+            let trimmed = line.strip_suffix('\r').unwrap_or(line);
+            match trimmed.rfind('\r') {
+                Some(index) => &trimmed[index + 1..],
+                None => trimmed,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub(super) async fn tiers(db_path: &Path, args: &[String]) -> CliResult {
     let mut f = Flags::new("dispatch tiers");
     f.bool(
@@ -1309,6 +1464,31 @@ mod tests {
             " conversation=codex:0123456789ab"
         );
         assert_eq!(format_files(Some(3), Some(10), Some(2)), "files=3 +10 -2");
+    }
+
+    #[test]
+    fn events_read_as_the_app_draws_them() {
+        let event = |kind: &str, text: &str| pb::WatchRunResponse {
+            seq: 1,
+            kind: kind.into(),
+            text: text.into(),
+            at: String::new(),
+            text_offset: 0,
+        };
+        let text = events_text(&[
+            event("started", "the prompt"),
+            event("output", "\u{1b}[32mok\u{1b}[0m\n"),
+            event("merged", "dispatch/r1\n"),
+        ]);
+        assert_eq!(text, "ok\n[merged] dispatch/r1\n");
+        // A page cut inside the first event starts at its first whole line.
+        let cut = pb::WatchRunResponse {
+            text_offset: 7,
+            ..event("output", "e end\nnext line\n")
+        };
+        assert_eq!(events_text(&[cut]), "next line\n");
+        assert_eq!(strip_ansi("10%\r50%\r100%"), "100%");
+        assert_eq!(strip_ansi("\u{1b}[1mbold\u{1b}[0m"), "bold");
     }
 
     #[test]

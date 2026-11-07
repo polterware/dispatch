@@ -820,7 +820,18 @@ impl Core {
         m: pb::ReadRunEventsRequest,
     ) -> RpcResult<pb::ReadRunEventsResponse> {
         let id = self.full_run_id(&m.id)?;
-        self.store.get_run(&id).map_err(store_error)?;
+        let run = self.store.get_run(&id).map_err(store_error)?;
+        // A read at the run's end is a snapshot of its log so far, a live run included: what
+        // its agent printed since the last reader becomes an output event first, as watching
+        // it does, so a reader that never watches still sees the text.
+        if m.before_seq <= 0 {
+            let log = self
+                .state_dir()
+                .join("logs")
+                .join(format!("{id}.agent.log"));
+            self.sync_agent_log(&run, &log)
+                .map_err(RpcError::internal)?;
+        }
         let before =
             (m.before_seq > 0).then(|| (m.before_seq, u64::try_from(m.before_offset).unwrap_or(0)));
         let (events, more, _) = self.event_page(&id, before, page_bytes(m.max_bytes))?;
