@@ -13,6 +13,10 @@ import { Dispatch } from "./rpc.js"
 
 const NATIVE_SUBAGENT = "subagent"
 const TOOLS = ["dispatch_run", "dispatch_wait", "dispatch_merge"]
+// The tools that would let an agent do the work itself. Built-in OpenCode
+// tools carry no namespace prefix; an MCP server's do, so these names are its
+// editor and its shell alone.
+const WORK_TOOLS = ["edit", "write", "patch", "apply_patch", "multiedit", "bash", "shell"]
 const TIERS = ["auto", "easy", "normal", "hard"]
 const TERMINAL = new Set(["COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT", "ORPHANED"])
 // One `dispatch wait` call; a longer run is waited on again.
@@ -33,6 +37,14 @@ const INSTRUCTIONS = [
   "To hand a task to another coding agent, call dispatch_run with a self-contained brief: the goal, what it may and may not touch, the exact test command, and a final report in at most 10 lines. Give paths, never pasted code.",
   "dispatch_run waits for the run and returns its summary and the agent's reply. Independent tasks go in the same response, one dispatch_run each. With wait false it returns the run id at once; call dispatch_wait on it before you end the turn.",
   "A COMPLETED write run leaves its work in a worktree: check it, run the tests, then call dispatch_merge. Do not delegate a one-line change or work that needs this whole conversation.",
+].join("\n")
+
+// FORCED is what a conversation the user ticked Delegate in gets on every
+// model call, in front of the instructions above.
+const FORCED = [
+  "This conversation is forced to delegate: every task in this turn that reads code, edits files, runs tests, or reviews work MUST go through dispatch_run.",
+  "Start independent tasks in the same response, one dispatch_run each, and wait for every run (wait true, or dispatch_wait) before you end the turn.",
+  "Do not do that work yourself: you may talk to the user, plan, and call dispatch_run, dispatch_wait, and dispatch_merge.",
 ].join("\n")
 
 function home() {
@@ -224,6 +236,18 @@ export default {
       return reachable.ok
     }
 
+    // The Delegate check, per conversation (the root session): kept in memory
+    // for the model calls and in storage, so it survives a restart.
+    const forced = new Map()
+    const forceKey = (id) => `force/${id}`
+    const forceOf = async (id) => {
+      if (forced.has(id)) return forced.get(id)
+      const saved = await ctx.storage.get(forceKey(id)).catch(() => undefined)
+      const value = saved === true
+      forced.set(id, value)
+      return value
+    }
+
     const registration = await ctx.rpc.register(Dispatch, {
       state: async () => state(),
       setEnabled: async (input) => {
@@ -255,6 +279,20 @@ export default {
           runs.push(view)
         }
         return { runs }
+      },
+      // The conversation's Delegate check: true means every model call must
+      // hand its work to Dispatch.
+      force: async (input) => {
+        const root = await conversation(asString(input.sessionID))
+        return { force: await forceOf(root.id) }
+      },
+      setForce: async (input) => {
+        const root = await conversation(asString(input.sessionID))
+        const value = input.force === true
+        forced.set(root.id, value)
+        await ctx.storage.set(forceKey(root.id), value).catch(() => {})
+        await registration.events.emit("forced", { sessionID: root.id, force: value })
+        return { force: value }
       },
       // log answers the end of a run's output for the panel's log view, with
       // the run's status so the view knows when to stop asking.
@@ -419,10 +457,17 @@ export default {
       })
     })
 
-    await ctx.session.hook("context", (event) => {
+    await ctx.session.hook("context", async (event) => {
       if (enabled() && usable()) {
         delete event.tools[NATIVE_SUBAGENT]
         event.system.push({ type: "text", text: INSTRUCTIONS })
+        // A forced conversation is told to delegate, and loses the tools that
+        // would let it do the work itself.
+        const root = await conversation(event.sessionID)
+        if (await forceOf(root.id)) {
+          for (const name of WORK_TOOLS) delete event.tools[name]
+          event.system.push({ type: "text", text: FORCED })
+        }
         return
       }
       for (const name of TOOLS) delete event.tools[name]

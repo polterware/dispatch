@@ -86,6 +86,11 @@ const definition = Plugin.define({
       "log.open": "Open in Dispatch",
       "pill.on": "Dispatch",
       "pill.off": "Dispatch off",
+      // The check beside the runs pill: the label stays Delegate, and the check
+      // and the success tone say whether this conversation must delegate.
+      "pill.force.on": "Delegate",
+      "pill.force.off": "Delegate",
+      "pill.force.title": "Force delegation: this conversation must hand its work to Dispatch",
       "runs.one": "{{count}} run",
       "runs.other": "{{count}} runs",
       "runs.running": "{{count}} running",
@@ -99,6 +104,8 @@ const definition = Plugin.define({
     // Runs by session key, and the last error reading them.
     const [runs, setRuns] = createStore<Record<string, RunView[]>>({});
     const [errors, setErrors] = createStore<Record<string, string>>({});
+    // The conversation's Delegate check, as the server part holds it.
+    const [forced, setForced] = createStore<Record<string, boolean>>({});
 
     const loadState = async () => {
       try {
@@ -121,13 +128,31 @@ const definition = Plugin.define({
     const refresh = async (session: Session | undefined) => {
       if (!session || session.pending) return;
       try {
-        const answer = await rpc().runs({ sessionID: session.id, directory: session.directory || "" });
+        // The runs and the Delegate check at once; a server part that does not
+        // know force yet leaves the check alone rather than the runs missing.
+        const [answer, flag] = await Promise.all([
+          rpc().runs({ sessionID: session.id, directory: session.directory || "" }),
+          rpc().force({ sessionID: session.id, directory: session.directory || "" }).catch(() => undefined),
+        ]);
         // Reconciled by id: a poll that brings the same runs keeps their rows,
         // so each bot stays mounted instead of being made again every poll.
         setRuns(session.key, reconcile(answer.runs || [], { key: "id" }));
         setErrors(session.key, answer.error || "");
+        if (flag) setForced(session.key, flag.force === true);
       } catch (error) {
         setErrors(session.key, String((error as Error)?.message || error));
+      }
+    };
+
+    // toggleForce ticks or unticks the Delegate check: ticked, every model call
+    // of the conversation must hand its work to Dispatch.
+    const toggleForce = async (session: Session) => {
+      const force = !forced[session.key];
+      try {
+        const answer = await rpc().setForce({ sessionID: session.id, directory: session.directory || "", force });
+        setForced(session.key, answer.force === true);
+      } catch (error) {
+        ctx.toast.show({ variant: "error", title: ctx.t("title"), description: String((error as Error)?.message || error) });
       }
     };
 
@@ -174,11 +199,14 @@ const definition = Plugin.define({
 
     let offChanged = () => {};
     let offStarted = () => {};
+    let offForced = () => {};
     try {
       offChanged = rpc().events.on("changed", (event: { data: { enabled: boolean } }) =>
         setStatus((prev) => ({ ...prev, enabled: event.data.enabled })),
       );
       offStarted = rpc().events.on("started", () => void tick());
+      // The check changed in another window, or from the CLI: read it again.
+      offForced = rpc().events.on("forced", () => void tick());
     } catch {
       // The server part is not up yet; polling still finds the runs.
     }
@@ -279,6 +307,24 @@ const definition = Plugin.define({
           tone: on ? "success" : undefined,
           title: ctx.t("command.panel"),
           run: () => openPanel(input.session),
+        };
+      },
+    });
+
+    ctx.add(ComposerPill, {
+      id: "force",
+      // The Delegate check beside it: ticked, the conversation must hand its
+      // work to Dispatch. It goes with delegation, so it is hidden while no
+      // dispatch_run can take the work.
+      show: (input: { session: Session }) => {
+        if (!status().enabled) return undefined;
+        const on = forced[input.session.key] === true;
+        return {
+          icon: on ? "circle-check" : undefined,
+          label: ctx.t(on ? "pill.force.on" : "pill.force.off"),
+          tone: on ? "success" : undefined,
+          title: ctx.t("pill.force.title"),
+          run: () => void toggleForce(input.session),
         };
       },
     });
@@ -480,6 +526,7 @@ const definition = Plugin.define({
       clearTimeout(timer);
       offChanged();
       offStarted();
+      offForced();
     };
   },
 });
