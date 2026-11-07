@@ -40,7 +40,7 @@ describe("voice runtime integration", () => {
         } },
         data: {
           on: (type: string, handler: (event: any) => void) => { handlers.set(type, [...(handlers.get(type) ?? []), handler]); return () => handlers.set(type, (handlers.get(type) ?? []).filter(item => item !== handler)) },
-          message: { list: () => messages, sync: async () => {} },
+          session: { message: { list: () => messages, sync: async () => {} } },
         },
       },
     } satisfies VoiceSession

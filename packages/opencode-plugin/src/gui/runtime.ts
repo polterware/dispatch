@@ -9,7 +9,7 @@ export interface VoiceSession {
     client: { session: { switchModel(input: { sessionID: string; model: { id: string; providerID: string; variant?: string } }): Promise<unknown>; prompt(input: { sessionID: string; text: string }): Promise<unknown> } }
     data: {
       on(type: "session.execution.started" | "session.execution.succeeded" | "session.execution.failed" | "permission.asked", handler: (event: any) => void): () => void
-      message: { list(sessionID: string): Array<{ type?: string; content?: Array<{ type?: string; text?: string }> }>; sync(sessionID: string): Promise<void> }
+      session: { message: { list(sessionID: string): ReadonlyArray<{ type: string }>; sync(sessionID: string): Promise<void> } }
     }
   }
 }
@@ -86,8 +86,10 @@ export function createVoiceRuntime(options: VoiceRuntimeOptions) {
       if (!started || event.data.sessionID !== session.id) return
       void (async () => {
         try {
-          await session.server.data.message.sync(session.id)
-          const last = [...session.server.data.message.list(session.id)].reverse().find(item => item.type === "assistant")
+          await session.server.data.session.message.sync(session.id)
+          const last = [...session.server.data.session.message.list(session.id)].reverse().find(item => item.type === "assistant") as
+            | { type: string; content?: Array<{ type?: string; text?: string }> }
+            | undefined
           const response = extractResponseText({ role: last?.type, parts: last?.content })
           options.controller.dispatch({ type: "turn.ended" })
           clearEvents()

@@ -7,7 +7,7 @@ import type { EngineMessage } from "@local-voice/client"
 import { VoiceBlob } from "./gui/blob.ts"
 import { createVoiceController } from "./gui/controller.ts"
 import { EngineBridge } from "./gui/contract.ts"
-import { createVoiceRuntime } from "./gui/runtime.ts"
+import { createVoiceRuntime, type VoiceSession } from "./gui/runtime.ts"
 import { main } from "./gui/main.ts"
 
 export default Plugin.define({
@@ -23,7 +23,7 @@ export default Plugin.define({
     const runtime = createVoiceRuntime({
       controller: voice,
       send: message => { void bridge.send({ json: JSON.stringify(message) }).catch(failed) },
-      currentSession: () => ctx.sessions.current() as unknown as import("./gui/runtime.ts").VoiceSession | undefined,
+      currentSession: (): VoiceSession | undefined => ctx.sessions.current(),
       currentModel: () => ctx.screen.current()?.composer.model(),
       insert: text => { const screen = ctx.screen.current(); if (!screen) return false; screen.composer.insert(text); return true },
       notice: title => ctx.toast.show({ title }),
@@ -99,9 +99,10 @@ export default Plugin.define({
     ctx.add(Command, (): GUICommand => ({ id: "stop", title: "Stop voice", section: "session", enabled: active(), run: () => { runtime.cancelSpeech(); if (voice.state === "listening") runtime.stopListening() } }))
     ctx.add(Command, (): GUICommand => ({ id: "mute", title: "Mute voice microphone", section: "session", enabled: active(), run: () => runtime.mute(!voice.micMuted) }))
     ctx.add(Command, (): GUICommand => ({ id: "hands-free", title: "Toggle hands-free voice", section: "session", enabled: active(), run: toggleHandsFree }))
+    const panelTab = { id: "main", title: "Voice" }
     ctx.add(Panel, {
       id: "main", region: "side", width: 350,
-      list: () => [{ id: "main", title: "Voice", fallback: true }],
+      list: input => (input.open.includes("main") ? [panelTab] : []),
       render: () => <div class="local-voice-panel" tabIndex={0} onKeyDown={event => { if (event.key === " " && event.target === event.currentTarget) { event.preventDefault(); voice.state === "listening" ? stopTalk() : startTalk() } }}>
         <VoiceBlob state={() => { revision(); return voice.blobState() }} levels={voice.levels} mode="expanded" size={220} theme={theme()} reducedMotion={reducedMotion()} />
         <div class="local-voice-panel__status">{active() ? stateLabel() : "Voice mode off"}{voice.micMuted ? " · mic muted" : ""}</div>
