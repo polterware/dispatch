@@ -326,7 +326,7 @@ impl Deps {
             role_board: Table::default(),
             disabled,
         };
-        let table = self.open_code_table(o, &mut agents, &ro.disabled).await;
+        let table = self.agent_table(o, &mut agents, &ro.disabled).await;
         let (cs, mut rejected) = router::select_candidates(&table, &self.policy, &agents, &ro);
         let mut out = Vec::with_capacity(cs.len());
         for c in cs {
@@ -349,23 +349,24 @@ impl Deps {
         (out, rejected)
     }
 
-    /// Widens a route restricted to OpenCode with the models it lists. Auto
-    /// weighs all of them. A tier route keeps the tier's OpenCode entries when
-    /// the table has some; otherwise it takes the models `build_tiers` would
-    /// put in the tier, best first.
-    async fn open_code_table(
+    /// Widens a route restricted to one agent (`--agent`, no `--model`) with the models that
+    /// agent's CLI lists, so asking for an agent never comes back empty because the tier table
+    /// names none of its models. Auto weighs all of them. A tier route keeps the tier's entries
+    /// for that agent when the table has some; otherwise it takes the models `build_tiers`
+    /// would put in the tier, best first.
+    async fn agent_table(
         &self,
         o: &Options,
         agents: &mut [router::Agent],
         disabled: &[DisabledModel],
     ) -> Table {
-        const OPEN_CODE: &str = crate::reports::OPEN_CODE_AGENT;
         let mut table = self.table.clone();
-        if o.filters.agent != OPEN_CODE || !o.filters.model.is_empty() {
+        let name = o.filters.agent.trim();
+        if name.is_empty() || !o.filters.model.is_empty() {
             return table;
         }
         let Some(a) = self
-            .adapter(OPEN_CODE)
+            .adapter(name)
             .filter(|a| self.is_installed(&a.binary()))
         else {
             return table;
@@ -375,7 +376,7 @@ impl Deps {
             && table
                 .tiers
                 .get(tier)
-                .is_some_and(|es| es.iter().any(|e| e.agent == OPEN_CODE))
+                .is_some_and(|es| es.iter().any(|e| e.agent == name))
         {
             return table;
         }
@@ -384,10 +385,10 @@ impl Deps {
         };
         if !valid_tier(tier) {
             // Auto, or no tier: every listed model is weighed, as if discovered.
-            if let Some(agent) = agents.iter_mut().find(|a| a.name == OPEN_CODE) {
+            if let Some(agent) = agents.iter_mut().find(|a| a.name == name) {
                 agent.discovered = models
                     .into_iter()
-                    .filter(|m| !crate::config::is_model_disabled(disabled, "", OPEN_CODE, &m.id))
+                    .filter(|m| !crate::config::is_model_disabled(disabled, "", name, &m.id))
                     .map(|m| m.id)
                     .collect();
             }
@@ -396,13 +397,13 @@ impl Deps {
         let listed: Vec<crate::tiers::Entry> = models
             .into_iter()
             .map(|m| crate::tiers::Entry {
-                agent: OPEN_CODE.into(),
-                provider: provider_of(OPEN_CODE, &m.id),
+                agent: name.into(),
+                provider: provider_of(name, &m.id),
                 model: m.id,
                 ..crate::tiers::Entry::default()
             })
             .collect();
-        let pool: Vec<_> = crate::reports::agent_pool(OPEN_CODE, &table, &listed)
+        let pool: Vec<_> = crate::reports::agent_pool(name, &table, &listed)
             .into_iter()
             .filter(|e| {
                 !crate::config::is_model_disabled(disabled, &e.provider, &e.agent, &e.model)
@@ -416,7 +417,7 @@ impl Deps {
         let built = crate::tiers_build::build_tiers(&pool, &self.catalog(), priority);
         if let Some(picks) = built.tiers.get(tier) {
             let rows = table.tiers.entry(tier.into()).or_default();
-            rows.retain(|e| e.agent != OPEN_CODE);
+            rows.retain(|e| e.agent != name);
             rows.extend(picks.iter().map(|b| b.entry.clone()));
         }
         table

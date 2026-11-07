@@ -654,14 +654,38 @@ impl Core {
                         return Err(RpcError::invalid(problems.join("; ")));
                     }
                 }
+                if m.action == "save" {
+                    // The board lists only enabled models, so it never sends the disabled
+                    // ones: they stay on the role's board until their model is back on.
+                    let disabled = self.disabled_models();
+                    let off = |e: &roles::RoleEntry| {
+                        config::is_model_disabled(&disabled, &e.provider, &e.agent, &e.model)
+                    };
+                    if let Some(prev) = roles::load_profiles(&user).map_err(invalid)?.get(name) {
+                        let hidden: Vec<roles::RoleEntry> = prev
+                            .tiers
+                            .iter()
+                            .filter(|e| off(e) && !p.tiers.contains(e))
+                            .cloned()
+                            .collect();
+                        p.tiers.extend(hidden);
+                    }
+                }
                 roles::save_profile(&user, name, p, m.action == "remove").map_err(invalid)?;
                 return respond(true, json!({"wrote": user, "name": name}));
             }
             "list" | "check" => {}
             _ => return Err(RpcError::invalid("unknown roles action")),
         }
-        let profiles = self.profiles(dir).map_err(invalid)?;
+        let mut profiles = self.profiles(dir).map_err(invalid)?;
         if m.action == "list" {
+            // A model turned off in Settings > Models leaves every board.
+            let disabled = self.disabled_models();
+            for p in profiles.values_mut() {
+                p.tiers.retain(|e| {
+                    !config::is_model_disabled(&disabled, &e.provider, &e.agent, &e.model)
+                });
+            }
             // user names the roles in the user file, the ones save and remove
             // change; the rest come from the repository's .dispatch/roles.json
             // or the built-in set.

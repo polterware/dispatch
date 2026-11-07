@@ -23,7 +23,7 @@ use crate::client::{
 use crate::models::roles::{
     GENERAL_ROLE, PaletteModel, RoleDraft, RoleListRow, RoleProfile, RoleRow, RoleSource,
     RolesList, TIER_COLUMNS, TierBuild, TierCardInput, TierColumns, TierSlot, board_row_count,
-    build_board, compose_profile, is_build_empty, models_label, palette_card_at, palette_efforts,
+    build_board, compose_profile, is_build_empty, models_label, palette_card_at,
     palette_groups, parse_roles_list, parse_tier_build, place_tier_card, profile_error,
     profile_with_board, remove_tier_card, rename_drops_previous, replace_tier_card,
     role_board_tiers, role_list_rows, role_models_prompt, role_name_error, tier_columns,
@@ -1119,6 +1119,7 @@ impl RolesView {
                                 model: model.model,
                                 provider: model.provider,
                                 tier: model.tier,
+                                efforts: model.efforts,
                             })
                             .collect();
                         view.palette_problems = response.problems;
@@ -2289,7 +2290,7 @@ impl RolesView {
                     // the agent takes is a chip that places the model at it; the row itself
                     // places it at the agent's default.
                     let mut efforts = div().flex_none().flex().items_center().gap(px(2.0));
-                    for effort in palette_efforts(&model.agent) {
+                    for effort in &model.efforts {
                         let at = palette_card_at(&model, effort);
                         let current = replacing
                             .as_ref()

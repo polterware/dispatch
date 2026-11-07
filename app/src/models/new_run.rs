@@ -445,6 +445,7 @@ mod tests {
             model: model.into(),
             provider: "openai".into(),
             tier: String::new(),
+            efforts: Vec::new(),
         }
     }
 

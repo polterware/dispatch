@@ -801,6 +801,8 @@ pub struct PaletteModel {
     pub model: String,
     pub provider: String,
     pub tier: String,
+    /// The efforts the agent takes beside this model, as the core lists them.
+    pub efforts: Vec<String>,
 }
 
 /// Models grouped by agent, filtered by the palette search, agents sorted.
@@ -816,16 +818,6 @@ pub fn palette_groups(models: &[PaletteModel], query: &str) -> Vec<(String, Vec<
             .push(model.clone());
     }
     by_agent.into_iter().collect()
-}
-
-/// The efforts an agent CLI takes beside its model, as the core's probe lists them; the board
-/// writes one into the model's name (`claude-opus-5-5-high`).
-pub fn palette_efforts(agent: &str) -> &'static [&'static str] {
-    match agent {
-        "claude" => &["low", "medium", "high", "xhigh", "max"],
-        "codex" | "pi" => &["low", "medium", "high", "xhigh"],
-        _ => &[],
-    }
 }
 
 /// `model`'s palette card at `effort`, or at the agent's default when `effort` is empty.
@@ -958,13 +950,13 @@ mod tests {
             model: "claude-opus-5-5".into(),
             provider: "anthropic".into(),
             tier: String::new(),
+            efforts: Vec::new(),
         };
         assert_eq!(
             super::palette_card_at(&model, "max").model,
             "claude-opus-5-5-max"
         );
         assert_eq!(super::palette_card_at(&model, "").model, "claude-opus-5-5");
-        assert!(super::palette_efforts("antigravity").is_empty());
     }
     #[test]
     fn a_built_board_names_each_model_at_its_effort_once() {
@@ -1411,12 +1403,14 @@ mod tests {
                 model: "grok-4".into(),
                 provider: "xai".into(),
                 tier: "hard".into(),
+                efforts: Vec::new(),
             },
             PaletteModel {
                 agent: "codex".into(),
                 model: "gpt-mini".into(),
                 provider: "openai".into(),
                 tier: "easy".into(),
+                efforts: Vec::new(),
             },
         ];
         let groups = palette_groups(&models, "grok");

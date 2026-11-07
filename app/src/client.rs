@@ -593,6 +593,7 @@ pub struct DispatchModel {
     pub model: String,
     pub provider: String,
     pub tier: String,
+    pub efforts: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

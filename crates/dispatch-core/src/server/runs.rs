@@ -1172,14 +1172,23 @@ impl Core {
         let mut out = pb::ListModelsResponse::default();
         for (a, r) in listed {
             match r {
-                Ok(models) => out
-                    .models
-                    .extend(models.into_iter().map(|m| pb::DispatchModel {
+                Ok(models) => {
+                    // An agent that takes its effort as a flag lists it beside each model;
+                    // one that names it in the model (antigravity) lists each effort as a model.
+                    let caps = a.capabilities();
+                    let efforts = if caps.effort_mode == "config" {
+                        caps.efforts
+                    } else {
+                        Vec::new()
+                    };
+                    out.models.extend(models.into_iter().map(|m| pb::DispatchModel {
                         agent: a.name(),
                         provider: provider_of(&a.name(), &m.id),
                         model: m.id,
                         tier: m.tier,
-                    })),
+                        efforts: efforts.clone(),
+                    }));
+                }
                 Err(e) => out.problems.push(format!("{}: {e}", a.name())),
             }
         }

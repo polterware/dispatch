@@ -357,6 +357,45 @@ fn roles_and_tiers_are_saved_and_removed() {
     let role = roles(&core)["e2e-checker"].clone();
     assert_eq!(role["tier"], "easy", "{role}");
     assert_eq!(role["tiers"][0]["model"], "fake-fast");
+    // A model that is off leaves the role's board, and a save from the board keeps it.
+    let save = |tiers: serde_json::Value| {
+        let mut p = profile.clone();
+        p["tiers"] = tiers;
+        let res = core
+            .client
+            .subagents(&SubagentsRequest {
+                action: "save".into(),
+                name: "e2e-checker".into(),
+                profile: p.to_string(),
+                ..SubagentsRequest::default()
+            })
+            .expect("save role");
+        assert!(res.ok, "{}", res.json);
+    };
+    save(serde_json::json!([
+        {"tier": "easy", "agent": "fake", "model": "fake-fast"},
+        {"tier": "hard", "agent": "codex", "model": "gpt-6.1-sol"},
+    ]));
+    let board = |core: &Core| {
+        roles(core)["e2e-checker"]["tiers"]
+            .as_array()
+            .unwrap()
+            .len()
+    };
+    assert_eq!(board(&core), 1);
+    save(serde_json::json!([{"tier": "easy", "agent": "fake", "model": "fake-fast"}]));
+    let openai = |enabled: bool| {
+        core.client
+            .set_model_enabled(&dispatch_app::client::SetModelEnabledRequest {
+                provider: "openai".into(),
+                model: String::new(),
+                enabled,
+            })
+            .unwrap();
+    };
+    openai(true);
+    assert_eq!(board(&core), 2);
+    openai(false);
     let removed = core
         .client
         .subagents(&SubagentsRequest {

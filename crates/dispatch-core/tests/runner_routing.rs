@@ -738,3 +738,34 @@ async fn test_discover_adds_normal_candidate_only_when_enabled() {
         "{cs:?} {why:?}"
     );
 }
+
+#[tokio::test]
+async fn test_an_agent_the_table_never_names_routes_on_its_own_models() {
+    let ran = ran();
+    let caps = Capabilities {
+        read_only: true,
+        file_editing: true,
+        effort_mode: "config".into(),
+        efforts: vec!["low".into(), "medium".into(), "high".into(), "xhigh".into()],
+        ..Capabilities::default()
+    };
+    let a = Fake::new("a", &ran).caps(caps.clone());
+    let mut c = Fake::new("c", &ran).caps(caps);
+    c.models = vec!["gpt-large".into(), "gpt-small".into()];
+    let mut t = test_deps(vec![a.arc(), c.arc()]);
+    t.deps.now = Some(Arc::new(now));
+    t.deps.table = table(&[
+        ("easy", vec![entry("a", "gpt-small")]),
+        ("hard", vec![entry("a", "gpt-large")]),
+    ]);
+    for tier in ["easy", "hard"] {
+        let (cs, why) = t
+            .deps
+            .select_candidates(&opts(tier, filters(|f| f.agent = "c".into())))
+            .await;
+        assert!(
+            !cs.is_empty() && cs.iter().all(|c| c.route.agent == "c"),
+            "{tier}: {cs:?} {why:?}"
+        );
+    }
+}

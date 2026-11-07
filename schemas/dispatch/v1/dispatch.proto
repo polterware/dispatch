@@ -374,6 +374,9 @@ message DispatchModel {
   string provider = 3;
   // The tier the agent suggests for the model, when it reports one.
   string tier = 4;
+  // The efforts the agent takes beside the model, which a tier writes into its name
+  // (claude-opus-5-5-high); empty when it takes none.
+  repeated string efforts = 5;
 }
 
 message ListModelsRequest {}
