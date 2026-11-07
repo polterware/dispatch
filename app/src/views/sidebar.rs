@@ -21,10 +21,11 @@ use crate::client::{
 use crate::format::agent_display_name;
 use crate::models::sidebar::{
     COLLAPSED_PREFERENCE, DISPLAY_PREFERENCE, Direction, GroupBy, GroupKind, HOVER_CLOSE_MS,
-    HOVER_OPEN_MS, RunsNotice, SEEN_PREFERENCE, Show, SidebarDisplay, SidebarGroup, SidebarRun,
-    SortBy, conversation_ref, ended_run_ids, group_sidebar_runs, has_unseen_update,
-    holding_section, now_unix_ms, parse_sidebar_display, repository_ref, run_mark, runs_notice,
-    section_ref, sidebar_run_title, sidebar_runs,
+    HOVER_OPEN_MS, REVEALED_PREFERENCE, RunsNotice, SEEN_PREFERENCE, SIDEBAR_PAGE_ROWS, Show,
+    SidebarDisplay, SidebarGroup, SidebarRun, SortBy, conversation_ref, ended_run_ids,
+    group_sidebar_runs, has_unseen_update, holding_section, now_unix_ms, page_sidebar_rows,
+    parse_sidebar_display, repository_ref, run_mark, runs_notice, section_ref, sidebar_run_title,
+    sidebar_runs,
 };
 use crate::motion::{Animator, SpringTier, SpringValue};
 use crate::state::{AppState, ConnectionState, Route, SettingsPage, observe};
@@ -75,6 +76,9 @@ pub struct SidebarView {
     state: Entity<AppState>,
     display: SidebarDisplay,
     collapsed: Vec<String>,
+    /// How many rows each group shows, by group id, once a Show more revealed past the first
+    /// page; absent groups show [`SIDEBAR_PAGE_ROWS`].
+    revealed: HashMap<String, usize>,
     /// Each run's mark as its page last showed it (`run_mark`); `None` until the first list,
     /// which marks every run then listed as seen, so an update means one since this app ran.
     seen: Option<HashMap<String, String>>,
@@ -119,6 +123,12 @@ impl SidebarView {
         let collapsed = state
             .read(cx)
             .read_preference::<Vec<String>>(COLLAPSED_PREFERENCE)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let revealed = state
+            .read(cx)
+            .read_preference::<HashMap<String, usize>>(REVEALED_PREFERENCE)
             .ok()
             .flatten()
             .unwrap_or_default();
@@ -186,6 +196,7 @@ impl SidebarView {
             state,
             display,
             collapsed,
+            revealed,
             seen,
             row_bounds: Rc::new(RefCell::new(HashMap::new())),
             hover_run: None,
@@ -328,6 +339,22 @@ impl SidebarView {
             .state
             .read(cx)
             .write_preference(COLLAPSED_PREFERENCE, &self.collapsed);
+    }
+
+    /// The rows a group shows: its first page, or as many as its Show more revealed.
+    fn revealed_limit(&self, id: &str) -> usize {
+        self.revealed
+            .get(id)
+            .copied()
+            .unwrap_or(SIDEBAR_PAGE_ROWS)
+            .max(1)
+    }
+
+    fn persist_revealed(&self, cx: &gpui::App) {
+        let _ = self
+            .state
+            .read(cx)
+            .write_preference(REVEALED_PREFERENCE, &self.revealed);
     }
 
     fn toast(&self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
@@ -505,6 +532,8 @@ impl SidebarView {
     fn reset_display(&mut self, cx: &mut Context<Self>) {
         self.display = SidebarDisplay::default();
         self.persist_display(cx);
+        self.revealed.clear();
+        self.persist_revealed(cx);
         self.display_open = false;
         cx.notify();
     }
@@ -577,6 +606,13 @@ impl SidebarView {
             self.collapsed.push(id);
         }
         self.persist_collapsed(cx);
+        cx.notify();
+    }
+
+    /// A Show more adds a page of rows to its group, kept with the collapsed groups.
+    fn reveal_more(&mut self, id: String, limit: usize, cx: &mut Context<Self>) {
+        self.revealed.insert(id, limit);
+        self.persist_revealed(cx);
         cx.notify();
     }
 
@@ -1417,13 +1453,52 @@ impl SidebarView {
                 cx,
             ));
         if !collapsed {
-            for run in &group.runs {
+            // A row that needs attention stays past the page, and the order the Display gives.
+            let page = page_sidebar_rows(&group.runs, self.revealed_limit(&group.id), |run| {
+                selected == Some(run.id.as_str())
+                    || crate::models::runs::is_run_active(&run.status)
+                    || self
+                        .seen
+                        .as_ref()
+                        .is_some_and(|seen| has_unseen_update(run, seen))
+            });
+            for run in page.rows.iter().copied() {
                 let row = self.run_row(run, selected == Some(run.id.as_str()), theme, cx);
                 section = section.child(fade_item(
                     format!("sidebar-run-{}", run.id),
                     &self.scroll,
                     fade_edges(theme),
                     row,
+                    window,
+                    cx,
+                ));
+            }
+            if page.hidden > 0 {
+                let more_id = format!("sidebar-show-more-{}", group.id);
+                let reveal_id = group.id.clone();
+                let next = page.next_limit;
+                let reveal_view = view.clone();
+                let more = SidebarItem::new(
+                    SharedString::from(more_id.clone()),
+                    format!(
+                        "Show {} more · {} hidden",
+                        page.hidden.min(SIDEBAR_PAGE_ROWS),
+                        page.hidden
+                    ),
+                )
+                .on_click(move |_, cx| {
+                    let id = reveal_id.clone();
+                    let _ = reveal_view.update(cx, |this, cx| this.reveal_more(id, next, cx));
+                });
+                let debug_id = more_id.clone();
+                section = section.child(fade_item(
+                    more_id,
+                    &self.scroll,
+                    fade_edges(theme),
+                    div()
+                        .w_full()
+                        .debug_selector(move || debug_id.clone())
+                        .child(more),
                     window,
                     cx,
                 ));
@@ -1512,9 +1587,11 @@ impl SidebarView {
             });
         let bounds = self.row_bounds.clone();
         let key = run.id.clone();
+        let row_key = run.id.clone();
         div()
             .relative()
             .w_full()
+            .debug_selector(move || format!("run-row-{row_key}"))
             .child(item)
             .child(
                 canvas(

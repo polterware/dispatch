@@ -137,6 +137,13 @@ impl Window<'_> {
         self.cx.debug_bounds(id).is_some()
     }
 
+    /// How many of these runs' sidebar rows are on screen.
+    fn visible_rows(&mut self, ids: &[String]) -> usize {
+        ids.iter()
+            .filter(|id| self.shows(&format!("run-row-{id}")))
+            .count()
+    }
+
     fn route_name(&mut self) -> String {
         format!(
             "{:?}",
@@ -545,5 +552,39 @@ fn settings_models_switch_models_and_providers(cx: &mut TestAppContext) {
     w.until("the provider is enabled", || {
         enabled("fake-fast") && enabled("fake-deep")
     });
+    assert!(w.toasts().is_empty(), "{:?}", w.toasts());
+}
+
+/// A group lists five rows and each Show more reveals five more, the rows left out counted on
+/// the row.
+#[gpui::test]
+fn the_sidebar_pages_a_groups_runs(cx: &mut TestAppContext) {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let core = Core::new();
+    for index in 0..17 {
+        let id = core.start(&format!("say hi {index}"), true);
+        core.wait_for(&id, "COMPLETED");
+    }
+    let mut w = open(&core, cx);
+    let ids: Vec<String> = w
+        .state
+        .read_with(w.cx, |s, _| s.runs().iter().map(|r| r.id.clone()).collect());
+    assert_eq!(ids.len(), 17, "the sidebar did not list every run");
+    let conversation = w.state.read_with(w.cx, |s, _| {
+        s.runs()
+            .iter()
+            .map(|run| run.conversation_id.clone())
+            .find(|id| !id.is_empty())
+            .expect("the runs' calling conversation")
+    });
+    let more = format!("sidebar-show-more-conversation:{conversation}");
+
+    assert_eq!(w.visible_rows(&ids), 5, "a group shows its first page");
+    assert!(w.shows(&more), "the rows left out are not counted");
+    w.click(&more);
+    assert_eq!(w.visible_rows(&ids), 10, "Show more revealed no rows");
+    w.click(&more);
+    assert_eq!(w.visible_rows(&ids), 15, "the second Show more fell short");
+    assert!(w.shows(&more), "two rows are still left out");
     assert!(w.toasts().is_empty(), "{:?}", w.toasts());
 }

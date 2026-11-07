@@ -12,6 +12,11 @@ pub const DISPLAY_PREFERENCE: &str = "pwdispatch.sidebar.display";
 pub const COLLAPSED_PREFERENCE: &str = "pwdispatch.sidebar.collapsed";
 /// Each run's mark as its page last showed it, so a row says when it changed since.
 pub const SEEN_PREFERENCE: &str = "pwdispatch.sidebar.seen";
+/// How many rows each group shows, by group id, for the groups a Show more revealed.
+pub const REVEALED_PREFERENCE: &str = "pwdispatch.sidebar.revealed";
+
+/// How many rows a group shows at first, and how many more each Show more adds.
+pub const SIDEBAR_PAGE_ROWS: usize = 5;
 
 /// How long a pointer must rest on a run before its transcript card opens: long enough that
 /// passing down the list opens nothing, short enough that a pause still does.
@@ -313,6 +318,34 @@ pub struct SidebarGroup {
 
 pub fn sidebar_run_title(run: &SidebarRun) -> String {
     prompt_first_line(&run.prompt, &run.id)
+}
+
+/// A group's rows as the sidebar lists them: the first `limit` in Display order, plus every
+/// row that needs attention, which is never cut. `hidden` counts the rows left out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SidebarPage<'a> {
+    pub rows: Vec<&'a SidebarRun>,
+    pub hidden: usize,
+    /// The limit a Show more asks for.
+    pub next_limit: usize,
+}
+
+pub fn page_sidebar_rows<'a>(
+    rows: &'a [SidebarRun],
+    limit: usize,
+    pinned: impl Fn(&SidebarRun) -> bool,
+) -> SidebarPage<'a> {
+    let limit = limit.max(1);
+    let shown: Vec<&SidebarRun> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(index, run)| (index < limit || pinned(run)).then_some(run))
+        .collect();
+    SidebarPage {
+        hidden: rows.len() - shown.len(),
+        rows: shown,
+        next_limit: limit.saturating_add(SIDEBAR_PAGE_ROWS),
+    }
 }
 
 /// Validate persisted preferences field by field, including older or malformed values.
@@ -904,8 +937,8 @@ fn civil_from_days(days: i64) -> (i32, i32, i32) {
 mod tests {
     use super::{
         Direction, GroupBy, RunsNotice, Show, SidebarDisplay, SidebarRun, SortBy, format_utc_iso,
-        group_sidebar_runs, has_unseen_update, local_clock, local_unix_ms, parse_sidebar_display,
-        run_mark, runs_notice, timestamp_ms,
+        group_sidebar_runs, has_unseen_update, local_clock, local_unix_ms, page_sidebar_rows,
+        parse_sidebar_display, run_mark, runs_notice, timestamp_ms,
     };
 
     #[test]
@@ -1483,5 +1516,39 @@ mod tests {
         assert_eq!(local_clock(&format_utc_iso(ms)).as_deref(), Some("00:05"));
         assert_eq!(local_clock(""), None);
         assert_eq!(local_clock("broken"), None);
+    }
+
+    #[test]
+    fn pages_a_groups_rows_five_at_a_time_without_cutting_a_pinned_row() {
+        let rows: Vec<SidebarRun> = (0..12)
+            .map(|index| run(&format!("r{index}"), |_| {}))
+            .collect();
+        let page = page_sidebar_rows(&rows, 5, |_| false);
+        assert_eq!(
+            page.rows
+                .iter()
+                .map(|run| run.id.as_str())
+                .collect::<Vec<_>>(),
+            ["r0", "r1", "r2", "r3", "r4"]
+        );
+        assert_eq!(page.hidden, 7);
+        assert_eq!(page.next_limit, 10);
+
+        let page = page_sidebar_rows(&rows, 10, |_| false);
+        assert_eq!(page.rows.len(), 10);
+        assert_eq!(page.hidden, 2);
+        let page = page_sidebar_rows(&rows, 15, |_| false);
+        assert_eq!(page.rows.len(), 12);
+        assert_eq!(page.hidden, 0);
+
+        // A row that needs attention stays past the limit, in its Display place, and counts
+        // as shown; one already inside the page changes nothing.
+        let page = page_sidebar_rows(&rows, 5, |run| run.id == "r9");
+        assert_eq!(page.rows.len(), 6);
+        assert_eq!(page.rows[5].id, "r9");
+        assert_eq!(page.hidden, 6);
+        let page = page_sidebar_rows(&rows, 5, |run| run.id == "r2");
+        assert_eq!(page.rows.len(), 5);
+        assert_eq!(page.hidden, 7);
     }
 }
