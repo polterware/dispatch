@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { AdaptiveNormalizer, blendParams, createBlobMatrices, createIcosphere, easeParams, makeCurve, stateParams } from "./math";
+import { AdaptiveNormalizer, blendParams, CAMERA_DISTANCE, createBlobMatrices, createIcosphere, easeParams, makeCurve, stateParams } from "./math";
+import { BASE_RADIUS, MAX_DISPLACEMENT } from "./webgl";
 
 describe("adaptive level normalization", () => {
   test("tracks quiet and loud input with a decaying peak", () => {
@@ -27,16 +28,23 @@ describe("state blending", () => {
   test("interpolates and exposes distinct state targets", () => {
     const idle = stateParams("idle");
     const listening = stateParams("listening");
-    expect(blendParams(idle, listening, 0.5).intensity).toBeCloseTo((idle.intensity + listening.intensity) / 2);
-    expect(stateParams("processing").speed).toBeGreaterThan(stateParams("idle").speed);
+    expect(blendParams(idle, listening, 0.5).amplitude).toBeCloseTo((idle.amplitude + listening.amplitude) / 2);
+    expect(blendParams(idle, listening, 0.5).accent[1]).toBeCloseTo((idle.accent[1] + listening.accent[1]) / 2);
+    expect(stateParams("processing").speed).toBeGreaterThan(idle.speed);
     expect(stateParams("disconnected").dim).toBeGreaterThan(0);
-    expect(stateParams("error").warmth).toBe(1);
-    expect(stateParams("idle").intensity).toBe(0.18);
-    expect(stateParams("processing").intensity).toBe(0.2);
     expect(stateParams("disconnected").speed).toBe(0);
-    expect(easeParams(idle, listening, 0).intensity).toBe(idle.intensity);
-    expect(easeParams(idle, listening, 250).intensity).toBe(listening.intensity);
-    expect(easeParams(idle, listening, 125).intensity).toBeCloseTo((idle.intensity + listening.intensity) / 2);
+    expect(listening.levelGain).toBeGreaterThan(0);
+    expect(stateParams("speaking").levelGain).toBeGreaterThan(0);
+    expect(easeParams(idle, listening, 0).amplitude).toBe(idle.amplitude);
+    expect(easeParams(idle, listening, 250).amplitude).toBe(listening.amplitude);
+    expect(easeParams(idle, listening, 125).amplitude).toBeCloseTo((idle.amplitude + listening.amplitude) / 2);
+  });
+  test("the loudest blob stays inside the frame", () => {
+    for (const state of ["idle", "listening", "processing", "speaking", "error", "disconnected"] as const) {
+      const p = stateParams(state);
+      const amplitude = Math.min(1, p.amplitude + p.levelGain);
+      expect((BASE_RADIUS + amplitude * MAX_DISPLACEMENT) * 1.035).toBeLessThan(0.98);
+    }
   });
 });
 
@@ -65,7 +73,7 @@ describe("WebGL geometry and camera", () => {
       const matrices = createBlobMatrices(aspect);
       expect([...matrices.projection, ...matrices.view].every(Number.isFinite)).toBe(true);
       expect(matrices.projection[0] / matrices.projection[5]).toBeCloseTo(1 / aspect);
-      expect(matrices.view[14]).toBeCloseTo(-3.15);
+      expect(matrices.view[14]).toBeCloseTo(-CAMERA_DISTANCE);
     }
   });
 });

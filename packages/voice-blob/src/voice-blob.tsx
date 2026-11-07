@@ -1,7 +1,7 @@
 import { createEffect, onCleanup, onMount } from "solid-js";
 import type { JSX } from "solid-js";
-import { AdaptiveNormalizer, easeParams, makeCurve, stateParams } from "./math";
-import type { BlobState, VisualParams } from "./math";
+import { AdaptiveNormalizer, easeParams, makeCurve, materialColors, stateParams } from "./math";
+import type { BlobState, Rgb, VisualParams } from "./math";
 import { createBlobRenderer } from "./webgl";
 import type { BlobRenderer } from "./webgl";
 import "./voice-blob.css";
@@ -17,103 +17,224 @@ export interface VoiceBlobProps {
   label?: string;
 }
 
-const labels: Record<BlobState, string> = { idle: "Voice idle", listening: "Listening", processing: "Processing voice", speaking: "Speaking", error: "Voice error", disconnected: "Voice disconnected" };
-const palette = {
-  dark: { core: [6, 12, 21], edge: [65, 108, 132], secondary: [136, 177, 196], warm: [174, 78, 63] },
-  light: { core: [190, 208, 216], edge: [83, 123, 145], secondary: [87, 127, 148], warm: [161, 74, 60] },
+const labels: Record<BlobState, string> = {
+  idle: "Voice idle",
+  listening: "Listening",
+  processing: "Processing voice",
+  speaking: "Speaking",
+  error: "Voice error",
+  disconnected: "Voice disconnected",
 };
-const mix = (a: number[], b: number[], t: number) => a.map((v, i) => v + (b[i] - v) * t);
-const rgb = (v: number[], alpha = 1) => `rgba(${v.map((n) => Math.round(n)).join(",")},${alpha})`;
+
+const TRANSITION_MS = 250;
+const css = (c: Rgb, alpha = 1) => `rgba(${Math.round(c[0] * 255)}, ${Math.round(c[1] * 255)}, ${Math.round(c[2] * 255)}, ${alpha})`;
+
+/** When `localStorage["voice-blob:debug"] = "1"`, each blob overlays its renderer, state, level, and frame time. */
+const debugEnabled = () => {
+  try {
+    return globalThis.localStorage?.getItem("voice-blob:debug") === "1";
+  } catch {
+    return false;
+  }
+};
 
 export function VoiceBlob(props: VoiceBlobProps): JSX.Element {
-  let canvas!: HTMLCanvasElement;
-  let fallback!: HTMLCanvasElement;
   let host!: HTMLDivElement;
+  let glCanvas!: HTMLCanvasElement;
+  let flatCanvas!: HTMLCanvasElement;
+  let debug!: HTMLSpanElement;
   const mode = () => props.mode ?? "expanded";
   const size = () => props.size ?? (mode() === "compact" ? 20 : 220);
-  const isReduced = () => props.reducedMotion ?? window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-  const currentLabel = () => props.label ?? labels[props.state()];
+  const theme = () => props.theme ?? "dark";
+  const reduced = () => props.reducedMotion ?? window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
   onMount(() => {
-    const ctx = fallback.getContext("2d", { alpha: true });
-    if (!ctx) return;
+    const showDebug = debugEnabled();
     const mic = new AdaptiveNormalizer();
     const out = new AdaptiveNormalizer();
-    let renderer: BlobRenderer | null = null;
-    let visible = false, inView = true, raf = 0, last = 0, lastPaint = 0, lastReducedLevel = 0;
-    let time = 0, level = 0, side = size(), dpr = 1, changed = true, theme = props.theme ?? "dark";
-    let activeState = props.state(), params: VisualParams = stateParams(activeState), from = { ...params }, target = { ...params }, transitionStart = 0;
-    const motionQuery = window.matchMedia("(prefers-reduced-motion: reduce)");
-    const setRendererVisibility = () => {
-      const glVisible = mode() !== "compact" && !!renderer;
-      canvas.style.display = glVisible ? "block" : "none";
-      fallback.style.display = glVisible ? "none" : "block";
+    let renderer: BlobRenderer | null = createBlobRenderer(glCanvas, mode() === "compact" ? 3 : 5);
+    let flat: CanvasRenderingContext2D | null = null;
+    let raf = 0;
+    let visible = false;
+    let inView = true;
+    let lastFrame = 0;
+    let lastPaint = 0;
+    let time = Math.random() * 100;
+    let side = size();
+    let dpr = 1;
+    let dirty = true;
+    let state = props.state();
+    let params: VisualParams = stateParams(state);
+    let from = params;
+    let target = params;
+    let changedAt = -Infinity;
+    let frameMs = 0;
+
+    const useRenderer = () => {
+      glCanvas.style.display = renderer ? "block" : "none";
+      flatCanvas.style.display = renderer ? "none" : "block";
+      if (!renderer && !flat) flat = flatCanvas.getContext("2d");
     };
     const resize = () => {
-      side = Math.max(1, size()); dpr = Math.min(2, window.devicePixelRatio || 1);
-      for (const targetCanvas of [canvas, fallback]) {
-        targetCanvas.width = Math.round(side * dpr); targetCanvas.height = Math.round(side * dpr);
-        targetCanvas.style.width = `${side}px`; targetCanvas.style.height = `${side}px`;
-      }
-      renderer?.resize(side, side, dpr); changed = true; schedule();
+      side = Math.max(1, size());
+      dpr = Math.min(2, window.devicePixelRatio || 1);
+      if (renderer) renderer.resize(side, side, dpr);
+      flatCanvas.width = Math.round(side * dpr);
+      flatCanvas.height = Math.round(side * dpr);
+      dirty = true;
+      schedule();
     };
-    const drawFallback = (now: number, reduced: boolean) => {
-      const compact = mode() === "compact", p = palette[theme], c = mix(p.core, p.warm, params.warmth), edge = mix(p.edge, p.warm, params.warmth);
-      const radius = side * (compact ? 0.42 : 0.39), center = side / 2;
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, side, side); ctx.globalAlpha = 1 - params.dim;
-      const grad = ctx.createRadialGradient(center * 0.73, center * 0.66, radius * 0.05, center, center, radius * 1.15);
-      grad.addColorStop(0, rgb(mix(c, [255, 255, 255], theme === "dark" ? 0.25 : 0.38), 0.98)); grad.addColorStop(0.58, rgb(c, 0.94)); grad.addColorStop(1, rgb(edge, 0.88));
-      const curve = makeCurve({ time: reduced ? 0 : time * 1000, amplitude: params.intensity + level * 0.5, processing: activeState === "processing" ? 1 : 0, error: activeState === "error" ? 1 : 0, points: compact ? 8 : 10, radius, seed: 29 });
-      ctx.beginPath(); ctx.moveTo(curve.start.x, curve.start.y); for (const s of curve.segments) ctx.bezierCurveTo(s.c1.x, s.c1.y, s.c2.x, s.c2.y, s.end.x, s.end.y); ctx.closePath(); ctx.fillStyle = grad; ctx.fill();
-      if (!compact) { const sheen = ctx.createRadialGradient(center * 0.7, center * 0.58, 1, center * 0.8, center * 0.72, radius); sheen.addColorStop(0, rgb([255,255,255], theme === "dark" ? 0.2 : 0.3)); sheen.addColorStop(1, rgb(edge, 0)); ctx.fillStyle = sheen; ctx.fill(); }
-      ctx.globalAlpha = 1; void now;
+    const setGlow = (accent: Rgb) => {
+      host.style.setProperty("--voice-blob-glow", css(accent, theme() === "dark" ? 0.32 : 0.22));
     };
+
+    const drawFlat = (amplitude: number, colors: { body: Rgb; band: Rgb }, accent: Rgb) => {
+      if (!flat) return;
+      const radius = side * 0.42;
+      const center = side / 2;
+      flat.setTransform(dpr, 0, 0, dpr, 0, 0);
+      flat.clearRect(0, 0, side, side);
+      flat.globalAlpha = 1 - params.dim;
+      const curve = makeCurve({ time: time * 1000, amplitude, processing: state === "processing" ? 1 : 0, error: 0, points: 12, radius });
+      flat.save();
+      flat.translate(center - radius, center - radius);
+      flat.beginPath();
+      flat.moveTo(curve.start.x, curve.start.y);
+      for (const s of curve.segments) flat.bezierCurveTo(s.c1.x, s.c1.y, s.c2.x, s.c2.y, s.end.x, s.end.y);
+      flat.closePath();
+      const fill = flat.createRadialGradient(radius * 0.75, radius * 0.6, radius * 0.1, radius, radius, radius * 1.1);
+      fill.addColorStop(0, css(colors.band, 0.9));
+      fill.addColorStop(0.45, css(colors.body));
+      fill.addColorStop(1, css(accent));
+      flat.fillStyle = fill;
+      flat.fill();
+      flat.restore();
+      flat.globalAlpha = 1;
+    };
+
     const paint = (now: number, dt: number) => {
-      const state = props.state();
-      if (state !== activeState) { activeState = state; from = { ...params }; target = stateParams(state); transitionStart = now; changed = true; }
-      const nextTheme = props.theme ?? "dark"; if (nextTheme !== theme) { theme = nextTheme; changed = true; }
-      const t = Math.min(1, Math.max(0, (now - transitionStart) / 250)); params = easeParams(from, target, now - transitionStart, 250);
-      const raw = state === "listening" ? props.levels.mic : state === "speaking" ? props.levels.out : 0;
-      const normalized = state === "listening" ? mic.update(props.levels.mic, dt) : state === "speaking" ? out.update(props.levels.out, dt) : 0;
-      if (isReduced()) level = now - lastReducedLevel >= 166 ? (lastReducedLevel = now, normalized) : level;
-      else level = normalized;
-      if (state === "listening") params.intensity += level * (isReduced() ? 0.035 : 0.55);
-      if (state === "speaking") params.intensity += level * (isReduced() ? 0.035 : 0.6);
-      if (renderer && mode() !== "compact") renderer.render({ time, intensity: params.intensity, warmth: params.warmth, dim: params.dim, level: state === "speaking" ? level : 0, theme });
-      else drawFallback(now, isReduced());
-      time += dt * params.speed; changed = false;
-      return { raw, transitioning: t < 1 };
+      const next = props.state();
+      if (next !== state) {
+        state = next;
+        from = params;
+        target = stateParams(next);
+        changedAt = now;
+        setGlow(target.accent);
+      }
+      params = easeParams(from, target, now - changedAt, TRANSITION_MS);
+      const level =
+        state === "listening" ? mic.update(props.levels.mic, dt) : state === "speaking" ? out.update(props.levels.out, dt) : (mic.update(0, dt), out.update(0, dt), 0);
+      const amplitude = Math.min(1, params.amplitude + level * params.levelGain * (reduced() ? 0.1 : 1));
+      if (!reduced()) time += dt * params.speed;
+      const colors = materialColors(theme(), params.accent, mode() === "compact");
+      if (renderer) {
+        renderer.render({ time, amplitude, pulse: state === "speaking" ? level : 0, dim: params.dim, body: colors.body, band: colors.band, accent: params.accent });
+      } else {
+        drawFlat(amplitude, colors, params.accent);
+      }
+      if (showDebug) debug.textContent = `${renderer ? "webgl" : "2d"} ${state} lvl ${level.toFixed(2)} amp ${amplitude.toFixed(2)} ${frameMs.toFixed(1)}ms`;
+      dirty = false;
+      return now - changedAt < TRANSITION_MS;
     };
-    const shouldAnimate = (now: number, raw: number, transitioning: boolean) => {
-      if (changed || transitioning) return true;
-      if (isReduced()) return (activeState === "listening" || activeState === "speaking") && raw > 0.00001;
-      return activeState === "idle" || activeState === "disconnected" || activeState === "processing" || activeState === "listening" || activeState === "speaking";
-    };
+
     const tick = (now: number) => {
-      raf = 0; if (!visible) return;
-      const state = props.state(), reduced = isReduced(); const interval = reduced ? 1000 / 6 : state === "idle" || state === "disconnected" ? 1000 / 30 : 1000 / 60;
-      let result = { raw: 0, transitioning: false };
-      if (now - lastPaint >= interval || changed) { const dt = last ? (now - last) / 1000 : interval / 1000; last = lastPaint = now; result = paint(now, dt); }
-      if (shouldAnimate(now, result.raw, result.transitioning)) schedule();
+      raf = 0;
+      if (!visible) return;
+      const isReduced = reduced();
+      // Full rate while reacting to audio or changing state; ~30 FPS at rest; ~6 FPS with reduced motion.
+      const interval = isReduced ? 1000 / 6 : state === "listening" || state === "speaking" ? 0 : 1000 / 30;
+      let transitioning = false;
+      if (dirty || now - lastPaint >= interval) {
+        const started = performance.now();
+        const dt = lastFrame ? Math.min(0.1, (now - lastFrame) / 1000) : 1 / 60;
+        lastFrame = lastPaint = now;
+        transitioning = paint(now, dt);
+        frameMs = performance.now() - started;
+      } else {
+        transitioning = now - changedAt < TRANSITION_MS;
+      }
+      const moving = !isReduced && state !== "disconnected";
+      const reactive = isReduced && (state === "listening" || state === "speaking");
+      if (moving || reactive || transitioning || dirty) schedule();
     };
-    function schedule() { if (visible && !raf) raf = requestAnimationFrame(tick); }
-    const visibility = () => { visible = host.isConnected && document.visibilityState === "visible" && inView; if (visible) { last = 0; changed = true; schedule(); } else if (raf) { cancelAnimationFrame(raf); raf = 0; } };
-    const observer = new IntersectionObserver((entries) => { inView = entries[0]?.isIntersecting ?? true; visibility(); }); observer.observe(host);
-    if (mode() !== "compact") renderer = createBlobRenderer(canvas);
-    setRendererVisibility(); resize();
-    const onLost = (event: Event) => { event.preventDefault(); renderer?.dispose(); renderer = null; setRendererVisibility(); changed = true; schedule(); };
-    const onRestored = () => { renderer = createBlobRenderer(canvas); setRendererVisibility(); resize(); changed = true; schedule(); };
-    canvas.addEventListener("webglcontextlost", onLost); canvas.addEventListener("webglcontextrestored", onRestored);
-    const onVisibility = () => visibility(); document.addEventListener("visibilitychange", onVisibility);
-    const onMotionChange = () => { changed = true; schedule(); }; motionQuery.addEventListener("change", onMotionChange); window.addEventListener("resize", resize, { passive: true });
-    createEffect(() => { props.state(); props.theme; props.mode; props.size; props.reducedMotion; changed = true; schedule(); });
-    visibility();
-    onCleanup(() => { if (raf) cancelAnimationFrame(raf); observer.disconnect(); document.removeEventListener("visibilitychange", onVisibility); motionQuery.removeEventListener("change", onMotionChange); window.removeEventListener("resize", resize); canvas.removeEventListener("webglcontextlost", onLost); canvas.removeEventListener("webglcontextrestored", onRestored); renderer?.dispose(); const lose = canvas.getContext("webgl2")?.getExtension("WEBGL_lose_context") ?? canvas.getContext("webgl")?.getExtension("WEBGL_lose_context"); lose?.loseContext(); });
+    function schedule() {
+      if (visible && !raf) raf = requestAnimationFrame(tick);
+    }
+    const updateVisibility = () => {
+      visible = host.isConnected && document.visibilityState === "visible" && inView;
+      if (visible) {
+        lastFrame = 0;
+        dirty = true;
+        schedule();
+      } else if (raf) {
+        cancelAnimationFrame(raf);
+        raf = 0;
+      }
+    };
+
+    const observer = new IntersectionObserver((entries) => {
+      inView = entries.some((entry) => entry.isIntersecting);
+      updateVisibility();
+    });
+    observer.observe(host);
+    const onLost = (event: Event) => {
+      event.preventDefault();
+      renderer = null;
+      useRenderer();
+      dirty = true;
+      schedule();
+    };
+    const onRestored = () => {
+      renderer = createBlobRenderer(glCanvas, mode() === "compact" ? 3 : 5);
+      useRenderer();
+      resize();
+    };
+    glCanvas.addEventListener("webglcontextlost", onLost);
+    glCanvas.addEventListener("webglcontextrestored", onRestored);
+    document.addEventListener("visibilitychange", updateVisibility);
+    window.addEventListener("resize", resize, { passive: true });
+
+    useRenderer();
+    setGlow(params.accent);
+    resize();
+    createEffect(() => {
+      props.state();
+      theme();
+      size();
+      props.reducedMotion;
+      setGlow(stateParams(props.state()).accent);
+      resize();
+    });
+    updateVisibility();
+
+    onCleanup(() => {
+      if (raf) cancelAnimationFrame(raf);
+      observer.disconnect();
+      document.removeEventListener("visibilitychange", updateVisibility);
+      window.removeEventListener("resize", resize);
+      glCanvas.removeEventListener("webglcontextlost", onLost);
+      glCanvas.removeEventListener("webglcontextrestored", onRestored);
+      renderer?.dispose();
+      const gl = (glCanvas.getContext("webgl2") ?? glCanvas.getContext("webgl")) as WebGLRenderingContext | null;
+      gl?.getExtension("WEBGL_lose_context")?.loseContext();
+    });
   });
 
-  return <div ref={host} class={`voice-blob voice-blob--${mode()} ${props.class ?? ""}`} style={{ width: `${size()}px`, height: `${size()}px` }} role="img" aria-label={currentLabel()} data-state={props.state()} data-theme={props.theme ?? "dark"}>
-    <canvas ref={canvas} aria-hidden="true" />
-    <canvas ref={fallback} aria-hidden="true" />
-    <span class="voice-blob__forced" aria-hidden="true" />
-  </div>;
+  return (
+    <div
+      ref={host}
+      class={`voice-blob voice-blob--${mode()} ${props.class ?? ""}`}
+      style={{ width: `${size()}px`, height: `${size()}px` }}
+      role="img"
+      aria-label={props.label ?? labels[props.state()]}
+      data-state={props.state()}
+      data-theme={theme()}
+    >
+      <span class="voice-blob__glow" aria-hidden="true" />
+      <canvas ref={glCanvas} aria-hidden="true" />
+      <canvas ref={flatCanvas} aria-hidden="true" />
+      <span class="voice-blob__forced" aria-hidden="true" />
+      <span ref={debug} class="voice-blob__debug" aria-hidden="true" />
+    </div>
+  );
 }

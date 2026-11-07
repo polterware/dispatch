@@ -1,10 +1,292 @@
-.local-voice-panel{display:flex;flex-direction:column;align-items:center;gap:16px;padding:24px;color:var(--text-base)}
-.local-voice-panel__status{font-size:13px;color:var(--text-weak)}
-.local-voice-panel__transcript{width:100%;min-height:56px;max-height:180px;overflow:auto;white-space:pre-wrap;font-size:13px}
-.local-voice-panel__controls{display:flex;flex-wrap:wrap;justify-content:center;gap:8px}
-.local-voice-panel button,.local-voice-header{border:1px solid var(--border-base);border-radius:8px;background:var(--surface-base);color:inherit;padding:8px 12px;cursor:pointer}
-.local-voice-panel button:disabled{opacity:.5;cursor:default}
-.local-voice-panel__talk{width:100%;min-height:54px;font-weight:600}
-.local-voice-panel__hint{font-size:12px;color:var(--text-weak);text-align:center}
-.local-voice-header{display:flex;align-items:center;gap:5px;padding:2px 7px;border:0;font-size:12px}
-.local-voice-panel__talk.is-listening{outline:2px solid currentColor;outline-offset:2px}
+/*
+ * Local Voice panel. Controls follow the Polterware texture build (design-system button.css /
+ * materials.css): a 1px frame, a lit outer ring, and a gradient face painted on ::before.
+ * Pressing pulls the face 1px in; tones only swap the --tx-* palette.
+ */
+.lv {
+  --tx-frame: #141414;
+  --tx-outer-top: #5c5c5c;
+  --tx-outer-bottom: #3d3d3d;
+  --tx-face-top: #262626;
+  --tx-face-bottom: #3b3b3b;
+  --tx-face-hover-top: #404040;
+  --tx-face-hover-bottom: #454545;
+  --tx-face-active-top: #262626;
+  --tx-face-active-bottom: #404040;
+  --tx-ink: #ededed;
+  --lv-muted: #9a9a9a;
+  --lv-card-top: #1c1c1c;
+  --lv-card-bottom: #181818;
+  --lv-ring-dark: #111111;
+  --lv-ring-light: #2c2c2c;
+  --lv-hover: rgb(255 255 255 / 0.06);
+  --lv-active: rgb(255 255 255 / 0.1);
+}
+.lv[data-theme="light"] {
+  --tx-frame: #b9b9b9;
+  --tx-outer-top: #ffffff;
+  --tx-outer-bottom: #d6d6d6;
+  --tx-face-top: #fbfbfb;
+  --tx-face-bottom: #ececec;
+  --tx-face-hover-top: #f3f3f3;
+  --tx-face-hover-bottom: #e4e4e4;
+  --tx-face-active-top: #e2e2e2;
+  --tx-face-active-bottom: #ececec;
+  --tx-ink: #242424;
+  --lv-muted: #6b6b6b;
+  --lv-card-top: #ffffff;
+  --lv-card-bottom: #f6f6f6;
+  --lv-ring-dark: #d4d4d4;
+  --lv-ring-light: #ffffff;
+  --lv-hover: rgb(0 0 0 / 0.05);
+  --lv-active: rgb(0 0 0 / 0.09);
+}
+
+/* Texture button. */
+.lv-btn {
+  position: relative;
+  isolation: isolate;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 12px;
+  border: 1px solid var(--tx-frame);
+  border-radius: 10px;
+  background: linear-gradient(to bottom, var(--tx-outer-top), var(--tx-outer-bottom));
+  color: var(--tx-ink);
+  font: 500 12px/1 inherit;
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+  transition: filter 120ms ease;
+}
+.lv-btn::before {
+  position: absolute;
+  z-index: -1;
+  inset: 1px;
+  border-radius: 8px;
+  background: linear-gradient(to bottom, var(--tx-face-top), var(--tx-face-bottom));
+  content: "";
+  pointer-events: none;
+  transition: inset 160ms cubic-bezier(0.2, 0.9, 0.3, 1), background 120ms ease;
+}
+.lv-btn:hover:not(:disabled)::before {
+  background: linear-gradient(to bottom, var(--tx-face-hover-top), var(--tx-face-hover-bottom));
+}
+.lv-btn:active:not(:disabled)::before,
+.lv-btn[aria-pressed="true"]::before {
+  inset: 2px;
+  background: linear-gradient(to bottom, var(--tx-face-active-top), var(--tx-face-active-bottom));
+  transition-duration: 80ms;
+}
+.lv-btn:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--tx-ink) 55%, transparent);
+  outline-offset: 2px;
+}
+.lv-btn:disabled {
+  cursor: not-allowed;
+  filter: saturate(0) opacity(0.45);
+}
+/* Brand tone: the ice-white key (dark key on the light theme). */
+.lv-btn--brand {
+  --tx-frame: #1a1a1a;
+  --tx-outer-top: #ffffff;
+  --tx-outer-bottom: #d4d4d4;
+  --tx-face-top: #e5e5e5;
+  --tx-face-bottom: #fafafa;
+  --tx-face-hover-top: #e7e5e4;
+  --tx-face-hover-bottom: #e5e5e5;
+  --tx-face-active-top: #d6d3d1;
+  --tx-face-active-bottom: #d4d4d4;
+  --tx-ink: #2a2a2a;
+}
+.lv[data-theme="light"] .lv-btn--brand {
+  --tx-frame: #111111;
+  --tx-outer-top: #5c5c5c;
+  --tx-outer-bottom: #2a2a2a;
+  --tx-face-top: #2a2a2a;
+  --tx-face-bottom: #3a3a3a;
+  --tx-face-hover-top: #333333;
+  --tx-face-hover-bottom: #424242;
+  --tx-face-active-top: #222222;
+  --tx-face-active-bottom: #333333;
+  --tx-ink: #f5f5f5;
+}
+/* Live tone while recording. */
+.lv-btn--live {
+  --tx-frame: #5e2323;
+  --tx-outer-top: #f87171;
+  --tx-outer-bottom: #c53b3b;
+  --tx-face-top: #a64545;
+  --tx-face-bottom: #b83c3c;
+  --tx-face-hover-top: #b34e4e;
+  --tx-face-hover-bottom: #c64545;
+  --tx-face-active-top: #9a3d3d;
+  --tx-face-active-bottom: #ad3a3a;
+  --tx-ink: #fff1f1;
+}
+.lv-btn--lg {
+  height: 44px;
+  border-radius: 12px;
+  font-size: 13px;
+  font-weight: 600;
+}
+.lv-btn--lg::before {
+  border-radius: 10px;
+}
+.lv-btn--block {
+  width: 100%;
+}
+/* Flat (ghost) button: a fill that appears on hover and deepens on press. */
+.lv-flat {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--lv-muted);
+  font: 500 12px/1 inherit;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+.lv-flat:hover:not(:disabled) {
+  background: var(--lv-hover);
+  color: var(--tx-ink);
+}
+.lv-flat:active:not(:disabled) {
+  background: var(--lv-active);
+}
+.lv-flat:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+.lv-flat:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--tx-ink) 45%, transparent);
+  outline-offset: 1px;
+}
+
+/* Panel layout. */
+.lv-panel {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 14px;
+  height: 100%;
+  padding: 18px 16px 14px;
+  overflow: auto;
+  color: var(--tx-ink);
+  outline: none;
+}
+.lv-panel__stage {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 0 2px;
+}
+.lv-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 22px;
+  padding: 0 9px;
+  border: 1px solid var(--tx-frame);
+  border-radius: 999px;
+  background: linear-gradient(to bottom, var(--tx-face-top), var(--tx-face-bottom));
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--tx-outer-top) 35%, transparent);
+  color: var(--lv-muted);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+}
+.lv-chip__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.lv-chip[data-state="listening"] { color: #5ad6f0; }
+.lv-chip[data-state="speaking"] { color: #f2a679; }
+.lv-chip[data-state="processing"],
+.lv-chip[data-state="transcribing"],
+.lv-chip[data-state="submitting"] { color: #a98bff; }
+.lv-chip[data-state="error"],
+.lv-chip[data-state="disconnected"] { color: #f07a72; }
+/* Transcript card: Polterware card rings (alternating hairlines) on a quiet gradient. */
+.lv-card {
+  min-height: 64px;
+  max-height: 200px;
+  padding: 12px 14px;
+  overflow: auto;
+  border-radius: 12px;
+  background: linear-gradient(to bottom, var(--lv-card-top), var(--lv-card-bottom));
+  box-shadow: inset 0 0 0 1px var(--lv-ring-dark), inset 0 0 0 2px var(--lv-ring-light);
+  font-size: 13px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.lv-card[data-empty="true"] {
+  display: grid;
+  place-items: center;
+  color: var(--lv-muted);
+  text-align: center;
+}
+.lv-card__partial {
+  color: var(--lv-muted);
+}
+.lv-row {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+.lv-footer {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: auto;
+  padding-top: 4px;
+}
+.lv-hint {
+  color: var(--lv-muted);
+  font-size: 12px;
+  line-height: 1.4;
+  text-align: center;
+}
+.lv-kbd {
+  padding: 1px 5px;
+  border: 1px solid var(--tx-frame);
+  border-radius: 4px;
+  font: 10px/1.4 ui-monospace, monospace;
+  opacity: 0.8;
+}
+
+/* Header slot: a flat pill with the compact blob, centred on the title row. */
+.lv-header {
+  display: inline-flex;
+  align-items: center;
+  align-self: center;
+  gap: 6px;
+  height: 24px;
+  padding: 0 8px 0 4px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--lv-muted);
+  font: 500 12px/1 inherit;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+.lv-header:hover {
+  background: var(--lv-hover);
+  color: var(--tx-ink);
+}
+.lv-header .voice-blob {
+  display: block;
+}

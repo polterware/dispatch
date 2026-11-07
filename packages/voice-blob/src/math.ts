@@ -77,29 +77,66 @@ export function makeCurve(options: {
   return { start: points[0], segments };
 }
 
-export interface VisualParams { intensity: number; speed: number; warmth: number; dim: number }
+export type Rgb = readonly [number, number, number];
+
+/** Everything a state controls; blended between states over ~250 ms. */
+export interface VisualParams {
+  /** Resting displacement amount, 0..1. */
+  amplitude: number;
+  /** How much the audio level adds to the displacement. */
+  levelGain: number;
+  /** Noise time speed. */
+  speed: number;
+  dim: number;
+  accent: Rgb;
+}
+
+const ACCENTS: Record<BlobState, Rgb> = {
+  idle: [0.42, 0.62, 1.0],
+  listening: [0.36, 0.84, 0.96],
+  processing: [0.66, 0.5, 1.0],
+  speaking: [1.0, 0.68, 0.48],
+  error: [0.96, 0.38, 0.34],
+  disconnected: [0.5, 0.52, 0.56],
+};
+
 export function stateParams(state: BlobState): VisualParams {
+  const accent = ACCENTS[state];
   switch (state) {
-    case "listening": return { intensity: 0.15, speed: 0.4, warmth: 0.12, dim: 0 };
-    case "speaking": return { intensity: 0.2, speed: 0.55, warmth: 0.72, dim: 0 };
-    case "processing": return { intensity: 0.2, speed: 0.8, warmth: 0.44, dim: 0 };
-    case "error": return { intensity: 0.1, speed: 0.16, warmth: 1, dim: 0.08 };
-    case "disconnected": return { intensity: 0.05, speed: 0, warmth: 0.12, dim: 0.38 };
-    default: return { intensity: 0.18, speed: 0.25, warmth: 0, dim: 0 };
+    case "listening": return { amplitude: 0.3, levelGain: 0.75, speed: 0.5, dim: 0, accent };
+    case "speaking": return { amplitude: 0.35, levelGain: 0.7, speed: 0.7, dim: 0, accent };
+    case "processing": return { amplitude: 0.38, levelGain: 0, speed: 1.1, dim: 0, accent };
+    case "error": return { amplitude: 0.2, levelGain: 0, speed: 0.2, dim: 0.05, accent };
+    case "disconnected": return { amplitude: 0.12, levelGain: 0, speed: 0, dim: 0.35, accent };
+    default: return { amplitude: 0.45, levelGain: 0, speed: 0.35, dim: 0, accent };
   }
 }
 
+const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
+
 export function blendParams(from: VisualParams, to: VisualParams, amount: number): VisualParams {
   const t = clamp(amount);
-  return { intensity: from.intensity + (to.intensity - from.intensity) * t,
-    speed: from.speed + (to.speed - from.speed) * t,
-    warmth: from.warmth + (to.warmth - from.warmth) * t,
-    dim: from.dim + (to.dim - from.dim) * t };
+  return {
+    amplitude: lerp(from.amplitude, to.amplitude, t),
+    levelGain: lerp(from.levelGain, to.levelGain, t),
+    speed: lerp(from.speed, to.speed, t),
+    dim: lerp(from.dim, to.dim, t),
+    accent: [lerp(from.accent[0], to.accent[0], t), lerp(from.accent[1], to.accent[1], t), lerp(from.accent[2], to.accent[2], t)],
+  };
 }
 
 export function easeParams(from: VisualParams, to: VisualParams, elapsedMs: number, durationMs = 250): VisualParams {
   const linear = clamp(elapsedMs / Math.max(1, durationMs));
   return blendParams(from, to, linear * linear * (3 - 2 * linear));
+}
+
+/** Body and band colours: a deep body with light bands, as in the reference, readable on both themes. */
+export function materialColors(theme: "light" | "dark", accent: Rgb, compact = false): { body: Rgb; band: Rgb } {
+  // At a few pixels a deep body reads as a hollow ring, so the compact dot is lit by its accent.
+  const deep: Rgb = theme === "dark" ? [0.035, 0.04, 0.06] : [0.09, 0.1, 0.13];
+  const body: Rgb = compact ? [lerp(deep[0], accent[0], 0.55), lerp(deep[1], accent[1], 0.55), lerp(deep[2], accent[2], 0.55)] : deep;
+  const band: Rgb = [lerp(0.93, accent[0], 0.35), lerp(0.95, accent[1], 0.35), lerp(0.98, accent[2], 0.35)];
+  return { body, band };
 }
 
 export interface Icosphere { positions: Float32Array; normals: Float32Array; uvs: Float32Array; indices: Uint16Array | Uint32Array }
@@ -125,10 +162,14 @@ export function createIcosphere(subdivisions = 4): Icosphere {
   return {positions,normals,uvs,indices};
 }
 
+/** Distance at which a unit sphere exactly fills a 30° field of view. */
+export const CAMERA_DISTANCE = 1 / Math.tan(Math.PI / 12);
+
 export interface BlobMatrices { projection: Float32Array; view: Float32Array }
 export function createBlobMatrices(aspect: number): BlobMatrices {
-  const safeAspect=Math.max(0.0001,Number.isFinite(aspect)?aspect:1), f=1/Math.tan(Math.PI/8), near=0.1, far=100;
+  // A 30° vertical field of view at this distance frames a unit sphere edge to edge.
+  const safeAspect=Math.max(0.0001,Number.isFinite(aspect)?aspect:1), f=1/Math.tan(Math.PI/12), near=0.1, far=100;
   const projection=new Float32Array([f/safeAspect,0,0,0, 0,f,0,0, 0,0,(far+near)/(near-far),-1, 0,0,(2*far*near)/(near-far),0]);
-  const view=new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,-3.15,1]);
+  const view=new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,-CAMERA_DISTANCE,1]);
   return {projection,view};
 }

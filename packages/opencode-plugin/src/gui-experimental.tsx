@@ -105,6 +105,15 @@ export default Plugin.define({
       else if (!enabled && voice.state === "listening") runtime.cancelListening()
     }
     const stateLabel = () => { revision(); return voice.state }
+    const STATE_TEXT: Record<string, string> = {
+      off: "Voice off", connecting: "Starting…", idle: "Ready", listening: "Listening", transcribing: "Transcribing…",
+      submitting: "Sending…", processing: "Agent working", speaking: "Speaking", error: "Error", disconnected: "Engine offline",
+    }
+    const stateText = () => {
+      revision()
+      const text = active() ? STATE_TEXT[voice.state] ?? voice.state : STATE_TEXT.off
+      return voice.micMuted && active() ? `${text} · muted` : text
+    }
     const theme = () => ctx.appearance.mode()
     const reducedMotion = () => window.matchMedia("(prefers-reduced-motion: reduce)").matches
 
@@ -126,22 +135,71 @@ export default Plugin.define({
     ctx.add(Panel, {
       id: "main", region: "side", width: 350,
       list: input => (input.open.includes("main") ? [panelTab] : []),
-      render: () => <div class="local-voice-panel" tabIndex={0} onKeyDown={event => { if (event.key === " " && event.target === event.currentTarget) { event.preventDefault(); voice.state === "listening" ? stopTalk() : startTalk() } }}>
-        <VoiceBlob state={() => { revision(); return voice.blobState() }} levels={voice.levels} mode="expanded" size={220} theme={theme()} reducedMotion={reducedMotion()} />
-        <div class="local-voice-panel__status">{active() ? stateLabel() : "Voice mode off"}{voice.micMuted ? " · mic muted" : ""}</div>
-        <div class="local-voice-panel__transcript">{voice.partial || voice.final || (voice.state === "disconnected" ? "Engine unavailable. Start the engine to use voice." : "Your transcript will appear here.")}</div>
-        <button class="local-voice-panel__talk" classList={{ "is-listening": (revision(), voice.state === "listening") }} onPointerDown={event => { event.currentTarget.setPointerCapture(event.pointerId); onTalkDown() }} onPointerUp={onTalkUp} onPointerCancel={onTalkUp} disabled={!active() || voice.state === "disconnected"}>{talkLabel()}</button>
-        <div class="local-voice-panel__controls">
-          <button onClick={() => runtime.mute(!voice.micMuted)} disabled={!active()}>{voice.micMuted ? "Unmute" : "Mute"}</button>
-          <button onClick={() => { runtime.cancelSpeech(); if (voice.state === "listening") runtime.stopListening() }} disabled={!active()}>Stop</button>
-          <button onClick={toggleHandsFree} disabled={!active()}>{voice.handsFree ? "Hands-free on" : "Hands-free off"}</button>
-          <button onClick={toggle}>{active() ? "Turn voice off" : "Start engine"}</button>
-          <button onClick={() => { deactivate(); ctx.screen.current()?.composer.focus() }}>Back to text</button>
+      render: () => (
+        <div
+          class="lv lv-panel"
+          data-theme={theme()}
+          tabIndex={0}
+          onKeyDown={event => {
+            if (event.key === " " && event.target === event.currentTarget) {
+              event.preventDefault()
+              voice.state === "listening" ? stopTalk() : startTalk()
+            }
+          }}
+        >
+          <div class="lv-panel__stage">
+            <VoiceBlob state={() => { revision(); return voice.blobState() }} levels={voice.levels} mode="expanded" size={200} theme={theme()} reducedMotion={reducedMotion()} />
+            <span class="lv-chip" data-state={(revision(), active() ? voice.state : "off")}>
+              <span class="lv-chip__dot" />
+              {stateText()}
+            </span>
+          </div>
+          <div class="lv-card" data-empty={(revision(), !voice.partial && !voice.final)}>
+            {(revision(), voice.partial)
+              ? <span class="lv-card__partial">{voice.partial}</span>
+              : voice.final || (voice.state === "disconnected" ? "Voice engine unavailable." : "Your words will appear here.")}
+          </div>
+          <button
+            class="lv-btn lv-btn--lg lv-btn--block"
+            classList={{ "lv-btn--brand": (revision(), voice.state !== "listening"), "lv-btn--live": voice.state === "listening" }}
+            onPointerDown={event => { event.currentTarget.setPointerCapture(event.pointerId); onTalkDown() }}
+            onPointerUp={onTalkUp}
+            onPointerCancel={onTalkUp}
+            disabled={(revision(), active() && voice.state === "disconnected")}
+          >
+            {talkLabel()}
+          </button>
+          <div class="lv-row">
+            <button class="lv-btn" aria-pressed={(revision(), voice.micMuted)} onClick={() => runtime.mute(!voice.micMuted)} disabled={!active()}>
+              {voice.micMuted ? "Unmute" : "Mute"}
+            </button>
+            <button class="lv-btn" onClick={() => { runtime.cancelSpeech(); if (voice.state === "listening") runtime.stopListening() }} disabled={!active()}>
+              Stop
+            </button>
+            <button class="lv-btn" aria-pressed={(revision(), voice.handsFree)} onClick={toggleHandsFree} disabled={!active()}>
+              Hands-free
+            </button>
+          </div>
+          {(revision(), voice.state === "disconnected") && (
+            <div class="lv-hint">Install voice-engine (or set VOICE_ENGINE_BIN), then start the engine.</div>
+          )}
+          <div class="lv-footer">
+            <button class="lv-flat" onClick={() => { deactivate(); ctx.screen.current()?.composer.focus() }}>Back to text</button>
+            <button class="lv-flat" onClick={toggle}>{active() ? "Turn voice off" : "Start engine"}</button>
+          </div>
         </div>
-        {voice.state === "disconnected" && <div class="local-voice-panel__hint">Install voice-engine or set VOICE_ENGINE_BIN, then select Start engine.</div>}
-      </div>,
+      ),
     })
-    ctx.add(Slot, { at: "session.header", order: 50, render: () => <button class="local-voice-header" onClick={openPanel} aria-label="Open voice panel"><VoiceBlob state={() => { revision(); return voice.blobState() }} levels={voice.levels} mode="compact" size={20} theme={theme()} reducedMotion={reducedMotion()} /><span>{active() ? stateLabel() : "Voice"}</span></button> })
-    ctx.add(ComposerPill, () => ({ id: "status", show: () => active() ? { label: stateLabel(), title: "Local voice", tone: (voice.state === "error" || voice.state === "disconnected" ? "danger" : undefined) as "danger" | undefined, run: openPanel } : undefined }))
+    ctx.add(Slot, {
+      at: "session.header",
+      order: 50,
+      render: () => (
+        <button class="lv lv-header" data-theme={theme()} onClick={openPanel} aria-label="Open voice panel">
+          <VoiceBlob state={() => { revision(); return voice.blobState() }} levels={voice.levels} mode="compact" size={16} theme={theme()} reducedMotion={reducedMotion()} />
+          <span>{active() ? stateText() : "Voice"}</span>
+        </button>
+      ),
+    })
+    ctx.add(ComposerPill, () => ({ id: "status", show: () => active() ? { label: stateText(), title: "Local voice", tone: (voice.state === "error" || voice.state === "disconnected" ? "danger" : undefined) as "danger" | undefined, run: openPanel } : undefined }))
   },
 })
