@@ -38,7 +38,8 @@ pub fn write(path: &Path, info: &EngineInfo) -> io::Result<()> {
         std::fs::create_dir_all(dir)?;
     }
     let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
-    let body = serde_json::to_vec_pretty(info).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let body = serde_json::to_vec_pretty(info)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     {
         use std::io::Write;
         let mut options = std::fs::OpenOptions::new();
@@ -85,7 +86,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
         }
         remove_if_owned(&path, 7).unwrap();
         assert!(path.exists());

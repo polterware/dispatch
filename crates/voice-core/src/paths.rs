@@ -25,7 +25,9 @@ pub fn models_dir() -> PathBuf {
 /// The discovery file a running engine writes (see `discovery`).
 pub fn discovery_file() -> PathBuf {
     if std::env::var_os("VOICE_ENGINE_HOME").is_none() {
-        if let Some(runtime) = directories::BaseDirs::new().and_then(|d| d.runtime_dir().map(|p| p.to_path_buf())) {
+        if let Some(runtime) =
+            directories::BaseDirs::new().and_then(|d| d.runtime_dir().map(|p| p.to_path_buf()))
+        {
             return runtime.join(APP_DIR).join("engine.json");
         }
     }

@@ -24,7 +24,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => return Err("language must be auto, pt, or en".into()),
     };
     let started = Instant::now();
-    let engine = SttEngine::load(Path::new(&args[1]), SttOptions { use_gpu: env::var_os("VOICE_STT_CPU").is_none(), ..SttOptions::default() })?;
+    let engine = SttEngine::load(
+        Path::new(&args[1]),
+        SttOptions {
+            use_gpu: env::var_os("VOICE_STT_CPU").is_none(),
+            ..SttOptions::default()
+        },
+    )?;
     let load_ms = started.elapsed().as_millis();
     let mut reader = hound::WavReader::open(&args[2])?;
     let spec = reader.spec();
@@ -69,12 +75,23 @@ fn vad(model: &str, wav: &str) -> Result<(), Box<dyn std::error::Error>> {
     let samples: Vec<f32> = if spec.sample_format == hound::SampleFormat::Float {
         reader.samples::<f32>().collect::<Result<_, _>>()?
     } else if spec.bits_per_sample <= 16 {
-        reader.samples::<i16>().map(|x| x.map(|v| v as f32 / i16::MAX as f32)).collect::<Result<_, _>>()?
+        reader
+            .samples::<i16>()
+            .map(|x| x.map(|v| v as f32 / i16::MAX as f32))
+            .collect::<Result<_, _>>()?
     } else {
-        reader.samples::<i32>().map(|x| x.map(|v| v as f32 / i32::MAX as f32)).collect::<Result<_, _>>()?
+        reader
+            .samples::<i32>()
+            .map(|x| x.map(|v| v as f32 / i32::MAX as f32))
+            .collect::<Result<_, _>>()?
     };
-    let mono: Vec<f32> = if spec.channels == 1 { samples } else {
-        samples.chunks_exact(spec.channels as usize).map(|f| f.iter().sum::<f32>() / f.len() as f32).collect()
+    let mono: Vec<f32> = if spec.channels == 1 {
+        samples
+    } else {
+        samples
+            .chunks_exact(spec.channels as usize)
+            .map(|f| f.iter().sum::<f32>() / f.len() as f32)
+            .collect()
     };
     let pcm = resample(&mono, spec.sample_rate, 16_000);
     let mut vad = Vad::silero(Path::new(model), VadOptions::default())?;
@@ -85,14 +102,22 @@ fn vad(model: &str, wav: &str) -> Result<(), Box<dyn std::error::Error>> {
             match event {
                 VadEvent::SpeechStart => speech_start = Some(timestamp),
                 VadEvent::SpeechEnd => {
-                    println!("speech={:.3}-{:.3}s", speech_start.unwrap_or(timestamp) as f64 / 16_000.0, timestamp as f64 / 16_000.0);
+                    println!(
+                        "speech={:.3}-{:.3}s",
+                        speech_start.unwrap_or(timestamp) as f64 / 16_000.0,
+                        timestamp as f64 / 16_000.0
+                    );
                     speech_start = None;
                 }
             }
         }
     }
     if let Some(start) = speech_start {
-        println!("speech={:.3}-{:.3}s", start as f64 / 16_000.0, pcm.len() as f64 / 16_000.0);
+        println!(
+            "speech={:.3}-{:.3}s",
+            start as f64 / 16_000.0,
+            pcm.len() as f64 / 16_000.0
+        );
     }
     println!("audio_seconds={:.3}", pcm.len() as f64 / 16_000.0);
     Ok(())
