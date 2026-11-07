@@ -1,8 +1,9 @@
 use crate::Error;
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub const MODELS_DEV_URL: &str = "https://models.dev/api.json";
 
@@ -86,6 +87,72 @@ pub(crate) fn lookup_keys(key: &str) -> Vec<&str> {
         }
         current = &current[..i];
         out.push(current);
+    }
+    out
+}
+
+/// Catalog keys an agent may name differently, mapped to the id the catalog lists. The
+/// `-free` entry is listed for completeness only: [`price_keys`] keeps a free name on
+/// free ids, so it stays unknown until the catalog lists a free entry of its own.
+const PRICE_ALIASES: [(&str, &str); 2] = [
+    ("deepseek-v4.1-flash", "deepseek-flash"),
+    ("deepseek-v4.1-flash-free", "deepseek-flash"),
+];
+
+/// Whether a dash-separated key segment is a version (`v4`, `4.1`, `1`), not a family.
+fn version_segment(segment: &str) -> bool {
+    let mut chars = segment.chars();
+    let rest = match chars.next() {
+        Some('v' | 'V') => chars.as_str(),
+        _ => segment,
+    };
+    !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit() || c == '.')
+}
+
+/// The key with its version segments dropped: `deepseek-v4.1-flash` becomes
+/// `deepseek-flash`. None when there is nothing to drop or no family would remain.
+fn versionless_key(key: &str) -> Option<String> {
+    let segments: Vec<&str> = key.split('-').collect();
+    if segments.len() < 3 || !segments.iter().any(|segment| version_segment(segment)) {
+        return None;
+    }
+    let kept: Vec<&str> = segments
+        .iter()
+        .copied()
+        .filter(|segment| !version_segment(segment))
+        .collect();
+    (kept.len() >= 2 && kept.len() < segments.len()).then(|| kept.join("-"))
+}
+
+fn push_key(out: &mut Vec<String>, key: &str) {
+    if !key.is_empty() && !out.iter().any(|known| known == key) {
+        out.push(key.to_owned());
+    }
+}
+
+/// The catalog ids to try for `key`, most specific first: the key and its shorter
+/// prefixes, the same with dots as dashes, the version-less family, and the explicit
+/// aliases. A `-free` key only tries `-free` ids, so a catalog without one keeps it
+/// unknown rather than taking its paid sibling's price.
+pub(crate) fn price_keys(key: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for known in lookup_keys(key) {
+        push_key(&mut out, known);
+    }
+    let dotted = key.replace('.', "-");
+    if dotted != key {
+        for known in lookup_keys(&dotted) {
+            push_key(&mut out, known);
+        }
+    }
+    if let Some(versionless) = versionless_key(key) {
+        push_key(&mut out, &versionless);
+    }
+    if let Some((_, alias)) = PRICE_ALIASES.iter().find(|(name, _)| *name == key) {
+        push_key(&mut out, alias);
+    }
+    if key.ends_with("-free") {
+        out.retain(|known| known.ends_with("-free"));
     }
     out
 }
@@ -353,6 +420,57 @@ pub fn save_refreshed_prices(
     Ok(count)
 }
 
+/// How long a stored catalog, or the embedded snapshot, stays fresh: the core refreshes
+/// its prices once a day.
+pub const CATALOG_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+fn catalog_time(value: &str) -> Option<DateTime<Utc>> {
+    let value = value.trim();
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|at| at.with_timezone(&Utc))
+        .or_else(|| {
+            NaiveDate::parse_from_str(value, "%Y-%m-%d")
+                .ok()
+                .and_then(|date| date.and_hms_opt(0, 0, 0))
+                .map(|date| date.and_utc())
+        })
+}
+
+/// Whether `now` is at least [`CATALOG_MAX_AGE`] past the catalog's date: `fetched` when a
+/// refresh stored one, else the embedded snapshot's `generated` date. An unreadable date
+/// counts as stale.
+pub fn catalog_refresh_due(fetched: &str, generated: &str, now: DateTime<Utc>) -> bool {
+    match catalog_time(fetched).or_else(|| catalog_time(generated)) {
+        Some(at) => {
+            now.signed_duration_since(at).num_seconds()
+                >= i64::try_from(CATALOG_MAX_AGE.as_secs()).unwrap_or(i64::MAX)
+        }
+        None => true,
+    }
+}
+
+#[derive(Deserialize)]
+struct SnapshotDate {
+    #[serde(default)]
+    generated: String,
+}
+
+/// [`catalog_refresh_due`] for a state folder's stored prices, falling back to the embedded
+/// snapshot's date when it holds no usable copy.
+pub fn refresh_due(state_dir: &Path, now: DateTime<Utc>) -> bool {
+    let fetched = prices_path(state_dir)
+        .and_then(|p| std::fs::read(p).ok())
+        .and_then(|b| serde_json::from_slice::<RefreshedPrices>(&b).ok())
+        .filter(|r| !r.models.is_empty())
+        .map(|r| r.fetched)
+        .unwrap_or_default();
+    let generated = serde_json::from_str::<SnapshotDate>(include_str!("models_snapshot.json"))
+        .map(|snapshot| snapshot.generated)
+        .unwrap_or_default();
+    catalog_refresh_due(&fetched, &generated, now)
+}
+
 impl Catalog {
     pub fn embedded() -> Result<Self, Error> {
         let mut c: Self = serde_json::from_str(include_str!("models_snapshot.json"))?;
@@ -385,7 +503,7 @@ impl Catalog {
     }
 
     pub(crate) fn price(&self, key: &str) -> Option<&CatalogModel> {
-        lookup_keys(key)
+        price_keys(key)
             .into_iter()
             .find_map(|k| self.models.iter().find(|m| m.id == k))
     }
@@ -508,5 +626,84 @@ impl Catalog {
             est.cost_source = "models.dev price".into();
         }
         est
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn embedded() -> Catalog {
+        Catalog::embedded().expect("embedded catalog")
+    }
+
+    #[test]
+    fn a_differently_named_model_prices_as_the_catalog_key() {
+        let catalog = embedded();
+        let model = catalog
+            .price("deepseek-v4.1-flash")
+            .expect("deepseek-v4.1-flash prices");
+        assert_eq!(model.id, "deepseek-flash");
+        assert_eq!(
+            (model.input, model.output, model.cache_read),
+            (0.15, 0.6, Some(0.003))
+        );
+    }
+
+    #[test]
+    fn an_agents_provider_prefix_still_finds_the_price() {
+        let key = catalog_key("opencode-go/deepseek-v4.1-flash");
+        assert_eq!(key, "deepseek-v4.1-flash");
+        assert_eq!(
+            self::embedded().price(&key).map(|m| m.id.as_str()),
+            Some("deepseek-flash")
+        );
+    }
+
+    #[test]
+    fn an_exact_key_wins_over_its_shorter_forms() {
+        let catalog = embedded();
+        assert_eq!(
+            catalog.price("deepseek-v4-flash").map(|m| m.id.as_str()),
+            Some("deepseek-v4-flash")
+        );
+        assert_eq!(
+            catalog.price("deepseek-flash").map(|m| m.id.as_str()),
+            Some("deepseek-flash")
+        );
+    }
+
+    #[test]
+    fn dots_read_as_dashes() {
+        let catalog = embedded();
+        assert_eq!(
+            catalog
+                .price("deepseek-v4.1-flash-1017")
+                .map(|m| m.id.as_str()),
+            Some("deepseek-v4-1-flash-1017")
+        );
+    }
+
+    #[test]
+    fn an_unrelated_name_stays_unknown() {
+        assert!(embedded().price("acme-mystery-9").is_none());
+    }
+
+    #[test]
+    fn a_free_model_does_not_take_its_paid_siblings_price() {
+        assert!(embedded().price("deepseek-v4.1-flash-free").is_none());
+    }
+
+    #[test]
+    fn the_catalog_refreshes_after_a_day() {
+        let now = Utc.with_ymd_and_hms(2026, 11, 7, 12, 0, 0).unwrap();
+        // Older than 24 hours: refresh.
+        assert!(catalog_refresh_due("2026-11-06T11:59:00Z", "", now));
+        // Fresher: keep it.
+        assert!(!catalog_refresh_due("2026-11-06T12:01:00Z", "", now));
+        // No stored copy: the embedded snapshot's date decides.
+        assert!(catalog_refresh_due("", "2026-11-02", now));
+        assert!(!catalog_refresh_due("", "2026-11-07", now));
     }
 }

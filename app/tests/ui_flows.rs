@@ -209,6 +209,12 @@ fn every_page_opens_with_data(cx: &mut TestAppContext) {
     ] {
         w.go(route.clone());
         assert_eq!(w.route(), route);
+        if route == Route::Intelligence {
+            assert!(
+                w.shows("intelligence-refresh"),
+                "Intelligence has no Refresh"
+            );
+        }
     }
     assert!(w.toasts().is_empty(), "a page complained: {:?}", w.toasts());
 }

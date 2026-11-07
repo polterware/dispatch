@@ -345,16 +345,23 @@ impl Core {
         })
     }
 
+    /// Downloads models.dev into the state folder's `models.json`, the prices and limits the
+    /// catalog reads. `dispatch models refresh`, Intelligence's Refresh, and the core's daily
+    /// background refresh all come through here.
+    pub(crate) async fn refresh_catalog(&self) -> Result<usize, Error> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|e| Error::Message(e.to_string()))?;
+        reports::refresh_catalog(&client, &self.state_dir(), chrono::Utc::now()).await
+    }
+
     pub(crate) async fn refresh_model_catalog(
         &self,
         _: pb::RefreshModelCatalogRequest,
     ) -> RpcResult<pb::RefreshModelCatalogResponse> {
         let mut out = json!({"source": crate::catalog::MODELS_DEV_URL});
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(RpcError::internal)?;
-        let r = reports::refresh_catalog(&client, &self.state_dir(), chrono::Utc::now()).await;
+        let r = self.refresh_catalog().await;
         match &r {
             Ok(n) => out["models"] = json!(n),
             Err(e) => out["error"] = json!(e.to_string()),

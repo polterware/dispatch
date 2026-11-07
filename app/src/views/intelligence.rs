@@ -16,11 +16,12 @@ use gpui::{
     SharedString, Window, canvas, div, prelude::*, px,
 };
 
-use crate::client::{CoreClient, CoreError, ListModelCatalogRequest};
+use crate::client::{CoreClient, CoreError, ListModelCatalogRequest, RefreshModelCatalogRequest};
 use crate::models::intelligence::{
     COLUMNS, Catalog, DEFAULT_SORT, ModelRow, SkillColumn, SkillSort, band_of, bar_note,
-    empty_catalog, empty_title, group_models, map_dispatch_catalog, model_filter_fields,
-    percent_text, policy_bar, score_detail, should_load, skill_digits, visible_rows,
+    empty_catalog, empty_title, group_models, map_dispatch_catalog, map_refresh,
+    model_filter_fields, percent_text, policy_bar, refresh_failure, score_detail, should_load,
+    skill_digits, visible_rows,
 };
 use crate::motion::{Animator, SpringTier, SpringValue};
 use crate::state::{AppState, ConnectionState, ToastTone};
@@ -29,7 +30,8 @@ use crate::ui::parts::intelligence::{band_cell, model_cell, model_details, score
 use crate::ui::patterns::{composer_card, modal_layer};
 use crate::ui::{
     Column, DataTable, FilterField, FilterPopover, FiltersChanged, Icon, MascotMood, TextInput,
-    mono, next_sort, page_empty, page_under, page_under_inset, sans, text_width, toolbar,
+    icon_button, mono, next_sort, page_empty, page_under, page_under_inset, sans, text_width,
+    toolbar,
 };
 use crate::ui::{SkeletonLayout, page_skeleton};
 
@@ -52,6 +54,8 @@ pub struct IntelligenceView {
     /// The last paint had no core client. A later client starts a real load.
     awaiting_core: bool,
     loading: bool,
+    /// A Refresh is in flight, so the toolbar's button waits for it.
+    refreshing: bool,
     /// The last load failed; the page tries again (see [`should_load`]) and says so once.
     failed: bool,
     /// When the last load started.
@@ -95,6 +99,7 @@ impl IntelligenceView {
             loaded: false,
             awaiting_core: false,
             loading: false,
+            refreshing: false,
             failed: false,
             last_load: None,
             load_generation: 0,
@@ -171,6 +176,56 @@ impl IntelligenceView {
                         }
                         view.failed = true;
                     }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The toolbar's Refresh: asks the core to fetch models.dev again, says how it went, and
+    /// reloads the table from the catalog the refresh rewrote.
+    fn refresh_prices(&mut self, cx: &mut Context<Self>) {
+        if self.refreshing {
+            return;
+        }
+        let Some(client) = self.state.read(cx).client() else {
+            self.toast("The Dispatch core is not running.", ToastTone::Danger, cx);
+            return;
+        };
+        self.refreshing = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    client.refresh_model_catalog(&RefreshModelCatalogRequest::default())
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                view.refreshing = false;
+                match result {
+                    Ok(response) => {
+                        let report = map_refresh(response.ok, &response.json);
+                        match refresh_failure(&report) {
+                            Some(error) => view.toast(error, ToastTone::Danger, cx),
+                            None => {
+                                let models = report.models.unwrap_or(0);
+                                view.toast(
+                                    format!("Refreshed {models} model prices."),
+                                    ToastTone::Success,
+                                    cx,
+                                );
+                                view.loaded = false;
+                                view.failed = false;
+                                view.spawn_load(cx);
+                            }
+                        }
+                    }
+                    Err(error) => view.toast(
+                        error_text(&error, "Could not refresh the model catalog."),
+                        ToastTone::Danger,
+                        cx,
+                    ),
                 }
                 cx.notify();
             });
@@ -355,17 +410,39 @@ impl Render for IntelligenceView {
                     .flex_col()
                     .overflow_hidden()
                     .child(
-                        models_table(rows, &self.catalog, bar, self.sort, view)
+                        models_table(rows, &self.catalog, bar, self.sort, view.clone())
                             .inset_top(top)
                             .fades(theme.color_surface),
                     ),
             );
         }
 
+        let catalog_date = if self.catalog.generated.is_empty() {
+            self.catalog.prices_fetched.as_str()
+        } else {
+            self.catalog.generated.as_str()
+        };
+        let refresh_tip = if catalog_date.is_empty() {
+            "Refresh prices and benchmarks".to_string()
+        } else {
+            format!("Refresh prices and benchmarks \u{00b7} catalog {catalog_date}")
+        };
+        let refresh_view = view.clone();
+        let refresh = icon_button(
+            "intelligence-refresh",
+            Icon::RefreshCw,
+            refresh_tip,
+            Rc::new(move |_, cx| {
+                refresh_view.update(cx, |this, cx| this.refresh_prices(cx));
+            }),
+            cx,
+        )
+        .disabled(self.refreshing);
         let end = div()
             .flex()
             .items_center()
             .gap(px(ACTIONS_GAP))
+            .child(refresh)
             .child(div().w(px(SEARCH_WIDTH)).child(self.search.clone()))
             .child(self.filters.clone());
         let layer = self.detail_layer(&theme, cx);

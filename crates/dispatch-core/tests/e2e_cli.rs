@@ -140,6 +140,7 @@ impl Env {
             .env_clear()
             .env("HOME", &self.home)
             .env("PWDISPATCH_DATA_DIR", &self.data)
+            .env("PWDISPATCH_CATALOG_REFRESH", "0")
             .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
             .env("SHELL", "/bin/sh")
             .env("TMPDIR", std::env::temp_dir())

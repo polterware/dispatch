@@ -37,6 +37,12 @@ use tokio_util::sync::CancellationToken;
 /// Header naming the calling client; the app is the default.
 pub const CLIENT_HEADER: &str = crate::coreclient::CLIENT_HEADER;
 
+/// How often the core checks whether its stored catalog is a day old.
+const CATALOG_REFRESH_GAP: Duration = Duration::from_secs(60 * 60);
+
+/// How long after start the first check waits, so no request meets the refresh.
+const CATALOG_REFRESH_DELAY: Duration = Duration::from_secs(5);
+
 /// What the per-run coordination of the core keeps.
 #[derive(Default)]
 struct WatchState {
@@ -210,6 +216,36 @@ impl Core {
         types::Store::list_disabled_agents(self.store.as_ref()).unwrap_or_default()
     }
 
+    /// Refreshes the catalog in the background when its stored copy, or the embedded
+    /// snapshot without one, is older than [`crate::catalog::CATALOG_MAX_AGE`]: once
+    /// shortly after start, then every hour until the core stops. No request waits on it;
+    /// a failure is logged and tried again at the next check.
+    pub(crate) fn spawn_catalog_refresh(self: &Arc<Self>) {
+        if !catalog_refresh_enabled() {
+            return;
+        }
+        let core = self.clone();
+        let done = self.done();
+        tokio::spawn(async move {
+            tokio::time::sleep(CATALOG_REFRESH_DELAY).await;
+            loop {
+                if crate::catalog::refresh_due(&core.state_dir(), chrono::Utc::now()) {
+                    match core.refresh_catalog().await {
+                        Ok(models) => eprintln!(
+                            "refreshed {models} model prices from {}",
+                            crate::catalog::MODELS_DEV_URL
+                        ),
+                        Err(e) => eprintln!("catalog refresh: {e}"),
+                    }
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(CATALOG_REFRESH_GAP) => {}
+                    () = done.cancelled() => break,
+                }
+            }
+        });
+    }
+
     /// Marks RUNNING and PENDING runs whose runner died with the previous
     /// core as ORPHANED, before the server accepts work.
     async fn reconcile_on_boot(&self) {
@@ -218,6 +254,18 @@ impl Core {
             let _ = tokio::time::timeout(Duration::from_secs(15), deps.reconcile(&cancel)).await;
         }
     }
+}
+
+/// Whether the core refreshes the catalog by itself, the default. `PWDISPATCH_CATALOG_REFRESH`
+/// set to `0`, `off`, or `false` turns it off; the end-to-end tests set it so none reaches
+/// the network.
+fn catalog_refresh_enabled() -> bool {
+    std::env::var("PWDISPATCH_CATALOG_REFRESH").map_or(true, |value| {
+        !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false"
+        )
+    })
 }
 
 pub(crate) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {

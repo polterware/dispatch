@@ -94,6 +94,8 @@ async fn serve(db_path: &Path, listen: String, token: String, idle: Duration) ->
         Ok(_) => {}
     }
     let server = tokio::spawn(server::serve(listener, core.clone()));
+    // The prices and benchmarks age out by themselves, never in a request's way.
+    core.spawn_catalog_refresh();
 
     let pid = i32::try_from(std::process::id()).unwrap_or(0);
     let state = runstate::Core {

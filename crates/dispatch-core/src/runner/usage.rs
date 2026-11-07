@@ -34,23 +34,6 @@ pub fn load_catalog(state_dir: &str) -> Catalog {
     c
 }
 
-/// The exact key, then shorter ones with trailing segments dropped.
-fn lookup_keys(key: &str) -> Vec<&str> {
-    let mut keys = vec![key];
-    let mut k = key;
-    while let Some(i) = k.rfind('-').filter(|i| *i > 0) {
-        k = &k[..i];
-        keys.push(k);
-    }
-    keys
-}
-
-fn price<'a>(c: &'a Catalog, key: &str) -> Option<&'a CatalogModel> {
-    lookup_keys(key)
-        .into_iter()
-        .find_map(|k| c.models.iter().find(|m| m.id == k))
-}
-
 /// Prices one attempt: the CLI's own price when it gave one, else its tokens
 /// at the model's list prices. A model with no cache price pays input price
 /// for cache tokens; an attempt whose context passed a price tier's size pays
@@ -59,7 +42,7 @@ pub fn usage_cost(c: &Catalog, model: &str, u: &AgentUsage) -> Option<(f64, &'st
     if let Some(cost) = u.cost_usd {
         return Some((cost, COST_AGENT));
     }
-    let m = price(c, &catalog_key(model))?;
+    let m = c.price(&catalog_key(model))?;
     let mut p = PriceTier {
         size: 0,
         input: m.input,
@@ -88,7 +71,7 @@ fn context_window(c: &Catalog, model: &str, u: &AgentUsage) -> i64 {
     if u.context_window > 0 {
         return u.context_window;
     }
-    price(c, &catalog_key(model)).map_or(0, |m| m.context)
+    c.price(&catalog_key(model)).map_or(0, |m| m.context)
 }
 
 /// Adds one attempt's reported usage, run on `model`, to the run: its tokens always, and its
@@ -185,7 +168,8 @@ pub fn usage_with_log(run: &Run, state_dir: &str, cat: &Catalog) -> Option<crate
 
 #[cfg(test)]
 mod log_tests {
-    use super::attempt_usage_from_log;
+    use super::{attempt_usage_from_log, usage_cost};
+    use crate::{adapters::usage::Usage as AgentUsage, catalog::Catalog};
 
     #[test]
     fn the_current_attempt_reads_its_last_usage_line() {
@@ -202,5 +186,19 @@ mod log_tests {
             (30, 4, 7)
         );
         assert!(attempt_usage_from_log("acp-agent", "no usage here").is_none());
+    }
+
+    #[test]
+    fn a_run_on_a_differently_named_model_gets_the_catalog_price() {
+        let catalog = Catalog::embedded().expect("embedded catalog");
+        let usage = AgentUsage {
+            input_tokens: 1_000_000,
+            ..AgentUsage::default()
+        };
+        let (cost, source) =
+            usage_cost(&catalog, "opencode/opencode-go/deepseek-v4.1-flash", &usage)
+                .expect("a price from the catalog");
+        assert_eq!(source, super::COST_CATALOG);
+        assert!((cost - 0.15).abs() < 1e-9, "{cost}");
     }
 }
