@@ -686,23 +686,14 @@ test("the GUI adds the switch, the runs pill, and the panel", async () => {
     assert.equal(on.icon, "circle-check")
     assert.equal(on.tone, "success")
 
-    // The target pill is beside it while the check is on: Auto until a model
-    // is picked, then that agent and model.
+    // The target pill is beside it while the check is on: its capsule says
+    // Auto until a model is picked, and its popover is the host's, holding the
+    // search and the models grouped by agent.
     const auto = target.show({ session })
     assert.equal(auto.label, "pill.target.auto")
     assert.equal(auto.title, "pill.target.title")
-    await new Promise((resolve) => setTimeout(resolve, 0))
-    const ready = target.show({ session })
-    assert.deepEqual(ready.rows.map((row) => row.label), ["pill.target.auto.row", "opencode · deepseek/deepseek-flash"])
-    assert.equal(ready.rows[0].icon, "circle-check")
-    ready.rows[1].run()
-    await new Promise((resolve) => setTimeout(resolve, 0))
-    const picked = target.show({ session })
-    assert.equal(picked.label, "opencode · deepseek/deepseek-flash")
-    assert.equal(picked.rows[1].icon, "circle-check")
-    picked.rows[0].run()
-    await new Promise((resolve) => setTimeout(resolve, 0))
-    assert.equal(target.show({ session }).label, "pill.target.auto")
+    assert.equal(auto.rows, undefined)
+    assert.equal(typeof target.menu, "function")
     assert.equal(added.some((entry) => entry.registry === "slot"), false)
 
     commands.find((command) => command.id === "app").run()
@@ -725,4 +716,29 @@ test("the GUI's run rows read like the app", () => {
     "Done · codex · gpt-6 · 2 files +10 −3 · 500 tokens · 1m 15s",
   )
   assert.equal(helpers.statusLabel({ status: "COMPLETED", mergedAt: "2026-11-02T00:00:00Z" }), "Merged")
+})
+
+test("the Agent pill's search keeps the models that match every word", () => {
+  const { helpers } = loadGui()
+  const agents = [
+    { name: "opencode", models: ["openai/gpt-6", "deepseek/deepseek-flash"] },
+    { name: "codex", models: ["gpt-6"] },
+    { name: "cursor", models: [] },
+  ]
+  // No search keeps every model, and an agent with none still shows nothing.
+  assert.deepEqual(helpers.filterTargets(agents, ""), [
+    { name: "opencode", models: ["openai/gpt-6", "deepseek/deepseek-flash"] },
+    { name: "codex", models: ["gpt-6"] },
+  ])
+  // Case-insensitive, by model name.
+  assert.deepEqual(helpers.filterTargets(agents, "GPT-6"), [
+    { name: "opencode", models: ["openai/gpt-6"] },
+    { name: "codex", models: ["gpt-6"] },
+  ])
+  // Every whitespace-separated word must match the agent or the model.
+  assert.deepEqual(helpers.filterTargets(agents, "  opencode   flash "), [
+    { name: "opencode", models: ["deepseek/deepseek-flash"] },
+  ])
+  assert.deepEqual(helpers.filterTargets(agents, "codex gpt"), [{ name: "codex", models: ["gpt-6"] }])
+  assert.deepEqual(helpers.filterTargets(agents, "nothing"), [])
 })
