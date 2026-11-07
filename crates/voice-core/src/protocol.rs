@@ -193,7 +193,11 @@ pub enum EngineMessage {
     /// Audio level, ~30 per second per source, only while that source is
     /// active. `rms` and `peak` are linear in 0..=1 (full scale), not smoothed.
     #[serde(rename = "level")]
-    Level { source: LevelSource, rms: f32, peak: f32 },
+    Level {
+        source: LevelSource,
+        rms: f32,
+        peak: f32,
+    },
     /// VAD saw speech start or stop inside the current utterance.
     #[serde(rename = "vad")]
     Vad { id: String, speech: bool },
@@ -263,18 +267,35 @@ mod tests {
     #[test]
     fn client_message_wire_shape() {
         let msg: ClientMessage =
-            serde_json::from_str(r#"{"type":"listen.start","id":"u1","language":"pt-br"}"#).unwrap();
+            serde_json::from_str(r#"{"type":"listen.start","id":"u1","language":"pt-br"}"#)
+                .unwrap();
         assert_eq!(
             msg,
-            ClientMessage::ListenStart { id: "u1".into(), language: Language::PtBr, mode: ListenMode::PushToTalk }
+            ClientMessage::ListenStart {
+                id: "u1".into(),
+                language: Language::PtBr,
+                mode: ListenMode::PushToTalk
+            }
         );
-        let speak: ClientMessage = serde_json::from_str(r#"{"type":"speak","id":"s1","text":"hi"}"#).unwrap();
-        assert!(matches!(speak, ClientMessage::Speak { format: TextFormat::Markdown, .. }));
+        let speak: ClientMessage =
+            serde_json::from_str(r#"{"type":"speak","id":"s1","text":"hi"}"#).unwrap();
+        assert!(matches!(
+            speak,
+            ClientMessage::Speak {
+                format: TextFormat::Markdown,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn engine_message_wire_shape() {
-        let json = serde_json::to_value(EngineMessage::Level { source: LevelSource::Mic, rms: 0.5, peak: 1.0 }).unwrap();
+        let json = serde_json::to_value(EngineMessage::Level {
+            source: LevelSource::Mic,
+            rms: 0.5,
+            peak: 1.0,
+        })
+        .unwrap();
         assert_eq!(json["type"], "level");
         assert_eq!(json["source"], "mic");
         let err = serde_json::to_value(EngineMessage::Error {
