@@ -41,6 +41,8 @@ pub(crate) const OPS_USAGE: &str = "       dispatch wait <id> [--timeout <dur>] 
        dispatch rename <conversation-id> <name>   (an empty name gives the conversation back its first prompt)
        dispatch recover <id>
        dispatch roles [--check] [--dir <repo>]
+       dispatch roles templates [--dir <repo>]
+       dispatch roles add <name> --from-template <template> [--dir <repo>]
        dispatch roles save <name> [--when <text>] [--tier easy|normal|hard] [--columns easy,normal,hard] [--easy|--normal|--hard agent/model,...] [--readonly] [--instructions <text>] [--manual] [--prefer a,b] [--avoid a,b] [--timeout <dur>] | remove <name>
        dispatch on|off|hook [--agent <name>]
        dispatch setup [--json] | link | skill [--remove] [<agent> | <folder>] | hook [<agent>] on|off | opencode [--remove | on | off]
@@ -1048,12 +1050,27 @@ pub(super) async fn roles(db_path: &Path, args: &[String]) -> CliResult {
         "columns",
         "",
         "save: the tier columns its board keeps, comma separated, such as easy,hard; empty keeps all three",
+    )
+    .string(
+        "from-template",
+        "",
+        "add: the built-in role to copy, as dispatch roles templates lists",
     );
     let positional = f.parse_interspersed(args)?;
     let check = f.flag("check");
     let mut action = "list".to_owned();
     let mut req = pb::SubagentsRequest::default();
     match positional.as_slice() {
+        [verb] if verb == "templates" && !check => action = "templates".into(),
+        [verb, name] if verb == "add" && !check => {
+            action = "add".into();
+            req.name = name.clone();
+            if f.str("from-template").is_empty() {
+                return Err(usage_err(
+                    "dispatch roles add needs --from-template <template>",
+                ));
+            }
+        }
         [verb, name] if (verb == "save" || verb == "remove") && !check => {
             action.clone_from(verb);
             req.name = name.clone();
@@ -1087,9 +1104,50 @@ pub(super) async fn roles(db_path: &Path, args: &[String]) -> CliResult {
     }
     let wd = working_dir(&f.str("dir"))?;
     let (c, _) = dial_workspace(db_path, "").await?;
-    req.action = action.clone();
+    if action == "add" {
+        let listed = c
+            .dispatch
+            .subagents(&pb::SubagentsRequest {
+                action: "list".into(),
+                dir: wd.clone(),
+                ..pb::SubagentsRequest::default()
+            })
+            .await
+            .map_err(run_error)?;
+        let body: Value = serde_json::from_str(&listed.json)?;
+        let template = f.str("from-template");
+        let entry = body
+            .get("templates")
+            .and_then(Value::as_array)
+            .and_then(|items| {
+                items.iter().find(|item| {
+                    item.get("name").and_then(Value::as_str) == Some(template.as_str())
+                })
+            })
+            .ok_or_else(|| usage_err(format!("no role template {template:?}")))?;
+        let mut profile: Profile =
+            serde_json::from_value(entry.get("profile").cloned().unwrap_or(Value::Null))?;
+        apply_role_flags(&f, &mut profile)?;
+        req.profile = serde_json::to_string(&profile)?;
+        req.action = "save".into();
+    } else if action == "templates" {
+        req.action = "list".into();
+    } else {
+        req.action = action.clone();
+    }
     req.dir = wd;
     let res = c.dispatch.subagents(&req).await.map_err(run_error)?;
+    if action == "templates" {
+        let body: Value = serde_json::from_str(&res.json)?;
+        let templates = body
+            .get("templates")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new()));
+        return print_op(
+            res.ok,
+            &serde_json::to_string(&serde_json::json!({"templates": templates}))?,
+        );
+    }
     if action == "check" {
         let body: Value = serde_json::from_str(&res.json)?;
         let problems: Vec<String> = body
@@ -1112,6 +1170,45 @@ pub(super) async fn roles(db_path: &Path, args: &[String]) -> CliResult {
         return Err(Fail::Exit(1));
     }
     print_op(res.ok, &res.json)
+}
+
+/// Writes the flags given over a template's profile; flags left out keep the template's.
+fn apply_role_flags(f: &Flags, profile: &mut Profile) -> Result<(), Fail> {
+    for (field, value) in [
+        (&mut profile.tier, f.str("tier")),
+        (&mut profile.instructions, f.str("instructions")),
+        (&mut profile.when, f.str("when")),
+        (&mut profile.timeout, f.str("timeout")),
+    ] {
+        if !value.is_empty() {
+            *field = value;
+        }
+    }
+    if f.flag("readonly") {
+        profile.read_only = true;
+    }
+    if f.flag("manual") {
+        profile.manual = true;
+    }
+    if let Some(columns) = role_columns(&f.str("columns"))? {
+        profile.columns = Some(columns);
+    }
+    let prefer = split_list(&f.str("prefer"));
+    if !prefer.is_empty() {
+        profile.prefer = prefer;
+    }
+    let avoid = split_list(&f.str("avoid"));
+    if !avoid.is_empty() {
+        profile.avoid = avoid;
+    }
+    let mut entries = Vec::new();
+    for tier in ["easy", "normal", "hard"] {
+        entries.extend(parse_role_models(tier, &f.str(tier))?);
+    }
+    if !entries.is_empty() {
+        profile.tiers = entries;
+    }
+    Ok(())
 }
 
 /// Reads the tier columns a role keeps; empty keeps all three.

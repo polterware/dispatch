@@ -286,10 +286,19 @@ pub struct RoleRow {
     pub source: RoleSource,
 }
 
+/// A built-in role offered as a template to create a role from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoleTemplate {
+    pub name: String,
+    pub profile: RoleProfile,
+    pub in_use: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RolesList {
     pub rows: Vec<RoleRow>,
     pub builtin: Vec<String>,
+    pub templates: Vec<RoleTemplate>,
     /// `pick` defaults to on when the core omits it.
     pub pick: bool,
 }
@@ -299,6 +308,35 @@ pub fn parse_roles_list(json: &str) -> Result<RolesList, String> {
     let value: Value = serde_json::from_str(json).map_err(|err| err.to_string())?;
     let pick = value.get("pick").and_then(Value::as_bool).unwrap_or(true);
     let builtin = string_list(value.get("builtin"));
+    let templates = value
+        .get("templates")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let name = item.get("name").and_then(Value::as_str)?.to_string();
+                    let profile = item
+                        .get("profile")
+                        .map(|profile| {
+                            serde_json::from_value::<RoleProfile>(profile.clone())
+                                .unwrap_or_default()
+                        })
+                        .unwrap_or_default();
+                    let in_use = item
+                        .get("in_use")
+                        .or_else(|| item.get("inUse"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    Some(RoleTemplate {
+                        name,
+                        profile,
+                        in_use,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let source = value.get("source").and_then(Value::as_object);
     let mut names: Vec<String> = value
         .get("roles")
@@ -327,8 +365,18 @@ pub fn parse_roles_list(json: &str) -> Result<RolesList, String> {
     Ok(RolesList {
         rows,
         builtin,
+        templates,
         pick,
     })
+}
+
+/// The templates New role offers: the ones no role of that name uses now.
+pub fn available_templates(templates: &[RoleTemplate]) -> Vec<RoleTemplate> {
+    templates
+        .iter()
+        .filter(|template| !template.in_use)
+        .cloned()
+        .collect()
 }
 
 fn string_list(value: Option<&Value>) -> Vec<String> {
@@ -1434,6 +1482,30 @@ mod tests {
                 .unwrap()
                 .pick
         );
+    }
+
+    #[test]
+    fn lists_new_role_templates_and_only_the_ones_not_in_use() {
+        let listed = parse_roles_list(
+            r#"{"roles":{"explorer":{"when":"Find it."}},"templates":[{"name":"explorer","profile":{"tier":"easy","readonly":true,"when":"Find it.","instructions":"Answer from the code."},"in_use":true},{"name":"reviewer","profile":{"tier":"hard","readonly":true,"when":"Review it."},"in_use":false}],"pick":true}"#,
+        )
+        .unwrap();
+        assert_eq!(listed.templates.len(), 2);
+        assert_eq!(listed.templates[0].name, "explorer");
+        assert!(listed.templates[0].in_use);
+        assert_eq!(
+            listed.templates[0].profile.instructions,
+            "Answer from the code."
+        );
+        let available = available_templates(&listed.templates);
+        assert_eq!(
+            available
+                .iter()
+                .map(|template| template.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["reviewer"]
+        );
+        assert!(available_templates(&[]).is_empty());
     }
 
     #[test]

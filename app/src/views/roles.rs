@@ -10,8 +10,9 @@ use std::rc::Rc;
 
 use gpui::{
     AnyElement, App, AppContext as _, Bounds, Context, CursorStyle, DispatchPhase, Entity,
-    FontWeight, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Render, SharedString, Window, canvas, deferred, div, point, prelude::*, px,
+    FocusHandle, FontWeight, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Render, SharedString, Window, canvas, deferred, div, point,
+    prelude::*, px,
 };
 
 use crate::avatar::agent_avatar;
@@ -22,12 +23,13 @@ use crate::client::{
 };
 use crate::models::roles::{
     GENERAL_ROLE, PaletteModel, RoleDraft, RoleListRow, RoleProfile, RoleRow, RoleSource,
-    RolesList, TIER_COLUMNS, TierBuild, TierCardInput, TierColumns, TierSlot, add_column,
-    board_row_count, build_board, compose_profile, is_build_empty, kept_columns, models_label,
-    palette_card_at, palette_groups, parse_roles_list, parse_tier_build, place_tier_card,
-    profile_error, profile_with_board, remove_column, remove_tier_card, rename_drops_previous,
-    replace_tier_card, role_board_tiers, role_list_rows, role_models_prompt, role_name_error,
-    stored_columns, tier_column_label, tier_columns, tier_columns_in, tier_matches, when_display,
+    RoleTemplate, RolesList, TIER_COLUMNS, TierBuild, TierCardInput, TierColumns, TierSlot,
+    add_column, available_templates, board_row_count, build_board, compose_profile, is_build_empty,
+    kept_columns, models_label, palette_card_at, palette_groups, parse_roles_list,
+    parse_tier_build, place_tier_card, profile_error, profile_with_board, remove_column,
+    remove_tier_card, rename_drops_previous, replace_tier_card, role_board_tiers, role_list_rows,
+    role_models_prompt, role_name_error, stored_columns, tier_column_label, tier_columns,
+    tier_columns_in, tier_matches, when_display,
 };
 use crate::motion::{Animator, SpringTier, SpringValue};
 use crate::state::{AppState, Route, ToastTone, observe};
@@ -38,9 +40,9 @@ use crate::ui::parts::roles::{
     build_sections, muted_note, order_mark, role_board_note, role_summary,
 };
 use crate::ui::patterns::{
-    AnchorSlot, Property, PropertyOption, PropertyPicker, PropertyPickerEvent, PropertyPills,
-    PropertyPillsEvent, composer_card, composer_field, composer_footer, modal_layer, window_anchor,
-    window_layer,
+    AnchorSlot, ConfirmDialog, Property, PropertyOption, PropertyPicker, PropertyPickerEvent,
+    PropertyPills, PropertyPillsEvent, composer_card, composer_field, composer_footer, modal_layer,
+    window_anchor, window_layer,
 };
 use crate::ui::{
     Button, ButtonKind, ButtonSize, Column, DataTable, Edge, Icon, IconTile, MascotMood, Menu,
@@ -107,7 +109,7 @@ struct Extras {
 pub struct RolesView {
     state: Entity<AppState>,
     roles: Vec<RoleRow>,
-    builtin: Vec<String>,
+    templates: Vec<RoleTemplate>,
     tiers: Vec<DispatchTier>,
     tier_problems: Vec<String>,
     agents: Vec<String>,
@@ -143,6 +145,11 @@ pub struct RolesView {
     build_role: String,
     build_judge: String,
     build_menu: Entity<Menu>,
+    /// New role's choice of a blank role or a template not in use.
+    new_menu: Entity<Menu>,
+    /// The role the Remove dialog asks about, and the handle that holds Enter and Escape.
+    removing: Option<String>,
+    confirm_focus: FocusHandle,
     /// Add column: the picker of the missing tiers, and the button it hangs from.
     column_picker: Entity<PropertyPicker>,
     column_anchor: AnchorSlot,
@@ -294,7 +301,7 @@ impl RolesView {
         Self {
             state,
             roles: Vec::new(),
-            builtin: Vec::new(),
+            templates: Vec::new(),
             tiers: Vec::new(),
             tier_problems: Vec::new(),
             agents: Vec::new(),
@@ -327,6 +334,9 @@ impl RolesView {
             build_role: GENERAL_ROLE.to_string(),
             build_judge: String::new(),
             build_menu: cx.new(Menu::new),
+            new_menu: cx.new(Menu::new),
+            removing: None,
+            confirm_focus: cx.focus_handle(),
             column_picker,
             column_anchor: AnchorSlot::default(),
             drag: None,
@@ -423,7 +433,7 @@ impl RolesView {
         }
         if let Ok(list) = bundle.roles {
             self.roles = list.rows;
-            self.builtin = list.builtin;
+            self.templates = list.templates;
             roles_ok = true;
             self.loaded = true;
             self.bounce_missing(cx);
@@ -677,6 +687,21 @@ impl RolesView {
             .as_ref()
             .map(|row| row.profile.clone())
             .unwrap_or_default();
+        self.composer = Some(name.unwrap_or("").to_string());
+        let title = name.unwrap_or("").to_string();
+        self.name_input
+            .update(cx, |input, cx| input.set_text(title, cx));
+        self.fill_draft(&profile, cx);
+    }
+
+    /// A new role from a built-in template: the composer opens with its words, tier,
+    /// access, time limit, and preferences, and the name is the user's to give.
+    fn open_composer_from_template(&mut self, template: &RoleTemplate, cx: &mut Context<Self>) {
+        self.open_composer(None, cx);
+        self.fill_draft(&template.profile, cx);
+    }
+
+    fn fill_draft(&mut self, profile: &RoleProfile, cx: &mut Context<Self>) {
         self.draft_tier = match profile.tier.as_str() {
             "easy" => 1,
             "normal" => 2,
@@ -687,13 +712,9 @@ impl RolesView {
         self.draft_manual = profile.manual;
         self.draft_prefer = profile.prefer.clone();
         self.draft_avoid = profile.avoid.clone();
-        self.composer = Some(name.unwrap_or("").to_string());
-        let title = name.unwrap_or("").to_string();
         let instructions = profile.instructions.clone();
         let when = profile.when.clone();
         let timeout = profile.timeout.clone();
-        self.name_input
-            .update(cx, |input, cx| input.set_text(title, cx));
         self.instructions_input
             .update(cx, |input, cx| input.set_text(instructions, cx));
         self.when_input
@@ -914,11 +935,11 @@ impl RolesView {
                 view.saving = false;
                 match result {
                     Ok(list) => {
-                        if view.fetch_gen == generation {
-                            if let Some(list) = list {
-                                view.roles = list.rows;
-                                view.builtin = list.builtin;
-                            }
+                        if view.fetch_gen == generation
+                            && let Some(list) = list
+                        {
+                            view.roles = list.rows;
+                            view.templates = list.templates;
                         }
                         view.composer = None;
                         view.toast(
@@ -953,11 +974,9 @@ impl RolesView {
         self.roles.sort_by(|left, right| left.name.cmp(&right.name));
     }
 
-    fn remove_editing(&mut self, cx: &mut Context<Self>) {
-        let Some(name) = self.composer.clone().filter(|name| !name.is_empty()) else {
-            return;
-        };
-        let restores = self.builtin.iter().any(|item| item == &name);
+    /// Deletes a role for good, built-in or the user's own. A built-in stays gone through
+    /// `roles.json`'s `removed` list and remains a template.
+    fn remove_role(&mut self, name: String, cx: &mut Context<Self>) {
         let Some(client) = self.state.read(cx).client() else {
             self.toast("The local core is not running.", ToastTone::Danger, cx);
             return;
@@ -991,30 +1010,23 @@ impl RolesView {
                         .ok()
                         .filter(|response| response.ok)
                         .and_then(|response| parse_roles_list(&response.json).ok());
-                    Ok((name, restores, listed))
+                    Ok((name, listed))
                 })
                 .await;
             let _ = this.update(cx, |view, cx| {
                 match result {
-                    Ok((name, restores, listed)) => {
+                    Ok((name, listed)) => {
                         if view.fetch_gen == generation {
                             if let Some(list) = listed {
                                 view.roles = list.rows;
-                                view.builtin = list.builtin;
-                            } else if !restores {
+                                view.templates = list.templates;
+                            } else {
                                 view.roles.retain(|row| row.name != name);
                             }
                         }
-                        let message = if restores {
-                            format!("Restored the built-in {name}.")
-                        } else {
-                            format!("Removed {name}.")
-                        };
-                        view.toast(message, ToastTone::Success, cx);
+                        view.toast(format!("Removed {name}."), ToastTone::Success, cx);
                         view.composer = None;
-                        if !restores {
-                            view.go(Route::Roles, cx);
-                        }
+                        view.go(Route::Roles, cx);
                     }
                     Err(message) => view.toast(message, ToastTone::Danger, cx),
                 }
@@ -1664,8 +1676,9 @@ impl RolesView {
                 .size(ButtonSize::Icon)
                 .icon(Icon::Plus)
                 .tooltip("New role")
+                .selected(self.new_menu.read(cx).is_open())
                 .on_click(move |_, cx| {
-                    view.update(cx, |this, cx| this.open_composer(None, cx));
+                    view.update(cx, |this, cx| this.toggle_new_menu(cx));
                 })
                 .into_any_element(),
         };
@@ -1673,6 +1686,46 @@ impl RolesView {
             return toolbar(start, end, cx).into_any_element();
         };
         toolbar_center(start, self.role_button(&name, cx), end, cx).into_any_element()
+    }
+
+    /// New role's choice: a blank role, or a built-in template no role uses now. With every
+    /// template in use it opens the blank composer at once.
+    fn toggle_new_menu(&mut self, cx: &mut Context<Self>) {
+        let templates = available_templates(&self.templates);
+        if templates.is_empty() {
+            self.open_composer(None, cx);
+            return;
+        }
+        let weak = cx.weak_entity();
+        let blank = weak.clone();
+        let mut items = vec![MenuItem::action(
+            "Blank role".to_string(),
+            Some(Icon::Plus),
+            Rc::new(move |_, cx| {
+                let _ = blank.update(cx, |this, cx| this.open_composer(None, cx));
+            }),
+        )];
+        for template in templates {
+            let label = format!("From {}", template.name);
+            let weak = weak.clone();
+            items.push(MenuItem::action(
+                label,
+                Some(Icon::FileText),
+                Rc::new(move |_, cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.open_composer_from_template(&template, cx);
+                    });
+                }),
+            ));
+        }
+        let open = !self.new_menu.read(cx).is_open();
+        self.new_menu.update(cx, |menu, cx| {
+            menu.set_menu(items);
+            menu.set_width(232.0);
+            menu.set_open(open);
+            cx.notify();
+        });
+        cx.notify();
     }
 
     /// The models button's menu: the catalog's pick, Jev's, or a prompt for an agent.
@@ -2655,6 +2708,51 @@ impl RolesView {
         .into_any_element()
     }
 
+    /// Asks before deleting a role, the way the app asks before removing a repository.
+    fn remove_dialog(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let name = self.removing.clone()?;
+        if !self.confirm_focus.is_focused(window) {
+            self.confirm_focus.focus(window);
+        }
+        let theme = *Theme::global(cx);
+        let template = self.templates.iter().any(|item| item.name == name);
+        let cancel_view = cx.entity().clone();
+        let cancel: crate::ui::Handler = Rc::new(move |_, cx: &mut App| {
+            cancel_view.update(cx, |this, cx| {
+                this.removing = None;
+                cx.notify();
+            });
+        });
+        let confirm_view = cx.entity().clone();
+        let confirm_name = name.clone();
+        let confirm: crate::ui::Handler = Rc::new(move |_, cx: &mut App| {
+            let name = confirm_name.clone();
+            confirm_view.update(cx, |this, cx| {
+                this.removing = None;
+                this.remove_role(name, cx);
+            });
+        });
+        let description = if template {
+            "The role stops being offered to runs. Its built-in template stays under New role."
+        } else {
+            "Dispatch deletes the role, its instructions, and its board."
+        };
+        let dialog = ConfirmDialog::new(
+            "remove-role",
+            format!("Remove \u{201c}{name}\u{201d}?"),
+            description,
+        )
+        .recovery(format!(
+            "Runs started with --role {name} are refused until a role of that name exists again."
+        ))
+        .confirm_label("Remove")
+        .danger()
+        .focus(&self.confirm_focus)
+        .on_cancel(cancel.clone())
+        .on_confirm(confirm);
+        Some(modal_layer(1.0, true, cancel, dialog, &theme))
+    }
+
     fn composer_layer(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
         let t = self.composer_opacity.value();
         let title = match self.composer.as_deref() {
@@ -2667,28 +2765,30 @@ impl RolesView {
             .as_ref()
             .filter(|name| !name.is_empty())
             .and_then(|name| self.role_row(name).map(|row| row.source));
-        let show_footer = source == Some(RoleSource::User);
-        let restores = self
+        // Every role but General can go; a repository's role is edited in its file, not here.
+        let show_footer = self
             .composer
             .as_ref()
-            .is_some_and(|name| self.builtin.iter().any(|item| item == name));
+            .is_some_and(|name| !name.is_empty() && name != GENERAL_ROLE)
+            && source != Some(RoleSource::Repository);
         let view = cx.entity().clone();
         let closer = view.clone();
         let mut start = Vec::new();
         if show_footer {
             let footer_view = view.clone();
-            let label: SharedString = if restores {
-                "Restore built-in".into()
-            } else {
-                "Remove role".into()
-            };
+            let removing = self.composer.clone().unwrap_or_default();
             start.push(
                 button(
                     "role-remove",
-                    label,
+                    "Remove role",
                     ButtonKind::Ghost,
-                    Rc::new(move |_, cx| {
-                        footer_view.update(cx, |this, cx| this.remove_editing(cx));
+                    Rc::new(move |window, cx| {
+                        let name = removing.clone();
+                        footer_view.update(cx, |this, cx| {
+                            this.removing = Some(name);
+                            this.confirm_focus.focus(window);
+                            cx.notify();
+                        });
                     }),
                     cx,
                 )
@@ -2944,6 +3044,7 @@ impl Render for RolesView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.prepare(window, cx);
         let theme = *Theme::global(cx);
+        let removal = self.remove_dialog(window, cx);
         let show_composer = Self::layer_open(self.composer.is_some(), &self.composer_opacity);
         let show_build = Self::layer_open(self.build_open, &self.build_opacity);
         let show_palette = self.palette_anchor.is_some();
@@ -2998,7 +3099,16 @@ impl Render for RolesView {
                 page.child(self.palette_layer(&theme, window, cx))
             })
             .when(show_ghost, |page| page.child(self.ghost_layer(&theme, cx)))
-            // Under the models button at the toolbar's right edge; it defers nothing of its own.
+            // Under the New role and models buttons at the toolbar's right edge; neither
+            // defers anything of its own.
+            .child(
+                div()
+                    .absolute()
+                    .top(px(theme.space_2))
+                    .right(px(theme.space_2))
+                    .w(px(232.0))
+                    .child(deferred(self.new_menu.clone()).with_priority(2)),
+            )
             .child(
                 div()
                     .absolute()
@@ -3017,6 +3127,8 @@ impl Render for RolesView {
                     self.column_picker.clone().into_any_element(),
                 ))
             })
+            // Last, over the composer it was opened from.
+            .when_some(removal, |page, dialog| page.child(dialog))
     }
 }
 

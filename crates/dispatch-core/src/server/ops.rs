@@ -66,10 +66,7 @@ impl Core {
         }
         let profiles = self.profiles(&opts.dir)?;
         let Some(p) = profiles.get(name) else {
-            return Err(Error::Message(format!(
-                "unknown role {name:?} (have: {})",
-                roles::profile_names(&profiles).join(", ")
-            )));
+            return Err(Error::Message(roles::missing_role_message(name, &profiles)));
         };
         runner::apply_profile(opts, name, p)
     }
@@ -664,6 +661,11 @@ impl Core {
         match m.action.as_str() {
             "save" | "remove" => {
                 let name = m.name.trim();
+                if m.action == "remove" && name == GENERAL_ROLE {
+                    return Err(RpcError::invalid(format!(
+                        "{GENERAL_ROLE} is the tier table and cannot be removed"
+                    )));
+                }
                 if !roles::valid_profile_name(name) {
                     return Err(RpcError::invalid(format!(
                         "invalid role name {name:?} (lowercase letters, digits, and dashes, starting with a letter)"
@@ -735,12 +737,21 @@ impl Core {
                 .collect();
             let pick = config::load(&config::policy_config_path(&state))
                 .map_or(config::default_policy().roles, |p| p.roles);
+            // The built-ins are templates to create a role from, whether or not one of
+            // that name is in use.
+            let templates: Vec<Value> = roles::builtin_profiles()
+                .into_iter()
+                .map(|(name, profile)| {
+                    let in_use = profiles.contains_key(&name);
+                    json!({"name": name, "profile": profile, "in_use": in_use})
+                })
+                .collect();
             return respond(
                 true,
                 json!({
                     "roles": profiles, "user": roles::profile_names(&own), "path": user,
                     "source": source, "builtin": roles::profile_names(&roles::builtin_profiles()),
-                    "pick": pick,
+                    "templates": templates, "pick": pick,
                 }),
             );
         }

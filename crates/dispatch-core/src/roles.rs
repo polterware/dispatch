@@ -201,6 +201,21 @@ pub fn is_builtin_profile(name: &str) -> bool {
     )
 }
 
+/// The message a run naming a role that is gone gets. A deleted built-in says how to
+/// bring it back from its template.
+pub fn missing_role_message(name: &str, profiles: &BTreeMap<String, Profile>) -> String {
+    if is_builtin_profile(name) {
+        format!(
+            "role {name:?} was removed; create it again with `dispatch roles add {name} --from-template {name}`"
+        )
+    } else {
+        format!(
+            "unknown role {name:?} (have: {})",
+            profile_names(profiles).join(", ")
+        )
+    }
+}
+
 pub fn global_profiles_path(state_dir: &Path) -> PathBuf {
     state_dir.join("roles.json")
 }
@@ -220,6 +235,10 @@ struct RolesFile {
     roles: Option<BTreeMap<String, Profile>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     agents: Option<BTreeMap<String, Profile>>,
+    /// The built-in roles the user deleted. Absent means none, so an existing install
+    /// keeps every built-in until one is deleted.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    removed: Vec<String>,
 }
 
 pub fn parse_profiles(input: &str) -> Result<BTreeMap<String, Profile>, Error> {
@@ -231,8 +250,22 @@ pub fn merge_profiles(
     user: BTreeMap<String, Profile>,
     project: BTreeMap<String, Profile>,
 ) -> BTreeMap<String, Profile> {
+    merge_profiles_with_removed(user, &HashSet::new(), project)
+}
+
+/// The built-ins less the user's removals, then the user's roles and the repository's,
+/// which still win by name even over a removed built-in.
+pub fn merge_profiles_with_removed(
+    user: BTreeMap<String, Profile>,
+    removed: &HashSet<String>,
+    project: BTreeMap<String, Profile>,
+) -> BTreeMap<String, Profile> {
     let builtin = builtin_profiles();
-    let mut out = builtin.clone();
+    let mut out: BTreeMap<_, _> = builtin
+        .iter()
+        .filter(|(name, _)| !removed.contains(*name))
+        .map(|(name, p)| (name.clone(), p.clone()))
+        .collect();
     for (name, mut p) in user.into_iter().chain(project) {
         if p.when.is_empty()
             && let Some(b) = builtin.get(&name)
@@ -444,9 +477,9 @@ fn parse_duration(value: &str) -> Option<i64> {
     Some(nanos as i64)
 }
 
-pub fn load_profiles(path: &Path) -> Result<BTreeMap<String, Profile>, Error> {
+fn read_roles_file(path: &Path) -> Result<RolesFile, Error> {
     if path.as_os_str().is_empty() {
-        return Ok(BTreeMap::new());
+        return Ok(RolesFile::default());
     }
     let mut path = path.to_path_buf();
     let mut content = std::fs::read_to_string(&path);
@@ -459,25 +492,61 @@ pub fn load_profiles(path: &Path) -> Result<BTreeMap<String, Profile>, Error> {
         content = std::fs::read_to_string(&path);
     }
     match content {
-        Ok(text) => {
-            parse_profiles(&text).map_err(|e| Error::Message(format!("{}: {e}", path.display())))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+        Ok(text) => serde_json::from_str(&text)
+            .map_err(|e| Error::Message(format!("{}: {e}", path.display()))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(RolesFile::default()),
         Err(e) => Err(e.into()),
     }
 }
 
+pub fn load_profiles(path: &Path) -> Result<BTreeMap<String, Profile>, Error> {
+    let f = read_roles_file(path)?;
+    Ok(f.roles.or(f.agents).unwrap_or_default())
+}
+
+/// The built-in names the user deleted, kept in the user file only.
+pub fn load_removed(path: &Path) -> Result<HashSet<String>, Error> {
+    Ok(read_roles_file(path)?
+        .removed
+        .into_iter()
+        .filter(|name| is_builtin_profile(name))
+        .collect())
+}
+
 pub fn load_all_profiles(user: &Path, project: &Path) -> Result<BTreeMap<String, Profile>, Error> {
-    Ok(merge_profiles(
+    let removed = load_removed(user)?;
+    Ok(merge_profiles_with_removed(
         load_profiles(user)?,
+        &removed,
         load_profiles(project)?,
     ))
 }
 
 pub fn save_profile(path: &Path, name: &str, profile: Profile, remove: bool) -> Result<(), Error> {
-    let mut profiles = load_profiles(path)?;
+    let f = read_roles_file(path)?;
+    let mut profiles = f.roles.or(f.agents).unwrap_or_default();
+    let mut removed: HashSet<String> = f
+        .removed
+        .into_iter()
+        .filter(|name| is_builtin_profile(name))
+        .collect();
     if remove {
-        if profiles.remove(name).is_none() {
+        if name == GENERAL_ROLE {
+            return Err(Error::Message(format!(
+                "{GENERAL_ROLE} is the tier table and cannot be removed"
+            )));
+        }
+        let existed = profiles.remove(name).is_some();
+        if is_builtin_profile(name) {
+            if !existed && removed.contains(name) {
+                return Err(Error::Message(format!(
+                    "no role {name:?} in {}",
+                    path.display()
+                )));
+            }
+            // The built-in goes for good: removing a user copy is not enough.
+            removed.insert(name.into());
+        } else if !existed {
             return Err(Error::Message(format!(
                 "no role {name:?} in {}",
                 path.display()
@@ -485,6 +554,8 @@ pub fn save_profile(path: &Path, name: &str, profile: Profile, remove: bool) -> 
         }
     } else {
         profiles.insert(name.into(), profile);
+        // Saving a removed built-in's name makes it the user's own again.
+        removed.remove(name);
     }
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;
@@ -492,6 +563,7 @@ pub fn save_profile(path: &Path, name: &str, profile: Profile, remove: bool) -> 
     let doc = RolesFile {
         roles: (!profiles.is_empty()).then_some(profiles),
         agents: None,
+        removed: removed.into_iter().collect(),
     };
     let mut data = serde_json::to_string_pretty(&doc)?;
     data.push('\n');
@@ -564,4 +636,92 @@ pub fn apply_picked(
     p.model.clear();
     p.provider.clear();
     apply_profile(options, name, &p)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn paths(dir: &Path) -> (PathBuf, PathBuf) {
+        (global_profiles_path(dir), project_profiles_path(dir))
+    }
+
+    fn role(when: &str) -> Profile {
+        Profile {
+            when: when.into(),
+            instructions: format!("Do {when}."),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn deleting_a_builtin_stays_deleted_until_it_is_saved_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (user, project) = paths(dir.path());
+        assert!(
+            load_all_profiles(&user, &project)
+                .unwrap()
+                .contains_key("explorer")
+        );
+
+        save_profile(&user, "explorer", Profile::default(), true).unwrap();
+        let after = load_all_profiles(&user, &project).unwrap();
+        assert!(!after.contains_key("explorer"));
+        // A fresh read of the file keeps it gone.
+        assert!(
+            !load_all_profiles(&user, &project)
+                .unwrap()
+                .contains_key("explorer")
+        );
+        assert!(load_removed(&user).unwrap().contains("explorer"));
+        assert!(
+            missing_role_message("explorer", &after)
+                .contains("dispatch roles add explorer --from-template explorer")
+        );
+        // The classifier's pick never offers it.
+        assert!(!pick_roles(&after).contains_key("explorer"));
+
+        // Saving it again re-creates it as the user's own and clears the removal.
+        save_profile(&user, "explorer", role("mine"), false).unwrap();
+        let after = load_all_profiles(&user, &project).unwrap();
+        assert_eq!(after["explorer"].when, "mine");
+        assert!(load_removed(&user).unwrap().is_empty());
+        assert!(!std::fs::read_to_string(&user).unwrap().contains("removed"));
+    }
+
+    #[test]
+    fn a_repository_role_of_a_removed_builtin_still_applies() {
+        let dir = tempfile::tempdir().unwrap();
+        let (user, project) = paths(dir.path());
+        save_profile(&user, "planner", Profile::default(), true).unwrap();
+        save_profile(&project, "planner", role("plan here"), false).unwrap();
+
+        let profiles = load_all_profiles(&user, &project).unwrap();
+        assert_eq!(profiles["planner"].when, "plan here");
+        // Outside that repository it stays gone.
+        let other = dir
+            .path()
+            .join("other")
+            .join(".dispatch")
+            .join("roles.json");
+        assert!(
+            !load_all_profiles(&user, &other)
+                .unwrap()
+                .contains_key("planner")
+        );
+    }
+
+    #[test]
+    fn general_cannot_be_removed_and_unknown_roles_still_say_no_role() {
+        let dir = tempfile::tempdir().unwrap();
+        let (user, _) = paths(dir.path());
+        let error = save_profile(&user, GENERAL_ROLE, Profile::default(), true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cannot be removed"), "{error}");
+        let error = save_profile(&user, "missing", Profile::default(), true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no role"), "{error}");
+    }
 }

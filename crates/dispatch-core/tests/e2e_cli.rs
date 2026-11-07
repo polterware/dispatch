@@ -823,12 +823,61 @@ fn roles_are_saved_used_updated_and_removed() {
         env.fails(&["roles", "remove", "e2e-checker"])
             .contains("no role")
     );
-    // The built-in roles are not the user's to remove.
-    assert!(
-        env.fails(&["roles", "remove", "explorer"])
-            .contains("no role")
-    );
+}
+
+#[test]
+fn builtin_roles_are_templates_and_can_be_removed() {
+    let env = Env::new();
+    let template = |env: &Env, name: &str| {
+        env.json(&["roles", "templates"])["templates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"] == name)
+            .cloned()
+            .unwrap_or_else(|| panic!("no {name} template"))
+    };
     assert!(env.json(&["roles"])["roles"].get("explorer").is_some());
+    let explorer = template(&env, "explorer");
+    assert_eq!(explorer["in_use"], true, "{explorer}");
+    assert_eq!(explorer["profile"]["tier"], "easy", "{explorer}");
+    assert_eq!(explorer["profile"]["readonly"], true, "{explorer}");
+
+    env.ok(&["roles", "remove", "explorer"]);
+    assert!(env.json(&["roles"])["roles"].get("explorer").is_none());
+    assert_eq!(template(&env, "explorer")["in_use"], false);
+    // A deleted built-in is refused by --role, naming the command that brings it back.
+    let refused = env.fails(&["run", "--role", "explorer", "--agent", "fake", "say hi"]);
+    assert!(
+        refused.contains("dispatch roles add explorer --from-template explorer"),
+        "{refused}"
+    );
+
+    env.ok(&["roles", "add", "my-explorer", "--from-template", "explorer"]);
+    let role = env.json(&["roles"])["roles"]["my-explorer"].clone();
+    assert_eq!(role["tier"], "easy", "{role}");
+    assert_eq!(role["readonly"], true, "{role}");
+    assert!(
+        role["when"].as_str().unwrap().contains("Find where"),
+        "{role}"
+    );
+    assert!(
+        role["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("Answer from the code"),
+        "{role}"
+    );
+
+    // Saving the deleted built-in's name makes it the user's own again.
+    env.ok(&["roles", "add", "explorer", "--from-template", "explorer"]);
+    assert!(env.json(&["roles"])["roles"].get("explorer").is_some());
+    assert_eq!(template(&env, "explorer")["in_use"], true);
+    // General is the one role that stays.
+    assert!(
+        env.fails(&["roles", "remove", "general"])
+            .contains("cannot be removed")
+    );
 }
 
 #[test]
