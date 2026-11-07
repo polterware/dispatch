@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 pub const GENERAL_ROLE: &str = "general";
 pub const GENERAL_WHEN: &str = "None of the other roles fits well: a mixed or unusual task, or one that names no clear kind of work.";
 pub const PICK_MIN: f64 = 0.5;
+/// The columns a role's board can have, easiest first. General keeps all three.
+pub const ROLE_COLUMNS: [&str; 3] = ["easy", "normal", "hard"];
 
 fn is_false(v: &bool) -> bool {
     !*v
@@ -42,6 +44,9 @@ pub struct Profile {
     pub when: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tiers: Vec<RoleEntry>,
+    /// The tier columns the role keeps, easiest first. Absent keeps all three.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub columns: Option<Vec<String>>,
     #[serde(skip_serializing_if = "is_false")]
     pub manual: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -67,11 +72,18 @@ impl Profile {
         !self.manual && !self.when.trim().is_empty()
     }
 
+    /// The tier columns the role keeps, easiest first. An absent setting keeps all three.
+    pub fn columns(&self) -> Vec<String> {
+        kept_columns(self.columns.as_deref())
+    }
+
     pub fn board(&self) -> Table {
+        let columns = self.columns();
         let rows: Vec<Tier> = self
             .tiers
             .iter()
             .enumerate()
+            .filter(|(_, e)| columns.iter().any(|c| c == &e.tier))
             .map(|(i, e)| Tier {
                 name: e.tier.clone(),
                 agent: e.agent.clone(),
@@ -83,6 +95,43 @@ impl Profile {
             .collect();
         table_from_rows(&rows)
     }
+}
+
+/// The kept columns, easiest first; unknown names drop and an empty setting keeps all three.
+pub fn kept_columns(columns: Option<&[String]>) -> Vec<String> {
+    let Some(columns) = columns.filter(|c| !c.is_empty()) else {
+        return ROLE_COLUMNS.iter().map(|c| (*c).to_string()).collect();
+    };
+    let kept: Vec<String> = ROLE_COLUMNS
+        .iter()
+        .filter(|c| columns.iter().any(|k| k == *c))
+        .map(|c| (*c).to_string())
+        .collect();
+    if kept.is_empty() {
+        ROLE_COLUMNS.iter().map(|c| (*c).to_string()).collect()
+    } else {
+        kept
+    }
+}
+
+/// The column a role's board runs a `band` task on: the band itself when kept, else the
+/// nearest kept column, the next harder before the next easier. The note says so when the
+/// band moved.
+pub fn nearest_column(columns: &[String], band: &str) -> Option<(String, String)> {
+    let kept = kept_columns(Some(columns));
+    if kept.iter().any(|c| c == band) {
+        return Some((band.to_owned(), String::new()));
+    }
+    let index = ROLE_COLUMNS.iter().position(|c| *c == band)?;
+    let at = |name: &String| ROLE_COLUMNS.iter().position(|c| c == name);
+    let harder = kept.iter().filter_map(at).filter(|i| *i > index).min();
+    let easier = kept.iter().filter_map(at).filter(|i| *i < index).max();
+    let pick = harder.or(easier)?;
+    let column = ROLE_COLUMNS[pick].to_string();
+    Some((
+        column.clone(),
+        format!("the role keeps no {band} column: routed on its {column} column"),
+    ))
 }
 
 pub fn builtin_profiles() -> BTreeMap<String, Profile> {
@@ -268,6 +317,24 @@ pub fn validate_profile(name: &str, p: &Profile, known: &HashSet<String>) -> Vec
     if !p.tier.is_empty() && !valid_tier(&p.tier) {
         add(format!("invalid tier {:?} (want easy|normal|hard)", p.tier));
     }
+    if let Some(columns) = &p.columns {
+        if matches!(name, GENERAL_ROLE | "none") {
+            add("columns: its board keeps all three".into());
+        }
+        if columns.is_empty() {
+            add("columns: keep at least one of easy, normal, hard".into());
+        }
+        let mut seen = HashSet::new();
+        for column in columns {
+            if !valid_tier(column) {
+                add(format!(
+                    "columns: invalid tier {column:?} (want easy|normal|hard)"
+                ));
+            } else if !seen.insert(column) {
+                add(format!("columns: {column:?} is listed twice"));
+            }
+        }
+    }
     if !p.timeout.is_empty() && parse_duration(&p.timeout).is_none() {
         add(format!("invalid timeout {:?}", p.timeout));
     }
@@ -445,6 +512,7 @@ pub struct ProfileOptions {
     pub prefer: Vec<String>,
     pub avoid: Vec<String>,
     pub role_board: Table,
+    pub role_columns: Vec<String>,
 }
 
 pub fn apply_profile(options: &mut ProfileOptions, name: &str, p: &Profile) -> Result<(), Error> {
@@ -482,6 +550,7 @@ pub fn apply_profile(options: &mut ProfileOptions, name: &str, p: &Profile) -> R
     options.prefer.clone_from(&p.prefer);
     options.avoid.clone_from(&p.avoid);
     options.role_board = p.board();
+    options.role_columns = p.columns();
     Ok(())
 }
 

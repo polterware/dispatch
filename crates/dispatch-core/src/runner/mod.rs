@@ -273,6 +273,8 @@ pub struct Options {
     pub prefer: Vec<String>,
     pub avoid: Vec<String>,
     pub role_board: Table,
+    /// The tier columns the role keeps; empty keeps all three.
+    pub role_columns: Vec<String>,
     pub tier_floor: String,
     pub no_profile: bool,
     /// The part of the project the task touches, resolved by the caller.
@@ -341,6 +343,7 @@ fn with_profile_options(
         prefer: o.prefer.clone(),
         avoid: o.avoid.clone(),
         role_board: o.role_board.clone(),
+        role_columns: o.role_columns.clone(),
     };
     f(&mut po)?;
     o.tier = po.tier;
@@ -353,6 +356,7 @@ fn with_profile_options(
     o.prefer = po.prefer;
     o.avoid = po.avoid;
     o.role_board = po.role_board;
+    o.role_columns = po.role_columns;
     Ok(())
 }
 

@@ -4,8 +4,8 @@ use dispatch_core::{
     difficulty::new_difficulty,
     roles::{
         GENERAL_ROLE, GENERAL_WHEN, Profile, ProfileOptions, RoleEntry, apply_picked,
-        apply_profile, builtin_profiles, global_profiles_path, is_builtin_profile,
-        load_all_profiles, load_profiles, pick_role, pick_roles, profile_names,
+        apply_profile, builtin_profiles, global_profiles_path, is_builtin_profile, kept_columns,
+        load_all_profiles, load_profiles, nearest_column, pick_role, pick_roles, profile_names,
         project_profiles_path, raise_to_floor, save_profile, valid_profile_name, validate_profile,
     },
     router::{Agent, Filters, RouteOptions, route},
@@ -467,5 +467,115 @@ fn test_role_board_routing_and_floor_lifting() {
     assert_eq!(
         easy_route.winner.as_ref().map(|w| w.model.as_str()),
         Some("general-easy")
+    );
+}
+
+#[test]
+fn test_a_role_keeps_its_columns_and_validation_says_which() {
+    let known = HashSet::from(["codex".to_owned()]);
+    let columns = |list: &[&str]| {
+        validate_profile(
+            "x",
+            &Profile {
+                when: "w".into(),
+                columns: Some(list.iter().map(|c| (*c).to_string()).collect()),
+                ..Default::default()
+            },
+            &known,
+        )
+    };
+    assert!(columns(&["easy", "hard"]).is_empty());
+    assert!(columns(&["easy"]).is_empty());
+    assert!(
+        columns(&[]).iter().any(|p| p.contains("keep at least one")),
+        "an empty setting is refused"
+    );
+    assert!(
+        columns(&["easy", "wide"])
+            .iter()
+            .any(|p| p.contains("invalid tier")),
+        "a column that is no tier is refused"
+    );
+    assert!(
+        columns(&["easy", "easy"])
+            .iter()
+            .any(|p| p.contains("twice")),
+        "a repeated column is refused"
+    );
+    let general = validate_profile(
+        GENERAL_ROLE,
+        &Profile {
+            when: "w".into(),
+            columns: Some(vec!["easy".into()]),
+            ..Default::default()
+        },
+        &known,
+    );
+    assert!(
+        general.iter().any(|p| p.contains("keeps all three")),
+        "General keeps all three: {general:?}"
+    );
+
+    // An absent setting keeps all three; a stored one drops the columns it left out.
+    assert_eq!(
+        kept_columns(None),
+        vec!["easy".to_string(), "normal".into(), "hard".into()]
+    );
+    assert_eq!(
+        kept_columns(Some(&["hard".to_string()])),
+        vec!["hard".to_string()]
+    );
+    let profile = Profile {
+        columns: Some(vec!["easy".to_string(), "hard".into()]),
+        tiers: vec![
+            RoleEntry {
+                tier: "easy".into(),
+                agent: "codex".into(),
+                model: "small".into(),
+                ..Default::default()
+            },
+            RoleEntry {
+                tier: "normal".into(),
+                agent: "codex".into(),
+                model: "mid".into(),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let board = profile.board();
+    assert!(board.tiers.contains_key("easy"));
+    assert!(
+        !board.tiers.contains_key("normal"),
+        "a deleted column's models never route: {board:?}"
+    );
+}
+
+#[test]
+fn test_nearest_column_prefers_the_next_harder_then_the_next_easier() {
+    assert_eq!(
+        nearest_column(&["easy".into(), "hard".into()], "normal"),
+        Some((
+            "hard".into(),
+            "the role keeps no normal column: routed on its hard column".into()
+        ))
+    );
+    assert_eq!(
+        nearest_column(&["easy".into(), "normal".into()], "hard"),
+        Some((
+            "normal".into(),
+            "the role keeps no hard column: routed on its normal column".into()
+        ))
+    );
+    assert_eq!(
+        nearest_column(&["hard".into()], "easy"),
+        Some((
+            "hard".into(),
+            "the role keeps no easy column: routed on its hard column".into()
+        ))
+    );
+    assert_eq!(
+        nearest_column(&["normal".into()], "normal"),
+        Some(("normal".into(), String::new()))
     );
 }

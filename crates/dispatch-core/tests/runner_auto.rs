@@ -413,6 +413,56 @@ async fn test_role_board_routes_its_band_in_order_and_falls_back_when_empty() {
 }
 
 #[tokio::test]
+async fn test_a_role_without_a_column_routes_on_its_nearest_kept_one() {
+    let (c, _) = RoleClassifier::new([0.02, 0.18, 0.8], named("tester")); // hard
+    let mut t = pick_deps(Some(c));
+    let board = |tier: &str, agent: &str, model: &str| RoleEntry {
+        tier: tier.into(),
+        agent: agent.into(),
+        model: model.into(),
+        ..RoleEntry::default()
+    };
+    let mut p = t.deps.profiles["tester"].clone();
+    p.tiers = vec![
+        board("easy", "a", "small"),
+        board("normal", "b", "mid"),
+        board("hard", "c", "deep"),
+    ];
+    p.columns = Some(vec!["easy".into(), "normal".into()]);
+    p.tier.clear();
+    t.deps.profiles.insert("tester".into(), p.clone());
+    let route = t.deps.route(prompt("hard work", false)).await.unwrap();
+    assert!(
+        route.role == "tester"
+            && route
+                .winner
+                .as_ref()
+                .is_some_and(|w| w.agent == "b" && w.model == "mid")
+            && route.note.contains("no hard column")
+            && route.note.contains("normal"),
+        "a deleted hard column routes on normal: {route:?}"
+    );
+
+    // An easy task goes the other way: the next harder kept column is normal.
+    let (c, _) = RoleClassifier::new([0.9, 0.05, 0.05], named("tester")); // easy
+    t.deps.classifier = Some(c);
+    let mut p = t.deps.profiles["tester"].clone();
+    p.columns = Some(vec!["normal".into(), "hard".into()]);
+    t.deps.profiles.insert("tester".into(), p);
+    let route = t.deps.route(prompt("rename a test", false)).await.unwrap();
+    assert!(
+        route.role == "tester"
+            && route
+                .winner
+                .as_ref()
+                .is_some_and(|w| w.agent == "b" && w.model == "mid")
+            && route.note.contains("no easy column")
+            && route.note.contains("normal"),
+        "a deleted easy column routes on the next harder column: {route:?}"
+    );
+}
+
+#[tokio::test]
 async fn test_named_role_tier_is_a_floor_not_a_fixed_tier() {
     let (c, _) = RoleClassifier::new([0.1, 0.1, 0.8], RoleAnswer::default());
     let mut t = pick_deps(Some(c));

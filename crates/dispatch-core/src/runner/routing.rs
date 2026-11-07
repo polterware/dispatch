@@ -330,6 +330,7 @@ impl Deps {
             prefer: o.prefer.clone(),
             avoid: o.avoid.clone(),
             role_board: Table::default(),
+            role_columns: Vec::new(),
             disabled,
             disabled_agents,
         };
@@ -455,15 +456,17 @@ impl Deps {
     }
 
     /// Routes a run whose role has models in the run's band over those alone,
-    /// in board order, as a tier route of that band. A band the role leaves
-    /// empty, and a model or provider filter, keep the general route.
-    fn with_role_board(&self, mut o: Options) -> (Deps, Options) {
+    /// in board order, as a tier route of that band. A band the role deleted
+    /// moves to its nearest kept column, the next harder before the next easier.
+    /// A kept but empty band, and a model or provider filter, keep the general
+    /// route.
+    fn with_role_board(&self, mut o: Options) -> (Deps, Options, String) {
         let mut d = self.clone();
         if o.role_board.tiers.is_empty()
             || !o.filters.model.is_empty()
             || !o.filters.provider.is_empty()
         {
-            return (d, o);
+            return (d, o, String::new());
         }
         let mut band = o.tier.clone();
         if band == TIER_AUTO {
@@ -472,14 +475,16 @@ impl Deps {
         if !valid_tier(&band) {
             band = "normal".into();
         }
+        let (band, note) =
+            crate::roles::nearest_column(&o.role_columns, &band).unwrap_or((band, String::new()));
         let Some(entries) = o.role_board.tiers.get(&band).filter(|e| !e.is_empty()) else {
-            return (d, o);
+            return (d, o, String::new());
         };
         d.table = Table::default();
         d.table.tiers.insert(band.clone(), entries.clone());
         d.policy.discover = false;
         o.tier = band;
-        (d, o)
+        (d, o, note)
     }
 
     /// The one candidate list behind both Route (live=false) and Execute
@@ -502,7 +507,7 @@ impl Deps {
         if o.tier == TIER_AUTO && o.difficulty.is_none() {
             o.tier = "normal".into();
         }
-        let (d, o) = self.with_role_board(o);
+        let (d, o, role_note) = self.with_role_board(o);
         let (primary, mut rejected) = d.select_candidates_cool(&o, cool).await;
         let mut extra = Vec::new();
         let disabled = store_disabled(d.store.as_deref(), &d.state_dir);
@@ -540,6 +545,11 @@ impl Deps {
         let relaxed = !extra.is_empty();
         let mut all = primary;
         all.extend(extra);
+        if !role_note.is_empty() {
+            for c in &mut all {
+                c.route.note = join_note(&c.route.note, &role_note);
+            }
+        }
         let all = d.observe_with_cooldowns(all, live, cool).await;
         if o.tier == TIER_AUTO {
             let diff = o.difficulty.as_ref().map_or(-1.8, |c| c.difficulty.d);

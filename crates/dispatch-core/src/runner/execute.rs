@@ -585,6 +585,7 @@ impl Deps {
             && let Some(p) = self.profiles.get(&rec.profile)
         {
             o.role_board = p.board();
+            o.role_columns = p.columns();
         }
         if let Some(f) = &rec.requested {
             o.filters = f.clone();

@@ -768,6 +768,44 @@ fn roles_are_saved_used_updated_and_removed() {
 }
 
 #[test]
+fn roles_save_their_columns_and_refuse_a_bad_set() {
+    let env = Env::new();
+    env.ok(&[
+        "roles",
+        "save",
+        "e2e-columns",
+        "--when",
+        "end to end checks",
+        "--columns",
+        "easy,hard",
+        "--easy",
+        "fake/fake-fast",
+    ]);
+    let role = env.json(&["roles"])["roles"]["e2e-columns"].clone();
+    assert_eq!(
+        role["columns"],
+        serde_json::json!(["easy", "hard"]),
+        "{role}"
+    );
+
+    // General and none keep all three; an empty or invalid set is refused.
+    assert!(
+        env.fails(&["roles", "save", "e2e-columns", "--columns", "easy,wide"])
+            .contains("not easy, normal, or hard")
+    );
+    assert!(
+        env.fails(&["roles", "save", "e2e-columns", "--columns", "easy,easy"])
+            .contains("twice")
+    );
+    env.ok(&["roles", "save", "e2e-columns", "--when", "all three"]);
+    let role = env.json(&["roles"])["roles"]["e2e-columns"].clone();
+    assert!(
+        role.get("columns").is_none(),
+        "no columns setting keeps all three: {role}"
+    );
+}
+
+#[test]
 fn config_is_set_read_and_global() {
     let env = Env::new();
     env.ok(&["config", "set", "priority", "speed"]);
