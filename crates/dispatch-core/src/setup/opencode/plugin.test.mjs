@@ -718,6 +718,94 @@ test("the GUI's run rows read like the app", () => {
   assert.equal(helpers.statusLabel({ status: "COMPLETED", mergedAt: "2026-11-02T00:00:00Z" }), "Merged")
 })
 
+test("the panel draws a run's log as a transcript", () => {
+  const { buildTranscript } = loadGui().helpers
+  const line = (value) => JSON.stringify(value)
+  const acp = (text, messageId = "m1") =>
+    line({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId: "s",
+        update: { sessionUpdate: "agent_message_chunk", messageId, content: { type: "text", text } },
+      },
+    })
+
+  // ACP chunks of one message merge into one reply.
+  assert.deepEqual(buildTranscript([acp("Hel"), acp("lo")].join("\n")), [{ kind: "message", text: "Hello" }])
+
+  // A tool call keeps its command and the output its update brings.
+  const tool = [
+    line({
+      method: "session/update",
+      params: {
+        update: { sessionUpdate: "tool_call", toolCallId: "t1", kind: "read", rawInput: { path: "src/main.rs" }, status: "pending" },
+      },
+    }),
+    line({
+      method: "session/update",
+      params: {
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId: "t1",
+          status: "completed",
+          content: [{ type: "content", content: { type: "text", text: "line one\nline two" } }],
+        },
+      },
+    }),
+  ].join("\n")
+  assert.deepEqual(buildTranscript(tool), [{ kind: "step", text: "Reading src/main.rs", output: "line one\nline two" }])
+
+  // OpenCode names a shell call's command only in an update; the folder it
+  // gives as location first is not the step's target.
+  const update = (fields) => line({ method: "session/update", params: { update: { toolCallId: "s1", ...fields } } })
+  const shell = [
+    update({ sessionUpdate: "tool_call", name: "shell", title: "shell", kind: "execute", status: "pending", locations: [{ path: "/repo" }], rawInput: { cwd: "/repo" } }),
+    update({ sessionUpdate: "tool_call_update", kind: "execute", status: "in_progress", title: "ls vendor", locations: [{ path: "/repo" }], rawInput: { command: "ls vendor" } }),
+    update({ sessionUpdate: "tool_call_update", status: "completed", content: [{ type: "content", content: { type: "text", text: "bot-avatars\n" } }] }),
+  ].join("\n")
+  assert.deepEqual(buildTranscript(shell), [{ kind: "step", text: "Running ls vendor", output: "bot-avatars" }])
+
+  // Claude Code stream-json: the reply, a tool use, and its result.
+  const claude = [
+    line({
+      type: "assistant",
+      message: {
+        content: [
+          { type: "text", text: "Done." },
+          { type: "tool_use", id: "tu1", name: "Bash", input: { command: "git status" } },
+        ],
+      },
+    }),
+    line({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tu1", content: [{ type: "text", text: "clean" }] }] } }),
+  ].join("\n")
+  assert.deepEqual(buildTranscript(claude), [
+    { kind: "message", text: "Done." },
+    { kind: "step", text: "Running git status", output: "clean" },
+  ])
+
+  // Codex app-server: a reply delta settled by its completed item, and a command.
+  const codex = [
+    line({ method: "item/agentMessage/delta", params: { itemId: "a1", delta: "Working" } }),
+    line({ method: "item/completed", params: { item: { id: "a1", type: "agentMessage", text: "Working" } } }),
+    line({ method: "item/started", params: { item: { id: "c1", type: "commandExecution", command: "bash -lc 'ls'" } } }),
+    line({
+      method: "item/completed",
+      params: { item: { id: "c1", type: "commandExecution", command: "bash -lc 'ls'", exitCode: 0, aggregatedOutput: "a.txt\n" } },
+    }),
+  ].join("\n")
+  assert.deepEqual(buildTranscript(codex), [
+    { kind: "message", text: "Working" },
+    { kind: "step", text: "Running ls", failed: false, output: "a.txt" },
+  ])
+
+  // Usage lines are not drawn, and a tail that starts inside a JSON line drops it.
+  assert.deepEqual(buildTranscript(line({ dispatch: "usage", input: 10 })), [])
+  assert.deepEqual(buildTranscript(['"text":"cut"}}', acp("whole")].join("\n")), [{ kind: "message", text: "whole" }])
+  // The core's own events read as one row.
+  assert.deepEqual(buildTranscript("[merged] three"), [{ kind: "event", event: "merged", text: "three" }])
+})
+
 test("the Agent pill's search keeps the models that match every word", () => {
   const { helpers } = loadGui()
   const agents = [

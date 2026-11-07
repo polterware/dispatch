@@ -4967,8 +4967,8 @@ function rng(seed) {
     return ((t ^ t >>> 14) >>> 0) / 4294967296;
   };
 }
-function approach(cur, target, rate, dt) {
-  return cur + (target - cur) * (1 - Math.exp(-rate * dt));
+function approach(cur, target2, rate, dt) {
+  return cur + (target2 - cur) * (1 - Math.exp(-rate * dt));
 }
 const easeInOut = (p) => p < 0.5 ? 4 * p * p * p : 1 - Math.pow(-2 * p + 2, 3) / 2;
 const easeSine = (p) => 0.5 - 0.5 * Math.cos(Math.PI * p);
@@ -5235,8 +5235,8 @@ class Sim {
       this.tr = Math.min(1, this.tr + dt / this.trDuration);
       const e = easeSine(this.tr);
       for (let i = 0; i < 3; i++) {
-        const target = STATES[i] === this.state ? 1 : 0;
-        w[i] = this.wFrom[i] + (target - this.wFrom[i]) * e;
+        const target2 = STATES[i] === this.state ? 1 : 0;
+        w[i] = this.wFrom[i] + (target2 - this.wFrom[i]) * e;
       }
     }
     const [wd, ww, ws] = w;
@@ -6251,7 +6251,696 @@ function runDetail(run) {
   if (took && !ACTIVE.has(run.status)) parts.push(took);
   return parts.join(" · ");
 }
-var _tmpl$ = /* @__PURE__ */ web.template(`<div class=dispatch-settings><p class=dispatch-muted></p><div>`), _tmpl$2 = /* @__PURE__ */ web.template(`<p class=dispatch-target-note>`), _tmpl$3 = /* @__PURE__ */ web.template(`<div class=dispatch-target><div class=dispatch-target-list role=listbox>`), _tmpl$4 = /* @__PURE__ */ web.template(`<p class=dispatch-target-agent>`), _tmpl$5 = /* @__PURE__ */ web.template(`<span class=dispatch-target-check>`), _tmpl$6 = /* @__PURE__ */ web.template(`<button type=button role=option class=dispatch-target-row><span class=dispatch-target-name>`), _tmpl$7 = /* @__PURE__ */ web.template(`<p class=dispatch-danger>`), _tmpl$8 = /* @__PURE__ */ web.template(`<pre class=dispatch-log-body>`), _tmpl$9 = /* @__PURE__ */ web.template(`<button class=dispatch-log-follow type=button>`), _tmpl$0 = /* @__PURE__ */ web.template(`<div class=dispatch-log-foot><span class=dispatch-muted>`), _tmpl$1 = /* @__PURE__ */ web.template(`<div class="dispatch-panel dispatch-panel-log"><div class=dispatch-log-head><span class=dispatch-run-bot></span><span class=dispatch-run-body><span class=dispatch-run-title></span><span></span></span></div><div class=dispatch-log-wrap>`), _tmpl$10 = /* @__PURE__ */ web.template(`<p class=dispatch-log-empty>`), _tmpl$11 = /* @__PURE__ */ web.template(`<span class=dispatch-muted> · `), _tmpl$12 = /* @__PURE__ */ web.template(`<ul class=dispatch-runs>`), _tmpl$13 = /* @__PURE__ */ web.template(`<div class=dispatch-panel><div class=dispatch-panel-head><span class=dispatch-panel-switch></span><span class=dispatch-panel-title></span><span class=dispatch-panel-actions>`), _tmpl$14 = /* @__PURE__ */ web.template(`<div class=dispatch-empty><p class=dispatch-empty-title></p><p class=dispatch-muted>`), _tmpl$15 = /* @__PURE__ */ web.template(`<li><button class=dispatch-run type=button><span class=dispatch-run-bot></span><span class=dispatch-run-body><span class=dispatch-run-title></span><span>`);
+const EMPTY = {};
+const obj = (value) => value && typeof value === "object" && !Array.isArray(value) ? value : EMPTY;
+const arr = (value) => Array.isArray(value) ? value : [];
+const str = (value) => typeof value === "string" ? value : "";
+const num = (value) => typeof value === "number" && Number.isFinite(value) ? value : void 0;
+const has = (entry, key) => Object.prototype.hasOwnProperty.call(entry, key);
+const truthy = (value) => {
+  if (value === void 0 || value === null) return false;
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value === "string") return value !== "";
+  return true;
+};
+const blockIs = (entry, kind) => entry?.kind === kind;
+const blockEntry = (kind, text) => ({ kind, text });
+const stepEntry = (update) => {
+  const entry = { kind: "step", text: update.text };
+  if (typeof update.detail === "string") entry.detail = update.detail;
+  if (update.failed !== void 0) entry.failed = update.failed;
+  if (typeof update.output === "string") entry.output = update.output;
+  return entry;
+};
+function stripAnsi(text) {
+  const cleaned = text.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "").replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, "");
+  return cleaned.split("\n").map((line) => {
+    const trimmed = line.endsWith("\r") ? line.slice(0, -1) : line;
+    const at = trimmed.lastIndexOf("\r");
+    return at >= 0 ? trimmed.slice(at + 1) : trimmed;
+  }).join("\n");
+}
+function unwrapShell(command) {
+  const text = command.trim();
+  const end = text.search(/\s/);
+  const token = text.slice(0, end < 0 ? text.length : end);
+  const starts = [...token.matchAll(/\//g)].map((match) => (match.index ?? 0) + 1);
+  starts.push(0);
+  starts.sort((left, right) => right - left);
+  for (const start2 of starts) {
+    const body = unwrapAt(text.slice(start2));
+    if (body !== null) return body;
+  }
+  return text;
+}
+function unwrapAt(command) {
+  let rest;
+  if (command.startsWith("bash ")) rest = command.slice(5);
+  else if (command.startsWith("zsh ")) rest = command.slice(4);
+  else if (command.startsWith("sh ")) rest = command.slice(3);
+  else return null;
+  if (rest.startsWith("-lc ")) rest = rest.slice(4);
+  else if (rest.startsWith("-c ")) rest = rest.slice(3);
+  else return null;
+  const quote = rest[0];
+  if (quote !== "'" && quote !== '"') return null;
+  const body = rest.slice(1);
+  return body.endsWith(quote) ? body.slice(0, -1) : null;
+}
+function target(args) {
+  for (const key of ["command", "cmd", "path", "Path", "file_path", "target_file", "filePath", "pattern", "query", "url", "glob"]) {
+    const value = args[key];
+    if (value === void 0) continue;
+    if (typeof value === "string" && value.trim()) return value.trim();
+    if (Array.isArray(value) && value.length > 0 && value.every((part) => typeof part === "string")) {
+      return value.join(" ");
+    }
+  }
+  return "";
+}
+function stepFor(tool, args) {
+  const name = tool.endsWith("ToolCall") ? tool.slice(0, -8) : tool;
+  const clean = name.replace(/[_-]/g, " ").trim();
+  const lower = clean.toLowerCase().replace(/ /g, "");
+  const on = target(args);
+  const verb = containsAny(lower, ["shell", "bash", "terminal", "command", "exec"]) ? "Running" : containsAny(lower, ["read", "view", "cat"]) ? "Reading" : containsAny(lower, ["write", "create"]) ? "Writing" : containsAny(lower, ["edit", "replace", "patch", "update", "delete"]) ? "Editing" : containsAny(lower, ["grep", "glob", "search", "find", "ls", "list"]) ? "Searching" : containsAny(lower, ["fetch", "web"]) ? "Fetching" : "";
+  if (verb) return { text: on ? `${verb} ${on}` : `${verb} (${clean})` };
+  return on ? { text: clean || "Tool call", detail: on } : { text: clean || "Tool call" };
+}
+function containsAny(haystack, needles) {
+  return needles.some((needle) => haystack.includes(needle));
+}
+function contentText(value) {
+  if (typeof value === "string") return value;
+  const parts = arr(value).map(obj).map((part) => {
+    const text = str(part.text);
+    if (text) return text;
+    const inner = str(obj(part.content).text);
+    if (inner) return inner;
+    if (str(part.type) === "diff") return `Edited ${str(part.path)}`;
+    return "";
+  }).filter(Boolean);
+  if (parts.length) return parts.join("\n");
+  const raw = obj(value);
+  for (const key of ["content", "output", "stdout", "result"]) {
+    const text = str(raw[key]);
+    if (text) return text;
+  }
+  return "";
+}
+function parseJson(line) {
+  try {
+    const value = JSON.parse(line.trim());
+    return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+function chunkHasJson(chunk) {
+  return chunk.split("\n").some((line) => line.trimStart().startsWith("{") && parseJson(line) !== null);
+}
+function partialJson(line) {
+  const text = line.trim();
+  if (!text) return false;
+  const marked = text.startsWith("{") || text.endsWith("}") || text.endsWith("]");
+  return marked && /["[\]{}]/.test(text);
+}
+function eventLine(line) {
+  if (!line.startsWith("[")) return null;
+  const close = line.indexOf("]");
+  if (close < 1) return null;
+  const kind = line.slice(1, close);
+  if (!/^[a-z][a-z_-]*$/.test(kind)) return null;
+  if (line[close + 1] !== " ") return null;
+  return { event: kind, text: line.slice(close + 2).trim() };
+}
+function trimFlush(text) {
+  return text.replace(/^\n+/, "").replace(/\s+$/, "");
+}
+class Builder {
+  entries = [];
+  items = /* @__PURE__ */ new Map();
+  untargeted = /* @__PURE__ */ new Map();
+  text = [];
+  fenced = false;
+  streamed = false;
+  delta = null;
+  plain = [];
+  feed(chunk) {
+    if (!chunk) return;
+    if (!this.streamed && chunkHasJson(chunk)) {
+      this.promotePlain();
+      this.streamed = true;
+    }
+    const lines = chunk.split("\n");
+    if (chunk.endsWith("\n") && lines[lines.length - 1] === "") lines.pop();
+    const last2 = lines.length - 1;
+    lines.forEach((line, index) => {
+      if (!this.fenced && line.trimStart().startsWith("{")) {
+        const event2 = parseJson(line);
+        if (event2) {
+          this.flushText();
+          this.readEvent(event2);
+          return;
+        }
+      }
+      if ((index === 0 || index === last2) && partialJson(line) && parseJson(line) === null) return;
+      if (line.trimStart().startsWith("```") || line.trimStart().startsWith("~~~")) this.fenced = !this.fenced;
+      const event = this.fenced ? null : eventLine(line);
+      if (event) {
+        this.flushText();
+        if (event.event !== "started") this.push({ kind: "event", event: event.event, text: event.text });
+        return;
+      }
+      this.text.push(line);
+    });
+  }
+  finish() {
+    const result = [];
+    for (const entry of this.entries) {
+      if (entry.kind === "message" || entry.kind === "thinking") {
+        const text = entry.text.trim();
+        if (text) result.push({ kind: entry.kind, text });
+      } else {
+        result.push(entry);
+      }
+    }
+    if (this.text.length) {
+      const joined = trimFlush(this.text.join("\n")).trim();
+      if (joined) result.push(this.streamed ? { kind: "output", text: joined } : { kind: "message", text: joined });
+    }
+    return result;
+  }
+  promotePlain() {
+    for (const index of this.plain) {
+      const entry = this.entries[index];
+      if (entry?.kind === "message") this.entries[index] = { kind: "output", text: entry.text };
+    }
+    this.plain = [];
+  }
+  flushText() {
+    if (!this.text.length) return;
+    const joined = trimFlush(this.text.join("\n"));
+    this.text = [];
+    if (!joined.trim()) return;
+    if (this.streamed) {
+      this.push({ kind: "output", text: joined });
+      return;
+    }
+    const index = this.push({ kind: "message", text: joined });
+    this.plain.push(index);
+  }
+  push(entry) {
+    this.delta = null;
+    this.entries.push(entry);
+    return this.entries.length - 1;
+  }
+  appendText(index, text) {
+    const entry = this.entries[index];
+    if (entry?.kind === "message" || entry?.kind === "thinking") {
+      this.entries[index] = { kind: entry.kind, text: entry.text + text };
+    }
+  }
+  setBlockText(index, text) {
+    const entry = this.entries[index];
+    if (entry?.kind === "message" || entry?.kind === "thinking") {
+      this.entries[index] = { kind: entry.kind, text };
+    }
+  }
+  appendBlock(kind, chunk, key = "") {
+    if (!chunk) return;
+    if (key) {
+      const index2 = this.items.get(key);
+      if (index2 !== void 0 && blockIs(this.entries[index2], kind)) {
+        this.appendText(index2, chunk);
+        return;
+      }
+    } else if (this.delta && this.delta.kind === kind && blockIs(this.entries[this.delta.index], kind)) {
+      this.appendText(this.delta.index, chunk);
+      return;
+    }
+    const index = this.push(blockEntry(kind, chunk));
+    this.delta = { kind, index };
+    if (key) this.items.set(key, index);
+  }
+  completeBlock(kind, full) {
+    if (!full.trim()) return;
+    if (this.delta && this.delta.kind === kind && blockIs(this.entries[this.delta.index], kind)) {
+      this.setBlockText(this.delta.index, full);
+      this.delta = null;
+      return;
+    }
+    this.push(blockEntry(kind, full));
+  }
+  streamItem(id, kind, chunk) {
+    if (!chunk) return;
+    if (id) {
+      const index2 = this.items.get(id);
+      if (index2 !== void 0 && blockIs(this.entries[index2], kind)) {
+        this.appendText(index2, chunk);
+        return;
+      }
+    }
+    const index = this.push(blockEntry(kind, chunk));
+    if (id) this.items.set(id, index);
+  }
+  settleItem(id, kind, full) {
+    if (!full.trim()) return;
+    if (id) {
+      const index = this.items.get(id);
+      if (index !== void 0 && blockIs(this.entries[index], kind)) {
+        this.setBlockText(index, full);
+        return;
+      }
+    }
+    this.streamItem(id, kind, full);
+  }
+  applyStep(id, update) {
+    if (id) {
+      const index2 = this.items.get(id);
+      if (index2 !== void 0) {
+        this.mergeStep(index2, update);
+        return;
+      }
+    }
+    const index = this.push(stepEntry(update));
+    if (id) this.items.set(id, index);
+  }
+  mergeStep(index, update) {
+    const entry = this.entries[index];
+    if (entry?.kind !== "step") {
+      this.entries[index] = stepEntry(update);
+      return;
+    }
+    const next = { ...entry, text: update.text };
+    if (update.failed !== void 0) next.failed = update.failed;
+    if (update.detail !== void 0) {
+      if (update.detail === null) delete next.detail;
+      else next.detail = update.detail;
+    }
+    if (update.output !== void 0) {
+      if (update.output === null) delete next.output;
+      else next.output = update.output;
+    }
+    this.entries[index] = next;
+  }
+  patchStep(id, patch) {
+    const index = this.items.get(id);
+    if (index === void 0) return;
+    const entry = this.entries[index];
+    if (entry?.kind !== "step") return;
+    const next = { ...entry };
+    if (patch.failed !== void 0) next.failed = patch.failed;
+    if (patch.output !== void 0) {
+      if (patch.output === null) delete next.output;
+      else next.output = patch.output;
+    }
+    this.entries[index] = next;
+  }
+  appendOutput(id, chunk) {
+    if (!chunk) return;
+    const index = this.items.get(id);
+    if (index === void 0) return;
+    const entry = this.entries[index];
+    if (entry?.kind !== "step") return;
+    this.entries[index] = { ...entry, output: (entry.output ?? "") + chunk };
+  }
+  readEvent(ev) {
+    if (has(ev, "dispatch")) return;
+    if (str(ev.method) === "session/update") {
+      this.readAcp(obj(obj(ev.params).update));
+      return;
+    }
+    if (str(ev.method)) {
+      this.readNotification(str(ev.method), obj(ev.params));
+      return;
+    }
+    const type = str(ev.type);
+    if (type === "stream_event") {
+      this.readClaude(obj(ev.event));
+      return;
+    }
+    if (type.startsWith("message_") || type.startsWith("tool_execution_")) {
+      this.readPi(type, ev);
+      return;
+    }
+    if (type.startsWith("item.")) {
+      this.readCodexJson(type, ev);
+      return;
+    }
+    if (type === "turn.failed" || type === "error") {
+      const message = str(obj(ev.error).message) || str(ev.message);
+      if (message) this.push({ kind: "event", event: "failed", text: message });
+      return;
+    }
+    if (type === "thinking") {
+      this.appendBlock("thinking", str(ev.text));
+      return;
+    }
+    if (type === "assistant" && has(ev, "message")) {
+      this.readAssistant(ev);
+      return;
+    }
+    if (type === "user" && has(ev, "message")) {
+      this.readToolResults(ev);
+      return;
+    }
+    if (type === "result") {
+      if (ev.is_error === true && str(ev.result)) {
+        this.push({ kind: "event", event: "failed", text: str(ev.result) });
+      } else if (!this.entries.some((entry) => entry.kind === "message")) {
+        this.completeBlock("message", str(ev.result));
+      }
+      return;
+    }
+    if (type === "text" && typeof ev.data === "string") {
+      this.appendBlock("message", str(ev.data));
+      return;
+    }
+    if ((type === "thought" || type === "reasoning") && typeof ev.data === "string") {
+      this.appendBlock("thinking", str(ev.data));
+      return;
+    }
+    if (type === "tool_call" && (has(ev, "toolName") || has(ev, "title"))) {
+      const tool = str(ev.toolName) || str(ev.title);
+      const built = stepFor(tool, obj(ev.rawInput));
+      this.applyStep(str(ev.toolCallId), { text: built.text, detail: built.detail ?? null });
+      return;
+    }
+    if (type === "tool_call_update") {
+      if (str(ev.status) === "failed") this.patchStep(str(ev.toolCallId), { failed: true });
+      return;
+    }
+    if (has(ev, "part")) {
+      this.readOpencode(type, ev);
+      return;
+    }
+    if (!type) {
+      for (const key of ["response", "result", "output", "text"]) {
+        if (typeof ev[key] === "string") {
+          this.completeBlock("message", str(ev[key]));
+          return;
+        }
+      }
+    }
+  }
+  readNotification(method, params) {
+    const id = str(params.itemId);
+    if (method === "item/agentMessage/delta") {
+      this.streamItem(id, "message", str(params.delta));
+      return;
+    }
+    if (method === "item/reasoning/summaryTextDelta" || method === "item/reasoning/textDelta" || method === "item/plan/delta") {
+      this.streamItem(id, "thinking", str(params.delta));
+      return;
+    }
+    if (method === "item/commandExecution/outputDelta") {
+      this.appendOutput(id, stripAnsi(str(params.delta)));
+      return;
+    }
+    if (method === "error") {
+      const message = str(obj(params.error).message);
+      if (message && !truthy(params.willRetry)) this.push({ kind: "event", event: "failed", text: message });
+      return;
+    }
+    if (method === "turn/completed") {
+      const message = str(obj(obj(params.turn).error).message);
+      if (message) this.push({ kind: "event", event: "failed", text: message });
+      return;
+    }
+    if (method !== "item/started" && method !== "item/completed") return;
+    const item = obj(params.item);
+    const itemId = str(item.id);
+    const done = method === "item/completed";
+    switch (str(item.type)) {
+      case "agentMessage":
+        if (done) this.settleItem(itemId, "message", str(item.text));
+        return;
+      case "reasoning":
+      case "plan":
+        if (done) this.settleItem(itemId, "thinking", reasoningText(item));
+        return;
+      case "commandExecution": {
+        const exit = num(item.exitCode);
+        const update = { text: `Running ${unwrapShell(str(item.command))}` };
+        if (exit !== void 0) {
+          update.failed = exit !== 0;
+          update.detail = exit !== 0 ? `exit ${exit}` : null;
+        }
+        const output = trimEnd(stripAnsi(str(item.aggregatedOutput)));
+        if (output) update.output = output;
+        this.applyStep(itemId, update);
+        return;
+      }
+      case "fileChange": {
+        const paths = changePaths(item);
+        this.applyStep(itemId, { text: paths ? `Edited ${paths}` : "Edited files", failed: str(item.status) === "failed" });
+        return;
+      }
+      case "mcpToolCall": {
+        const called = [str(item.server), str(item.tool)].filter(Boolean).join(".");
+        this.applyStep(itemId, { text: `Called ${called}`, failed: str(item.status) === "failed" });
+        return;
+      }
+      case "dynamicToolCall": {
+        const built = stepFor(str(item.tool), obj(item.arguments));
+        this.applyStep(itemId, { text: built.text, detail: built.detail ?? null, failed: str(item.status) === "failed" });
+        return;
+      }
+      case "webSearch":
+        this.applyStep(itemId, { text: `Searching the web for ${str(item.query)}` });
+        return;
+      default:
+        return;
+    }
+  }
+  readAcp(update) {
+    const text = str(obj(update.content).text);
+    const kind = str(update.sessionUpdate);
+    if (kind === "agent_message_chunk") {
+      this.appendBlock("message", text, str(update.messageId));
+    } else if (kind === "agent_thought_chunk") {
+      this.appendBlock("thinking", text, str(update.messageId));
+    } else if (kind === "plan") {
+      const plan = arr(update.entries).map(obj).map((entry) => `${str(entry.status) === "completed" ? "- [x]" : "- [ ]"} ${str(entry.content)}`).join("\n");
+      this.settleItem("acp-plan", "thinking", plan);
+    } else if (kind === "tool_call" || kind === "tool_call_update") {
+      this.readAcpTool(update);
+    }
+  }
+  readAcpTool(update) {
+    const id = str(update.toolCallId);
+    const args = { ...obj(update.rawInput), ...obj(update.args) };
+    const location = str(obj(arr(update.locations)[0]).path);
+    const own = target(args);
+    if (!own && location) args.path = location;
+    const tool = str(update.name) || str(update.kind) || str(update.title) || this.untargeted.get(id) || "";
+    const status = str(update.status);
+    const fromContent = contentText(update.content);
+    const output = trimEnd(stripAnsi(fromContent || contentText(update.rawOutput)));
+    const known = id ? this.items.get(id) : void 0;
+    if (known !== void 0 && this.entries[known]?.kind === "step") {
+      if (this.untargeted.has(id) && own) {
+        const built2 = stepFor(tool, args);
+        this.mergeStep(known, { text: built2.text, detail: built2.detail ?? null });
+        this.untargeted.delete(id);
+      }
+      this.patchStep(id, { failed: status === "failed" ? true : void 0, output: output ? output : void 0 });
+      return;
+    }
+    const built = stepFor(tool, args);
+    const step = { text: built.text, detail: built.detail ?? null };
+    if (!own) {
+      this.untargeted.set(id, tool);
+      const title = str(update.title);
+      if (title && title !== tool) step.text = title;
+    }
+    if (status === "failed") step.failed = true;
+    if (output) step.output = output;
+    this.applyStep(id, step);
+  }
+  readClaude(event) {
+    if (str(event.type) !== "content_block_delta") return;
+    const delta = obj(event.delta);
+    if (str(delta.type) === "text_delta") this.appendBlock("message", str(delta.text));
+    else if (str(delta.type) === "thinking_delta") this.appendBlock("thinking", str(delta.thinking));
+  }
+  readPi(type, ev) {
+    if (type === "message_update") {
+      const event = obj(ev.assistantMessageEvent);
+      const kind = str(event.type);
+      if (kind === "text_delta") this.appendBlock("message", str(event.delta));
+      else if (kind === "thinking_delta") this.appendBlock("thinking", str(event.delta));
+      else if (kind === "text_end") this.completeBlock("message", str(event.content));
+      else if (kind === "thinking_end") this.completeBlock("thinking", str(event.content));
+      return;
+    }
+    if (type === "message_end") {
+      const message = obj(ev.message);
+      if (str(message.stopReason) === "error") {
+        const text = str(message.errorMessage);
+        if (text) this.push({ kind: "event", event: "failed", text });
+      }
+      return;
+    }
+    const id = str(ev.toolCallId);
+    if (type === "tool_execution_start") {
+      const built = stepFor(str(ev.toolName), obj(ev.args));
+      this.applyStep(id, { text: built.text, detail: built.detail ?? null });
+      return;
+    }
+    if (type === "tool_execution_end") {
+      const output = trimEnd(stripAnsi(contentText(obj(ev.result).content)));
+      this.patchStep(id, { failed: ev.isError === true ? true : void 0, output: output ? output : void 0 });
+    }
+  }
+  readCodexJson(type, ev) {
+    const item = obj(ev.item);
+    const id = str(item.id);
+    const itemType = str(item.type) || str(item.item_type);
+    const done = type === "item.completed";
+    if (itemType === "agent_message" || itemType === "assistant_message") {
+      if (done) this.completeBlock("message", str(item.text));
+      return;
+    }
+    if (itemType === "reasoning") {
+      if (done) this.completeBlock("thinking", str(item.text));
+      return;
+    }
+    if (itemType === "command_execution") {
+      const exit = num(item.exit_code);
+      const output = trimEnd(stripAnsi(str(item.aggregated_output)));
+      const update = { text: `Running ${unwrapShell(str(item.command))}` };
+      if (exit !== void 0) {
+        update.failed = exit !== 0;
+        update.detail = exit !== 0 ? `exit ${exit}` : null;
+      }
+      if (output) update.output = output;
+      this.applyStep(id, update);
+      return;
+    }
+    if (itemType === "file_change") {
+      const paths = changePaths(item);
+      this.applyStep(id, { text: paths ? `Edited ${paths}` : "Edited files" });
+      return;
+    }
+    if (itemType === "mcp_tool_call") {
+      const called = [str(item.server), str(item.tool)].filter(Boolean).join(".");
+      this.applyStep(id, { text: `Called ${called}`, failed: str(item.status) === "failed" });
+      return;
+    }
+    if (itemType === "web_search") {
+      this.applyStep(id, { text: `Searching the web for ${str(item.query)}` });
+      return;
+    }
+    if (itemType === "error") {
+      this.push({ kind: "event", event: "failed", text: str(item.message) });
+    }
+  }
+  readAssistant(ev) {
+    const parts = arr(obj(ev.message).content).map(obj);
+    const chunk = parts.filter((part) => str(part.type) === "text").map((part) => str(part.text)).join("");
+    if (has(ev, "timestamp_ms")) this.appendBlock("message", chunk);
+    else this.completeBlock("message", chunk);
+    for (const part of parts) {
+      if (str(part.type) === "thinking") this.completeBlock("thinking", str(part.thinking));
+      if (str(part.type) === "tool_use") {
+        const built = stepFor(str(part.name), obj(part.input));
+        this.applyStep(str(part.id), { text: built.text, detail: built.detail ?? null });
+      }
+    }
+  }
+  readToolResults(ev) {
+    for (const part of arr(obj(ev.message).content).map(obj)) {
+      if (str(part.type) !== "tool_result") continue;
+      const id = str(part.tool_use_id);
+      if (!id) continue;
+      const output = trimEnd(stripAnsi(contentText(part.content)));
+      this.patchStep(id, {
+        failed: part.is_error === true ? true : void 0,
+        output: output ? output : void 0
+      });
+    }
+  }
+  readOpencode(type, ev) {
+    const part = obj(ev.part);
+    if (type === "text") {
+      this.appendBlock("message", str(part.text));
+      return;
+    }
+    if (type === "reasoning") {
+      this.appendBlock("thinking", str(part.text));
+      return;
+    }
+    if (type !== "tool_use" && type !== "tool") return;
+    const state2 = obj(part.state);
+    const built = stepFor(str(part.tool), obj(state2.input));
+    const id = str(part.callID) || str(part.id);
+    this.applyStep(id, {
+      text: built.text,
+      detail: built.detail ?? null,
+      failed: str(state2.status) === "error" ? true : void 0
+    });
+  }
+}
+function reasoningText(item) {
+  const summary = arr(item.summary);
+  const parts = summary.length ? summary : arr(item.content);
+  const direct = str(item.text);
+  if (direct) return direct;
+  return parts.map(str).filter(Boolean).join("\n\n");
+}
+function changePaths(item) {
+  return arr(item.changes).map(obj).map((change) => str(change.path)).filter(Boolean).join(", ");
+}
+function trimEnd(text) {
+  return text.replace(/\s+$/, "");
+}
+function buildTranscript(log) {
+  const builder = new Builder();
+  builder.feed(stripAnsi(log));
+  return builder.finish();
+}
+function foldRepeats(entries) {
+  const stepText = (index2) => {
+    const entry = entries[index2];
+    return entry?.kind === "step" && entry.failed !== true ? entry.text : void 0;
+  };
+  const said = (index2) => {
+    const entry = entries[index2];
+    return entry?.kind === "message" || entry?.kind === "thinking";
+  };
+  const shown = [];
+  let index = 0;
+  while (index < entries.length) {
+    const text = stepText(index);
+    if (text === void 0) {
+      shown.push({ index });
+      index += 1;
+      continue;
+    }
+    const unit = (at) => said(at + 1) ? 2 : 1;
+    let last2 = index;
+    let count = 1;
+    let next = index + unit(index);
+    while (stepText(next) === text) {
+      last2 = next;
+      count += 1;
+      next += unit(next);
+    }
+    if (count === 1) {
+      shown.push({ index });
+      index += 1;
+      continue;
+    }
+    shown.push({ index: last2, repeats: count });
+    if (said(last2 + 1)) shown.push({ index: last2 + 1 });
+    index = next;
+  }
+  return shown;
+}
+var _tmpl$ = /* @__PURE__ */ web.template(`<div class=dispatch-settings><p class=dispatch-muted></p><div>`), _tmpl$2 = /* @__PURE__ */ web.template(`<p class=dispatch-target-note>`), _tmpl$3 = /* @__PURE__ */ web.template(`<div class=dispatch-target><input class=dispatch-target-search type=search autofocus><div class=dispatch-target-list role=listbox>`), _tmpl$4 = /* @__PURE__ */ web.template(`<p class=dispatch-target-agent>`), _tmpl$5 = /* @__PURE__ */ web.template(`<span class=dispatch-target-check>`), _tmpl$6 = /* @__PURE__ */ web.template(`<button type=button role=option class=dispatch-target-row><span class=dispatch-target-name>`), _tmpl$7 = /* @__PURE__ */ web.template(`<span class=dispatch-log-step-text>`), _tmpl$8 = /* @__PURE__ */ web.template(`<span class=dispatch-log-step-output>`), _tmpl$9 = /* @__PURE__ */ web.template(`<span class=dispatch-log-event>✓ `), _tmpl$0 = /* @__PURE__ */ web.template(`<span class=dispatch-log-text>`), _tmpl$1 = /* @__PURE__ */ web.template(`<div>`), _tmpl$10 = /* @__PURE__ */ web.template(`<p class=dispatch-danger>`), _tmpl$11 = /* @__PURE__ */ web.template(`<div class=dispatch-log-body>`), _tmpl$12 = /* @__PURE__ */ web.template(`<button class=dispatch-log-follow type=button>`), _tmpl$13 = /* @__PURE__ */ web.template(`<div class=dispatch-log-foot><span class=dispatch-muted>`), _tmpl$14 = /* @__PURE__ */ web.template(`<div class="dispatch-panel dispatch-panel-log"><div class=dispatch-log-head><span class=dispatch-run-bot></span><span class=dispatch-run-body><span class=dispatch-run-title></span><span></span></span></div><div class=dispatch-log-wrap>`), _tmpl$15 = /* @__PURE__ */ web.template(`<p class=dispatch-log-empty>`), _tmpl$16 = /* @__PURE__ */ web.template(`<span class=dispatch-muted> · `), _tmpl$17 = /* @__PURE__ */ web.template(`<ul class=dispatch-runs>`), _tmpl$18 = /* @__PURE__ */ web.template(`<div class=dispatch-panel><div class=dispatch-panel-head><span class=dispatch-panel-switch></span><span class=dispatch-panel-title></span><span class=dispatch-panel-actions>`), _tmpl$19 = /* @__PURE__ */ web.template(`<div class=dispatch-empty><p class=dispatch-empty-title></p><p class=dispatch-muted>`), _tmpl$20 = /* @__PURE__ */ web.template(`<li><button class=dispatch-run type=button><span class=dispatch-run-bot></span><span class=dispatch-run-body><span class=dispatch-run-title></span><span>`);
 const POLL_ACTIVE_MS = 3e3;
 const POLL_IDLE_MS = 15e3;
 const LOG_POLL_MS = 2e3;
@@ -6262,7 +6951,15 @@ const CSS = `
 .dispatch-log-head { display: flex; align-items: center; gap: 8px; padding: 4px 4px 8px; }
 .dispatch-log-head .dispatch-run-body { flex: 1; }
 .dispatch-log-wrap { display: flex; flex-direction: column; flex: 1; min-height: 0; gap: 6px; }
-.dispatch-log-body { flex: 1; min-height: 0; margin: 0; padding: 8px; overflow: auto; border-radius: 8px; background: var(--surface-base-hover); color: var(--text-base); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+.dispatch-log-body { display: flex; flex-direction: column; gap: 6px; flex: 1; min-height: 0; margin: 0; padding: 8px; overflow: auto; border-radius: 8px; background: var(--surface-base-hover); color: var(--text-base); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 1.5; white-space: normal; overflow-wrap: anywhere; }
+.dispatch-log-entry { min-width: 0; }
+.dispatch-log-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.dispatch-log-thinking { color: var(--text-weak); font-style: italic; }
+.dispatch-log-step-text { display: block; white-space: pre-wrap; overflow-wrap: anywhere; }
+.dispatch-log-step-failed { color: var(--text-error); }
+.dispatch-log-step-output { display: block; margin: 2px 0 0 14px; color: var(--text-weak); white-space: pre-wrap; overflow-wrap: anywhere; }
+.dispatch-log-event { color: var(--text-weak); white-space: pre-wrap; overflow-wrap: anywhere; }
+.dispatch-log-markdown { white-space: normal; overflow-wrap: anywhere; }
 .dispatch-log-empty { flex: 1; display: grid; place-items: center; margin: 0; color: var(--text-weak); font-size: 12px; }
 .dispatch-log-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 0 4px; }
 .dispatch-log-follow { border: 0; border-radius: 999px; padding: 4px 10px; background: var(--surface-base-hover); color: var(--text-base); font: inherit; font-size: 12px; cursor: pointer; }
@@ -6283,11 +6980,14 @@ const CSS = `
 .dispatch-empty-title { margin-top: 8px; color: var(--text-strong); font-size: 15px; font-weight: 600; }
 .dispatch-empty .dispatch-muted { max-width: 280px; line-height: 1.45; }
 .dispatch-settings { display: flex; flex-direction: column; gap: 16px; }
-.dispatch-target { display: flex; flex-direction: column; gap: 8px; width: 320px; box-sizing: border-box; }
-.dispatch-target-search { width: 100%; }
-.dispatch-target-list { display: flex; flex-direction: column; gap: 2px; min-height: 240px; max-height: 360px; overflow-y: auto; overscroll-behavior: contain; }
+.dispatch-target { display: flex; flex-direction: column; gap: 8px; width: 320px; max-width: 100%; min-width: 0; box-sizing: border-box; overflow-x: hidden; }
+.dispatch-target, .dispatch-target * { box-sizing: border-box; }
+.dispatch-target-search { width: 100%; min-width: 0; border: 1px solid var(--border-weak-base, var(--surface-base-hover)); border-radius: 6px; padding: 6px 8px; background: transparent; color: var(--text-base); font: inherit; font-size: 13px; outline: none; }
+.dispatch-target-search:focus { border-color: var(--border-strong-base, var(--text-weak)); }
+.dispatch-target-search::placeholder { color: var(--text-weak); }
+.dispatch-target-list { display: flex; flex-direction: column; gap: 2px; width: 100%; min-width: 0; min-height: 240px; max-height: 360px; overflow-y: auto; overscroll-behavior: contain; }
 .dispatch-target-agent { margin: 6px 8px 2px; color: var(--text-weak); font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; }
-.dispatch-target-row { display: flex; align-items: center; gap: 8px; width: 100%; padding: 6px 8px; border: 0; border-radius: 6px; background: transparent; color: var(--text-base); font: inherit; font-size: 13px; text-align: left; cursor: pointer; }
+.dispatch-target-row { display: flex; align-items: center; gap: 8px; width: 100%; min-width: 0; padding: 6px 8px; border: 0; border-radius: 6px; background: transparent; color: var(--text-base); font: inherit; font-size: 13px; text-align: left; cursor: pointer; }
 .dispatch-target-row:hover, .dispatch-target-row-active { background: var(--surface-base-hover); outline: none; }
 .dispatch-target-row:focus-visible { background: var(--surface-base-hover); outline: none; }
 .dispatch-target-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -6664,6 +7364,10 @@ const definition = gui.Plugin.define({
       const [query, setQuery] = solidJs.createSignal("");
       const [active, setActive] = solidJs.createSignal(0);
       const elements = [];
+      let search;
+      solidJs.onMount(() => {
+        queueMicrotask(() => search?.focus());
+      });
       void ensureTargets();
       const pick = () => forced[props.session.key];
       const chosen = (agent, model) => pick()?.agent === agent && (pick()?.model || "") === model;
@@ -6729,77 +7433,84 @@ const definition = gui.Plugin.define({
           choose(row.agent, row.model);
         }
       };
+      const onSearchKeyDown = (event) => {
+        if (event.key === "Escape") return;
+        event.stopPropagation();
+        onKeyDown(event);
+      };
       return (() => {
-        var _el$4 = _tmpl$3(), _el$5 = _el$4.firstChild;
+        var _el$4 = _tmpl$3(), _el$5 = _el$4.firstChild, _el$6 = _el$5.nextSibling;
         _el$4.$$keydown = onKeyDown;
-        web.insert(_el$4, web.createComponent(ctx.ui.TextInput, {
-          "class": "dispatch-target-search",
-          get value() {
-            return query();
-          },
-          get placeholder() {
-            return ctx.t("pill.target.search");
-          },
-          get label() {
-            return ctx.t("pill.target.search");
-          },
-          autofocus: true,
-          onInput: (value) => {
-            setQuery(value);
-            setActive(0);
-          }
-        }), _el$5);
-        web.insert(_el$5, web.createComponent(solidJs.For, {
+        _el$5.$$keyup = (event) => {
+          if (event.key !== "Escape") event.stopPropagation();
+        };
+        _el$5.$$keydown = onSearchKeyDown;
+        _el$5.$$input = (event) => {
+          setQuery(event.currentTarget.value);
+          setActive(0);
+        };
+        web.use((el) => search = el, _el$5);
+        web.insert(_el$6, web.createComponent(solidJs.For, {
           get each() {
             return entries();
           },
           children: (entry) => entry.kind === "agent" ? (() => {
-            var _el$7 = _tmpl$4();
-            web.insert(_el$7, () => entry.name);
-            return _el$7;
+            var _el$8 = _tmpl$4();
+            web.insert(_el$8, () => entry.name);
+            return _el$8;
           })() : (() => {
-            var _el$8 = _tmpl$6(), _el$9 = _el$8.firstChild;
-            _el$8.$$click = () => choose(entry.agent, entry.model);
-            web.use((el) => elements[entry.index] = el, _el$8);
-            web.insert(_el$9, () => entry.label);
-            web.insert(_el$8, web.createComponent(solidJs.Show, {
+            var _el$9 = _tmpl$6(), _el$0 = _el$9.firstChild;
+            _el$9.$$click = () => choose(entry.agent, entry.model);
+            web.use((el) => elements[entry.index] = el, _el$9);
+            web.insert(_el$0, () => entry.label);
+            web.insert(_el$9, web.createComponent(solidJs.Show, {
               get when() {
                 return chosen(entry.agent, entry.model);
               },
               get children() {
-                var _el$0 = _tmpl$5();
-                web.insert(_el$0, web.createComponent(ctx.ui.Icon, {
+                var _el$1 = _tmpl$5();
+                web.insert(_el$1, web.createComponent(ctx.ui.Icon, {
                   name: "circle-check",
                   size: "small"
                 }));
-                return _el$0;
+                return _el$1;
               }
             }), null);
             web.effect((_p$) => {
-              var _v$ = chosen(entry.agent, entry.model), _v$2 = !!(active() === entry.index), _v$3 = entry.label;
-              _v$ !== _p$.e && web.setAttribute(_el$8, "aria-selected", _p$.e = _v$);
-              _v$2 !== _p$.t && _el$8.classList.toggle("dispatch-target-row-active", _p$.t = _v$2);
-              _v$3 !== _p$.a && web.setAttribute(_el$9, "title", _p$.a = _v$3);
+              var _v$4 = chosen(entry.agent, entry.model), _v$5 = !!(active() === entry.index), _v$6 = entry.label;
+              _v$4 !== _p$.e && web.setAttribute(_el$9, "aria-selected", _p$.e = _v$4);
+              _v$5 !== _p$.t && _el$9.classList.toggle("dispatch-target-row-active", _p$.t = _v$5);
+              _v$6 !== _p$.a && web.setAttribute(_el$0, "title", _p$.a = _v$6);
               return _p$;
             }, {
               e: void 0,
               t: void 0,
               a: void 0
             });
-            return _el$8;
+            return _el$9;
           })()
         }), null);
-        web.insert(_el$5, web.createComponent(solidJs.Show, {
+        web.insert(_el$6, web.createComponent(solidJs.Show, {
           get when() {
             return note();
           },
           get children() {
-            var _el$6 = _tmpl$2();
-            web.insert(_el$6, note);
-            return _el$6;
+            var _el$7 = _tmpl$2();
+            web.insert(_el$7, note);
+            return _el$7;
           }
         }), null);
-        web.effect(() => web.setAttribute(_el$5, "aria-label", ctx.t("pill.target.title")));
+        web.effect((_p$) => {
+          var _v$ = ctx.t("pill.target.search"), _v$2 = ctx.t("pill.target.search"), _v$3 = ctx.t("pill.target.title");
+          _v$ !== _p$.e && web.setAttribute(_el$5, "aria-label", _p$.e = _v$);
+          _v$2 !== _p$.t && web.setAttribute(_el$5, "placeholder", _p$.t = _v$2);
+          _v$3 !== _p$.a && web.setAttribute(_el$6, "aria-label", _p$.a = _v$3);
+          return _p$;
+        }, {
+          e: void 0,
+          t: void 0,
+          a: void 0
+        });
         return _el$4;
       })();
     };
@@ -6835,6 +7546,72 @@ const definition = gui.Plugin.define({
       },
       closable: "hover"
     };
+    const EntryBody = (props) => {
+      const entry = props.entry;
+      if (entry.kind === "step") {
+        return [(() => {
+          var _el$10 = _tmpl$7();
+          web.insert(_el$10, () => `› ${entry.text}${entry.detail ? ` ${entry.detail}` : ""}${props.repeats && props.repeats > 1 ? ` ×${props.repeats}` : ""}`);
+          web.effect(() => _el$10.classList.toggle("dispatch-log-step-failed", !!(entry.failed === true)));
+          return _el$10;
+        })(), web.createComponent(solidJs.Show, {
+          get when() {
+            return entry.output;
+          },
+          children: (output) => (() => {
+            var _el$11 = _tmpl$8();
+            web.insert(_el$11, () => output().split("\n").slice(0, 3).join("\n"));
+            return _el$11;
+          })()
+        })];
+      }
+      if (entry.kind === "event") return (() => {
+        var _el$12 = _tmpl$9();
+        _el$12.firstChild;
+        web.insert(_el$12, () => entry.text, null);
+        return _el$12;
+      })();
+      if (entry.kind === "message") {
+        return web.createComponent(solidJs.Show, {
+          get when() {
+            return !!ctx.ui.Markdown;
+          },
+          get fallback() {
+            return (() => {
+              var _el$14 = _tmpl$0();
+              web.insert(_el$14, () => entry.text);
+              return _el$14;
+            })();
+          },
+          get children() {
+            return web.createComponent(ctx.ui.Markdown, {
+              get text() {
+                return entry.text;
+              },
+              "class": "dispatch-log-markdown"
+            });
+          }
+        });
+      }
+      return (() => {
+        var _el$15 = _tmpl$0();
+        web.insert(_el$15, () => entry.text);
+        return _el$15;
+      })();
+    };
+    const EntryRow = (props) => (() => {
+      var _el$16 = _tmpl$1();
+      web.insert(_el$16, web.createComponent(EntryBody, {
+        get entry() {
+          return props.entry;
+        },
+        get repeats() {
+          return props.repeats;
+        }
+      }));
+      web.effect(() => web.className(_el$16, `dispatch-log-entry dispatch-log-${props.entry.kind}`));
+      return _el$16;
+    })();
     const RunLog = (props) => {
       const [log, setLog] = solidJs.createSignal(void 0);
       const [failure, setFailure] = solidJs.createSignal("");
@@ -6842,6 +7619,19 @@ const definition = gui.Plugin.define({
       let area;
       let timer2;
       let stopped = false;
+      const rows = solidJs.createMemo(() => {
+        const entries = buildTranscript(log()?.text || "");
+        return foldRepeats(entries).flatMap(({
+          index,
+          repeats
+        }) => {
+          const entry = entries[index];
+          return entry ? [{
+            entry,
+            repeats
+          }] : [];
+        });
+      });
       const status2 = () => log()?.status || props.run.status;
       const working = () => ACTIVE.has(status2());
       const atEnd = () => {
@@ -6881,8 +7671,8 @@ const definition = gui.Plugin.define({
         clearTimeout(timer2);
       });
       return (() => {
-        var _el$1 = _tmpl$1(), _el$10 = _el$1.firstChild, _el$11 = _el$10.firstChild, _el$12 = _el$11.nextSibling, _el$13 = _el$12.firstChild, _el$14 = _el$13.nextSibling, _el$17 = _el$10.nextSibling;
-        web.insert(_el$10, web.createComponent(ctx.ui.Tooltip, {
+        var _el$17 = _tmpl$14(), _el$18 = _el$17.firstChild, _el$19 = _el$18.firstChild, _el$20 = _el$19.nextSibling, _el$21 = _el$20.firstChild, _el$22 = _el$21.nextSibling, _el$25 = _el$18.nextSibling;
+        web.insert(_el$18, web.createComponent(ctx.ui.Tooltip, {
           get value() {
             return ctx.t("panel.back");
           },
@@ -6899,8 +7689,8 @@ const definition = gui.Plugin.define({
               }
             });
           }
-        }), _el$11);
-        web.insert(_el$11, web.createComponent(AgentBot, {
+        }), _el$19);
+        web.insert(_el$19, web.createComponent(AgentBot, {
           get agent() {
             return props.run.agent;
           },
@@ -6914,12 +7704,12 @@ const definition = gui.Plugin.define({
             return props.run.mergedAt;
           }
         }));
-        web.insert(_el$13, () => firstLine(props.run.prompt, 120) || props.run.id);
-        web.insert(_el$14, () => runDetail({
+        web.insert(_el$21, () => firstLine(props.run.prompt, 120) || props.run.id);
+        web.insert(_el$22, () => runDetail({
           ...props.run,
           status: status2()
         }));
-        web.insert(_el$10, web.createComponent(ctx.ui.Tooltip, {
+        web.insert(_el$18, web.createComponent(ctx.ui.Tooltip, {
           get value() {
             return ctx.t("log.open");
           },
@@ -6935,70 +7725,82 @@ const definition = gui.Plugin.define({
             });
           }
         }), null);
-        web.insert(_el$1, web.createComponent(solidJs.Show, {
+        web.insert(_el$17, web.createComponent(solidJs.Show, {
           get when() {
             return props.run.error;
           },
           get children() {
-            var _el$15 = _tmpl$7();
-            web.insert(_el$15, () => props.run.error);
-            return _el$15;
+            var _el$23 = _tmpl$10();
+            web.insert(_el$23, () => props.run.error);
+            return _el$23;
           }
-        }), _el$17);
-        web.insert(_el$1, web.createComponent(solidJs.Show, {
+        }), _el$25);
+        web.insert(_el$17, web.createComponent(solidJs.Show, {
           get when() {
             return failure();
           },
           get children() {
-            var _el$16 = _tmpl$7();
-            web.insert(_el$16, () => ctx.t("log.failed", {
+            var _el$24 = _tmpl$10();
+            web.insert(_el$24, () => ctx.t("log.failed", {
               error: failure()
             }));
-            return _el$16;
+            return _el$24;
           }
-        }), _el$17);
-        web.insert(_el$17, web.createComponent(solidJs.Show, {
+        }), _el$25);
+        web.insert(_el$25, web.createComponent(solidJs.Show, {
           get when() {
             return log()?.text;
           },
           get fallback() {
             return (() => {
-              var _el$22 = _tmpl$10();
-              web.insert(_el$22, () => ctx.t(working() ? "log.empty" : "log.none"));
-              return _el$22;
+              var _el$30 = _tmpl$15();
+              web.insert(_el$30, () => ctx.t(working() ? "log.empty" : "log.none"));
+              return _el$30;
             })();
           },
           get children() {
-            var _el$18 = _tmpl$8();
-            _el$18.addEventListener("scroll", () => setFollowing(atEnd()));
-            web.use((el) => area = el, _el$18);
-            web.insert(_el$18, () => log()?.text);
-            return _el$18;
+            var _el$26 = _tmpl$11();
+            _el$26.addEventListener("scroll", () => setFollowing(atEnd()));
+            web.use((el) => area = el, _el$26);
+            web.insert(_el$26, web.createComponent(solidJs.For, {
+              get each() {
+                return rows();
+              },
+              children: (row) => web.createComponent(EntryRow, {
+                get entry() {
+                  return row.entry;
+                },
+                get repeats() {
+                  return row.repeats;
+                }
+              })
+            }));
+            return _el$26;
           }
         }), null);
-        web.insert(_el$17, web.createComponent(solidJs.Show, {
+        web.insert(_el$25, web.createComponent(solidJs.Show, {
           get when() {
             return working() || !following();
           },
           get children() {
-            var _el$19 = _tmpl$0(), _el$20 = _el$19.firstChild;
-            web.insert(_el$20, () => ctx.t(following() ? "log.following" : "log.paused"));
-            web.insert(_el$19, web.createComponent(solidJs.Show, {
+            var _el$27 = _tmpl$13(), _el$28 = _el$27.firstChild;
+            web.insert(_el$28, () => ctx.t(following() ? "log.following" : "log.paused"));
+            web.insert(_el$27, web.createComponent(solidJs.Show, {
               get when() {
                 return !following();
               },
               get children() {
-                var _el$21 = _tmpl$9();
-                _el$21.$$click = toEnd;
-                web.insert(_el$21, () => ctx.t("log.follow"));
-                return _el$21;
+                var _el$29 = _tmpl$12();
+                _el$29.$$click = toEnd;
+                web.insert(_el$29, () => ctx.t("log.follow"));
+                return _el$29;
               }
             }), null);
-            return _el$19;
+            return _el$27;
           }
         }), null);
-        web.effect(() => web.className(_el$14, FAILED.has(status2()) ? "dispatch-danger" : "dispatch-muted"));
-        return _el$1;
+        web.effect(() => web.className(_el$22, FAILED.has(status2()) ? "dispatch-danger" : "dispatch-muted"));
+        return _el$17;
       })();
     };
     const RunsView = (props) => {
@@ -7016,8 +7818,8 @@ const definition = gui.Plugin.define({
         },
         get fallback() {
           return (() => {
-            var _el$23 = _tmpl$13(), _el$24 = _el$23.firstChild, _el$25 = _el$24.firstChild, _el$26 = _el$25.nextSibling, _el$29 = _el$26.nextSibling;
-            web.insert(_el$25, web.createComponent(ctx.ui.Tooltip, {
+            var _el$31 = _tmpl$18(), _el$32 = _el$31.firstChild, _el$33 = _el$32.firstChild, _el$34 = _el$33.nextSibling, _el$37 = _el$34.nextSibling;
+            web.insert(_el$33, web.createComponent(ctx.ui.Tooltip, {
               get value() {
                 return ctx.t(status().enabled ? "command.toggle.on" : "command.toggle.off");
               },
@@ -7033,19 +7835,19 @@ const definition = gui.Plugin.define({
                 });
               }
             }));
-            web.insert(_el$26, () => ctx.t("panel.runs"), null);
-            web.insert(_el$26, web.createComponent(solidJs.Show, {
+            web.insert(_el$34, () => ctx.t("panel.runs"), null);
+            web.insert(_el$34, web.createComponent(solidJs.Show, {
               get when() {
                 return list().length > 0;
               },
               get children() {
-                var _el$27 = _tmpl$11();
-                _el$27.firstChild;
-                web.insert(_el$27, () => list().length, null);
-                return _el$27;
+                var _el$35 = _tmpl$16();
+                _el$35.firstChild;
+                web.insert(_el$35, () => list().length, null);
+                return _el$35;
               }
             }), null);
-            web.insert(_el$29, web.createComponent(ctx.ui.Tooltip, {
+            web.insert(_el$37, web.createComponent(ctx.ui.Tooltip, {
               get value() {
                 return ctx.t("command.app");
               },
@@ -7061,45 +7863,45 @@ const definition = gui.Plugin.define({
                 });
               }
             }));
-            web.insert(_el$23, web.createComponent(solidJs.Show, {
+            web.insert(_el$31, web.createComponent(solidJs.Show, {
               get when() {
                 return error();
               },
               get children() {
-                var _el$30 = _tmpl$7();
-                web.insert(_el$30, () => ctx.t("panel.unreachable", {
+                var _el$38 = _tmpl$10();
+                web.insert(_el$38, () => ctx.t("panel.unreachable", {
                   error: error()
                 }));
-                return _el$30;
+                return _el$38;
               }
             }), null);
-            web.insert(_el$23, web.createComponent(solidJs.Show, {
+            web.insert(_el$31, web.createComponent(solidJs.Show, {
               get when() {
                 return list().length > 0;
               },
               get fallback() {
                 return (() => {
-                  var _el$32 = _tmpl$14(), _el$33 = _el$32.firstChild, _el$34 = _el$33.nextSibling;
-                  web.insert(_el$32, web.createComponent(EmptyBot, {
+                  var _el$40 = _tmpl$19(), _el$41 = _el$40.firstChild, _el$42 = _el$41.nextSibling;
+                  web.insert(_el$40, web.createComponent(EmptyBot, {
                     get mood() {
                       return status().enabled ? "sleeping" : "lost";
                     }
-                  }), _el$33);
-                  web.insert(_el$33, () => ctx.t(status().enabled ? "panel.empty.title" : "panel.empty.off.title"));
-                  web.insert(_el$34, () => ctx.t(status().enabled ? "panel.empty.on" : "panel.empty.off"));
-                  return _el$32;
+                  }), _el$41);
+                  web.insert(_el$41, () => ctx.t(status().enabled ? "panel.empty.title" : "panel.empty.off.title"));
+                  web.insert(_el$42, () => ctx.t(status().enabled ? "panel.empty.on" : "panel.empty.off"));
+                  return _el$40;
                 })();
               },
               get children() {
-                var _el$31 = _tmpl$12();
-                web.insert(_el$31, web.createComponent(solidJs.For, {
+                var _el$39 = _tmpl$17();
+                web.insert(_el$39, web.createComponent(solidJs.For, {
                   get each() {
                     return list();
                   },
                   children: (run) => (() => {
-                    var _el$35 = _tmpl$15(), _el$36 = _el$35.firstChild, _el$37 = _el$36.firstChild, _el$38 = _el$37.nextSibling, _el$39 = _el$38.firstChild, _el$40 = _el$39.nextSibling;
-                    _el$36.$$click = () => setSelected(run);
-                    web.insert(_el$37, web.createComponent(AgentBot, {
+                    var _el$43 = _tmpl$20(), _el$44 = _el$43.firstChild, _el$45 = _el$44.firstChild, _el$46 = _el$45.nextSibling, _el$47 = _el$46.firstChild, _el$48 = _el$47.nextSibling;
+                    _el$44.$$click = () => setSelected(run);
+                    web.insert(_el$45, web.createComponent(AgentBot, {
                       get agent() {
                         return run.agent;
                       },
@@ -7113,24 +7915,24 @@ const definition = gui.Plugin.define({
                         return run.mergedAt;
                       }
                     }));
-                    web.insert(_el$39, () => firstLine(run.prompt, 120) || run.id);
-                    web.insert(_el$40, () => runDetail(run));
+                    web.insert(_el$47, () => firstLine(run.prompt, 120) || run.id);
+                    web.insert(_el$48, () => runDetail(run));
                     web.effect((_p$) => {
-                      var _v$4 = run.prompt, _v$5 = FAILED.has(run.status) ? "dispatch-danger" : "dispatch-muted";
-                      _v$4 !== _p$.e && web.setAttribute(_el$36, "title", _p$.e = _v$4);
-                      _v$5 !== _p$.t && web.className(_el$40, _p$.t = _v$5);
+                      var _v$7 = run.prompt, _v$8 = FAILED.has(run.status) ? "dispatch-danger" : "dispatch-muted";
+                      _v$7 !== _p$.e && web.setAttribute(_el$44, "title", _p$.e = _v$7);
+                      _v$8 !== _p$.t && web.className(_el$48, _p$.t = _v$8);
                       return _p$;
                     }, {
                       e: void 0,
                       t: void 0
                     });
-                    return _el$35;
+                    return _el$43;
                   })()
                 }));
-                return _el$31;
+                return _el$39;
               }
             }), null);
-            return _el$23;
+            return _el$31;
           })();
         },
         children: (run) => web.createComponent(RunLog, {
@@ -7180,9 +7982,10 @@ const helpers = {
   formatTokens,
   formatDuration,
   filterTargets,
-  expressionFor
+  expressionFor,
+  buildTranscript
 };
-web.delegateEvents(["keydown", "click"]);
+web.delegateEvents(["keydown", "input", "keyup", "click"]);
 exports.Dispatch = Dispatch;
 exports.default = definition;
 exports.helpers = helpers;
