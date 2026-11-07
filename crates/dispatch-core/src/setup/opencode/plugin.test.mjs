@@ -37,7 +37,20 @@ switch (args[0]) {
     break
   }
   case "result":
-    process.stdout.write("Done: changed two files.\\n")
+    if (!args.includes("--json")) {
+      process.stdout.write("Done: changed two files.\\n")
+      break
+    }
+    out({
+      id: args[1],
+      status: "RUNNING",
+      section: "output",
+      offset: 0,
+      limit: 2000,
+      total_lines: 2500,
+      has_more: false,
+      content: "\\u001b[32mline one\\u001b[0m\\nline two\\n[merged] three",
+    })
     break
   case "runs":
     out({ runs: [{ ID: "r1", Status: "RUNNING", Agent: "codex", Model: "gpt-6", Prompt: "Fix the parser\\nmore", Usage: { inputTokens: 1000, cacheReadTokens: 500, outputTokens: 200 }, FilesChanged: 2, Insertions: 10, Deletions: 3 }] })
@@ -189,6 +202,29 @@ test("runs lists the root conversation's runs", async () => {
     { id: answer.runs[0].id, status: answer.runs[0].status, tokens: answer.runs[0].tokens, files: answer.runs[0].filesChanged },
     { id: "r1", status: "RUNNING", tokens: 1700, files: 2 },
   )
+})
+
+test("log answers the end of a run's output without escapes, and its status", async () => {
+  const { impl } = await loadServer()
+  const answer = await impl().log({ runID: "r1" })
+  const result = calls().filter((call) => call.args[0] === "result")
+  // The first read ends short of the output; the second takes its tail.
+  assert.deepEqual(result[0].args, ["result", "r1", "--section", "output", "--json", "--offset", "0", "--limit", "2000"])
+  assert.deepEqual(result[1].args, ["result", "r1", "--section", "output", "--json", "--offset", "500", "--limit", "2000"])
+  assert.equal(answer.status, "RUNNING")
+  assert.equal(answer.text, "line one\nline two\n[merged] three")
+  assert.equal(answer.lines, 3)
+  assert.equal(Object.values(answer).some((value) => value === undefined), false)
+
+  // A page from an offset asks once, where the reader left off.
+  await impl().log({ runID: "r1", offset: 10 })
+  const paged = calls().filter((call) => call.args[0] === "result")
+  assert.deepEqual(paged.at(-1).args, ["result", "r1", "--section", "output", "--json", "--offset", "10", "--limit", "2000"])
+
+  const refused = await impl().log({ runID: "--force" })
+  assert.ok(refused.error)
+  assert.equal(refused.text, "")
+  assert.equal(calls().filter((call) => call.args[0] === "result").length, 3)
 })
 
 test("a run with no files, tokens, or cost answers no undefined values", async () => {

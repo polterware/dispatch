@@ -57,6 +57,31 @@ const Dispatch = {
         required: ["runs"],
         additionalProperties: false
       }
+    },
+    // The run's output so far, and the status the panel polls on: the Desktop
+    // part shows it in place instead of only opening the run in the app.
+    log: {
+      input: {
+        type: "object",
+        properties: {
+          runID: { type: "string" },
+          directory: { type: "string" },
+          offset: { type: "integer" }
+        },
+        required: ["runID"],
+        additionalProperties: false
+      },
+      output: {
+        type: "object",
+        properties: {
+          status: { type: "string" },
+          text: { type: "string" },
+          lines: { type: "integer" },
+          error: { type: "string" }
+        },
+        required: ["status", "text", "lines"],
+        additionalProperties: false
+      }
     }
   },
   events: {
@@ -6078,11 +6103,22 @@ function runDetail(run) {
   if (took && !ACTIVE.has(run.status)) parts.push(took);
   return parts.join(" · ");
 }
-var _tmpl$ = /* @__PURE__ */ web.template(`<div class=dispatch-settings><p class=dispatch-muted></p><div>`), _tmpl$2 = /* @__PURE__ */ web.template(`<span class=dispatch-muted> · `), _tmpl$3 = /* @__PURE__ */ web.template(`<p class=dispatch-danger>`), _tmpl$4 = /* @__PURE__ */ web.template(`<ul class=dispatch-runs>`), _tmpl$5 = /* @__PURE__ */ web.template(`<div class=dispatch-panel><div class=dispatch-panel-head><span class=dispatch-panel-switch></span><span class=dispatch-panel-title></span><span class=dispatch-panel-actions>`), _tmpl$6 = /* @__PURE__ */ web.template(`<div class=dispatch-empty><p class=dispatch-empty-title></p><p class=dispatch-muted>`), _tmpl$7 = /* @__PURE__ */ web.template(`<li><button class=dispatch-run type=button><span class=dispatch-run-bot></span><span class=dispatch-run-body><span class=dispatch-run-title></span><span>`);
+var _tmpl$ = /* @__PURE__ */ web.template(`<div class=dispatch-settings><p class=dispatch-muted></p><div>`), _tmpl$2 = /* @__PURE__ */ web.template(`<p class=dispatch-danger>`), _tmpl$3 = /* @__PURE__ */ web.template(`<pre class=dispatch-log-body>`), _tmpl$4 = /* @__PURE__ */ web.template(`<button class=dispatch-log-follow type=button>`), _tmpl$5 = /* @__PURE__ */ web.template(`<div class=dispatch-log-foot><span class=dispatch-muted>`), _tmpl$6 = /* @__PURE__ */ web.template(`<div class="dispatch-panel dispatch-panel-log"><div class=dispatch-log-head><span class=dispatch-run-bot></span><span class=dispatch-run-body><span class=dispatch-run-title></span><span></span></span></div><div class=dispatch-log-wrap>`), _tmpl$7 = /* @__PURE__ */ web.template(`<p class=dispatch-log-empty>`), _tmpl$8 = /* @__PURE__ */ web.template(`<span class=dispatch-muted> · `), _tmpl$9 = /* @__PURE__ */ web.template(`<ul class=dispatch-runs>`), _tmpl$0 = /* @__PURE__ */ web.template(`<div class=dispatch-panel><div class=dispatch-panel-head><span class=dispatch-panel-switch></span><span class=dispatch-panel-title></span><span class=dispatch-panel-actions>`), _tmpl$1 = /* @__PURE__ */ web.template(`<div class=dispatch-empty><p class=dispatch-empty-title></p><p class=dispatch-muted>`), _tmpl$10 = /* @__PURE__ */ web.template(`<li><button class=dispatch-run type=button><span class=dispatch-run-bot></span><span class=dispatch-run-body><span class=dispatch-run-title></span><span>`);
 const POLL_ACTIVE_MS = 3e3;
 const POLL_IDLE_MS = 15e3;
+const LOG_POLL_MS = 2e3;
+const FOLLOW_SLACK = 48;
 const CSS = `
 .dispatch-panel { display: flex; flex-direction: column; gap: 4px; padding: 8px; overflow: auto; height: 100%; box-sizing: border-box; }
+.dispatch-panel-log { overflow: hidden; }
+.dispatch-log-head { display: flex; align-items: center; gap: 8px; padding: 4px 4px 8px; }
+.dispatch-log-head .dispatch-run-body { flex: 1; }
+.dispatch-log-wrap { display: flex; flex-direction: column; flex: 1; min-height: 0; gap: 6px; }
+.dispatch-log-body { flex: 1; min-height: 0; margin: 0; padding: 8px; overflow: auto; border-radius: 8px; background: var(--surface-base-hover); color: var(--text-base); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+.dispatch-log-empty { flex: 1; display: grid; place-items: center; margin: 0; color: var(--text-weak); font-size: 12px; }
+.dispatch-log-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 0 4px; }
+.dispatch-log-follow { border: 0; border-radius: 999px; padding: 4px 10px; background: var(--surface-base-hover); color: var(--text-base); font: inherit; font-size: 12px; cursor: pointer; }
+.dispatch-log-follow:hover, .dispatch-log-follow:focus-visible { background: var(--surface-base-hover); color: var(--text-strong); outline: none; }
 .dispatch-panel-head { display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 8px; padding: 4px 4px 8px 8px; }
 .dispatch-panel-switch { display: flex; align-items: center; justify-self: start; }
 .dispatch-panel-title { color: var(--text-strong); font-weight: 500; text-align: center; white-space: nowrap; }
@@ -6121,6 +6157,14 @@ const definition = gui.Plugin.define({
       "panel.empty.off.title": "Delegation is off",
       "panel.empty.off": "This conversation uses OpenCode's own subagents. Turn Dispatch on with the switch above.",
       "panel.unreachable": "Dispatch did not answer: {{error}}",
+      "panel.back": "Back to runs",
+      "log.empty": "Waiting for output…",
+      "log.none": "This run left no output.",
+      "log.failed": "Could not read the run: {{error}}",
+      "log.following": "Following the end",
+      "log.paused": "Not following new lines",
+      "log.follow": "Follow",
+      "log.open": "Open in Dispatch",
       "pill.on": "Dispatch",
       "pill.off": "Dispatch off",
       "runs.one": "{{count}} run",
@@ -6360,42 +6404,90 @@ const definition = gui.Plugin.define({
       },
       closable: "hover"
     };
-    const RunsView = (props) => {
-      const list = () => sessionRuns(props.session);
-      const error = () => props.session ? errors[props.session.key] : "";
+    const RunLog = (props) => {
+      const [log, setLog] = solidJs.createSignal(void 0);
+      const [failure, setFailure] = solidJs.createSignal("");
+      const [following, setFollowing] = solidJs.createSignal(true);
+      let area;
+      let timer2;
+      let stopped = false;
+      const status2 = () => log()?.status || props.run.status;
+      const working = () => ACTIVE.has(status2());
+      const atEnd = () => {
+        const el = area;
+        return !el || el.scrollHeight - el.scrollTop - el.clientHeight <= FOLLOW_SLACK;
+      };
+      const toEnd = () => {
+        const el = area;
+        if (el) el.scrollTop = el.scrollHeight;
+        setFollowing(true);
+      };
+      const load = async () => {
+        try {
+          const answer = await rpc().log({
+            runID: props.run.id,
+            directory: props.session.directory || ""
+          });
+          if (stopped) return false;
+          setLog(answer);
+          setFailure(answer.error || "");
+          if (following()) toEnd();
+          return !answer.error && ACTIVE.has(answer.status);
+        } catch (error) {
+          if (stopped) return false;
+          setFailure(String(error?.message || error));
+          return false;
+        }
+      };
+      const tick2 = async () => {
+        timer2 = void 0;
+        if (stopped || !await load()) return;
+        timer2 = setTimeout(tick2, LOG_POLL_MS);
+      };
+      solidJs.onMount(() => void tick2());
+      solidJs.onCleanup(() => {
+        stopped = true;
+        clearTimeout(timer2);
+      });
       return (() => {
-        var _el$4 = _tmpl$5(), _el$5 = _el$4.firstChild, _el$6 = _el$5.firstChild, _el$7 = _el$6.nextSibling, _el$0 = _el$7.nextSibling;
-        web.insert(_el$6, web.createComponent(ctx.ui.Tooltip, {
+        var _el$4 = _tmpl$6(), _el$5 = _el$4.firstChild, _el$6 = _el$5.firstChild, _el$7 = _el$6.nextSibling, _el$8 = _el$7.firstChild, _el$9 = _el$8.nextSibling, _el$10 = _el$5.nextSibling;
+        web.insert(_el$5, web.createComponent(ctx.ui.Tooltip, {
           get value() {
-            return ctx.t(status().enabled ? "command.toggle.on" : "command.toggle.off");
+            return ctx.t("panel.back");
           },
           get children() {
-            return web.createComponent(ctx.ui.Switch, {
-              get checked() {
-                return status().enabled;
+            return web.createComponent(ctx.ui.IconButton, {
+              icon: "arrow-left",
+              variant: "ghost",
+              size: "small",
+              get label() {
+                return ctx.t("panel.back");
               },
-              onChange: (checked) => void setEnabled(checked),
-              get ["aria-label"]() {
-                return ctx.t(status().enabled ? "command.toggle.on" : "command.toggle.off");
+              get onClick() {
+                return props.onBack;
               }
             });
           }
-        }));
-        web.insert(_el$7, () => ctx.t("panel.runs"), null);
-        web.insert(_el$7, web.createComponent(solidJs.Show, {
-          get when() {
-            return list().length > 0;
+        }), _el$6);
+        web.insert(_el$6, web.createComponent(AgentBot, {
+          get agent() {
+            return props.run.agent;
           },
-          get children() {
-            var _el$8 = _tmpl$2();
-            _el$8.firstChild;
-            web.insert(_el$8, () => list().length, null);
-            return _el$8;
+          get seed() {
+            return props.run.id;
+          },
+          get status() {
+            return status2();
           }
-        }), null);
-        web.insert(_el$0, web.createComponent(ctx.ui.Tooltip, {
+        }));
+        web.insert(_el$8, () => firstLine(props.run.prompt, 120) || props.run.id);
+        web.insert(_el$9, () => runDetail({
+          ...props.run,
+          status: status2()
+        }));
+        web.insert(_el$5, web.createComponent(ctx.ui.Tooltip, {
           get value() {
-            return ctx.t("command.app");
+            return ctx.t("log.open");
           },
           get children() {
             return web.createComponent(ctx.ui.IconButton, {
@@ -6403,80 +6495,217 @@ const definition = gui.Plugin.define({
               variant: "ghost",
               size: "small",
               get label() {
-                return ctx.t("command.app");
+                return ctx.t("log.open");
               },
-              onClick: openApp
+              onClick: () => openRun(props.run)
             });
           }
-        }));
+        }), null);
         web.insert(_el$4, web.createComponent(solidJs.Show, {
           get when() {
-            return error();
+            return props.run.error;
           },
           get children() {
-            var _el$1 = _tmpl$3();
-            web.insert(_el$1, () => ctx.t("panel.unreachable", {
-              error: error()
+            var _el$0 = _tmpl$2();
+            web.insert(_el$0, () => props.run.error);
+            return _el$0;
+          }
+        }), _el$10);
+        web.insert(_el$4, web.createComponent(solidJs.Show, {
+          get when() {
+            return failure();
+          },
+          get children() {
+            var _el$1 = _tmpl$2();
+            web.insert(_el$1, () => ctx.t("log.failed", {
+              error: failure()
             }));
             return _el$1;
           }
-        }), null);
-        web.insert(_el$4, web.createComponent(solidJs.Show, {
+        }), _el$10);
+        web.insert(_el$10, web.createComponent(solidJs.Show, {
           get when() {
-            return list().length > 0;
+            return log()?.text;
           },
           get fallback() {
             return (() => {
-              var _el$11 = _tmpl$6(), _el$12 = _el$11.firstChild, _el$13 = _el$12.nextSibling;
-              web.insert(_el$11, web.createComponent(EmptyBot, {
-                get mood() {
-                  return status().enabled ? "sleeping" : "lost";
-                }
-              }), _el$12);
-              web.insert(_el$12, () => ctx.t(status().enabled ? "panel.empty.title" : "panel.empty.off.title"));
-              web.insert(_el$13, () => ctx.t(status().enabled ? "panel.empty.on" : "panel.empty.off"));
-              return _el$11;
+              var _el$15 = _tmpl$7();
+              web.insert(_el$15, () => ctx.t(working() ? "log.empty" : "log.none"));
+              return _el$15;
             })();
           },
           get children() {
-            var _el$10 = _tmpl$4();
-            web.insert(_el$10, web.createComponent(solidJs.For, {
-              get each() {
-                return list();
-              },
-              children: (run) => (() => {
-                var _el$14 = _tmpl$7(), _el$15 = _el$14.firstChild, _el$16 = _el$15.firstChild, _el$17 = _el$16.nextSibling, _el$18 = _el$17.firstChild, _el$19 = _el$18.nextSibling;
-                _el$15.$$click = () => openRun(run);
-                web.insert(_el$16, web.createComponent(AgentBot, {
-                  get agent() {
-                    return run.agent;
-                  },
-                  get seed() {
-                    return run.id;
-                  },
-                  get status() {
-                    return run.status;
-                  }
-                }));
-                web.insert(_el$18, () => firstLine(run.prompt, 120) || run.id);
-                web.insert(_el$19, () => runDetail(run));
-                web.effect((_p$) => {
-                  var _v$ = run.prompt, _v$2 = FAILED.has(run.status) ? "dispatch-danger" : "dispatch-muted";
-                  _v$ !== _p$.e && web.setAttribute(_el$15, "title", _p$.e = _v$);
-                  _v$2 !== _p$.t && web.className(_el$19, _p$.t = _v$2);
-                  return _p$;
-                }, {
-                  e: void 0,
-                  t: void 0
-                });
-                return _el$14;
-              })()
-            }));
-            return _el$10;
+            var _el$11 = _tmpl$3();
+            _el$11.addEventListener("scroll", () => setFollowing(atEnd()));
+            web.use((el) => area = el, _el$11);
+            web.insert(_el$11, () => log()?.text);
+            return _el$11;
           }
         }), null);
+        web.insert(_el$10, web.createComponent(solidJs.Show, {
+          get when() {
+            return working() || !following();
+          },
+          get children() {
+            var _el$12 = _tmpl$5(), _el$13 = _el$12.firstChild;
+            web.insert(_el$13, () => ctx.t(following() ? "log.following" : "log.paused"));
+            web.insert(_el$12, web.createComponent(solidJs.Show, {
+              get when() {
+                return !following();
+              },
+              get children() {
+                var _el$14 = _tmpl$4();
+                _el$14.$$click = toEnd;
+                web.insert(_el$14, () => ctx.t("log.follow"));
+                return _el$14;
+              }
+            }), null);
+            return _el$12;
+          }
+        }), null);
+        web.effect(() => web.className(_el$9, FAILED.has(status2()) ? "dispatch-danger" : "dispatch-muted"));
         return _el$4;
       })();
+    };
+    const RunsView = (props) => {
+      const [selected, setSelected] = solidJs.createSignal(void 0);
+      const list = () => sessionRuns(props.session);
+      const error = () => props.session ? errors[props.session.key] : "";
+      const selectedRun = () => {
+        const open = selected();
+        if (!open) return void 0;
+        return list().find((run) => run.id === open.id) || open;
+      };
+      return web.createComponent(solidJs.Show, {
+        get when() {
+          return selectedRun();
+        },
+        get fallback() {
+          return (() => {
+            var _el$16 = _tmpl$0(), _el$17 = _el$16.firstChild, _el$18 = _el$17.firstChild, _el$19 = _el$18.nextSibling, _el$22 = _el$19.nextSibling;
+            web.insert(_el$18, web.createComponent(ctx.ui.Tooltip, {
+              get value() {
+                return ctx.t(status().enabled ? "command.toggle.on" : "command.toggle.off");
+              },
+              get children() {
+                return web.createComponent(ctx.ui.Switch, {
+                  get checked() {
+                    return status().enabled;
+                  },
+                  onChange: (checked) => void setEnabled(checked),
+                  get ["aria-label"]() {
+                    return ctx.t(status().enabled ? "command.toggle.on" : "command.toggle.off");
+                  }
+                });
+              }
+            }));
+            web.insert(_el$19, () => ctx.t("panel.runs"), null);
+            web.insert(_el$19, web.createComponent(solidJs.Show, {
+              get when() {
+                return list().length > 0;
+              },
+              get children() {
+                var _el$20 = _tmpl$8();
+                _el$20.firstChild;
+                web.insert(_el$20, () => list().length, null);
+                return _el$20;
+              }
+            }), null);
+            web.insert(_el$22, web.createComponent(ctx.ui.Tooltip, {
+              get value() {
+                return ctx.t("command.app");
+              },
+              get children() {
+                return web.createComponent(ctx.ui.IconButton, {
+                  icon: "square-arrow-top-right",
+                  variant: "ghost",
+                  size: "small",
+                  get label() {
+                    return ctx.t("command.app");
+                  },
+                  onClick: openApp
+                });
+              }
+            }));
+            web.insert(_el$16, web.createComponent(solidJs.Show, {
+              get when() {
+                return error();
+              },
+              get children() {
+                var _el$23 = _tmpl$2();
+                web.insert(_el$23, () => ctx.t("panel.unreachable", {
+                  error: error()
+                }));
+                return _el$23;
+              }
+            }), null);
+            web.insert(_el$16, web.createComponent(solidJs.Show, {
+              get when() {
+                return list().length > 0;
+              },
+              get fallback() {
+                return (() => {
+                  var _el$25 = _tmpl$1(), _el$26 = _el$25.firstChild, _el$27 = _el$26.nextSibling;
+                  web.insert(_el$25, web.createComponent(EmptyBot, {
+                    get mood() {
+                      return status().enabled ? "sleeping" : "lost";
+                    }
+                  }), _el$26);
+                  web.insert(_el$26, () => ctx.t(status().enabled ? "panel.empty.title" : "panel.empty.off.title"));
+                  web.insert(_el$27, () => ctx.t(status().enabled ? "panel.empty.on" : "panel.empty.off"));
+                  return _el$25;
+                })();
+              },
+              get children() {
+                var _el$24 = _tmpl$9();
+                web.insert(_el$24, web.createComponent(solidJs.For, {
+                  get each() {
+                    return list();
+                  },
+                  children: (run) => (() => {
+                    var _el$28 = _tmpl$10(), _el$29 = _el$28.firstChild, _el$30 = _el$29.firstChild, _el$31 = _el$30.nextSibling, _el$32 = _el$31.firstChild, _el$33 = _el$32.nextSibling;
+                    _el$29.$$click = () => setSelected(run);
+                    web.insert(_el$30, web.createComponent(AgentBot, {
+                      get agent() {
+                        return run.agent;
+                      },
+                      get seed() {
+                        return run.id;
+                      },
+                      get status() {
+                        return run.status;
+                      }
+                    }));
+                    web.insert(_el$32, () => firstLine(run.prompt, 120) || run.id);
+                    web.insert(_el$33, () => runDetail(run));
+                    web.effect((_p$) => {
+                      var _v$ = run.prompt, _v$2 = FAILED.has(run.status) ? "dispatch-danger" : "dispatch-muted";
+                      _v$ !== _p$.e && web.setAttribute(_el$29, "title", _p$.e = _v$);
+                      _v$2 !== _p$.t && web.className(_el$33, _p$.t = _v$2);
+                      return _p$;
+                    }, {
+                      e: void 0,
+                      t: void 0
+                    });
+                    return _el$28;
+                  })()
+                }));
+                return _el$24;
+              }
+            }), null);
+            return _el$16;
+          })();
+        },
+        children: (run) => web.createComponent(RunLog, {
+          get run() {
+            return run();
+          },
+          get session() {
+            return props.session;
+          },
+          onBack: () => setSelected(void 0)
+        })
+      });
     };
     ctx.add(gui.Panel, {
       id: "runs",

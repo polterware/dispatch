@@ -58,6 +58,31 @@ export const Dispatch = {
         additionalProperties: false,
       },
     },
+    // The run's output so far, and the status the panel polls on: the Desktop
+    // part shows it in place instead of only opening the run in the app.
+    log: {
+      input: {
+        type: "object",
+        properties: {
+          runID: { type: "string" },
+          directory: { type: "string" },
+          offset: { type: "integer" },
+        },
+        required: ["runID"],
+        additionalProperties: false,
+      },
+      output: {
+        type: "object",
+        properties: {
+          status: { type: "string" },
+          text: { type: "string" },
+          lines: { type: "integer" },
+          error: { type: "string" },
+        },
+        required: ["status", "text", "lines"],
+        additionalProperties: false,
+      },
+    },
   },
   events: {
     changed: {
