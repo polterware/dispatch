@@ -21,6 +21,9 @@ const READ_TIMEOUT_MS = 20_000
 const START_TIMEOUT_MS = 120_000
 const RESULT_LINES = 200
 const PROMPT_PREVIEW = 400
+// The tail of a run's output the panel holds: enough to read, little to carry.
+const LOG_LINES = 2000
+const LOG_BYTES = 256 * 1024
 // The app's own link, or a run in it.
 const RUN_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/
 const DISPATCH_LINK = /^dispatch:\/\/(run\/[A-Za-z0-9_-]{1,128})?$/
@@ -115,6 +118,26 @@ function asString(value) {
 // compact drops the keys with no value: OpenCode's RPC refuses undefined.
 function compact(view) {
   return Object.fromEntries(Object.entries(view).filter(([, value]) => value !== undefined))
+}
+
+// ANSI is what an agent's output colors, not text the panel can draw.
+const ANSI_CSI = /\u001b\[[0-?]*[ -/]*[@-~]/g
+const ANSI_OSC = /\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g
+
+function stripAnsi(text) {
+  return String(text).replace(ANSI_OSC, "").replace(ANSI_CSI, "").replace(/\r\n/g, "\n")
+}
+
+// logText keeps the end of the output: its last lines inside the byte cap.
+function logText(raw) {
+  let text = stripAnsi(raw)
+  if (text.length > LOG_BYTES) {
+    text = text.slice(text.length - LOG_BYTES)
+    const cut = text.indexOf("\n")
+    if (cut >= 0) text = text.slice(cut + 1)
+  }
+  const rows = text.split("\n")
+  return rows.length > LOG_LINES ? rows.slice(-LOG_LINES).join("\n") : text
 }
 
 // runView is what the Desktop part shows of one run.
@@ -232,6 +255,37 @@ export default {
           runs.push(view)
         }
         return { runs }
+      },
+      // log answers the end of a run's output for the panel's log view, with
+      // the run's status so the view knows when to stop asking.
+      log: async (input) => {
+        const id = asString(input.runID)
+        if (!RUN_ID.test(id)) return { status: "", text: "", lines: 0, error: "not a run id" }
+        const cwd = asString(input.directory)
+        const read = async (offset, limit) => {
+          const out = await exec(
+            binary(),
+            ["result", id, "--section", "output", "--json", "--offset", String(offset), "--limit", String(limit)],
+            { cwd, timeout: READ_TIMEOUT_MS },
+          )
+          const body = parseJSON(out.stdout)
+          if (out.code !== 0 || !body) return { error: out.stderr || `dispatch result exited ${out.code}` }
+          return { body }
+        }
+        const offset = Number.isInteger(input.offset) && input.offset > 0 ? input.offset : 0
+        const first = await read(offset, LOG_LINES)
+        if (first.error) return { status: "", text: "", lines: 0, error: first.error }
+        const total = typeof first.body.total_lines === "number" ? first.body.total_lines : 0
+        // The end of a longer output, which the first read ends short of.
+        let page = first
+        if (!offset && total > LOG_LINES) {
+          page = await read(total - LOG_LINES, LOG_LINES)
+          if (page.error) return { status: "", text: "", lines: 0, error: page.error }
+        }
+        const text = logText(asString(page.body.content))
+        const rows = text ? text.split("\n") : []
+        if (rows.length && !rows[rows.length - 1]) rows.pop()
+        return { status: asString(page.body.status), text, lines: rows.length }
       },
     })
 

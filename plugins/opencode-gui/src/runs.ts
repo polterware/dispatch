@@ -21,6 +21,14 @@ export type RunView = {
   error?: string;
 };
 
+/** One run's output, and its status, as the plugin's server part answers it. */
+export type LogView = {
+  status: string;
+  text: string;
+  lines: number;
+  error?: string;
+};
+
 export const ACTIVE = new Set(["PENDING", "RUNNING"]);
 export const FAILED = new Set(["FAILED", "CANCELLED", "TIMED_OUT", "ORPHANED"]);
 

@@ -1,16 +1,16 @@
 // Dispatch in OpenCode Desktop: the delegation switch (the runs panel's header,
 // Settings › Dispatch, the palette, and /dispatch), and the conversation's runs
 // in a side panel with each agent's bot, opened from the composer pill; a run
-// opens in the Dispatch app.
+// opens in the panel as its log, and Open in Dispatch opens it in the app.
 // `pnpm --dir plugins/opencode-gui build` writes it to
 // crates/dispatch-core/src/setup/opencode/gui-experimental.cjs, which the
 // dispatch binary embeds and `dispatch setup opencode` installs.
 import { Command, ComposerPill, MenuItem, Panel, Plugin, SettingsPage, Style } from "@opencode/plugin/gui";
-import { For, Show, createSignal } from "solid-js";
+import { For, Show, createSignal, onCleanup, onMount } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
 import { Dispatch } from "../../../crates/dispatch-core/src/setup/opencode/rpc.js";
 import { AgentBot, EmptyBot } from "./avatars";
-import { ACTIVE, FAILED, firstLine, formatDuration, formatTokens, runDetail, runLink, statusLabel, type RunView } from "./runs";
+import { ACTIVE, FAILED, firstLine, formatDuration, formatTokens, runDetail, runLink, statusLabel, type LogView, type RunView } from "./runs";
 
 // The app's context; its types live in @opencode/plugin/gui.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -20,9 +20,22 @@ type Status = { enabled: boolean; binary: string; available: boolean; loaded: bo
 
 const POLL_ACTIVE_MS = 3_000;
 const POLL_IDLE_MS = 15_000;
+// An open run's log: read again while it works, and followed until the reader
+// scrolls away from the end, which is the app's transcript rule.
+const LOG_POLL_MS = 2_000;
+const FOLLOW_SLACK = 48;
 
 const CSS = `
 .dispatch-panel { display: flex; flex-direction: column; gap: 4px; padding: 8px; overflow: auto; height: 100%; box-sizing: border-box; }
+.dispatch-panel-log { overflow: hidden; }
+.dispatch-log-head { display: flex; align-items: center; gap: 8px; padding: 4px 4px 8px; }
+.dispatch-log-head .dispatch-run-body { flex: 1; }
+.dispatch-log-wrap { display: flex; flex-direction: column; flex: 1; min-height: 0; gap: 6px; }
+.dispatch-log-body { flex: 1; min-height: 0; margin: 0; padding: 8px; overflow: auto; border-radius: 8px; background: var(--surface-base-hover); color: var(--text-base); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+.dispatch-log-empty { flex: 1; display: grid; place-items: center; margin: 0; color: var(--text-weak); font-size: 12px; }
+.dispatch-log-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 0 4px; }
+.dispatch-log-follow { border: 0; border-radius: 999px; padding: 4px 10px; background: var(--surface-base-hover); color: var(--text-base); font: inherit; font-size: 12px; cursor: pointer; }
+.dispatch-log-follow:hover, .dispatch-log-follow:focus-visible { background: var(--surface-base-hover); color: var(--text-strong); outline: none; }
 .dispatch-panel-head { display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 8px; padding: 4px 4px 8px 8px; }
 .dispatch-panel-switch { display: flex; align-items: center; justify-self: start; }
 .dispatch-panel-title { color: var(--text-strong); font-weight: 500; text-align: center; white-space: nowrap; }
@@ -63,6 +76,14 @@ const definition = Plugin.define({
       "panel.empty.off.title": "Delegation is off",
       "panel.empty.off": "This conversation uses OpenCode's own subagents. Turn Dispatch on with the switch above.",
       "panel.unreachable": "Dispatch did not answer: {{error}}",
+      "panel.back": "Back to runs",
+      "log.empty": "Waiting for output…",
+      "log.none": "This run left no output.",
+      "log.failed": "Could not read the run: {{error}}",
+      "log.following": "Following the end",
+      "log.paused": "Not following new lines",
+      "log.follow": "Follow",
+      "log.open": "Open in Dispatch",
       "pill.on": "Dispatch",
       "pill.off": "Dispatch off",
       "runs.one": "{{count}} run",
@@ -270,61 +291,171 @@ const definition = Plugin.define({
       closable: "hover",
     };
 
+    // RunLog is a run's page in the panel: its status, followed by the end of
+    // its output while the reader stays there, and asked again while it works.
+    const RunLog = (props: { run: RunView; session: Session; onBack: () => void }) => {
+      const [log, setLog] = createSignal<LogView | undefined>(undefined);
+      const [failure, setFailure] = createSignal("");
+      const [following, setFollowing] = createSignal(true);
+      let area: HTMLPreElement | undefined;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let stopped = false;
+
+      const status = () => log()?.status || props.run.status;
+      const working = () => ACTIVE.has(status());
+      const atEnd = () => {
+        const el = area;
+        return !el || el.scrollHeight - el.scrollTop - el.clientHeight <= FOLLOW_SLACK;
+      };
+      const toEnd = () => {
+        const el = area;
+        if (el) el.scrollTop = el.scrollHeight;
+        setFollowing(true);
+      };
+
+      const load = async () => {
+        try {
+          const answer = (await rpc().log({ runID: props.run.id, directory: props.session.directory || "" })) as LogView;
+          if (stopped) return false;
+          setLog(answer);
+          setFailure(answer.error || "");
+          if (following()) toEnd();
+          return !answer.error && ACTIVE.has(answer.status);
+        } catch (error) {
+          if (stopped) return false;
+          setFailure(String((error as Error)?.message || error));
+          return false;
+        }
+      };
+      const tick = async () => {
+        timer = undefined;
+        if (stopped || !(await load())) return;
+        timer = setTimeout(tick, LOG_POLL_MS);
+      };
+
+      onMount(() => void tick());
+      onCleanup(() => {
+        stopped = true;
+        clearTimeout(timer);
+      });
+
+      return (
+        <div class="dispatch-panel dispatch-panel-log">
+          <div class="dispatch-log-head">
+            <ctx.ui.Tooltip value={ctx.t("panel.back")}>
+              <ctx.ui.IconButton icon="arrow-left" variant="ghost" size="small" label={ctx.t("panel.back")} onClick={props.onBack} />
+            </ctx.ui.Tooltip>
+            <span class="dispatch-run-bot">
+              <AgentBot agent={props.run.agent} seed={props.run.id} status={status()} />
+            </span>
+            <span class="dispatch-run-body">
+              <span class="dispatch-run-title">{firstLine(props.run.prompt, 120) || props.run.id}</span>
+              <span class={FAILED.has(status()) ? "dispatch-danger" : "dispatch-muted"}>{runDetail({ ...props.run, status: status() })}</span>
+            </span>
+            <ctx.ui.Tooltip value={ctx.t("log.open")}>
+              <ctx.ui.IconButton icon="square-arrow-top-right" variant="ghost" size="small" label={ctx.t("log.open")} onClick={() => openRun(props.run)} />
+            </ctx.ui.Tooltip>
+          </div>
+          <Show when={props.run.error}>
+            <p class="dispatch-danger">{props.run.error}</p>
+          </Show>
+          <Show when={failure()}>
+            <p class="dispatch-danger">{ctx.t("log.failed", { error: failure() })}</p>
+          </Show>
+          <div class="dispatch-log-wrap">
+            <Show
+              when={log()?.text}
+              fallback={<p class="dispatch-log-empty">{ctx.t(working() ? "log.empty" : "log.none")}</p>}
+            >
+              <pre class="dispatch-log-body" ref={(el) => (area = el)} onScroll={() => setFollowing(atEnd())}>
+                {log()?.text}
+              </pre>
+            </Show>
+            <Show when={working() || !following()}>
+              <div class="dispatch-log-foot">
+                <span class="dispatch-muted">{ctx.t(following() ? "log.following" : "log.paused")}</span>
+                <Show when={!following()}>
+                  <button class="dispatch-log-follow" type="button" onClick={toEnd}>
+                    {ctx.t("log.follow")}
+                  </button>
+                </Show>
+              </div>
+            </Show>
+          </div>
+        </div>
+      );
+    };
+
     const RunsView = (props: { session: Session }) => {
+      // The run whose log this panel shows, if any.
+      const [selected, setSelected] = createSignal<RunView | undefined>(undefined);
       const list = () => sessionRuns(props.session);
       const error = () => (props.session ? errors[props.session.key] : "");
+      // The row the panel polls keeps the open run's status and detail fresh.
+      const selectedRun = () => {
+        const open = selected();
+        if (!open) return undefined;
+        return list().find((run) => run.id === open.id) || open;
+      };
       return (
-        <div class="dispatch-panel">
-          <div class="dispatch-panel-head">
-            <span class="dispatch-panel-switch">
-              <ctx.ui.Tooltip value={ctx.t(status().enabled ? "command.toggle.on" : "command.toggle.off")}>
-                <ctx.ui.Switch checked={status().enabled} onChange={(checked: boolean) => void setEnabled(checked)} aria-label={ctx.t(status().enabled ? "command.toggle.on" : "command.toggle.off")} />
-              </ctx.ui.Tooltip>
-            </span>
-            <span class="dispatch-panel-title">
-              {ctx.t("panel.runs")}
-              <Show when={list().length > 0}>
-                <span class="dispatch-muted"> · {list().length}</span>
-              </Show>
-            </span>
-            <span class="dispatch-panel-actions">
-              <ctx.ui.Tooltip value={ctx.t("command.app")}>
-                <ctx.ui.IconButton icon="square-arrow-top-right" variant="ghost" size="small" label={ctx.t("command.app")} onClick={openApp} />
-              </ctx.ui.Tooltip>
-            </span>
-          </div>
-          <Show when={error()}>
-            <p class="dispatch-danger">{ctx.t("panel.unreachable", { error: error() })}</p>
-          </Show>
-          <Show
-            when={list().length > 0}
-            fallback={
-              <div class="dispatch-empty">
-                <EmptyBot mood={status().enabled ? "sleeping" : "lost"} />
-                <p class="dispatch-empty-title">{ctx.t(status().enabled ? "panel.empty.title" : "panel.empty.off.title")}</p>
-                <p class="dispatch-muted">{ctx.t(status().enabled ? "panel.empty.on" : "panel.empty.off")}</p>
+        <Show
+          when={selectedRun()}
+          fallback={
+            <div class="dispatch-panel">
+              <div class="dispatch-panel-head">
+                <span class="dispatch-panel-switch">
+                  <ctx.ui.Tooltip value={ctx.t(status().enabled ? "command.toggle.on" : "command.toggle.off")}>
+                    <ctx.ui.Switch checked={status().enabled} onChange={(checked: boolean) => void setEnabled(checked)} aria-label={ctx.t(status().enabled ? "command.toggle.on" : "command.toggle.off")} />
+                  </ctx.ui.Tooltip>
+                </span>
+                <span class="dispatch-panel-title">
+                  {ctx.t("panel.runs")}
+                  <Show when={list().length > 0}>
+                    <span class="dispatch-muted"> · {list().length}</span>
+                  </Show>
+                </span>
+                <span class="dispatch-panel-actions">
+                  <ctx.ui.Tooltip value={ctx.t("command.app")}>
+                    <ctx.ui.IconButton icon="square-arrow-top-right" variant="ghost" size="small" label={ctx.t("command.app")} onClick={openApp} />
+                  </ctx.ui.Tooltip>
+                </span>
               </div>
-            }
-          >
-            <ul class="dispatch-runs">
-              <For each={list()}>
-                {(run) => (
-                  <li>
-                    <button class="dispatch-run" type="button" title={run.prompt} onClick={() => openRun(run)}>
-                      <span class="dispatch-run-bot">
-                        <AgentBot agent={run.agent} seed={run.id} status={run.status} />
-                      </span>
-                      <span class="dispatch-run-body">
-                        <span class="dispatch-run-title">{firstLine(run.prompt, 120) || run.id}</span>
-                        <span class={FAILED.has(run.status) ? "dispatch-danger" : "dispatch-muted"}>{runDetail(run)}</span>
-                      </span>
-                    </button>
-                  </li>
-                )}
-              </For>
-            </ul>
-          </Show>
-        </div>
+              <Show when={error()}>
+                <p class="dispatch-danger">{ctx.t("panel.unreachable", { error: error() })}</p>
+              </Show>
+              <Show
+                when={list().length > 0}
+                fallback={
+                  <div class="dispatch-empty">
+                    <EmptyBot mood={status().enabled ? "sleeping" : "lost"} />
+                    <p class="dispatch-empty-title">{ctx.t(status().enabled ? "panel.empty.title" : "panel.empty.off.title")}</p>
+                    <p class="dispatch-muted">{ctx.t(status().enabled ? "panel.empty.on" : "panel.empty.off")}</p>
+                  </div>
+                }
+              >
+                <ul class="dispatch-runs">
+                  <For each={list()}>
+                    {(run) => (
+                      <li>
+                        <button class="dispatch-run" type="button" title={run.prompt} onClick={() => setSelected(run)}>
+                          <span class="dispatch-run-bot">
+                            <AgentBot agent={run.agent} seed={run.id} status={run.status} />
+                          </span>
+                          <span class="dispatch-run-body">
+                            <span class="dispatch-run-title">{firstLine(run.prompt, 120) || run.id}</span>
+                            <span class={FAILED.has(run.status) ? "dispatch-danger" : "dispatch-muted"}>{runDetail(run)}</span>
+                          </span>
+                        </button>
+                      </li>
+                    )}
+                  </For>
+                </ul>
+              </Show>
+            </div>
+          }
+        >
+          {(run) => <RunLog run={run()} session={props.session} onBack={() => setSelected(undefined)} />}
+        </Show>
       );
     };
 
