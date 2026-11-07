@@ -103,7 +103,7 @@ impl SttEngine {
 
         let detected = if language == Language::Auto {
             state
-                .pcm_to_mel(pcm, self.threads)
+                .pcm_to_mel(pcm, self.threads as usize)
                 .map_err(|e| SttError::Inference(e.to_string()))?;
             let (_, probs) = state
                 .lang_detect(0, self.threads as usize)
@@ -135,7 +135,11 @@ impl SttEngine {
             .full(params, pcm)
             .map_err(|e| SttError::Inference(e.to_string()))?;
         let text = (0..state.full_n_segments())
-            .filter_map(|i| state.get_segment(i).map(|s| s.to_str_lossy().into_owned()))
+            .filter_map(|i| {
+                state
+                    .get_segment(i)
+                    .and_then(|segment| segment.to_str_lossy().ok().map(|text| text.into_owned()))
+            })
             .collect::<String>()
             .trim()
             .to_owned();
@@ -217,7 +221,10 @@ impl VadModel {
         if !path.is_file() {
             return Err(SttError::ModelMissing(path.to_owned()));
         }
-        let session = Session::builder()
+        let environment = ort::init()
+            .build()
+            .map_err(|e| SttError::Load(e.to_string()))?;
+        let session = Session::builder(&environment)
             .map_err(|e| SttError::Load(e.to_string()))?
             .with_intra_threads(1)
             .map_err(|e| SttError::Load(e.to_string()))?
@@ -225,8 +232,8 @@ impl VadModel {
             .map_err(|e| SttError::Load(e.to_string()))?
             .commit_from_file(path)
             .map_err(|e| SttError::Load(e.to_string()))?;
-        let inputs: Vec<_> = session.inputs.iter().map(|x| x.name.as_str()).collect();
-        let outputs: Vec<_> = session.outputs.iter().map(|x| x.name.as_str()).collect();
+        let inputs: Vec<_> = session.inputs().iter().map(|x| x.name()).collect();
+        let outputs: Vec<_> = session.outputs().iter().map(|x| x.name()).collect();
         tracing::info!(?inputs, ?outputs, "Loaded Silero VAD ONNX model");
         if inputs != ["input", "state", "sr"] || outputs != ["output", "stateN"] {
             return Err(SttError::Load(format!(
@@ -248,7 +255,7 @@ enum VadBackend {
     Silero {
         model: Arc<VadModelInner>,
         state: Vec<f32>,
-        context: [f32; 64],
+        context: Box<[f32; 64]>,
     },
 }
 struct Hysteresis {
@@ -313,7 +320,7 @@ impl Vad {
             backend: VadBackend::Silero {
                 model: model.inner.clone(),
                 state: vec![0.0; 2 * 128],
-                context: [0.0; 64],
+                context: Box::new([0.0; 64]),
             },
             core: Hysteresis::new(options),
             pending: Vec::with_capacity(512),
@@ -331,7 +338,7 @@ impl Vad {
         match &mut self.backend {
             VadBackend::Energy { noise_floor } => {
                 let rms = rms(chunk);
-                let threshold = (noise_floor * 3.0).max(0.008);
+                let threshold = (*noise_floor * 3.0).max(0.008);
                 if rms < *noise_floor {
                     *noise_floor += (rms - *noise_floor) * 0.08;
                 } else {
@@ -351,7 +358,7 @@ impl Vad {
                 while self.pending.len() >= 512 {
                     let frame: Vec<f32> = self.pending.drain(..512).collect();
                     let mut input = Vec::with_capacity(576);
-                    input.extend_from_slice(context);
+                    input.extend_from_slice(&context[..]);
                     input.extend_from_slice(&frame);
                     context.copy_from_slice(&frame[448..512]);
                     let mut session = match model.session.lock() {
