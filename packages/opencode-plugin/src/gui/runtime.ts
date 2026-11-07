@@ -33,6 +33,8 @@ export interface VoiceRuntimeOptions {
   speak(text: string, language: Language, id: string): void
   /** The language the user speaks and wants to hear. Defaults to pt-BR. */
   language?(): Language
+  /** Read every finished turn aloud. Defaults to true. */
+  autoRead?(): boolean
   onFailure?(error: unknown): void
 }
 export type VoiceTransportMessage = { type: "connection"; connected: boolean }
@@ -105,7 +107,7 @@ export function createVoiceRuntime(options: VoiceRuntimeOptions) {
           await session.server.data.session.message.sync(session.id)
           const text = turnText(session.server.data.session.message.list(session.id))
           if (options.controller.state === "processing" || options.controller.state === "submitting") options.controller.dispatch({ type: "turn.ended" })
-          if (text) speak(text)
+          if (text && (options.autoRead?.() ?? true)) speak(text)
         } catch (error) {
           options.onFailure?.(error)
           options.controller.dispatch({ type: "failure" })
@@ -221,6 +223,12 @@ export function createVoiceRuntime(options: VoiceRuntimeOptions) {
       send({ type: "mic.mute", muted: value })
     },
     cancelSpeech,
+    /** Speaks any text now (e.g. an earlier reply the user picked), replacing what is playing. */
+    speakText(text: string) {
+      cancelSpeech()
+      speak(text)
+      return speakID!
+    },
     sessionChanged(session: VoiceSession | undefined) {
       cancelSpeech()
       if (options.controller.state === "listening" && listeningID) send({ type: "listen.cancel", id: listeningID })

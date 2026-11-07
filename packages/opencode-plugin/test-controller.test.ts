@@ -111,3 +111,17 @@ describe("turn text", () => {
     expect(spoken).toEqual(["pt-br:Feito."])
   })
 })
+
+describe("history", () => {
+  test("lists assistant replies with text, newest first", async () => {
+    const { assistantReplies } = await import("./src/gui/history.ts")
+    const replies = assistantReplies([
+      { type: "user" },
+      { type: "assistant", id: "a1", time: { created: 1 }, content: [{ type: "text", text: "Primeira." }] },
+      { type: "assistant", id: "a2", content: [{ type: "tool", text: "x" }] },
+      { type: "assistant", id: "a3", time: { created: 3 }, content: [{ type: "text", text: "Segunda." }] },
+    ] as any)
+    expect(replies.map(r => r.id)).toEqual(["a3", "a1"])
+    expect(replies[0]!.text).toBe("Segunda.")
+  })
+})
