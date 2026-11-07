@@ -55,6 +55,22 @@ switch (args[0]) {
   case "runs":
     out({ runs: [{ ID: "r1", Status: "RUNNING", Agent: "codex", Model: "gpt-6", Prompt: "Fix the parser\\nmore", Usage: { inputTokens: 1000, cacheReadTokens: 500, outputTokens: 200 }, FilesChanged: 2, Insertions: 10, Deletions: 3 }] })
     break
+  case "agents":
+    out({ agents: [
+      { Name: "codex", Bin: "codex", Provider: "openai", UsedPercent: 0, CooldownUntil: null, Enabled: true },
+      { Name: "opencode", Bin: "opencode", Provider: "opencode", UsedPercent: null, CooldownUntil: null, Enabled: true },
+      { Name: "gemini", Bin: "gemini", Provider: "google", UsedPercent: null, CooldownUntil: null, Enabled: false },
+    ] })
+    break
+  case "models":
+    out({ entries: [
+      { agent: "opencode", model: "deepseek/deepseek-flash" },
+      { agent: "codex", model: "gpt-6-astra" },
+      { agent: "codex", model: "gpt-6-astra" },
+      { agent: "codex", model: "gpt-6-luna" },
+      { agent: "gemini", model: "gemini-3-flash" },
+    ] })
+    break
   case "merge":
     process.stdout.write("merged r1\\n")
     break
@@ -179,18 +195,73 @@ test("delegation off keeps OpenCode's subagents and hides Dispatch's tools", asy
 
 test("the Delegate check round-trips for the root conversation and persists", async () => {
   const { impl, emitted, stored } = await loadServer()
-  assert.deepEqual(await impl().force({ sessionID: "child" }), { force: false })
-  assert.deepEqual(await impl().setForce({ sessionID: "child", directory: "", force: true }), { force: true })
+  assert.deepEqual(await impl().force({ sessionID: "child" }), { force: false, agent: "", model: "" })
+  assert.deepEqual(await impl().setForce({ sessionID: "child", directory: "", force: true }), { force: true, agent: "", model: "" })
   // The conversation is the root session, so a child session's check is the chat's.
-  assert.deepEqual(emitted.at(-1), { name: "forced", data: { sessionID: "root", force: true } })
-  assert.deepEqual(await impl().force({ sessionID: "root" }), { force: true })
-  assert.equal(stored.get("force/root"), true)
+  assert.deepEqual(emitted.at(-1), { name: "forced", data: { sessionID: "root", force: true, agent: "", model: "" } })
+  assert.deepEqual(await impl().force({ sessionID: "root" }), { force: true, agent: "", model: "" })
+  assert.deepEqual(stored.get("force/root"), { force: true, agent: "", model: "" })
 
   // A server part started again over the same storage reads the flag back.
   const restarted = await loadServer({ storage: stored })
-  assert.deepEqual(await restarted.impl().force({ sessionID: "child" }), { force: true })
-  assert.deepEqual(await restarted.impl().setForce({ sessionID: "root", force: false }), { force: false })
-  assert.equal(stored.get("force/root"), false)
+  assert.deepEqual(await restarted.impl().force({ sessionID: "child" }), { force: true, agent: "", model: "" })
+  assert.deepEqual(await restarted.impl().setForce({ sessionID: "root", force: false }), { force: false, agent: "", model: "" })
+  assert.deepEqual(stored.get("force/root"), { force: false, agent: "", model: "" })
+})
+
+test("a forced target is stored with the check, and a toggle keeps it", async () => {
+  const { impl, emitted, stored } = await loadServer()
+  const pick = { agent: "opencode", model: "deepseek/deepseek-flash" }
+  assert.deepEqual(await impl().setForce({ sessionID: "child", force: true, ...pick }), { force: true, ...pick })
+  assert.deepEqual(emitted.at(-1), { name: "forced", data: { sessionID: "root", force: true, ...pick } })
+  assert.deepEqual(stored.get("force/root"), { force: true, ...pick })
+
+  // Ticking or unticking the check leaves the target in place.
+  assert.deepEqual(await impl().setForce({ sessionID: "root", force: false }), { force: false, ...pick })
+  assert.deepEqual(await impl().setForce({ sessionID: "root", force: true }), { force: true, ...pick })
+
+  // Auto passes empty strings and clears it.
+  assert.deepEqual(await impl().setForce({ sessionID: "root", force: true, agent: "", model: "" }), { force: true, agent: "", model: "" })
+
+  // A value that could read as a flag is dropped instead of stored.
+  assert.deepEqual(await impl().setForce({ sessionID: "root", force: true, agent: "--force", model: "x" }), { force: true, agent: "", model: "" })
+
+  // A server part started again over the same storage reads the target back.
+  await impl().setForce({ sessionID: "root", force: true, ...pick })
+  const restarted = await loadServer({ storage: stored })
+  assert.deepEqual(await restarted.impl().force({ sessionID: "child" }), { force: true, ...pick })
+})
+
+test("targets lists each agent's models for the forced target pill", async () => {
+  const { impl } = await loadServer()
+  const answer = await impl().targets({})
+  // A disabled agent is left out, as is one with no model; the duplicates are one row.
+  assert.deepEqual(answer.agents, [
+    { name: "codex", models: ["gpt-6-astra", "gpt-6-luna"] },
+    { name: "opencode", models: ["deepseek/deepseek-flash"] },
+  ])
+  assert.equal(answer.error, undefined)
+  assert.deepEqual(
+    calls().map((call) => call.args.slice(0, 2).join(" ")).filter((args) => /^(agents|models) /.test(args)).sort(),
+    ["agents --json", "models --json"],
+  )
+})
+
+test("targets reports a CLI that fails", async () => {
+  const { impl, ctx } = await loadServer()
+  fs.rmSync(ctx.options.binary)
+  const savedPath = process.env.PATH
+  const savedHome = process.env.HOME
+  process.env.PATH = "/nonexistent"
+  process.env.HOME = tmp
+  try {
+    const answer = await impl().targets({})
+    assert.deepEqual(answer.agents, [])
+    assert.ok(answer.error)
+  } finally {
+    process.env.PATH = savedPath
+    process.env.HOME = savedHome
+  }
 })
 
 test("a forced conversation is told to delegate and loses the work tools", async () => {
@@ -225,6 +296,57 @@ test("a forced conversation is left alone while delegation is off", async () => 
   assert.equal(event.system.length, 0)
   assert.ok("bash" in event.tools)
   assert.ok("subagent" in event.tools)
+})
+
+test("a forced conversation with a target names it and sends every run there", async () => {
+  const { hooks, impl, tools } = await loadServer()
+  await impl().setForce({ sessionID: "root", force: true, agent: "opencode", model: "deepseek/deepseek-flash" })
+  const event = contextEvent()
+  await hooks.context(event)
+  const forced = event.system.find((part) => /forced to delegate/.test(part.text))
+  assert.ok(forced)
+  assert.match(forced.text, /opencode · deepseek\/deepseek-flash/)
+
+  await tools.dispatch_run.execute(
+    { prompt: "Fix the parser", tier: "easy", agent: "codex", model: "gpt-6-astra" },
+    { sessionID: "child", progress: async () => {} },
+  )
+  const [run] = calls().filter((call) => call.args[0] === "run")
+  // The target wins over the call's own agent and model.
+  assert.deepEqual(run.args, [
+    "run",
+    "--json",
+    "--compact",
+    "--dir",
+    path.join(tmp, "repo"),
+    "--agent",
+    "opencode",
+    "--model",
+    "deepseek/deepseek-flash",
+    "--tier",
+    "easy",
+    "-",
+  ])
+})
+
+test("a forced conversation with no target keeps Auto", async () => {
+  const { hooks, impl, tools } = await loadServer()
+  await impl().setForce({ sessionID: "root", force: true })
+  const event = contextEvent()
+  await hooks.context(event)
+  assert.equal(event.system.some((part) => /goes to/.test(part.text)), false)
+
+  await tools.dispatch_run.execute({ prompt: "x", wait: false }, { sessionID: "child", progress: async () => {} })
+  const [run] = calls().filter((call) => call.args[0] === "run")
+  assert.equal(run.args.includes("--agent"), false)
+  assert.equal(run.args.includes("--model"), false)
+})
+
+test("a call's own agent and model stand when the conversation is not forced", async () => {
+  const { tools } = await loadServer()
+  await tools.dispatch_run.execute({ prompt: "x", wait: false, agent: "codex", model: "gpt-6-astra" }, { sessionID: "root", progress: async () => {} })
+  const [run] = calls().filter((call) => call.args[0] === "run")
+  assert.deepEqual(run.args.slice(-5), ["--agent", "codex", "--model", "gpt-6-astra", "-"])
 })
 
 test("dispatch_run starts a run under the root conversation and waits for it", async () => {
@@ -432,8 +554,15 @@ test("the GUI adds the switch, the runs pill, and the panel", async () => {
         state: async () => (rpcCalls.push("state"), { enabled: true, binary: "/bin/dispatch", available: true }),
         setEnabled: async ({ enabled }) => (rpcCalls.push(`set:${enabled}`), { enabled, binary: "/bin/dispatch", available: true }),
         runs: async () => ({ runs: [] }),
-        force: async () => ({ force: false }),
-        setForce: async ({ force }) => (rpcCalls.push(`force:${force}`), { force }),
+        force: async () => ({ force: false, agent: "", model: "" }),
+        setForce: async ({ force, agent, model }) => (
+          rpcCalls.push(`force:${force}`),
+          { force, agent: agent || "", model: model || "" }
+        ),
+        targets: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 0))
+          return { agents: [{ name: "opencode", models: ["deepseek/deepseek-flash"] }] }
+        },
         open: async ({ url }) => (opened.push(url), { opened: true }),
         events: { on: () => () => {} },
       }),
@@ -470,14 +599,17 @@ test("the GUI adds the switch, the runs pill, and the panel", async () => {
 
     // The Delegate check beside it goes with delegation: hidden while off.
     const pills = added.filter((entry) => entry.registry === "composer-pill").map((entry) => entry.item)
-    assert.deepEqual(pills.map((item) => item.id), ["runs", "force"])
+    assert.deepEqual(pills.map((item) => item.id), ["runs", "force", "target"])
     const force = pills.find((item) => item.id === "force")
+    const target = pills.find((item) => item.id === "target")
     assert.equal(force.show({ session }), undefined)
+    assert.equal(target.show({ session }), undefined)
     await toggle.run()
     const off = force.show({ session })
     assert.equal(off.label, "pill.force.off")
     assert.equal(off.icon, undefined)
     assert.equal(off.title, "pill.force.title")
+    assert.equal(target.show({ session }), undefined)
     off.run()
     await new Promise((resolve) => setTimeout(resolve, 0))
     assert.ok(rpcCalls.includes("force:true"))
@@ -485,6 +617,24 @@ test("the GUI adds the switch, the runs pill, and the panel", async () => {
     assert.equal(on.label, "pill.force.on")
     assert.equal(on.icon, "circle-check")
     assert.equal(on.tone, "success")
+
+    // The target pill is beside it while the check is on: Auto until a model
+    // is picked, then that agent and model.
+    const auto = target.show({ session })
+    assert.equal(auto.label, "pill.target.auto")
+    assert.equal(auto.title, "pill.target.title")
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    const ready = target.show({ session })
+    assert.deepEqual(ready.rows.map((row) => row.label), ["pill.target.auto.row", "opencode · deepseek/deepseek-flash"])
+    assert.equal(ready.rows[0].icon, "circle-check")
+    ready.rows[1].run()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    const picked = target.show({ session })
+    assert.equal(picked.label, "opencode · deepseek/deepseek-flash")
+    assert.equal(picked.rows[1].icon, "circle-check")
+    picked.rows[0].run()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    assert.equal(target.show({ session }).label, "pill.target.auto")
     assert.equal(added.some((entry) => entry.registry === "slot"), false)
 
     commands.find((command) => command.id === "app").run()

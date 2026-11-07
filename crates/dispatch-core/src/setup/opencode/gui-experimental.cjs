@@ -59,7 +59,9 @@ const Dispatch = {
       }
     },
     // The Delegate check beside the composer pill, per conversation; directory
-    // is taken for symmetry with runs and not needed to resolve the root.
+    // is taken for symmetry with runs and not needed to resolve the root. A
+    // forced conversation also keeps the agent and model its runs go to, empty
+    // for Auto.
     force: {
       input: {
         type: "object",
@@ -69,8 +71,8 @@ const Dispatch = {
       },
       output: {
         type: "object",
-        properties: { force: { type: "boolean" } },
-        required: ["force"],
+        properties: { force: { type: "boolean" }, agent: { type: "string" }, model: { type: "string" } },
+        required: ["force", "agent", "model"],
         additionalProperties: false
       }
     },
@@ -80,15 +82,43 @@ const Dispatch = {
         properties: {
           sessionID: { type: "string" },
           directory: { type: "string" },
-          force: { type: "boolean" }
+          force: { type: "boolean" },
+          // The target the forced runs go to; empty strings mean Auto.
+          agent: { type: "string" },
+          model: { type: "string" }
         },
         required: ["sessionID", "force"],
         additionalProperties: false
       },
       output: {
         type: "object",
-        properties: { force: { type: "boolean" } },
-        required: ["force"],
+        properties: { force: { type: "boolean" }, agent: { type: "string" }, model: { type: "string" } },
+        required: ["force", "agent", "model"],
+        additionalProperties: false
+      }
+    },
+    // The agents and models a forced conversation can send its runs to, from
+    // `dispatch agents --json` and `dispatch models --json`.
+    targets: {
+      input: { type: "object", additionalProperties: false },
+      output: {
+        type: "object",
+        properties: {
+          agents: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                name: { type: "string" },
+                models: { type: "array", items: { type: "string" } }
+              },
+              required: ["name", "models"],
+              additionalProperties: false
+            }
+          },
+          error: { type: "string" }
+        },
+        required: ["agents"],
         additionalProperties: false
       }
     },
@@ -6215,6 +6245,14 @@ const definition = gui.Plugin.define({
       "pill.force.on": "Delegate",
       "pill.force.off": "Delegate",
       "pill.force.title": "Force delegation: this conversation must hand its work to Dispatch",
+      // The pill beside it, while the check is on: the agent and model each
+      // forced run goes to, or Auto.
+      "pill.target.auto": "Auto",
+      "pill.target.auto.row": "Auto (Dispatch decides)",
+      "pill.target.title": "Agent and model every forced run goes to",
+      "pill.target.loading": "Loading agents…",
+      "pill.target.empty": "No agents to pick",
+      "pill.target.failed": "Could not read the agents: {{error}}",
       "runs.one": "{{count}} run",
       "runs.other": "{{count}} runs",
       "runs.running": "{{count}} running",
@@ -6233,6 +6271,10 @@ const definition = gui.Plugin.define({
     const [runs, setRuns] = store.createStore({});
     const [errors, setErrors] = store.createStore({});
     const [forced, setForced] = store.createStore({});
+    const [targets, setTargets] = solidJs.createSignal(void 0);
+    const [targetsError, setTargetsError] = solidJs.createSignal("");
+    let targetsLoading = false;
+    let targetsTried = 0;
     const loadState = async () => {
       try {
         setStatus({
@@ -6267,6 +6309,26 @@ const definition = gui.Plugin.define({
       }
     };
     const toggle = () => setEnabled(!status().enabled);
+    const forcedView = (answer) => ({
+      force: answer.force === true,
+      agent: answer.agent || "",
+      model: answer.model || ""
+    });
+    const ensureTargets = async () => {
+      if (targets() !== void 0 || targetsLoading) return;
+      if (Date.now() - targetsTried < 15e3) return;
+      targetsTried = Date.now();
+      targetsLoading = true;
+      try {
+        const answer = await rpc().targets({});
+        setTargets(Array.isArray(answer.agents) ? answer.agents : []);
+        setTargetsError(answer.error || "");
+      } catch (error) {
+        setTargetsError(String(error?.message || error));
+      } finally {
+        targetsLoading = false;
+      }
+    };
     const refresh = async (session) => {
       if (!session || session.pending) return;
       try {
@@ -6281,20 +6343,44 @@ const definition = gui.Plugin.define({
           key: "id"
         }));
         setErrors(session.key, answer.error || "");
-        if (flag) setForced(session.key, flag.force === true);
+        if (flag) {
+          const view = forcedView(flag);
+          setForced(session.key, view);
+          if (view.force) void ensureTargets();
+        }
       } catch (error) {
         setErrors(session.key, String(error?.message || error));
       }
     };
     const toggleForce = async (session) => {
-      const force = !forced[session.key];
+      const force = forced[session.key]?.force !== true;
       try {
         const answer = await rpc().setForce({
           sessionID: session.id,
           directory: session.directory || "",
           force
         });
-        setForced(session.key, answer.force === true);
+        setForced(session.key, forcedView(answer));
+        if (answer.force === true) void ensureTargets();
+      } catch (error) {
+        ctx.toast.show({
+          variant: "error",
+          title: ctx.t("title"),
+          description: String(error?.message || error)
+        });
+      }
+    };
+    const pickTarget = async (session, agent, model) => {
+      const force = forced[session.key]?.force === true;
+      try {
+        const answer = await rpc().setForce({
+          sessionID: session.id,
+          directory: session.directory || "",
+          force,
+          agent,
+          model
+        });
+        setForced(session.key, forcedView(answer));
       } catch (error) {
         ctx.toast.show({
           variant: "error",
@@ -6477,13 +6563,68 @@ const definition = gui.Plugin.define({
       // dispatch_run can take the work.
       show: (input) => {
         if (!status().enabled) return void 0;
-        const on = forced[input.session.key] === true;
+        const on = forced[input.session.key]?.force === true;
         return {
           icon: on ? "circle-check" : void 0,
           label: ctx.t(on ? "pill.force.on" : "pill.force.off"),
           tone: on ? "success" : void 0,
           title: ctx.t("pill.force.title"),
           run: () => void toggleForce(input.session)
+        };
+      }
+    });
+    ctx.add(gui.ComposerPill, {
+      id: "target",
+      // The agent and model every forced run goes to, beside the Delegate
+      // check while it is on: Auto, or a model of one of the agents here. The
+      // menu is read from the CLIs the first time a conversation needs it.
+      show: (input) => {
+        if (!status().enabled || forced[input.session.key]?.force !== true) return void 0;
+        void ensureTargets();
+        const pick = forced[input.session.key];
+        const chosen = (agent, model) => pick?.agent === agent && (pick?.model || "") === model;
+        const rows = [{
+          id: "target:auto",
+          label: ctx.t("pill.target.auto.row"),
+          ...chosen("", "") ? {
+            icon: "circle-check",
+            tone: "success"
+          } : {},
+          run: () => void pickTarget(input.session, "", "")
+        }];
+        const list = targets();
+        if (!list) {
+          rows.push({
+            id: "target:loading",
+            label: targetsError() ? ctx.t("pill.target.failed", {
+              error: targetsError()
+            }) : ctx.t("pill.target.loading")
+          });
+        } else {
+          for (const agent of list) {
+            for (const model of agent.models) {
+              const on = chosen(agent.name, model);
+              rows.push({
+                id: `target:${agent.name}:${model}`,
+                label: `${agent.name} · ${model}`,
+                ...on ? {
+                  icon: "circle-check",
+                  tone: "success"
+                } : {},
+                run: () => void pickTarget(input.session, agent.name, model)
+              });
+            }
+          }
+          if (!list.length) rows.push({
+            id: "target:none",
+            label: ctx.t("pill.target.empty")
+          });
+        }
+        return {
+          icon: "models",
+          label: pick?.agent ? pick.model ? `${pick.agent} · ${pick.model}` : pick.agent : ctx.t("pill.target.auto"),
+          title: ctx.t("pill.target.title"),
+          rows
         };
       }
     });
