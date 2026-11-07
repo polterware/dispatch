@@ -222,6 +222,24 @@ pub enum EngineMessage {
     SpeakEnded { id: String, reason: SpeakEndReason },
     #[serde(rename = "pong")]
     Pong { nonce: u64 },
+    /// A model download advanced (broadcast to every client).
+    #[serde(rename = "model.progress")]
+    ModelProgress {
+        id: String,
+        downloaded_bytes: u64,
+        total_bytes: u64,
+    },
+    #[serde(rename = "model.installed")]
+    ModelInstalled { id: String },
+    #[serde(rename = "model.removed")]
+    ModelRemoved { id: String },
+    #[serde(rename = "model.failed")]
+    ModelFailed { id: String, message: String },
+    /// Settings changed (broadcast to every client).
+    #[serde(rename = "settings.changed")]
+    SettingsChanged {
+        settings: crate::catalog::EngineSettings,
+    },
     #[serde(rename = "error")]
     Error {
         /// Stable machine code, see `ErrorCode`.

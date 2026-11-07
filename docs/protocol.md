@@ -91,3 +91,23 @@ Text frames, one JSON message each, tagged by `type`.
 `error { code, message, id? }`, with `code` one of `busy`, `model_missing`,
 `audio_device`, `mic_permission`, `stt_failed`, `tts_failed`, `bad_request`,
 `internal`. An error never closes the connection.
+
+## Catalog, models, and settings
+
+Types: `crates/voice-core/src/catalog.rs` (TS: `packages/voice-client/src/protocol.ts`).
+
+| Method | Path | Answer |
+|---|---|---|
+| GET | `/v1/catalog` | `Catalog { models, voices }` with installed/active flags |
+| POST | `/v1/models/{id}/download` | 202; then `model.progress`, `model.installed` or `model.failed` on every WebSocket |
+| DELETE | `/v1/models/{id}` | 204; 409 when the current settings use it; broadcasts `model.removed` |
+| GET | `/v1/settings` | `EngineSettings` |
+| PATCH | `/v1/settings` | `SettingsPatch` in, new `EngineSettings` out; persisted and broadcast as `settings.changed` |
+
+Downloads run only on an explicit request from a client (the UI shows the size and
+license before the user confirms). Files go to `.part` and are renamed when complete;
+one download per model at a time.
+
+Voice ids name the backend: `piper:pt_BR-faber-medium`, `kokoro:af_heart`,
+`system:Luciana`. A `speak` request may name a voice id; otherwise the engine uses
+`voice_pt` or `voice_en` from the settings for the text's language.

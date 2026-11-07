@@ -59,6 +59,11 @@ export type EngineMessage =
   | { type: "speak.started"; id: string; first_audio_ms: number }
   | { type: "speak.ended"; id: string; reason: SpeakEndReason }
   | { type: "pong"; nonce: number }
+  | { type: "model.progress"; id: string; downloaded_bytes: number; total_bytes: number }
+  | { type: "model.installed"; id: string }
+  | { type: "model.removed"; id: string }
+  | { type: "model.failed"; id: string; message: string }
+  | { type: "settings.changed"; settings: EngineSettings }
   | { type: "error"; code: ErrorCode; message: string; id?: string }
 
 export interface Health {
@@ -76,3 +81,46 @@ export interface EngineInfo {
   port: number
   token: string
 }
+
+// Catalog and settings (crates/voice-core/src/catalog.rs).
+export type ModelKind = "stt" | "tts" | "vad"
+
+export interface CatalogEntry {
+  id: string
+  kind: ModelKind
+  backend: string
+  name: string
+  description: string
+  languages: Language[]
+  size_bytes: number
+  license: string
+  installed: boolean
+  active: boolean
+}
+
+export interface VoiceEntry {
+  id: string
+  backend: string
+  name: string
+  language: Language
+  model_id?: string
+  installed: boolean
+}
+
+export interface Catalog {
+  models: CatalogEntry[]
+  voices: VoiceEntry[]
+}
+
+export interface EngineSettings {
+  language: Language
+  stt_model: string
+  voice_pt: string
+  voice_en: string
+  speed: number
+  partials: boolean
+  model_idle_secs: number
+  exit_after_idle_secs: number
+}
+
+export type SettingsPatch = Partial<EngineSettings>

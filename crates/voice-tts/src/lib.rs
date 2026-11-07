@@ -421,6 +421,8 @@ pub struct KokoroOptions {
 }
 
 mod kokoro;
+pub mod piper;
+pub use piper::{PiperOptions, PiperTts};
 pub use kokoro::KokoroTts;
 impl KokoroTts {
     pub fn load(options: KokoroOptions) -> Result<Self> {
