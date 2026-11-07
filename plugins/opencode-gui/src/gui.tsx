@@ -6,12 +6,13 @@
 // crates/dispatch-core/src/setup/opencode/gui-experimental.cjs, which the
 // dispatch binary embeds and `dispatch setup opencode` installs.
 import { Command, ComposerPill, MenuItem, Panel, Plugin, SettingsPage, Style } from "@opencode/plugin/gui";
-import { For, Show, createSignal, onCleanup, onMount } from "solid-js";
+import { For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
 import { Dispatch } from "../../../crates/dispatch-core/src/setup/opencode/rpc.js";
 import { AgentBot, EmptyBot } from "./avatars";
 import { expressionFor } from "./expressions";
 import { ACTIVE, FAILED, filterTargets, firstLine, formatDuration, formatTokens, runDetail, runLink, statusLabel, type LogView, type RunView, type TargetAgent } from "./runs";
+import { buildTranscript, foldRepeats, type Entry } from "./transcript";
 
 // The app's context; its types live in @opencode/plugin/gui.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -39,7 +40,15 @@ const CSS = `
 .dispatch-log-head { display: flex; align-items: center; gap: 8px; padding: 4px 4px 8px; }
 .dispatch-log-head .dispatch-run-body { flex: 1; }
 .dispatch-log-wrap { display: flex; flex-direction: column; flex: 1; min-height: 0; gap: 6px; }
-.dispatch-log-body { flex: 1; min-height: 0; margin: 0; padding: 8px; overflow: auto; border-radius: 8px; background: var(--surface-base-hover); color: var(--text-base); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+.dispatch-log-body { display: flex; flex-direction: column; gap: 6px; flex: 1; min-height: 0; margin: 0; padding: 8px; overflow: auto; border-radius: 8px; background: var(--surface-base-hover); color: var(--text-base); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 1.5; white-space: normal; overflow-wrap: anywhere; }
+.dispatch-log-entry { min-width: 0; }
+.dispatch-log-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.dispatch-log-thinking { color: var(--text-weak); font-style: italic; }
+.dispatch-log-step-text { display: block; white-space: pre-wrap; overflow-wrap: anywhere; }
+.dispatch-log-step-failed { color: var(--text-error); }
+.dispatch-log-step-output { display: block; margin: 2px 0 0 14px; color: var(--text-weak); white-space: pre-wrap; overflow-wrap: anywhere; }
+.dispatch-log-event { color: var(--text-weak); white-space: pre-wrap; overflow-wrap: anywhere; }
+.dispatch-log-markdown { white-space: normal; overflow-wrap: anywhere; }
 .dispatch-log-empty { flex: 1; display: grid; place-items: center; margin: 0; color: var(--text-weak); font-size: 12px; }
 .dispatch-log-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 0 4px; }
 .dispatch-log-follow { border: 0; border-radius: 999px; padding: 4px 10px; background: var(--surface-base-hover); color: var(--text-base); font: inherit; font-size: 12px; cursor: pointer; }
@@ -60,11 +69,14 @@ const CSS = `
 .dispatch-empty-title { margin-top: 8px; color: var(--text-strong); font-size: 15px; font-weight: 600; }
 .dispatch-empty .dispatch-muted { max-width: 280px; line-height: 1.45; }
 .dispatch-settings { display: flex; flex-direction: column; gap: 16px; }
-.dispatch-target { display: flex; flex-direction: column; gap: 8px; width: 320px; box-sizing: border-box; }
-.dispatch-target-search { width: 100%; }
-.dispatch-target-list { display: flex; flex-direction: column; gap: 2px; min-height: 240px; max-height: 360px; overflow-y: auto; overscroll-behavior: contain; }
+.dispatch-target { display: flex; flex-direction: column; gap: 8px; width: 320px; max-width: 100%; min-width: 0; box-sizing: border-box; overflow-x: hidden; }
+.dispatch-target, .dispatch-target * { box-sizing: border-box; }
+.dispatch-target-search { width: 100%; min-width: 0; border: 1px solid var(--border-weak-base, var(--surface-base-hover)); border-radius: 6px; padding: 6px 8px; background: transparent; color: var(--text-base); font: inherit; font-size: 13px; outline: none; }
+.dispatch-target-search:focus { border-color: var(--border-strong-base, var(--text-weak)); }
+.dispatch-target-search::placeholder { color: var(--text-weak); }
+.dispatch-target-list { display: flex; flex-direction: column; gap: 2px; width: 100%; min-width: 0; min-height: 240px; max-height: 360px; overflow-y: auto; overscroll-behavior: contain; }
 .dispatch-target-agent { margin: 6px 8px 2px; color: var(--text-weak); font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; }
-.dispatch-target-row { display: flex; align-items: center; gap: 8px; width: 100%; padding: 6px 8px; border: 0; border-radius: 6px; background: transparent; color: var(--text-base); font: inherit; font-size: 13px; text-align: left; cursor: pointer; }
+.dispatch-target-row { display: flex; align-items: center; gap: 8px; width: 100%; min-width: 0; padding: 6px 8px; border: 0; border-radius: 6px; background: transparent; color: var(--text-base); font: inherit; font-size: 13px; text-align: left; cursor: pointer; }
 .dispatch-target-row:hover, .dispatch-target-row-active { background: var(--surface-base-hover); outline: none; }
 .dispatch-target-row:focus-visible { background: var(--surface-base-hover); outline: none; }
 .dispatch-target-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -417,6 +429,11 @@ const definition = Plugin.define({
       const [query, setQuery] = createSignal("");
       const [active, setActive] = createSignal(0);
       const elements: (HTMLButtonElement | undefined)[] = [];
+      let search: HTMLInputElement | undefined;
+      onMount(() => {
+        // The host moves focus into the popover as it opens; take it after that.
+        queueMicrotask(() => search?.focus());
+      });
       void ensureTargets();
       const pick = () => forced[props.session.key];
       const chosen = (agent: string, model: string) => pick()?.agent === agent && (pick()?.model || "") === model;
@@ -464,17 +481,30 @@ const definition = Plugin.define({
           choose(row.agent, row.model);
         }
       };
+      // The popover's host handles keys around its content, and the popover is
+      // focused when it opens: keep every key in the field but Escape, which
+      // closes it, and let the arrows and Enter move its list.
+      const onSearchKeyDown = (event: KeyboardEvent) => {
+        if (event.key === "Escape") return;
+        event.stopPropagation();
+        onKeyDown(event);
+      };
       return (
         <div class="dispatch-target" onKeyDown={onKeyDown}>
-          <ctx.ui.TextInput
+          <input
+            ref={(el) => (search = el)}
             class="dispatch-target-search"
-            value={query()}
-            placeholder={ctx.t("pill.target.search")}
-            label={ctx.t("pill.target.search")}
+            type="search"
             autofocus
-            onInput={(value: string) => {
-              setQuery(value);
+            aria-label={ctx.t("pill.target.search")}
+            placeholder={ctx.t("pill.target.search")}
+            onInput={(event) => {
+              setQuery(event.currentTarget.value);
               setActive(0);
+            }}
+            onKeyDown={onSearchKeyDown}
+            onKeyUp={(event) => {
+              if (event.key !== "Escape") event.stopPropagation();
             }}
           />
           <div class="dispatch-target-list" role="listbox" aria-label={ctx.t("pill.target.title")}>
@@ -541,16 +571,57 @@ const definition = Plugin.define({
       closable: "hover",
     };
 
+    // One transcript entry: a step's line and its first output lines, the
+    // agent's reasoning dimmed, its reply as Markdown, and a core event.
+    const EntryBody = (props: { entry: Entry; repeats?: number }) => {
+      const entry = props.entry;
+      if (entry.kind === "step") {
+        return (
+          <>
+            <span class="dispatch-log-step-text" classList={{ "dispatch-log-step-failed": entry.failed === true }}>
+              {`› ${entry.text}${entry.detail ? ` ${entry.detail}` : ""}${props.repeats && props.repeats > 1 ? ` ×${props.repeats}` : ""}`}
+            </span>
+            <Show when={entry.output}>
+              {(output) => <span class="dispatch-log-step-output">{output().split("\n").slice(0, 3).join("\n")}</span>}
+            </Show>
+          </>
+        );
+      }
+      if (entry.kind === "event") return <span class="dispatch-log-event">✓ {entry.text}</span>;
+      if (entry.kind === "message") {
+        return (
+          <Show when={!!ctx.ui.Markdown} fallback={<span class="dispatch-log-text">{entry.text}</span>}>
+            <ctx.ui.Markdown text={entry.text} class="dispatch-log-markdown" />
+          </Show>
+        );
+      }
+      return <span class="dispatch-log-text">{entry.text}</span>;
+    };
+
+    const EntryRow = (props: { entry: Entry; repeats?: number }) => (
+      <div class={`dispatch-log-entry dispatch-log-${props.entry.kind}`}>
+        <EntryBody entry={props.entry} repeats={props.repeats} />
+      </div>
+    );
+
     // RunLog is a run's page in the panel: its status, followed by the end of
-    // its output while the reader stays there, and asked again while it works.
+    // its transcript while the reader stays there, and asked again while it works.
     const RunLog = (props: { run: RunView; session: Session; onBack: () => void }) => {
       const [log, setLog] = createSignal<LogView | undefined>(undefined);
       const [failure, setFailure] = createSignal("");
       const [following, setFollowing] = createSignal(true);
-      let area: HTMLPreElement | undefined;
+      let area: HTMLDivElement | undefined;
       let timer: ReturnType<typeof setTimeout> | undefined;
       let stopped = false;
 
+      // The panel draws the agent's stream as the app's transcript does.
+      const rows = createMemo(() => {
+        const entries = buildTranscript(log()?.text || "");
+        return foldRepeats(entries).flatMap(({ index, repeats }) => {
+          const entry = entries[index];
+          return entry ? [{ entry, repeats }] : [];
+        });
+      });
       const status = () => log()?.status || props.run.status;
       const working = () => ACTIVE.has(status());
       const atEnd = () => {
@@ -617,9 +688,9 @@ const definition = Plugin.define({
               when={log()?.text}
               fallback={<p class="dispatch-log-empty">{ctx.t(working() ? "log.empty" : "log.none")}</p>}
             >
-              <pre class="dispatch-log-body" ref={(el) => (area = el)} onScroll={() => setFollowing(atEnd())}>
-                {log()?.text}
-              </pre>
+              <div class="dispatch-log-body" ref={(el) => (area = el)} onScroll={() => setFollowing(atEnd())}>
+                <For each={rows()}>{(row) => <EntryRow entry={row.entry} repeats={row.repeats} />}</For>
+              </div>
             </Show>
             <Show when={working() || !following()}>
               <div class="dispatch-log-foot">
@@ -737,4 +808,4 @@ const definition = Plugin.define({
 
 export default definition;
 export { Dispatch };
-export const helpers = { firstLine, statusLabel, runDetail, runLink, formatTokens, formatDuration, filterTargets, expressionFor };
+export const helpers = { firstLine, statusLabel, runDetail, runLink, formatTokens, formatDuration, filterTargets, expressionFor, buildTranscript };
