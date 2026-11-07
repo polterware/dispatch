@@ -23,11 +23,10 @@ use crate::client::{
 use crate::models::roles::{
     GENERAL_ROLE, PaletteModel, RoleDraft, RoleListRow, RoleProfile, RoleRow, RoleSource,
     RolesList, TIER_COLUMNS, TierBuild, TierCardInput, TierColumns, TierSlot, board_row_count,
-    build_board, compose_profile, is_build_empty, models_label, palette_card_at,
-    palette_groups, parse_roles_list, parse_tier_build, place_tier_card, profile_error,
-    profile_with_board, remove_tier_card, rename_drops_previous, replace_tier_card,
-    role_board_tiers, role_list_rows, role_models_prompt, role_name_error, tier_columns,
-    tier_matches, when_display,
+    build_board, compose_profile, is_build_empty, models_label, palette_card_at, palette_groups,
+    parse_roles_list, parse_tier_build, place_tier_card, profile_error, profile_with_board,
+    remove_tier_card, rename_drops_previous, replace_tier_card, role_board_tiers, role_list_rows,
+    role_models_prompt, role_name_error, tier_columns, tier_matches, when_display,
 };
 use crate::motion::{Animator, SpringTier, SpringValue};
 use crate::state::{AppState, Route, ToastTone, observe};
