@@ -1,4 +1,4 @@
-use std::{env, path::Path, time::Instant};
+use std::{env, mem, path::Path, time::Instant};
 use voice_core::protocol::Language;
 use voice_stt::{SttEngine, SttOptions, Vad, VadEvent, VadOptions};
 
@@ -28,10 +28,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Path::new(&args[1]),
         SttOptions {
             use_gpu: env::var_os("VOICE_STT_CPU").is_none(),
+            flash_attn: env::var_os("VOICE_STT_FLASH_ATTN").is_some(),
             ..SttOptions::default()
         },
     )?;
     let load_ms = started.elapsed().as_millis();
+    println!("rss_after_load_kb={}", current_rss_kb());
     let mut reader = hound::WavReader::open(&args[2])?;
     let spec = reader.spec();
     let samples: Vec<f32> = if spec.sample_format == hound::SampleFormat::Float {
@@ -65,8 +67,56 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             transcript.language,
             transcript.text
         );
+        println!("rss_after_transcription_{run}_kb={}", current_rss_kb());
     }
     Ok(())
+}
+
+fn current_rss_kb() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        #[repr(C)]
+        struct TaskBasicInfo64 {
+            virtual_size: u64,
+            resident_size: u64,
+            resident_size_max: u64,
+            user_time_seconds: i32,
+            user_time_microseconds: i32,
+            system_time_seconds: i32,
+            system_time_microseconds: i32,
+            policy: i32,
+            suspend_count: i32,
+        }
+        unsafe extern "C" {
+            static mach_task_self_: u32;
+            fn task_info(
+                target_task: u32,
+                flavor: i32,
+                task_info_out: *mut i32,
+                task_info_out_count: *mut u32,
+            ) -> i32;
+        }
+        let mut info = mem::MaybeUninit::<TaskBasicInfo64>::uninit();
+        let mut count = (mem::size_of::<TaskBasicInfo64>() / mem::size_of::<i32>()) as u32;
+        let status = unsafe {
+            task_info(
+                mach_task_self_,
+                20,
+                info.as_mut_ptr().cast(),
+                &mut count,
+            )
+        };
+        if status == 0 {
+            let info = unsafe { info.assume_init() };
+            (info.resident_size / 1024).to_string()
+        } else {
+            format!("unavailable({status})")
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "unavailable".to_owned()
+    }
 }
 
 fn vad(model: &str, wav: &str) -> Result<(), Box<dyn std::error::Error>> {

@@ -260,7 +260,42 @@ pub mod text {
         if !tail.is_empty() {
             pieces.extend(split_long(tail));
         }
+        if let Some(first) = pieces.first().cloned() {
+            if let Some((head, remainder)) = split_first_piece(&first) {
+                pieces[0] = head;
+                if !remainder.is_empty() {
+                    if pieces.len() > 1 {
+                        pieces[1] = format!("{remainder} {}", pieces[1]);
+                    } else {
+                        pieces.push(remainder);
+                    }
+                }
+            }
+        }
         pieces
+    }
+    fn split_first_piece(s: &str) -> Option<(String, String)> {
+        if s.chars().count() <= 40 {
+            return None;
+        }
+        let split = s
+            .char_indices()
+            .take_while(|(byte, _)| *byte <= 60)
+            .find(|(_, ch)| *ch == ',')
+            .map(|(byte, ch)| byte + ch.len_utf8())
+            .or_else(|| {
+                if s.chars().count() <= 60 {
+                    return None;
+                }
+                s.char_indices()
+                    .take_while(|(byte, _)| *byte <= 60)
+                    .filter(|(_, ch)| ch.is_whitespace())
+                    .map(|(byte, _)| byte)
+                    .last()
+            })?;
+        let head = s[..split].trim().to_string();
+        let remainder = s[split..].trim().to_string();
+        (!head.is_empty() && !remainder.is_empty()).then_some((head, remainder))
     }
     fn split_long(s: &str) -> Vec<String> {
         let mut rest = s.trim();
@@ -385,6 +420,12 @@ pub mod text {
                 detect_language("The file is ready and all tests passed."),
                 Language::En
             );
+        }
+        #[test]
+        fn makes_the_first_long_reply_piece_short() {
+            let pieces = sentences("Pronto, criei o arquivo e todos os testes passaram.");
+            assert_eq!(pieces[0], "Pronto,");
+            assert_eq!(pieces[1], "criei o arquivo e todos os testes passaram.");
         }
     }
 }

@@ -1,4 +1,4 @@
-use std::{path::PathBuf, time::Instant};
+use std::{mem, path::PathBuf, time::Instant};
 use voice_core::protocol::{Language, TextFormat};
 use voice_tts::{text, KokoroOptions, KokoroTts, SystemTts, TtsBackend, VoiceSpec};
 
@@ -70,12 +70,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => return Err("backend must be kokoro or system".into()),
     };
+    println!("rss_after_load_kb: {}", current_rss_kb());
     let cold_start = Instant::now();
     let cold_samples = model.synthesize(&sentence, &voice)?;
     let cold_ms = cold_start.elapsed().as_secs_f64() * 1000.0;
+    println!("rss_after_synthesis_1_kb: {}", current_rss_kb());
     let warm_start = Instant::now();
     let samples = model.synthesize(&sentence, &voice)?;
     let warm_ms = warm_start.elapsed().as_secs_f64() * 1000.0;
+    println!("rss_after_synthesis_2_kb: {}", current_rss_kb());
+    let third_start = Instant::now();
+    let _third_samples = model.synthesize(&sentence, &voice)?;
+    let third_ms = third_start.elapsed().as_secs_f64() * 1000.0;
+    println!("rss_after_synthesis_3_kb: {}", current_rss_kb());
     let audio_ms = samples.len() as f64 / model.sample_rate() as f64 * 1000.0;
     let peak = samples.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
     let spec = hound::WavSpec {
@@ -90,6 +97,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     writer.finalize()?;
     let cold_audio_ms = cold_samples.len() as f64 / model.sample_rate() as f64 * 1000.0;
-    println!("phonemes: {phonemes}\nload_ms: {load_ms:.1}\ncold_synthesis_ms: {cold_ms:.1}\nwarm_synthesis_ms: {warm_ms:.1}\naudio_ms: {audio_ms:.1}\ncold_rtf: {:.3}\nwarm_rtf: {:.3}\npeak: {peak:.4}\noutput: {}",cold_ms/cold_audio_ms.max(1.0),warm_ms/audio_ms.max(1.0),out.display());
+    println!("phonemes: {phonemes}\nload_ms: {load_ms:.1}\ncold_synthesis_ms: {cold_ms:.1}\nwarm_synthesis_ms: {warm_ms:.1}\nthird_synthesis_ms: {third_ms:.1}\naudio_ms: {audio_ms:.1}\ncold_rtf: {:.3}\nwarm_rtf: {:.3}\npeak: {peak:.4}\noutput: {}",cold_ms/cold_audio_ms.max(1.0),warm_ms/audio_ms.max(1.0),out.display());
     Ok(())
+}
+
+fn current_rss_kb() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        #[repr(C)]
+        struct TaskBasicInfo64 {
+            virtual_size: u64,
+            resident_size: u64,
+            resident_size_max: u64,
+            user_time_seconds: i32,
+            user_time_microseconds: i32,
+            system_time_seconds: i32,
+            system_time_microseconds: i32,
+            policy: i32,
+            suspend_count: i32,
+        }
+        unsafe extern "C" {
+            static mach_task_self_: u32;
+            fn task_info(
+                target_task: u32,
+                flavor: i32,
+                task_info_out: *mut i32,
+                task_info_out_count: *mut u32,
+            ) -> i32;
+        }
+        let mut info = mem::MaybeUninit::<TaskBasicInfo64>::uninit();
+        let mut count = (mem::size_of::<TaskBasicInfo64>() / mem::size_of::<i32>()) as u32;
+        let status = unsafe {
+            task_info(
+                mach_task_self_,
+                20,
+                info.as_mut_ptr().cast(),
+                &mut count,
+            )
+        };
+        if status == 0 {
+            let info = unsafe { info.assume_init() };
+            (info.resident_size / 1024).to_string()
+        } else {
+            format!("unavailable({status})")
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "unavailable".to_owned()
+    }
 }

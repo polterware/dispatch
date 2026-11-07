@@ -31,12 +31,16 @@ pub type Result<T> = std::result::Result<T, SttError>;
 pub struct SttOptions {
     pub threads: u32,
     pub use_gpu: bool,
+    /// Enable whisper.cpp flash attention. Keep disabled unless validated on
+    /// the target backend because kernel support and quality can vary.
+    pub flash_attn: bool,
 }
 impl Default for SttOptions {
     fn default() -> Self {
         Self {
             threads: 4,
             use_gpu: true,
+            flash_attn: false,
         }
     }
 }
@@ -66,10 +70,17 @@ impl SttEngine {
             .len();
         let params = WhisperContextParameters {
             use_gpu: options.use_gpu,
+            flash_attn: options.flash_attn,
             ..Default::default()
         };
         let context = WhisperContext::new_with_params(model.to_string_lossy().as_ref(), params)
             .map_err(|e| SttError::Load(e.to_string()))?;
+        tracing::info!(
+            use_gpu = options.use_gpu,
+            flash_attn = options.flash_attn,
+            model_bytes = bytes,
+            "loaded Whisper model"
+        );
         Ok(Self {
             context,
             state: Mutex::new(None),
