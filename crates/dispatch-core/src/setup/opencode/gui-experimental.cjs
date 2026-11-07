@@ -122,15 +122,14 @@ const Dispatch = {
         additionalProperties: false
       }
     },
-    // The run's output so far, and the status the panel polls on: the Desktop
-    // part shows it in place instead of only opening the run in the app.
+    // The run's log so far and the status the panel polls on: the Desktop part
+    // shows it in place instead of only opening the run in the app.
     log: {
       input: {
         type: "object",
         properties: {
           runID: { type: "string" },
-          directory: { type: "string" },
-          offset: { type: "integer" }
+          directory: { type: "string" }
         },
         required: ["runID"],
         additionalProperties: false

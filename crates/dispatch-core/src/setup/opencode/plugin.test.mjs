@@ -36,6 +36,34 @@ switch (args[0]) {
     out({ id: args[1], status: "COMPLETED", worktree: "/wt/r1" })
     break
   }
+  case "events":
+    if (process.env.FAKE_DISPATCH_NO_EVENTS) {
+      process.stderr.write('unknown command "events"\\nusage: dispatch ...\\n')
+      process.exit(2)
+    }
+    // A run read from its end: its first event is cut at the read's offset.
+    if (args[1] === "r2") {
+      out({ status: "COMPLETED", more: true, events: [{ seq: 9, offset: 12, kind: "output", text: "cut head\\nwhole line\\n" }] })
+      break
+    }
+    // A run that is not there yet: the command exists and says so.
+    if (args[1] === "r3") {
+      process.stderr.write("run not found\\n")
+      process.exit(1)
+    }
+    // Live: started repeats the prompt, an agent's output comes as it is,
+    // and any other kind is one line.
+    out({
+      status: "RUNNING",
+      more: false,
+      events: [
+        { seq: 1, offset: 0, kind: "started", text: "Fix the parser" },
+        { seq: 2, offset: 0, kind: "output", text: "\\u001b[32mline one\\u001b[0m\\n" },
+        { seq: 3, offset: 10, kind: "merged", text: "three\\n" },
+        { seq: 4, offset: 20, kind: "agent", text: "four" },
+      ],
+    })
+    break
   case "result":
     if (!args.includes("--json")) {
       process.stdout.write("Done: changed two files.\\n")
@@ -389,27 +417,53 @@ test("runs lists the root conversation's runs", async () => {
   )
 })
 
-test("log answers the end of a run's output without escapes, and its status", async () => {
+test("log answers a run's events while it works, without escapes, and its status", async () => {
   const { impl } = await loadServer()
   const answer = await impl().log({ runID: "r1" })
-  const result = calls().filter((call) => call.args[0] === "result")
-  // The first read ends short of the output; the second takes its tail.
-  assert.deepEqual(result[0].args, ["result", "r1", "--section", "output", "--json", "--offset", "0", "--limit", "2000"])
-  assert.deepEqual(result[1].args, ["result", "r1", "--section", "output", "--json", "--offset", "500", "--limit", "2000"])
+  const [events] = calls().filter((call) => call.args[0] === "events")
+  assert.deepEqual(events.args, ["events", "r1", "--json", "--tail-bytes", "262144"])
   assert.equal(answer.status, "RUNNING")
-  assert.equal(answer.text, "line one\nline two\n[merged] three")
+  // An agent's output as it came, other kinds as one `[kind]` line, and
+  // `started`, which repeats the prompt, not at all.
+  assert.equal(answer.text, "line one\n[merged] three\nfour")
   assert.equal(answer.lines, 3)
   assert.equal(Object.values(answer).some((value) => value === undefined), false)
 
-  // A page from an offset asks once, where the reader left off.
-  await impl().log({ runID: "r1", offset: 10 })
-  const paged = calls().filter((call) => call.args[0] === "result")
-  assert.deepEqual(paged.at(-1).args, ["result", "r1", "--section", "output", "--json", "--offset", "10", "--limit", "2000"])
+  // A page read from the end starts at its first whole line.
+  const tail = await impl().log({ runID: "r2" })
+  assert.equal(tail.text, "whole line\n")
+  assert.equal(tail.status, "COMPLETED")
+
+  // A failure that is not the missing command is reported, not read as an
+  // older binary.
+  const missing = await impl().log({ runID: "r3" })
+  assert.ok(missing.error)
+  assert.equal(missing.text, "")
+  assert.equal(calls().filter((call) => call.args[0] === "result").length, 0)
 
   const refused = await impl().log({ runID: "--force" })
   assert.ok(refused.error)
   assert.equal(refused.text, "")
-  assert.equal(calls().filter((call) => call.args[0] === "result").length, 3)
+  assert.equal(calls().filter((call) => call.args[0] === "events").length, 3)
+})
+
+test("log falls back to the ended output when dispatch has no events command", async (t) => {
+  process.env.FAKE_DISPATCH_NO_EVENTS = "1"
+  t.after(() => delete process.env.FAKE_DISPATCH_NO_EVENTS)
+  const { impl } = await loadServer()
+  const answer = await impl().log({ runID: "r1" })
+  assert.equal(answer.status, "RUNNING")
+  assert.equal(answer.text, "line one\nline two\n[merged] three")
+  assert.equal(answer.lines, 3)
+  // The first read ends short of the output; the second takes its tail.
+  const result = calls().filter((call) => call.args[0] === "result")
+  assert.deepEqual(result[0].args, ["result", "r1", "--section", "output", "--json", "--offset", "0", "--limit", "2000"])
+  assert.deepEqual(result[1].args, ["result", "r1", "--section", "output", "--json", "--offset", "500", "--limit", "2000"])
+
+  // The answer is kept: the next read does not ask again.
+  await impl().log({ runID: "r1" })
+  assert.equal(calls().filter((call) => call.args[0] === "events").length, 1)
+  assert.equal(calls().filter((call) => call.args[0] === "result").length, 4)
 })
 
 test("a run with no files, tokens, or cost answers no undefined values", async () => {
