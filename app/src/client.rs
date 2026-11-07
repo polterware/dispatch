@@ -419,6 +419,49 @@ pub struct RenameConversationResponse {}
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
+pub struct GetConversationUsageRequest {
+    pub conversation_id: String,
+}
+
+/// One agent and model's share of a conversation, with its runs (none for the caller's
+/// own session), tokens, and API-equivalent cost when a price covers it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DispatchUsageSlice {
+    pub agent: String,
+    pub model: String,
+    pub runs: i32,
+    pub input_tokens: ProtoI64,
+    pub cache_read_tokens: ProtoI64,
+    pub cache_write_tokens: ProtoI64,
+    pub output_tokens: ProtoI64,
+    pub reasoning_tokens: ProtoI64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+    pub cost_partial: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct GetConversationUsageResponse {
+    pub conversation_id: String,
+    pub caller_agent: String,
+    pub caller_session: String,
+    /// False when the calling agent's own transcript could not be read.
+    pub caller_measured: bool,
+    pub caller_note: String,
+    pub runs: Vec<DispatchUsageSlice>,
+    pub caller: Vec<DispatchUsageSlice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_totals: Option<DispatchUsageSlice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller_totals: Option<DispatchUsageSlice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<DispatchUsageSlice>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 pub struct SaveSectionRequest {
     pub id: String,
     pub name: String,
@@ -1360,6 +1403,9 @@ const SLOW_PROCEDURES: &[&str] = &[
     "dispatch.v1.DispatchService/CleanRun",
     // It discards each run's worktree with git.
     "dispatch.v1.DispatchService/DeleteRuns",
+    "dispatch.v1.DispatchService/GetAgentSetup",
+    // It reads the calling agent's transcript from disk.
+    "dispatch.v1.DispatchService/GetConversationUsage",
     "dispatch.v1.DispatchService/ListAgents",
     "dispatch.v1.DispatchService/ListModelBenchmarks",
     "dispatch.v1.DispatchService/ListModelCatalog",
@@ -1510,6 +1556,13 @@ impl CoreClient {
         request: &RenameConversationRequest,
     ) -> Result<RenameConversationResponse, CoreError> {
         self.rpc("dispatch.v1.DispatchService/RenameConversation", request)
+    }
+
+    pub fn conversation_usage(
+        &self,
+        request: &GetConversationUsageRequest,
+    ) -> Result<GetConversationUsageResponse, CoreError> {
+        self.rpc("dispatch.v1.DispatchService/GetConversationUsage", request)
     }
 
     pub fn save_section(

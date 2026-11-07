@@ -46,4 +46,5 @@ pub mod setup;
 pub mod skill;
 pub mod store;
 pub mod types;
+pub mod usage;
 pub mod worktree;

@@ -588,3 +588,37 @@ fn the_sidebar_pages_a_groups_runs(cx: &mut TestAppContext) {
     assert!(w.shows(&more), "two rows are still left out");
     assert!(w.toasts().is_empty(), "{:?}", w.toasts());
 }
+
+#[gpui::test]
+fn the_conversation_menu_opens_its_usage_dialog(cx: &mut TestAppContext) {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let core = Core::new();
+    let id = core.start("say hi", true);
+    core.wait_for(&id, "COMPLETED");
+    let mut w = open(&core, cx);
+
+    // The conversation's heading carries its group's id, so the menu opens from a right
+    // click as it does for a person.
+    let heading =
+        w.cx.debug_bounds("sidebar-group-conversation:claude:app-e2e")
+            .expect("the conversation's heading");
+    w.cx.simulate_mouse_down(
+        heading.center(),
+        gpui::MouseButton::Right,
+        Modifiers::none(),
+    );
+    w.cx.simulate_mouse_up(
+        heading.center(),
+        gpui::MouseButton::Right,
+        Modifiers::none(),
+    );
+    w.settle();
+    // Rename… leads the menu and Usage follows it.
+    w.pick("menu-item-1");
+    w.pump();
+    assert!(
+        w.shows("conversation-usage"),
+        "the usage dialog did not open: {:?}",
+        w.toasts()
+    );
+}

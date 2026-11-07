@@ -28,6 +28,7 @@ const RUN_USAGE: &str = "usage: dispatch run [--tier <auto|easy|normal|hard>] [-
        dispatch tiers [--check] [--json] [--compact]
        dispatch tiers build [--agent <a>] [--apply] [--json]
        dispatch stats [--json] [--compact]
+       dispatch usage [--by <model|agent|provider|tier|effort>] [--since <7d>] [--conversation <id>] [--json] [--compact]
        dispatch agents [--json] [--compact]
        dispatch agents add <name> -- <command that starts its ACP server...>
        dispatch agents remove <name>
@@ -1261,10 +1262,25 @@ fn is_zero_i32(v: &i32) -> bool {
 pub(super) async fn stats(db_path: &Path, args: &[String]) -> CliResult {
     let mut f = Flags::new("dispatch stats");
     f.string("by", "model", "group by: model|agent|provider|tier|effort")
-        .string("since", "7d", "window such as 7d, 24h, or all");
+        .string("since", "7d", "window such as 7d, 24h, or all")
+        .string(
+            "conversation",
+            "",
+            "a conversation id, such as claude-code:<session> or opencode:ses_<id>",
+        );
     common(&mut f);
     if !f.parse_interspersed(args)?.is_empty() {
         return Err(usage());
+    }
+    let conversation = f.str("conversation");
+    if !conversation.trim().is_empty() {
+        return conversation_usage(
+            db_path,
+            conversation.trim(),
+            f.flag("json"),
+            f.flag("compact"),
+        )
+        .await;
     }
     let (c, project) = dial_workspace(db_path, &f.str("project")).await?;
     let res = c
@@ -1326,6 +1342,133 @@ pub(super) async fn stats(db_path: &Path, args: &[String]) -> CliResult {
         );
     }
     Ok(())
+}
+
+/// What one conversation used: its Dispatch runs and, when this build can read that
+/// agent's local transcript, the calling session's own usage.
+async fn conversation_usage(
+    db_path: &Path,
+    conversation: &str,
+    json: bool,
+    compact: bool,
+) -> CliResult {
+    let c = super::dial(db_path).await?;
+    let res = c
+        .dispatch
+        .conversation_usage(&pb::GetConversationUsageRequest {
+            conversation_id: conversation.to_string(),
+        })
+        .await
+        .map_err(run_error)?;
+    if json {
+        let slice = |s: &pb::DispatchUsageSlice| {
+            json!({
+                "agent": s.agent,
+                "model": s.model,
+                "runs": s.runs,
+                "inputTokens": s.input_tokens,
+                "cacheReadTokens": s.cache_read_tokens,
+                "cacheWriteTokens": s.cache_write_tokens,
+                "outputTokens": s.output_tokens,
+                "reasoningTokens": s.reasoning_tokens,
+                "costUsd": s.cost_usd,
+                "costPartial": s.cost_partial,
+            })
+        };
+        let body = json!({
+            "conversationId": res.conversation_id,
+            "callerAgent": res.caller_agent,
+            "callerSession": res.caller_session,
+            "callerMeasured": res.caller_measured,
+            "callerNote": res.caller_note,
+            "runs": res.runs.iter().map(slice).collect::<Vec<_>>(),
+            "caller": res.caller.iter().map(slice).collect::<Vec<_>>(),
+            "runTotals": res.run_totals.as_ref().map(slice),
+            "callerTotals": res.caller_totals.as_ref().map(slice),
+            "total": res.total.as_ref().map(slice),
+        });
+        write_json_compact(&body, compact)?;
+        return Ok(());
+    }
+    let section = |title: &str, slices: &[pb::DispatchUsageSlice], empty: &str| {
+        println!("{title}");
+        if slices.is_empty() {
+            println!("  {empty}");
+        }
+        for s in slices {
+            println!("  {}", format_usage_slice(s));
+        }
+    };
+    println!("conversation {}", res.conversation_id);
+    section("Dispatch runs", &res.runs, "no runs");
+    println!(
+        "  total {}",
+        format_usage_slice_value(res.run_totals.as_ref())
+    );
+    let agent = if res.caller_agent.trim().is_empty() {
+        "unknown agent"
+    } else {
+        res.caller_agent.trim()
+    };
+    println!("Calling agent {agent} · {}", res.caller_session.trim());
+    if res.caller_measured {
+        for s in &res.caller {
+            println!("  {}", format_usage_slice(s));
+        }
+        println!(
+            "  total {}",
+            format_usage_slice_value(res.caller_totals.as_ref())
+        );
+    } else if res.caller_note.trim().is_empty() {
+        println!("  not measured");
+    } else {
+        println!("  {}", res.caller_note.trim());
+    }
+    println!("Total {}", format_usage_slice_value(res.total.as_ref()));
+    println!("Costs are API-equivalent prices, not what a subscription bills.");
+    Ok(())
+}
+
+fn format_usage_slice_value(slice: Option<&pb::DispatchUsageSlice>) -> String {
+    slice.map_or_else(|| "none".into(), format_usage_slice)
+}
+
+/// One agent and model's tokens and cost, as `dispatch usage` prints it.
+fn format_usage_slice(s: &pb::DispatchUsageSlice) -> String {
+    let total = s.input_tokens + s.cache_read_tokens + s.cache_write_tokens + s.output_tokens;
+    let mut out = if s.agent.is_empty() && s.model.is_empty() {
+        format!("tokens={}", format_tokens(total))
+    } else {
+        format!(
+            "{:<10} {:<24} runs={} tokens={}",
+            s.agent,
+            if s.model.trim().is_empty() {
+                "—"
+            } else {
+                s.model.as_str()
+            },
+            s.runs,
+            format_tokens(total)
+        )
+    };
+    out += &format!(
+        " (in {} cache {} write {} out {})",
+        format_tokens(s.input_tokens),
+        format_tokens(s.cache_read_tokens),
+        format_tokens(s.cache_write_tokens),
+        format_tokens(s.output_tokens)
+    );
+    match s.cost_usd {
+        Some(cost) => {
+            out += &format!(" cost=${cost:.2}");
+            if s.cost_partial {
+                out += " (partial)";
+            }
+        }
+        None if total > 0 => out += " cost=unknown",
+        None => {}
+    }
+    out
 }
 
 /// A stats row's tokens and the cost of its priced runs.

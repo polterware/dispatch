@@ -1,6 +1,7 @@
 //! One file per screen. Later runs replace exactly one of these and leave the others alone.
 
 mod commander;
+mod conversation_usage;
 mod intelligence;
 pub mod repository_actions;
 mod roles;
@@ -13,6 +14,7 @@ mod stats;
 mod transcript;
 
 pub use commander::CommanderView;
+pub use conversation_usage::ConversationUsageView;
 
 /// What the core said when a call failed, in words for a toast.
 pub(crate) fn core_message(error: crate::client::CoreError) -> String {

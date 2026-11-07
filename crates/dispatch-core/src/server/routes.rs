@@ -190,6 +190,11 @@ pub(super) fn router(core: Arc<Core>) -> Router {
     let r = unary!(r, "/dispatch.v1.DispatchService/Stats", stats);
     let r = unary!(
         r,
+        "/dispatch.v1.DispatchService/GetConversationUsage",
+        conversation_usage
+    );
+    let r = unary!(
+        r,
         "/dispatch.v1.DispatchService/GetRouteDecision",
         get_route_decision
     );

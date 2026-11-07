@@ -546,4 +546,25 @@ fn the_report_pages_read_the_core() {
         .expect("resolve")
         .workspace;
     assert_eq!(resolved.id, project);
+
+    // The conversation's Usage dialog: the run's stored usage and the calling session's
+    // transcript, which the core reads from this home.
+    let projects = core.home.join(".claude/projects/-e2e");
+    std::fs::create_dir_all(&projects).unwrap();
+    std::fs::write(
+        projects.join("app-e2e.jsonl"),
+        include_str!("../../crates/dispatch-core/tests/fixtures/usage/claude.jsonl"),
+    )
+    .unwrap();
+    let usage = c
+        .conversation_usage(&GetConversationUsageRequest {
+            conversation_id: "claude:app-e2e".into(),
+        })
+        .expect("conversation usage");
+    assert!(usage.caller_measured, "{}", usage.caller_note);
+    assert_eq!(usage.runs.len(), 1);
+    assert_eq!(usage.runs[0].agent, "fake");
+    assert_eq!(usage.runs[0].input_tokens.0, 100);
+    assert_eq!(usage.caller.len(), 2);
+    assert_eq!(usage.total.as_ref().map(|t| t.input_tokens.0), Some(122));
 }

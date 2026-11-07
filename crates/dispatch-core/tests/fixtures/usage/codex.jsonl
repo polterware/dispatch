@@ -1,0 +1,5 @@
+{"type":"session_meta","payload":{"id":"thread-1"}}
+{"type":"turn_context","payload":{"model":"gpt-6.1-sol"}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":10,"reasoning_output_tokens":0},"model_context_window":475000}}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":81364,"cached_input_tokens":36480,"cache_write_input_tokens":0,"output_tokens":86,"reasoning_output_tokens":14},"model_context_window":475000}}}
+{ this line is malformed

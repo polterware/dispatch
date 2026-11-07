@@ -506,6 +506,45 @@ message StatsResponse {
   DispatchStatsRankings rankings = 5;
 }
 
+// What one conversation used: its Dispatch runs and the calling agent's own session.
+message GetConversationUsageRequest {
+  string conversation_id = 1;
+}
+
+// One agent and model's share of a conversation: its runs (none for the caller's own
+// session), its tokens, and its API-equivalent cost when a price covers it.
+message DispatchUsageSlice {
+  string agent = 1;
+  string model = 2;
+  int32 runs = 3;
+  int64 input_tokens = 4;
+  int64 cache_read_tokens = 5;
+  int64 cache_write_tokens = 6;
+  int64 output_tokens = 7;
+  int64 reasoning_tokens = 8;
+  // Absent when nothing priced the slice; a priced slice with cost_partial
+  // leaves out tokens no price covered.
+  optional double cost_usd = 9;
+  bool cost_partial = 10;
+}
+
+message GetConversationUsageResponse {
+  string conversation_id = 1;
+  // The harness that called Dispatch and the session inside conversation_id.
+  string caller_agent = 2;
+  string caller_session = 3;
+  // False when the caller's own transcript could not be read, with caller_note saying why.
+  bool caller_measured = 4;
+  string caller_note = 5;
+  // The conversation's Dispatch runs, by agent and model.
+  repeated DispatchUsageSlice runs = 6;
+  // The calling agent's own session, by model, when measured.
+  repeated DispatchUsageSlice caller = 7;
+  DispatchUsageSlice run_totals = 8;
+  DispatchUsageSlice caller_totals = 9;
+  DispatchUsageSlice total = 10;
+}
+
 // How a run's candidates were routed: the logged decision as JSON.
 message GetRouteDecisionRequest {
   string run_id = 1;
@@ -814,6 +853,7 @@ service DispatchService {
   rpc SetAgentEnabled(SetAgentEnabledRequest) returns (SetAgentEnabledResponse);
   rpc ReplaceTiers(ReplaceTiersRequest) returns (ReplaceTiersResponse);
   rpc Stats(StatsRequest) returns (StatsResponse);
+  rpc GetConversationUsage(GetConversationUsageRequest) returns (GetConversationUsageResponse);
   rpc GetRouteDecision(GetRouteDecisionRequest) returns (GetRouteDecisionResponse);
   rpc BuildTiers(BuildTiersRequest) returns (BuildTiersResponse);
   rpc Capacity(CapacityRequest) returns (CapacityResponse);

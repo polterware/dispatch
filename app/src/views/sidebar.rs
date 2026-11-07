@@ -12,6 +12,7 @@ use gpui::{
 };
 
 use super::TranscriptView;
+use super::conversation_usage::ConversationUsageView;
 use super::repository_actions;
 use crate::avatar::agent_avatar_live;
 use crate::client::{
@@ -106,6 +107,8 @@ pub struct SidebarView {
     conversation_name: Entity<TextInput>,
     rename_opacity: SpringValue,
     rename_y: SpringValue,
+    /// The conversation Usage dialog, once a conversation menu opened it.
+    usage: Option<Entity<ConversationUsageView>>,
     scroll: ScrollHandle,
     animator: Animator,
 }
@@ -219,6 +222,7 @@ impl SidebarView {
             conversation_name,
             rename_opacity: SpringValue::new(0.0, SpringTier::Fast),
             rename_y: SpringValue::new(8.0, SpringTier::Fast),
+            usage: None,
             scroll: ScrollHandle::new(),
             animator: Animator::new(),
         }
@@ -956,7 +960,10 @@ impl SidebarView {
             }
             items
         } else if let Some(conversation) = conversation_ref(&group.id) {
-            let mut items = vec![self.rename_entry(conversation, &group.title, cx)];
+            let mut items = vec![
+                self.rename_entry(conversation, &group.title, cx),
+                self.usage_entry(conversation, cx),
+            ];
             items.extend(self.move_entries("conversation", conversation, cx));
             items.push(self.delete_entry(
                 "Delete conversation",
@@ -988,6 +995,30 @@ impl SidebarView {
                 let _ = view.update(cx, |this, cx| this.open_rename(conversation, title, cx));
             }),
         }
+    }
+
+    /// Opens the conversation's Usage dialog: its Dispatch runs and its calling session.
+    fn usage_entry(&self, conversation: &str, cx: &mut Context<Self>) -> MenuEntry {
+        let view = cx.entity();
+        let conversation = conversation.to_string();
+        MenuEntry {
+            label: "Usage".into(),
+            icon: None,
+            danger: false,
+            on_select: Rc::new(move |_, cx| {
+                let conversation = conversation.clone();
+                let _ = view.update(cx, |this, cx| this.open_usage(conversation, cx));
+            }),
+        }
+    }
+
+    fn open_usage(&mut self, conversation: String, cx: &mut Context<Self>) {
+        self.close_menu(cx);
+        let state = self.state.clone();
+        let dialog = cx.new(|cx| ConversationUsageView::new(state, conversation, cx));
+        dialog.update(cx, |dialog, cx| dialog.open(cx));
+        self.usage = Some(dialog);
+        cx.notify();
     }
 
     fn open_rename(&mut self, conversation: String, title: String, cx: &mut Context<Self>) {
@@ -1403,7 +1434,14 @@ impl SidebarView {
 
         // The heading row: its label, and a section's "…" over it. A conversation reads as
         // its title alone, cut short, with the chevron after it.
-        let mut heading = div().relative().w_full().child(label);
+        let mut heading = div()
+            .relative()
+            .w_full()
+            .debug_selector({
+                let id = group.id.clone();
+                move || format!("sidebar-group-{id}")
+            })
+            .child(label);
         if custom {
             let section_id = group.id.clone();
             let section_name = group.title.clone();
@@ -1887,6 +1925,9 @@ impl Render for SidebarView {
         }
         if let Some(rename) = rename {
             root = root.child(rename);
+        }
+        if let Some(usage) = self.usage.clone() {
+            root = root.child(usage);
         }
         if let Some(preview) = preview {
             root = root.child(preview);

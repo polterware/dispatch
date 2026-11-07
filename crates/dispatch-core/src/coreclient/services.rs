@@ -304,6 +304,12 @@ impl DispatchClient {
     );
     unary_rpc!(stats, "Stats", proto::StatsRequest, proto::StatsResponse);
     unary_rpc!(
+        conversation_usage,
+        "GetConversationUsage",
+        proto::GetConversationUsageRequest,
+        proto::GetConversationUsageResponse
+    );
+    unary_rpc!(
         get_route_decision,
         "GetRouteDecision",
         proto::GetRouteDecisionRequest,
