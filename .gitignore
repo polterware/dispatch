@@ -6,7 +6,6 @@ dist
 # Lockfiles are committed at release time; parallel development runs would
 # otherwise conflict on them.
 Cargo.lock
-bun.lock
 bun.lockb
 pnpm-lock.yaml
 package-lock.json
