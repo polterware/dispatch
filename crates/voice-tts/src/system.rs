@@ -91,6 +91,11 @@ pub(super) fn synthesize(text: &str, voice: &VoiceSpec) -> Result<Vec<f32>> {
             .map(|s| s.map(|x| x as f32 / 32768.0))
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| TtsError::Synthesis(e.to_string()))?;
+        if samples.is_empty() {
+            return Err(TtsError::Synthesis(
+                "say returned an empty audio file".into(),
+            ));
+        }
         Ok(if channels == 1 {
             samples
         } else {

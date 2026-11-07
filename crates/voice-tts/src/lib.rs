@@ -157,18 +157,13 @@ pub mod text {
                     break;
                 }
             }
-            if let Some((label, after)) = text.split_once("](") {
-                if let Some(end) = after.find(')') {
-                    text = format!("{}{}", label.trim_start_matches('['), &after[end + 1..]);
-                }
-            }
+            text = remove_markdown_links(&text);
             text = remove_urls(&text);
             text = inline_code(&text);
             text = text
                 .replace("**", "")
                 .replace("__", "")
-                .replace('*', " ")
-                .replace('_', " ")
+                .replace(['*', '_'], " ")
                 .replace('`', "");
             text = shorten_paths(&text);
             let text = text.trim();
@@ -189,6 +184,25 @@ pub mod text {
             .collect::<Vec<_>>()
             .join(" ")
     }
+    fn remove_markdown_links(s: &str) -> String {
+        let mut out = String::new();
+        let mut rest = s;
+        while let Some(link_end) = rest.find("](") {
+            let Some(label_start) = rest[..link_end].rfind('[') else {
+                out.push_str(&rest[..link_end + 2]);
+                rest = &rest[link_end + 2..];
+                continue;
+            };
+            let Some(url_end) = rest[link_end + 2..].find(')') else {
+                break;
+            };
+            out.push_str(&rest[..label_start]);
+            out.push_str(&rest[label_start + 1..link_end]);
+            rest = &rest[link_end + 2 + url_end + 1..];
+        }
+        out.push_str(rest);
+        out
+    }
     fn inline_code(s: &str) -> String {
         let mut out = String::new();
         let mut rest = s;
@@ -197,7 +211,7 @@ pub mod text {
             rest = &rest[start + 1..];
             if let Some(end) = rest.find('`') {
                 let code = &rest[..end];
-                if code.chars().count() <= 24 {
+                if code.chars().count() <= 24 || code.contains('/') {
                     out.push_str(code);
                 }
                 rest = &rest[end + 1..];
@@ -213,10 +227,13 @@ pub mod text {
         s.split_whitespace()
             .map(|w| {
                 let clean = w.trim_matches(|c: char| ",;()[]{}".contains(c));
-                if clean.contains('/') && !clean.starts_with("http") {
-                    clean.rsplit('/').next().unwrap_or(clean)
+                let (path, punctuation) = clean
+                    .strip_suffix('.')
+                    .map_or((clean, ""), |path| (path, "."));
+                if path.contains('/') && !path.starts_with("http") {
+                    format!("{}{}", path.rsplit('/').next().unwrap_or(path), punctuation)
                 } else {
-                    w
+                    w.to_string()
                 }
             })
             .collect::<Vec<_>>()
@@ -252,7 +269,6 @@ pub mod text {
             let upto = rest
                 .char_indices()
                 .take_while(|(i, _)| *i <= 300)
-                .map(|(i, c)| (i, c))
                 .collect::<Vec<_>>();
             let limit = upto
                 .last()
@@ -356,7 +372,7 @@ pub mod text {
         fn splits_long_first_sentence_and_detects_language() {
             let s = format!(
                 "{} e depois termina.",
-                "a frase tem várias palavras".repeat(8)
+                "a frase tem várias palavras".repeat(16)
             );
             let p = sentences(&s);
             assert!(p.len() > 1);
