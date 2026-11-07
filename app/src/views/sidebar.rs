@@ -24,9 +24,9 @@ use crate::models::sidebar::{
     COLLAPSED_PREFERENCE, DISPLAY_PREFERENCE, Direction, GroupBy, GroupKind, HOVER_CLOSE_MS,
     HOVER_OPEN_MS, REVEALED_PREFERENCE, RunsNotice, SEEN_PREFERENCE, SIDEBAR_PAGE_ROWS, Show,
     SidebarDisplay, SidebarGroup, SidebarRun, SortBy, conversation_ref, ended_run_ids,
-    group_sidebar_runs, has_unseen_update, holding_section, now_unix_ms, page_sidebar_rows,
-    parse_sidebar_display, repository_ref, run_mark, runs_notice, section_ref, sidebar_run_title,
-    sidebar_runs,
+    group_sidebar_runs, group_title_tooltip, has_unseen_update, holding_section, now_unix_ms,
+    page_sidebar_rows, parse_sidebar_display, repository_ref, run_mark, runs_notice, section_ref,
+    sidebar_run_title, sidebar_runs,
 };
 use crate::motion::{Animator, SpringTier, SpringValue};
 use crate::state::{AppState, ConnectionState, Route, SettingsPage, observe};
@@ -1418,6 +1418,7 @@ impl SidebarView {
                 group.title.clone(),
                 collapsed,
             )
+            .title_tooltip(group_title_tooltip(&group.title))
             .padding(theme.space_2, if custom { 32.0 } else { theme.space_2 })
             .on_toggle(move |_, cx| {
                 let id = toggle_id.clone();

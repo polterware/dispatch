@@ -320,6 +320,21 @@ pub fn sidebar_run_title(run: &SidebarRun) -> String {
     prompt_first_line(&run.prompt, &run.id)
 }
 
+/// How much of a group's title its heading tooltip shows: a very long prompt is cut here
+/// rather than shown whole.
+pub const GROUP_TITLE_TIP_CHARS: usize = 500;
+
+/// A group heading's tooltip title: the group's whole title (its conversation's name, else
+/// its first prompt), clamped to [`GROUP_TITLE_TIP_CHARS`].
+pub fn group_title_tooltip(title: &str) -> String {
+    if title.chars().count() <= GROUP_TITLE_TIP_CHARS {
+        return title.to_string();
+    }
+    let mut cut: String = title.chars().take(GROUP_TITLE_TIP_CHARS).collect();
+    cut.push('…');
+    cut
+}
+
 /// A group's rows as the sidebar lists them: the first `limit` in Display order, plus every
 /// row that needs attention, which is never cut. `hidden` counts the rows left out.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1111,6 +1126,28 @@ mod tests {
             group_sidebar_runs(&runs, &[], &ascending, 0)[1].title,
             "Other runs"
         );
+    }
+
+    #[test]
+    fn a_group_keeps_its_whole_title_for_the_heading_tooltip() {
+        let prompt = format!("Goal: {}", ["in the Dispatch app"; 40].join(" "));
+        let runs = vec![run("first", |run| {
+            run.conversation_id = "chat".into();
+            run.prompt = prompt.clone();
+        })];
+        let groups = group_sidebar_runs(&runs, &[], &SidebarDisplay::default(), 0);
+        assert_eq!(
+            groups[0].title, prompt,
+            "the group keeps the untruncated title"
+        );
+        let tip = super::group_title_tooltip(&groups[0].title);
+        assert_eq!(tip.chars().count(), super::GROUP_TITLE_TIP_CHARS + 1);
+        let cut = tip.strip_suffix('…').unwrap();
+        assert!(
+            prompt.starts_with(cut),
+            "the tooltip keeps the title's start"
+        );
+        assert_eq!(super::group_title_tooltip("Short task"), "Short task");
     }
 
     #[test]
