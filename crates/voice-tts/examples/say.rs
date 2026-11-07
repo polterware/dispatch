@@ -70,9 +70,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => return Err("backend must be kokoro or system".into()),
     };
-    let synth_start = Instant::now();
+    let cold_start = Instant::now();
+    let cold_samples = model.synthesize(&sentence, &voice)?;
+    let cold_ms = cold_start.elapsed().as_secs_f64() * 1000.0;
+    let warm_start = Instant::now();
     let samples = model.synthesize(&sentence, &voice)?;
-    let synth_ms = synth_start.elapsed().as_secs_f64() * 1000.0;
+    let warm_ms = warm_start.elapsed().as_secs_f64() * 1000.0;
     let audio_ms = samples.len() as f64 / model.sample_rate() as f64 * 1000.0;
     let peak = samples.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
     let spec = hound::WavSpec {
@@ -86,6 +89,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         writer.write_sample((s.clamp(-1.0, 1.0) * 32767.0) as i16)?;
     }
     writer.finalize()?;
-    println!("phonemes: {phonemes}\nload_ms: {load_ms:.1}\nfirst_sentence_synthesis_ms: {synth_ms:.1}\naudio_ms: {audio_ms:.1}\nrtf: {:.3}\npeak: {peak:.4}\noutput: {}",synth_ms/audio_ms.max(1.0),out.display());
+    let cold_audio_ms = cold_samples.len() as f64 / model.sample_rate() as f64 * 1000.0;
+    println!("phonemes: {phonemes}\nload_ms: {load_ms:.1}\ncold_synthesis_ms: {cold_ms:.1}\nwarm_synthesis_ms: {warm_ms:.1}\naudio_ms: {audio_ms:.1}\ncold_rtf: {:.3}\nwarm_rtf: {:.3}\npeak: {peak:.4}\noutput: {}",cold_ms/cold_audio_ms.max(1.0),warm_ms/audio_ms.max(1.0),out.display());
     Ok(())
 }

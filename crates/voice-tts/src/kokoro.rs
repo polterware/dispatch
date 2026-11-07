@@ -87,22 +87,24 @@ pub(super) fn load(options: KokoroOptions) -> Result<KokoroTts> {
     } else {
         options.threads
     };
-    let session = Session::builder()
+    let environment = ort::init().build().map_err(load_err)?;
+    let session = Session::builder(&environment)
         .map_err(load_err)?
         .with_intra_threads(threads)
         .map_err(load_err)?
         .commit_from_file(&model)
         .map_err(load_err)?;
     let inputs = session
-        .inputs
+        .inputs()
         .iter()
-        .map(|value| format!("{}: {:?}", value.name, value.input_type))
+        .map(|value| format!("{}: {:?}", value.name(), value.dtype()))
         .collect::<Vec<_>>();
     let outputs = session
-        .outputs
+        .outputs()
         .iter()
-        .map(|value| format!("{}: {:?}", value.name, value.output_type))
+        .map(|value| format!("{}: {:?}", value.name(), value.dtype()))
         .collect::<Vec<_>>();
+    eprintln!("Kokoro ONNX inputs: {inputs:?}; outputs: {outputs:?}");
     tracing::info!(model = %model.display(), threads, ?inputs, ?outputs, "loaded Kokoro ONNX model");
     Ok(KokoroTts {
         session: Mutex::new(session),
@@ -279,7 +281,9 @@ pub(super) fn synthesize(tts: &KokoroTts, text: &str, voice: &VoiceSpec) -> Resu
         ids.push(0);
         ids.extend(chunk.iter().map(|(_, id)| *id));
         ids.push(0);
-        let row = chunk.len().min(509);
+        // kokoro-onnx selects voice[min(token_count, rows) - 1]. The
+        // sequence here includes BOS/EOS, so this is the last content token.
+        let row = chunk.len().saturating_sub(1).min(509);
         let style = style_data[row * 256..(row + 1) * 256].to_vec();
         let ids_tensor = Tensor::from_array(([1usize, ids.len()], ids))
             .map_err(|e| TtsError::Synthesis(e.to_string()))?;
