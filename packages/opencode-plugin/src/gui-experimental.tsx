@@ -14,6 +14,9 @@ export default Plugin.define({
   main,
   setup(ctx) {
     const voice = createVoiceController()
+    // Plugin option `language` in opencode.json: "pt-br" (default), "en", or "auto".
+    const option = ctx.options.language
+    const configuredLanguage: "auto" | "pt-br" | "en" = option === "en" || option === "auto" ? option : "pt-br"
     const [revision, setRevision] = createSignal(0)
     const refresh = voice.subscribe(() => setRevision(value => value + 1))
     const bridge = ctx.main(EngineBridge)
@@ -28,6 +31,7 @@ export default Plugin.define({
       insert: text => { const screen = ctx.screen.current(); if (!screen) return false; screen.composer.insert(text); return true },
       notice: title => ctx.toast.show({ title }),
       speak: (text, language, id) => runtimeSendSpeak(text, language, id),
+      language: () => configuredLanguage,
       onFailure: failed,
     })
     function failed(error: unknown) {
@@ -64,6 +68,7 @@ export default Plugin.define({
         })
         await bridge.connect()
         voice.dispatch({ type: "connected" })
+        runtime.watch(ctx.sessions.current())
         await bridge.send({ json: JSON.stringify({ type: "models.warm", stt: true, tts: true }) })
       } catch (error) { failed(error); voice.dispatch({ type: "disconnected" }) }
     }
@@ -75,6 +80,24 @@ export default Plugin.define({
     }
     const startTalk = () => { if (!active()) void activate().then(() => { if (voice.state === "idle") runtime.listen() }); else runtime.listen() }
     const stopTalk = () => runtime.stopListening()
+    // Tap to start and tap again to send; holding longer than TAP_MS sends on release instead.
+    const TAP_MS = 350
+    let pressedAt = 0
+    let pressStartedListening = false
+    const onTalkDown = () => {
+      pressedAt = performance.now()
+      pressStartedListening = voice.state !== "listening"
+      if (pressStartedListening) startTalk()
+      else stopTalk()
+    }
+    const onTalkUp = () => {
+      if (pressStartedListening && performance.now() - pressedAt > TAP_MS && voice.state === "listening") stopTalk()
+      pressStartedListening = false
+    }
+    const talkLabel = () => {
+      revision()
+      return voice.state === "listening" ? "Tap to send" : "Tap or hold to talk"
+    }
     const toggleHandsFree = () => {
       const enabled = !voice.handsFree
       voice.dispatch({ type: "hands-free", value: enabled })
@@ -88,7 +111,7 @@ export default Plugin.define({
     createEffect(() => {
       const current = ctx.sessions.current()
       const key = current?.key
-      if (initializedSession !== undefined && key !== initializedSession) runtime.sessionChanged()
+      if (initializedSession !== undefined && key !== initializedSession && active()) runtime.sessionChanged(current)
       initializedSession = key
     })
     onCleanup(() => { refresh(); deactivate(); runtime.dispose() })
@@ -107,7 +130,7 @@ export default Plugin.define({
         <VoiceBlob state={() => { revision(); return voice.blobState() }} levels={voice.levels} mode="expanded" size={220} theme={theme()} reducedMotion={reducedMotion()} />
         <div class="local-voice-panel__status">{active() ? stateLabel() : "Voice mode off"}{voice.micMuted ? " · mic muted" : ""}</div>
         <div class="local-voice-panel__transcript">{voice.partial || voice.final || (voice.state === "disconnected" ? "Engine unavailable. Start the engine to use voice." : "Your transcript will appear here.")}</div>
-        <button class="local-voice-panel__talk" onPointerDown={event => { event.currentTarget.setPointerCapture(event.pointerId); startTalk() }} onPointerUp={stopTalk} onPointerCancel={stopTalk} onPointerLeave={event => { if (event.currentTarget.hasPointerCapture(event.pointerId)) stopTalk() }} disabled={!active() || voice.state === "disconnected"}>Hold to talk</button>
+        <button class="local-voice-panel__talk" classList={{ "is-listening": (revision(), voice.state === "listening") }} onPointerDown={event => { event.currentTarget.setPointerCapture(event.pointerId); onTalkDown() }} onPointerUp={onTalkUp} onPointerCancel={onTalkUp} disabled={!active() || voice.state === "disconnected"}>{talkLabel()}</button>
         <div class="local-voice-panel__controls">
           <button onClick={() => runtime.mute(!voice.micMuted)} disabled={!active()}>{voice.micMuted ? "Unmute" : "Mute"}</button>
           <button onClick={() => { runtime.cancelSpeech(); if (voice.state === "listening") runtime.stopListening() }} disabled={!active()}>Stop</button>

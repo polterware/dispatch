@@ -112,7 +112,7 @@ impl SttEngine {
             let en_id = whisper_rs::get_lang_id("en").unwrap_or(-1) as usize;
             let code = match (probs.get(pt_id), probs.get(en_id)) {
                 (Some(pt), Some(en)) if pt >= en => "pt",
-                _ => "en",
+                _ => "pt",
             };
             code
         } else {

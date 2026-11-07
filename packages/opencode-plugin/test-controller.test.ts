@@ -74,3 +74,40 @@ describe("voice runtime integration", () => {
     expect(voice.state).toBe("disconnected")
   })
 })
+
+describe("turn text", () => {
+  test("reads every assistant message after the last user message", async () => {
+    const { turnText } = await import("./src/gui/runtime.ts")
+    expect(turnText([
+      { type: "assistant", content: [{ type: "text", text: "Old reply." }] },
+      { type: "user" },
+      { type: "assistant", content: [{ type: "text", text: "Vou verificar." }, { type: "tool", text: "x" }] },
+      { type: "assistant", content: [{ type: "text", text: "Pronto, os testes passaram." }] },
+    ] as any)).toBe("Vou verificar.\n\nPronto, os testes passaram.")
+  })
+
+  test("speaks replies to typed prompts while voice mode watches the session", async () => {
+    const voice = createVoiceController()
+    voice.dispatch({ type: "enable" }); voice.dispatch({ type: "connected" })
+    const handlers = new Map<string, Array<(event: any) => void>>()
+    const spoken: string[] = []
+    const session = {
+      key: "s\n2", id: "2",
+      server: {
+        client: { session: { switchModel: async () => {}, prompt: async () => {} } },
+        data: {
+          on: (type: string, handler: (event: any) => void) => { handlers.set(type, [...(handlers.get(type) ?? []), handler]); return () => {} },
+          session: { message: { list: () => [{ type: "user" }, { type: "assistant", content: [{ type: "text", text: "Feito." }] }], sync: async () => {} } },
+        },
+      },
+    } satisfies VoiceSession
+    const runtime = createVoiceRuntime({ controller: voice, send: () => {}, currentSession: () => session, currentModel: () => undefined,
+      insert: () => true, notice: () => {}, speak: (text, language) => { spoken.push(`${language}:${text}`) } })
+    runtime.watch(session)
+    for (const handler of handlers.get("session.execution.started") ?? []) handler({ data: { sessionID: "2" } })
+    expect(voice.state).toBe("processing")
+    for (const handler of handlers.get("session.execution.succeeded") ?? []) handler({ data: { sessionID: "2" } })
+    await Promise.resolve(); await Promise.resolve()
+    expect(spoken).toEqual(["pt-br:Feito."])
+  })
+})

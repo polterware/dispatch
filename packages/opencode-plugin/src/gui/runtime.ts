@@ -2,13 +2,22 @@ import type { EngineMessage, Language } from "@local-voice/client"
 import type { VoiceController } from "./controller.ts"
 import { extractResponseText } from "./response-text.ts"
 
+type SessionEvent = { data: { sessionID: string } }
+type WatchedEvent = "session.execution.started" | "session.execution.succeeded" | "session.execution.failed" | "permission.asked"
+
+/** The slice of the host's MountedSession the runtime uses (structurally checked against the real type). */
 export interface VoiceSession {
   key: string
   id: string
   server: {
-    client: { session: { switchModel(input: { sessionID: string; model: { id: string; providerID: string; variant?: string } }): Promise<unknown>; prompt(input: { sessionID: string; text: string }): Promise<unknown> } }
+    client: {
+      session: {
+        switchModel(input: { sessionID: string; model: { id: string; providerID: string; variant?: string } }): Promise<unknown>
+        prompt(input: { sessionID: string; text: string }): Promise<unknown>
+      }
+    }
     data: {
-      on(type: "session.execution.started" | "session.execution.succeeded" | "session.execution.failed" | "permission.asked", handler: (event: any) => void): () => void
+      on(type: WatchedEvent, handler: (event: any) => void): () => void
       session: { message: { list(sessionID: string): ReadonlyArray<{ type: string }>; sync(sessionID: string): Promise<void> } }
     }
   }
@@ -22,25 +31,109 @@ export interface VoiceRuntimeOptions {
   insert(text: string): boolean
   notice(message: string): void
   speak(text: string, language: Language, id: string): void
+  /** The language the user speaks and wants to hear. Defaults to pt-BR. */
+  language?(): Language
   onFailure?(error: unknown): void
 }
 export type VoiceTransportMessage = { type: "connection"; connected: boolean }
 
+type AssistantContent = Array<{ type?: string; text?: string }>
+
+/** The text the agent wrote in its latest turn: every assistant message after the last user message. */
+export function turnText(messages: ReadonlyArray<{ type: string }>): string {
+  let start = 0
+  for (let index = messages.length - 1; index >= 0; index--) {
+    if (messages[index]!.type === "user") {
+      start = index + 1
+      break
+    }
+  }
+  return messages
+    .slice(start)
+    .filter(message => message.type === "assistant")
+    .map(message => extractResponseText({ role: "assistant", parts: (message as { content?: AssistantContent }).content }))
+    .filter(Boolean)
+    .join("\n\n")
+}
+
 export function createVoiceRuntime(options: VoiceRuntimeOptions) {
+  const language = () => options.language?.() ?? "pt-br"
   let listeningID: string | undefined
   let speakID: string | undefined
-  let submittedSession: VoiceSession | undefined
-  let started = false
-  let removeEvents: Array<() => void> = []
+  let watched: { session: VoiceSession; remove: Array<() => void> } | undefined
 
-  const clearEvents = () => { removeEvents.forEach(remove => remove()); removeEvents = []; started = false; submittedSession = undefined }
-  const send = (message: Record<string, unknown>) => { try { options.send(message); return true } catch (error) { options.onFailure?.(error); options.controller.dispatch({ type: "disconnected" }); return false } }
-  const cancelSpeech = () => { send({ type: "speak.cancel", ...(speakID ? { id: speakID } : {}) }); speakID = undefined }
+  const send = (message: Record<string, unknown>) => {
+    try {
+      options.send(message)
+      return true
+    } catch (error) {
+      options.onFailure?.(error)
+      options.controller.dispatch({ type: "disconnected" })
+      return false
+    }
+  }
+  const cancelSpeech = () => {
+    send({ type: "speak.cancel", ...(speakID ? { id: speakID } : {}) })
+    speakID = undefined
+  }
+  const speak = (text: string) => {
+    const id = crypto.randomUUID()
+    speakID = id
+    options.speak(text, language(), id)
+  }
   const listen = () => {
     listeningID = crypto.randomUUID()
-    if (send({ type: "listen.start", id: listeningID, mode: options.controller.handsFree ? "hands-free" : "push-to-talk", language: "auto" })) options.controller.dispatch({ type: "listen.start" })
+    const mode = options.controller.handsFree ? "hands-free" : "push-to-talk"
+    if (send({ type: "listen.start", id: listeningID, mode, language: language() })) options.controller.dispatch({ type: "listen.start" })
     else listeningID = undefined
   }
+
+  /** Follows one session's turns while voice mode is on: every finished turn is read aloud, typed or spoken. */
+  const watch = (session: VoiceSession | undefined) => {
+    if (watched?.session.key === session?.key) return
+    unwatch()
+    if (!session) return
+    const mine = (event: SessionEvent) => event.data.sessionID === session.id
+    const onStarted = (event: SessionEvent) => {
+      if (!mine(event)) return
+      if (options.controller.state === "idle" || options.controller.state === "submitting") options.controller.dispatch({ type: "turn.started" })
+    }
+    const onSucceeded = (event: SessionEvent) => {
+      if (!mine(event)) return
+      void (async () => {
+        try {
+          await session.server.data.session.message.sync(session.id)
+          const text = turnText(session.server.data.session.message.list(session.id))
+          if (options.controller.state === "processing" || options.controller.state === "submitting") options.controller.dispatch({ type: "turn.ended" })
+          if (text) speak(text)
+        } catch (error) {
+          options.onFailure?.(error)
+          options.controller.dispatch({ type: "failure" })
+        }
+      })()
+    }
+    const onFailed = (event: SessionEvent) => {
+      if (mine(event) && options.controller.state === "processing") options.controller.dispatch({ type: "turn.ended" })
+    }
+    const onPermission = (event: SessionEvent) => {
+      if (!mine(event)) return
+      speak(language() === "en" ? "The agent is waiting for your approval." : "O agente está aguardando sua aprovação.")
+    }
+    watched = {
+      session,
+      remove: [
+        session.server.data.on("session.execution.started", onStarted),
+        session.server.data.on("session.execution.succeeded", onSucceeded),
+        session.server.data.on("session.execution.failed", onFailed),
+        session.server.data.on("permission.asked", onPermission),
+      ],
+    }
+  }
+  const unwatch = () => {
+    watched?.remove.forEach(remove => remove())
+    watched = undefined
+  }
+
   const processMessage = (message: EngineMessage | VoiceTransportMessage) => {
     if (message.type === "connection") {
       if (message.connected && options.controller.state === "disconnected") options.controller.dispatch({ type: "connected" })
@@ -53,23 +146,39 @@ export function createVoiceRuntime(options: VoiceRuntimeOptions) {
       return
     }
     switch (message.type) {
-      case "level": options.controller.levels[message.source === "mic" ? "mic" : "out"] = message.rms; break
-      case "state": if (message.state.mic === "idle" && options.controller.state === "disconnected") options.controller.dispatch({ type: "connected" }); break
-      case "transcript.partial": options.controller.dispatch({ type: "transcript.partial", text: message.text }); break
+      case "level":
+        options.controller.levels[message.source === "mic" ? "mic" : "out"] = message.rms
+        break
+      case "state":
+        if (message.state.mic === "idle" && options.controller.state === "disconnected") options.controller.dispatch({ type: "connected" })
+        break
+      case "transcript.partial":
+        options.controller.dispatch({ type: "transcript.partial", text: message.text })
+        break
       case "transcript.final": {
         listeningID = undefined
         options.controller.dispatch({ type: "transcript.final", text: message.text })
         const text = message.text.trim()
-        if (!text) return
-        void submit(text, message.language)
+        if (text) void submit(text)
         break
       }
-      case "speak.started": speakID = message.id; options.controller.dispatch({ type: "speak.started" }); break
-      case "speak.ended": speakID = undefined; options.controller.dispatch({ type: "speak.ended", reason: message.reason }); if (message.reason === "done" && options.controller.handsFree) listen(); break
-      case "error": options.controller.dispatch({ type: "failure" }); options.notice(`Voice engine: ${message.message}`); break
+      case "speak.started":
+        speakID = message.id
+        options.controller.dispatch({ type: "speak.started" })
+        break
+      case "speak.ended":
+        speakID = undefined
+        options.controller.dispatch({ type: "speak.ended", reason: message.reason })
+        if (message.reason === "done" && options.controller.handsFree) listen()
+        break
+      case "error":
+        options.controller.dispatch({ type: "failure" })
+        options.notice(`Voice engine: ${message.message}`)
+        break
     }
   }
-  const submit = async (text: string, language: Language) => {
+
+  const submit = async (text: string) => {
     const session = options.currentSession()
     if (!session) {
       const inserted = options.insert(text)
@@ -77,63 +186,50 @@ export function createVoiceRuntime(options: VoiceRuntimeOptions) {
       options.controller.dispatch({ type: "turn.ended" })
       return
     }
-    clearEvents()
-    submittedSession = session
-    const onStarted = (event: { data: { sessionID: string } }) => {
-      if (event.data.sessionID === session.id) { started = true; options.controller.dispatch({ type: "turn.started" }) }
-    }
-    const onSucceeded = (event: { data: { sessionID: string } }) => {
-      if (!started || event.data.sessionID !== session.id) return
-      void (async () => {
-        try {
-          await session.server.data.session.message.sync(session.id)
-          const last = [...session.server.data.session.message.list(session.id)].reverse().find(item => item.type === "assistant") as
-            | { type: string; content?: Array<{ type?: string; text?: string }> }
-            | undefined
-          const response = extractResponseText({ role: last?.type, parts: last?.content })
-          options.controller.dispatch({ type: "turn.ended" })
-          clearEvents()
-          if (response) {
-            const id = crypto.randomUUID(); speakID = id
-            options.speak(response, language, id)
-          }
-        } catch (error) { options.onFailure?.(error); options.controller.dispatch({ type: "failure" }) }
-      })()
-    }
-    const onFailed = (event: { data: { sessionID: string } }) => {
-      if (event.data.sessionID === session.id) { clearEvents(); options.controller.dispatch({ type: "failure" }) }
-    }
-    const onPermission = (event: { data: { sessionID: string } }) => {
-      if (event.data.sessionID !== session.id) return
-      const id = crypto.randomUUID(); speakID = id
-      options.speak(language === "pt-br" ? "O agente está aguardando sua aprovação." : "The agent is waiting for your approval.", language, id)
-    }
-    removeEvents = [
-      session.server.data.on("session.execution.started", onStarted),
-      session.server.data.on("session.execution.succeeded", onSucceeded),
-      session.server.data.on("session.execution.failed", onFailed),
-      session.server.data.on("permission.asked", onPermission),
-    ]
+    watch(session)
     try {
       const model = options.currentModel()
       if (model) await session.server.client.session.switchModel({ sessionID: session.id, model: { id: model.modelID, providerID: model.providerID, variant: model.variant } })
       await session.server.client.session.prompt({ sessionID: session.id, text })
       options.controller.dispatch({ type: "prompt.submitted" })
     } catch (error) {
-      clearEvents()
       options.onFailure?.(error)
       options.controller.dispatch({ type: "failure" })
       options.notice(`Could not submit voice transcript: ${String(error)}`)
     }
   }
+
   return {
     processMessage,
     listen,
-    stopListening() { if (listeningID) send({ type: "listen.stop", id: listeningID }); options.controller.dispatch({ type: "listen.stop" }) },
-    cancelListening() { if (listeningID) send({ type: "listen.cancel", id: listeningID }); listeningID = undefined; options.controller.dispatch({ type: "listen.cancel" }) },
-    mute(value: boolean) { options.controller.dispatch({ type: "mute", value }); send({ type: "mic.mute", muted: value }) },
+    watch,
+    unwatch,
+    get listening() {
+      return listeningID !== undefined
+    },
+    stopListening() {
+      if (listeningID) send({ type: "listen.stop", id: listeningID })
+      options.controller.dispatch({ type: "listen.stop" })
+    },
+    cancelListening() {
+      if (listeningID) send({ type: "listen.cancel", id: listeningID })
+      listeningID = undefined
+      options.controller.dispatch({ type: "listen.cancel" })
+    },
+    mute(value: boolean) {
+      options.controller.dispatch({ type: "mute", value })
+      send({ type: "mic.mute", muted: value })
+    },
     cancelSpeech,
-    sessionChanged() { clearEvents(); cancelSpeech(); if (options.controller.state === "listening" && listeningID) send({ type: "listen.cancel", id: listeningID }); listeningID = undefined },
-    dispose() { clearEvents(); cancelSpeech() },
+    sessionChanged(session: VoiceSession | undefined) {
+      cancelSpeech()
+      if (options.controller.state === "listening" && listeningID) send({ type: "listen.cancel", id: listeningID })
+      listeningID = undefined
+      watch(session)
+    },
+    dispose() {
+      unwatch()
+      cancelSpeech()
+    },
   }
 }

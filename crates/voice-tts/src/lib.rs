@@ -8,7 +8,7 @@ use voice_core::protocol::{Language, TextFormat};
 pub mod text {
     use super::*;
 
-    pub const MAX_SPOKEN_CHARS: usize = 1200;
+    pub const MAX_SPOKEN_CHARS: usize = 8000;
     const OMIT_PT: &str = "trecho de código omitido";
     const OMIT_EN: &str = "code omitted";
     const TRUNC_PT: &str = "Resposta resumida; veja o restante na tela.";
@@ -363,7 +363,7 @@ pub mod text {
         }
         #[test]
         fn plain_collapses_and_truncates_in_language() {
-            let input = format!("{} Fim.", "palavra ".repeat(200));
+            let input = format!("{} Fim.", "palavra ".repeat(MAX_SPOKEN_CHARS / 8 + 50));
             let got = speakable(&input, TextFormat::Plain, Language::PtBr);
             assert!(got.ends_with(TRUNC_PT));
             assert!(got.chars().count() <= MAX_SPOKEN_CHARS);

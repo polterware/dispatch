@@ -7,3 +7,4 @@
 .local-voice-panel__talk{width:100%;min-height:54px;font-weight:600}
 .local-voice-panel__hint{font-size:12px;color:var(--text-weak);text-align:center}
 .local-voice-header{display:flex;align-items:center;gap:5px;padding:2px 7px;border:0;font-size:12px}
+.local-voice-panel__talk.is-listening{outline:2px solid currentColor;outline-offset:2px}
