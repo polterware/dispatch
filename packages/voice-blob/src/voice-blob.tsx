@@ -84,9 +84,6 @@ export function VoiceBlob(props: VoiceBlobProps): JSX.Element {
       dirty = true;
       schedule();
     };
-    const setGlow = (accent: Rgb) => {
-      host.style.setProperty("--voice-blob-glow", css(accent, theme() === "dark" ? 0.32 : 0.22));
-    };
 
     const drawFlat = (amplitude: number, colors: { body: Rgb; band: Rgb }, accent: Rgb) => {
       if (!flat) return;
@@ -119,7 +116,6 @@ export function VoiceBlob(props: VoiceBlobProps): JSX.Element {
         from = params;
         target = stateParams(next);
         changedAt = now;
-        setGlow(target.accent);
       }
       params = easeParams(from, target, now - changedAt, TRANSITION_MS);
       const level =
@@ -195,14 +191,12 @@ export function VoiceBlob(props: VoiceBlobProps): JSX.Element {
     window.addEventListener("resize", resize, { passive: true });
 
     useRenderer();
-    setGlow(params.accent);
     resize();
     createEffect(() => {
       props.state();
       theme();
       size();
       props.reducedMotion;
-      setGlow(stateParams(props.state()).accent);
       resize();
     });
     updateVisibility();
@@ -230,7 +224,6 @@ export function VoiceBlob(props: VoiceBlobProps): JSX.Element {
       data-state={props.state()}
       data-theme={theme()}
     >
-      <span class="voice-blob__glow" aria-hidden="true" />
       <canvas ref={glCanvas} aria-hidden="true" />
       <canvas ref={flatCanvas} aria-hidden="true" />
       <span class="voice-blob__forced" aria-hidden="true" />
