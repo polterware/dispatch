@@ -8,17 +8,36 @@ export interface Reply {
 
 type Message = { type: string; id?: string; time?: { created?: number }; content?: Array<{ type?: string; text?: string }> }
 
-/** The session's assistant replies that have text, newest first. */
+/**
+ * The session's replies, newest first. One reply is a whole turn: every assistant message
+ * (each step between tool calls) after one user message, joined in order.
+ */
 export function assistantReplies(messages: ReadonlyArray<{ type: string }>, limit = 30): Reply[] {
   const replies: Reply[] = []
-  for (let index = messages.length - 1; index >= 0 && replies.length < limit; index--) {
-    const message = messages[index] as Message
+  let parts: string[] = []
+  let id: string | undefined
+  let created: number | undefined
+  const flush = () => {
+    if (parts.length && id) replies.push({ id, text: parts.join("\n\n"), created })
+    parts = []
+    id = undefined
+    created = undefined
+  }
+  for (const raw of messages) {
+    const message = raw as Message
+    if (message.type === "user") {
+      flush()
+      continue
+    }
     if (message.type !== "assistant") continue
     const text = extractResponseText({ role: "assistant", parts: message.content })
     if (!text) continue
-    replies.push({ id: message.id ?? String(index), text, created: message.time?.created })
+    id ??= message.id
+    parts.push(text)
+    created = message.time?.created ?? created
   }
-  return replies
+  flush()
+  return replies.reverse().slice(0, limit)
 }
 
 export function timeLabel(created: number | undefined, now = Date.now()): string {

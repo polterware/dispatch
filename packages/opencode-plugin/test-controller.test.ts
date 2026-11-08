@@ -113,15 +113,18 @@ describe("turn text", () => {
 })
 
 describe("history", () => {
-  test("lists assistant replies with text, newest first", async () => {
+  test("groups every step of a turn into one reply, newest first", async () => {
     const { assistantReplies } = await import("./src/gui/history.ts")
     const replies = assistantReplies([
       { type: "user" },
-      { type: "assistant", id: "a1", time: { created: 1 }, content: [{ type: "text", text: "Primeira." }] },
+      { type: "assistant", id: "a1", time: { created: 1 }, content: [{ type: "text", text: "Vou verificar." }] },
       { type: "assistant", id: "a2", content: [{ type: "tool", text: "x" }] },
-      { type: "assistant", id: "a3", time: { created: 3 }, content: [{ type: "text", text: "Segunda." }] },
+      { type: "assistant", id: "a3", time: { created: 3 }, content: [{ type: "text", text: "Pronto." }] },
+      { type: "user" },
+      { type: "assistant", id: "b1", time: { created: 5 }, content: [{ type: "text", text: "Segunda resposta." }] },
     ] as any)
-    expect(replies.map(r => r.id)).toEqual(["a3", "a1"])
-    expect(replies[0]!.text).toBe("Segunda.")
+    expect(replies.map(r => r.id)).toEqual(["b1", "a1"])
+    expect(replies[1]!.text).toBe("Vou verificar.\n\nPronto.")
+    expect(replies[1]!.created).toBe(3)
   })
 })
