@@ -12,18 +12,18 @@ use axum::{
     },
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use futures_util::{SinkExt, StreamExt};
 use rand::RngCore;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::Arc,
     time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use voice_core::{
     discovery::{self, EngineInfo},
     paths,
@@ -36,6 +36,11 @@ struct App {
     engine: EngineHandle,
     models: Arc<ModelManager>,
     stop: broadcast::Sender<()>,
+    events: broadcast::Sender<EngineMessage>,
+    settings: Arc<RwLock<voice_core::catalog::EngineSettings>>,
+    downloads: Arc<Mutex<HashSet<String>>>,
+    root: std::path::PathBuf,
+    settings_path: std::path::PathBuf,
 }
 #[derive(serde::Serialize)]
 struct Status {
@@ -173,9 +178,160 @@ fn router(app: App) -> Router {
         .route("/v1/health", get(health))
         .route("/v1/status", get(status))
         .route("/v1/shutdown", post(shutdown))
+        .route("/v1/catalog", get(get_catalog))
+        .route("/v1/models/:id/download", post(download_model))
+        .route("/v1/models/:id", delete(remove_model))
+        .route("/v1/settings", get(get_settings).patch(patch_settings))
         .route("/v1/ws", get(websocket))
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
         .with_state(app)
+}
+fn auth_response(headers: &HeaderMap, app: &App) -> Option<StatusCode> {
+    if !origin_allowed(headers) {
+        Some(StatusCode::FORBIDDEN)
+    } else if !authorized(headers, &app.token, None) {
+        Some(StatusCode::UNAUTHORIZED)
+    } else {
+        None
+    }
+}
+async fn get_catalog(State(app): State<App>, headers: HeaderMap) -> Response {
+    if let Some(status) = auth_response(&headers, &app) {
+        return status.into_response();
+    }
+    let settings = app.settings.read().await.clone();
+    Json(crate::catalog::catalog_with_vad(
+        &app.root,
+        &settings,
+        app.engine.state().mic == MicState::Listening,
+    ))
+    .into_response()
+}
+async fn get_settings(State(app): State<App>, headers: HeaderMap) -> Response {
+    if let Some(status) = auth_response(&headers, &app) {
+        return status.into_response();
+    }
+    Json(app.settings.read().await.clone()).into_response()
+}
+async fn patch_settings(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(patch): Json<voice_core::catalog::SettingsPatch>,
+) -> Response {
+    if let Some(status) = auth_response(&headers, &app) {
+        return status.into_response();
+    }
+    if patch
+        .speed
+        .is_some_and(|v| !v.is_finite() || !(0.5..=2.0).contains(&v))
+    {
+        return (StatusCode::BAD_REQUEST, "speed must be between 0.5 and 2.0").into_response();
+    }
+    let mut settings = app.settings.write().await;
+    let next = match crate::settings::apply(&settings, patch, &app.root) {
+        Ok(v) => v,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
+    if let Err(error) = crate::settings::persist_to(&next, &app.settings_path) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+    }
+    *settings = next.clone();
+    app.models.apply_settings(&next).await;
+    let mut config = config::load();
+    config.apply_settings(&next);
+    let _ = app.engine.tx.send(Input::Configure(config)).await;
+    let _ = app.events.send(EngineMessage::SettingsChanged {
+        settings: next.clone(),
+    });
+    Json(next).into_response()
+}
+async fn download_model(
+    State(app): State<App>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    if let Some(status) = auth_response(&headers, &app) {
+        return status.into_response();
+    }
+    let Some(spec) = crate::catalog::find(&id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let mut active = app.downloads.lock().await;
+    if !active.insert(id.clone()) {
+        return StatusCode::CONFLICT.into_response();
+    }
+    let root = app.root.clone();
+    let events = app.events.clone();
+    let done_events = app.events.clone();
+    let downloads = app.downloads.clone();
+    let owned = id.clone();
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            crate::download::download_model(spec, &root, |downloaded_bytes, total_bytes| {
+                let _ = events.send(EngineMessage::ModelProgress {
+                    id: owned.clone(),
+                    downloaded_bytes,
+                    total_bytes,
+                });
+            })
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => {
+                let _ = done_events.send(EngineMessage::ModelInstalled { id: id.clone() });
+            }
+            Ok(Err(error)) => {
+                let _ = done_events.send(EngineMessage::ModelFailed {
+                    id: id.clone(),
+                    message: error.to_string(),
+                });
+            }
+            Err(error) => {
+                let _ = done_events.send(EngineMessage::ModelFailed {
+                    id: id.clone(),
+                    message: error.to_string(),
+                });
+            }
+        }
+        downloads.lock().await.remove(&id);
+    });
+    StatusCode::ACCEPTED.into_response()
+}
+async fn remove_model(
+    State(app): State<App>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    if let Some(status) = auth_response(&headers, &app) {
+        return status.into_response();
+    }
+    let Some(spec) = crate::catalog::find(&id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if app.downloads.lock().await.contains(&id) {
+        return StatusCode::CONFLICT.into_response();
+    }
+    let settings = app.settings.read().await;
+    if crate::catalog::is_active(spec, &settings) {
+        return StatusCode::CONFLICT.into_response();
+    }
+    if spec.kind == voice_core::catalog::ModelKind::Vad
+        && app.engine.state().mic == MicState::Listening
+    {
+        return StatusCode::CONFLICT.into_response();
+    }
+    drop(settings);
+    app.models.unload_model(&id).await;
+    let root = app.root.clone();
+    for path in crate::catalog::file_paths(spec, &root) {
+        if let Err(error) = std::fs::remove_file(path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+            }
+        }
+    }
+    let _ = app.events.send(EngineMessage::ModelRemoved { id });
+    StatusCode::NO_CONTENT.into_response()
 }
 async fn client(socket: WebSocket, app: App) {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -213,6 +369,21 @@ async fn client(socket: WebSocket, app: App) {
                 .is_err()
             {
                 break;
+            }
+        }
+    });
+    let mut event_rx = app.events.subscribe();
+    let event_tx = tx.clone();
+    let event_writer = tokio::spawn(async move {
+        loop {
+            match event_rx.recv().await {
+                Ok(event) => {
+                    if event_tx.send(event).await.is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => break,
             }
         }
     });
@@ -268,6 +439,7 @@ async fn client(socket: WebSocket, app: App) {
     }
     let _ = app.engine.tx.send(Input::Disconnected(id)).await;
     writer.abort();
+    event_writer.abort();
 }
 pub async fn serve(port: Option<u16>, if_not_running: bool) -> anyhow::Result<()> {
     if let Some(info) = healthy() {
@@ -321,12 +493,17 @@ pub async fn serve(port: Option<u16>, if_not_running: bool) -> anyhow::Result<()
         engine: engine.clone(),
         models,
         stop: stop.clone(),
+        events: broadcast::channel(256).0,
+        settings: Arc::new(RwLock::new(crate::settings::load())),
+        downloads: Arc::new(Mutex::new(HashSet::new())),
+        root: paths::models_dir(),
+        settings_path: paths::config_file(),
     };
+    let settings_for_idle = app.settings.clone();
     let router = router(app);
     let mut stopped = stop.subscribe();
-    let idle = cfg.exit_after_idle_secs;
     let engine_for_idle = engine.clone();
-    let result = tokio::select! {r=axum::serve(listener,router)=>r.map_err(anyhow::Error::from),_=stopped.recv()=>Ok(()),_=shutdown_signal()=>Ok(()),_=async move{if idle==0{std::future::pending::<()>().await;}let mut since:Option<Instant>=None;loop{tokio::time::sleep(Duration::from_secs(1)).await;let state=engine_for_idle.state();if state.clients==0&&state.listen_id.is_none()&&state.speak_id.is_none(){let start=since.get_or_insert_with(Instant::now);if start.elapsed()>=Duration::from_secs(idle){break;}}else{since=None;}}}=>Ok(())};
+    let result = tokio::select! {r=axum::serve(listener,router)=>r.map_err(anyhow::Error::from),_=stopped.recv()=>Ok(()),_=shutdown_signal()=>Ok(()),_=async move{let mut since:Option<Instant>=None;loop{tokio::time::sleep(Duration::from_secs(1)).await;let idle=settings_for_idle.read().await.exit_after_idle_secs;let state=engine_for_idle.state();if idle>0&&state.clients==0&&state.listen_id.is_none()&&state.speak_id.is_none(){let start=since.get_or_insert_with(Instant::now);if start.elapsed()>=Duration::from_secs(idle){break;}}else{since=None;}}}=>Ok(())};
     let _ = engine.tx.send(Input::Shutdown).await;
     discovery::remove_if_owned(&file, std::process::id())?;
     result
@@ -612,11 +789,21 @@ mod tests {
             models,
         );
         let (stop, _) = broadcast::channel(1);
+        let root = std::env::temp_dir().join(format!("voice-http-models-{}", std::process::id()));
+        let settings_path =
+            std::env::temp_dir().join(format!("voice-http-settings-{}.json", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(&settings_path);
         let app = App {
             token: Arc::new(token.clone()),
             engine: engine.clone(),
             models: ModelManager::new(Config::default(), paths::models_dir()),
             stop,
+            events: broadcast::channel(256).0,
+            settings: Arc::new(RwLock::new(voice_core::catalog::EngineSettings::default())),
+            downloads: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            root: root.clone(),
+            settings_path: settings_path.clone(),
         };
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, router(app)).await;
@@ -629,6 +816,42 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(health.status(), 200);
+        let catalog_url = format!("http://{addr}/v1/catalog");
+        let settings_url = format!("http://{addr}/v1/settings");
+        let bearer = format!("Bearer {token}");
+        let catalog_response = ureq::get(&catalog_url)
+            .set("Authorization", &bearer)
+            .call()
+            .unwrap();
+        let catalog_json: voice_core::catalog::Catalog =
+            serde_json::from_str(&catalog_response.into_string().unwrap()).unwrap();
+        assert!(catalog_json
+            .models
+            .iter()
+            .any(|m| m.id == "whisper-small-q5_1" && m.active));
+        let active_delete = ureq::delete(&format!("http://{addr}/v1/models/whisper-small-q5_1"))
+            .set("Authorization", &bearer)
+            .call()
+            .unwrap_err();
+        assert!(matches!(active_delete, ureq::Error::Status(409, _)));
+        let inactive = crate::catalog::find("whisper-base").unwrap();
+        for file in inactive.files {
+            let target = root.join(file.path);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(target, b"dummy").unwrap();
+        }
+        let deleted = ureq::delete(&format!("http://{addr}/v1/models/whisper-base"))
+            .set("Authorization", &bearer)
+            .call()
+            .unwrap();
+        assert_eq!(deleted.status(), 204);
+        assert!(!root.join("whisper/ggml-base.bin").exists());
+        let bad_patch = ureq::patch(&settings_url)
+            .set("Authorization", &bearer)
+            .set("Content-Type", "application/json")
+            .send_string(r#"{"voice_pt":"invalid"}"#)
+            .unwrap_err();
+        assert!(matches!(bad_patch, ureq::Error::Status(400, _)));
         let endpoint = format!("ws://{addr}/v1/ws");
         let unauth = tokio_tungstenite::connect_async(&endpoint)
             .await
@@ -666,6 +889,32 @@ mod tests {
                 .unwrap();
             let parsed: EngineMessage = serde_json::from_str(msg.to_text().unwrap()).unwrap();
             assert!(matches!(parsed, EngineMessage::Hello { .. }));
+        }
+        let changed = ureq::patch(&settings_url)
+            .set("Authorization", &bearer)
+            .set("Content-Type", "application/json")
+            .send_string(r#"{"language":"en"}"#)
+            .unwrap();
+        assert_eq!(changed.status(), 200);
+        let stored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&settings_path).unwrap()).unwrap();
+        assert_eq!(stored["language"], "en");
+        for socket in [&mut a, &mut b] {
+            let message = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let item = socket.next().await.unwrap().unwrap();
+                    if let Ok(parsed) =
+                        serde_json::from_str::<EngineMessage>(item.to_text().unwrap_or(""))
+                    {
+                        if matches!(parsed, EngineMessage::SettingsChanged { .. }) {
+                            break parsed;
+                        }
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert!(matches!(message, EngineMessage::SettingsChanged { .. }));
         }
         a.send(ClientMessage::Text(
             r#"{"type":"listen.start","id":"a","language":"pt-br"}"#.into(),
@@ -737,6 +986,8 @@ mod tests {
         assert!(no_final.is_err());
         let _ = engine.tx.send(Input::Shutdown).await;
         server.abort();
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_file(settings_path);
     }
 
     #[tokio::test]
@@ -772,11 +1023,22 @@ mod tests {
             models.clone(),
         );
         let (stop, _) = broadcast::channel(1);
+        let root =
+            std::env::temp_dir().join(format!("voice-http-models-speech-{}", std::process::id()));
+        let settings_path = std::env::temp_dir().join(format!(
+            "voice-http-settings-speech-{}.json",
+            std::process::id()
+        ));
         let app = App {
             token: Arc::new(token.clone()),
             engine: engine.clone(),
             models,
             stop,
+            events: broadcast::channel(256).0,
+            settings: Arc::new(RwLock::new(voice_core::catalog::EngineSettings::default())),
+            downloads: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            root,
+            settings_path,
         };
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, router(app)).await;

@@ -62,6 +62,7 @@ pub enum Input {
         tts: bool,
         error: Option<String>,
     },
+    Configure(Config),
     Shutdown,
 }
 #[derive(Clone, Copy)]
@@ -142,6 +143,13 @@ struct SpeakRequest {
     language: Language,
     voice: Option<String>,
     requested: Instant,
+}
+fn selected_voice(language: Language, config: &Config) -> String {
+    if language == Language::PtBr {
+        config.voice_pt.clone()
+    } else {
+        config.voice_en.clone()
+    }
 }
 struct Actor {
     config: Config,
@@ -378,6 +386,9 @@ impl Actor {
                     self.changed();
                 }
             }
+            Input::Configure(config) => {
+                self.config = config;
+            }
             Input::Shutdown => self.cancel_all(),
         }
     }
@@ -385,6 +396,12 @@ impl Actor {
         match msg {
             ClientMessage::Ping { nonce } => self.send_to(owner, EngineMessage::Pong { nonce }),
             ClientMessage::ListenStart { id, language, mode } => {
+                let language =
+                    if language == Language::Auto && self.config.language != Language::Auto {
+                        self.config.language
+                    } else {
+                        language
+                    };
                 if self.listening.as_ref().is_some_and(|s| s.owner != owner) {
                     self.error(owner, ErrorCode::Busy, "microphone is busy", Some(id));
                     return;
@@ -594,16 +611,17 @@ impl Actor {
         let requested = item.requested;
         let sentence = item.sentences.pop_front().unwrap_or_default();
         let remaining = item.sentences;
-        let voice = item.voice.unwrap_or_else(|| {
-            if item.language == Language::PtBr {
-                self.config.voice_pt.clone()
-            } else {
-                self.config.voice_en.clone()
-            }
-        });
+        let voice = item
+            .voice
+            .unwrap_or_else(|| selected_voice(item.language, &self.config));
+        let name = voice
+            .rsplit_once(':')
+            .map(|(_, name)| name)
+            .unwrap_or(&voice)
+            .to_owned();
         let spec = voice_tts::VoiceSpec {
             language: item.language,
-            name: Some(voice),
+            name: Some(name),
             speed: self.config.speed,
         };
         self.pending_speak = Some((owner, id.clone(), generation));
@@ -613,7 +631,7 @@ impl Actor {
         let models = self.models.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let loaded = models.tts().await;
+            let loaded = models.tts(&voice).await;
             let (synthesizer, sample_rate, result) = match loaded {
                 Ok(synth) => {
                     let rate = synth.sample_rate();
@@ -1101,6 +1119,20 @@ impl Actor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selects_configured_voice_by_language() {
+        let config = Config {
+            voice_pt: "piper:pt_BR-faber-medium".into(),
+            voice_en: "kokoro:af_heart".into(),
+            ..Config::default()
+        };
+        assert_eq!(
+            selected_voice(Language::PtBr, &config),
+            "piper:pt_BR-faber-medium"
+        );
+        assert_eq!(selected_voice(Language::En, &config), "kokoro:af_heart");
+    }
     use crate::{
         backends::{MicHandle, MicSource, Speaker, SpeakerHandle, VadFactory},
         config::Config,
