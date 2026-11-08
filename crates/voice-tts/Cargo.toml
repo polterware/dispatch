@@ -14,3 +14,6 @@ serde_json.workspace = true
 tracing.workspace = true
 ort.workspace = true
 hound = "3.5"
+
+[dev-dependencies]
+tracing-subscriber.workspace = true

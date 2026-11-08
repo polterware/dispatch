@@ -9,6 +9,7 @@ fn rss_mib() -> Option<f64> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).with_writer(std::io::stderr).init();
     let mut args = env::args().skip(1);
     let mut language = Language::PtBr;
     let mut exaggeration = 0.5f32;
@@ -32,6 +33,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let started = Instant::now();
     let samples = tts.synthesize(text, &VoiceSpec { language, name: None, speed: 1.0 })?;
     let synth_time = started.elapsed();
+    if env::var_os("CHATTERBOX_WARM").is_some() {
+        let started = Instant::now();
+        tts.synthesize(text, &VoiceSpec { language, name: None, speed: 1.0 })?;
+        println!("Warm synthesis: {:.1} s", started.elapsed().as_secs_f64());
+    }
     let rss_synth = rss_mib();
     let duration = samples.len() as f64 / tts.sample_rate() as f64;
     let peak = samples.iter().fold(0.0f32, |max, value| max.max(value.abs()));

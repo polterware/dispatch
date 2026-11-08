@@ -21,7 +21,7 @@ use std::{
 
 use ort::{
     ep::CPU,
-    session::{Session, SessionInputValue},
+    session::{builder::AutoDevicePolicy, Session, SessionInputValue},
     value::{DynValue, Tensor, ValueType},
 };
 use tokenizers::Tokenizer;
@@ -85,7 +85,9 @@ impl ChatterboxTts {
         let encoder_inputs = bind_named(&speech_encoder, HashMap::from([
             ("audio_values", Tensor::from_array(([1usize, audio.len()], audio)).map_err(load_err)?.into()),
         ]))?;
+        let started = std::time::Instant::now();
         let mut encoded = speech_encoder.run(encoder_inputs).map_err(load_err)?;
+        tracing::debug!(ms = started.elapsed().as_millis() as u64, "Chatterbox reference voice encoded");
         let cond_emb = take_output(&mut encoded, &["cond_emb", "cond_embeds", "audio_features"])?;
         let prompt_token = take_output(&mut encoded, &["prompt_token", "prompt_tokens", "audio_tokens"])?;
         let speaker_embeddings = take_output(&mut encoded, &["ref_x_vector", "speaker_embeddings"])?;
@@ -157,7 +159,9 @@ impl ChatterboxTts {
             }
         }
         let first_inputs = bind_named_owned(&lm, inputs)?;
+        let started = std::time::Instant::now();
         let first = lm.run(first_inputs).map_err(synth_err)?;
+        tracing::debug!(prompt_len, ms = started.elapsed().as_millis() as u64, "Chatterbox prompt prefill");
         let (mut logits, mut past) = split_lm_outputs(first, &cache_names)?;
         let max_new_tokens = (60 + text.chars().count() * 4).min(HARD_MAX_TOKENS);
         let mut generated = vec![START_SPEECH_TOKEN];
@@ -187,7 +191,9 @@ impl ChatterboxTts {
             let (new_logits, new_past) = split_lm_outputs(output, &cache_names)?;
             logits = new_logits;
             past = new_past;
+            tracing::trace!(step, token, "Chatterbox speech token");
         }
+        tracing::debug!(tokens = generated.len(), stopped = generated.last() == Some(&STOP_SPEECH_TOKEN), "Chatterbox generation finished");
         drop(lm);
         if generated.last() != Some(&STOP_SPEECH_TOKEN) { generated.push(STOP_SPEECH_TOKEN); }
         let speech_tokens = generated.get(1..generated.len().saturating_sub(1)).unwrap_or(&[]).to_vec();
@@ -200,8 +206,10 @@ impl ChatterboxTts {
             ("speaker_embeddings", self.conditioning.speaker_embeddings.view().into()),
             ("speaker_features", self.conditioning.speaker_features.view().into()),
         ]))?;
+        let started = std::time::Instant::now();
         let mut decoded = decoder.run(decoder_inputs).map_err(synth_err)?;
-        let wav = take_output(&mut decoded, &["wav", "audio", "output"])?;
+        tracing::debug!(ms = started.elapsed().as_millis() as u64, "Chatterbox decoder");
+        let wav = take_output(&mut decoded, &["waveform", "wav", "audio"])?;
         let mut samples = tensor_f32(&wav)?.to_vec();
         trim_silence(&mut samples, SAMPLE_RATE);
         Ok(samples)
@@ -216,12 +224,18 @@ impl TtsBackend for ChatterboxTts {
 }
 
 fn make_session(environment: &ort::environment::Environment, path: &Path, threads: usize) -> Result<Session> {
-    Session::builder(environment).map_err(load_err)?
+    let started = std::time::Instant::now();
+    // ort registers CoreML automatically on macOS; it splits these graphs into thousands of
+    // partitions and session setup never finishes, so stay on CPU.
+    let session = Session::builder(environment).map_err(load_err)?
+        .with_auto_device(AutoDevicePolicy::PreferCPU).map_err(load_err)?
         .with_intra_threads(threads).map_err(load_err)?
         .with_inter_threads(1).map_err(load_err)?
         .with_memory_pattern(false).map_err(load_err)?
         .with_execution_providers([CPU::default().with_arena_allocator(false).build()]).map_err(load_err)?
-        .commit_from_file(path).map_err(load_err)
+        .commit_from_file(path).map_err(load_err)?;
+    tracing::debug!(path = %path.display(), ms = started.elapsed().as_millis() as u64, "Chatterbox session loaded");
+    Ok(session)
 }
 
 fn log_io(label: &str, session: &Session) {

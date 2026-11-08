@@ -4,7 +4,7 @@
 
 use std::{collections::HashMap, path::PathBuf, sync::Mutex};
 
-use ort::{session::Session, value::Tensor};
+use ort::{session::{builder::AutoDevicePolicy, Session}, value::Tensor};
 use serde_json::Value;
 
 use crate::{Result, TtsBackend, TtsError, VoiceSpec};
@@ -62,7 +62,10 @@ impl PiperTts {
             options.threads
         };
         let environment = ort::init().build().map_err(load_err)?;
+        // ort registers CoreML automatically on macOS; keep inference on CPU.
         let mut builder = Session::builder(&environment)
+            .map_err(load_err)?
+            .with_auto_device(AutoDevicePolicy::PreferCPU)
             .map_err(load_err)?
             .with_intra_threads(threads)
             .map_err(load_err)?;

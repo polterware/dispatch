@@ -6,7 +6,7 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
-use ort::{ep::CPU, session::Session, value::Tensor};
+use ort::{ep::CPU, session::{builder::AutoDevicePolicy, Session}, value::Tensor};
 use serde_json::Value;
 use voice_core::protocol::Language;
 
@@ -88,7 +88,10 @@ pub(super) fn load(options: KokoroOptions) -> Result<KokoroTts> {
         options.threads
     };
     let environment = ort::init().build().map_err(load_err)?;
+    // ort registers CoreML automatically on macOS; keep inference on CPU.
     let session = Session::builder(&environment)
+        .map_err(load_err)?
+        .with_auto_device(AutoDevicePolicy::PreferCPU)
         .map_err(load_err)?
         .with_intra_threads(threads)
         .map_err(load_err)?

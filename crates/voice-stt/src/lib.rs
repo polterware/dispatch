@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ort::{session::Session, value::Tensor};
+use ort::{session::{builder::AutoDevicePolicy, Session}, value::Tensor};
 use voice_core::protocol::Language;
 use whisper_rs::{
     FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState,
@@ -235,7 +235,10 @@ impl VadModel {
         let environment = ort::init()
             .build()
             .map_err(|e| SttError::Load(e.to_string()))?;
+        // ort registers CoreML automatically on macOS; keep inference on CPU.
         let session = Session::builder(&environment)
+            .map_err(|e| SttError::Load(e.to_string()))?
+            .with_auto_device(AutoDevicePolicy::PreferCPU)
             .map_err(|e| SttError::Load(e.to_string()))?
             .with_intra_threads(1)
             .map_err(|e| SttError::Load(e.to_string()))?
