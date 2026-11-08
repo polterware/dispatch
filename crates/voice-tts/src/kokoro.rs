@@ -122,7 +122,7 @@ pub(super) fn load(options: KokoroOptions) -> Result<KokoroTts> {
 fn load_err(e: impl std::fmt::Display) -> TtsError {
     TtsError::Load(e.to_string())
 }
-fn find_espeak(explicit: Option<&Path>) -> Option<PathBuf> {
+pub(super) fn find_espeak(explicit: Option<&Path>) -> Option<PathBuf> {
     if let Some(path) = explicit {
         if path.is_file() {
             return Some(path.to_owned());
@@ -143,15 +143,18 @@ fn find_espeak(explicit: Option<&Path>) -> Option<PathBuf> {
 }
 static ESPEAK_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 fn phonemize(bin: &Path, text: &str, lang: Language) -> Result<String> {
-    let _guard = ESPEAK_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .map_err(|e| TtsError::Synthesis(e.to_string()))?;
     let voice = if lang == Language::PtBr {
         "pt-br"
     } else {
         "en-us"
     };
+    phonemize_with_voice(bin, text, voice)
+}
+pub(super) fn phonemize_with_voice(bin: &Path, text: &str, voice: &str) -> Result<String> {
+    let _guard = ESPEAK_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|e| TtsError::Synthesis(e.to_string()))?;
     // eSpeak omits punctuation from IPA output, so process clauses separately
     // and put the original punctuation back for Kokoro's pause model.
     let mut out = String::new();
@@ -203,7 +206,7 @@ fn espeak_words(bin: &Path, text: &str, voice: &str) -> Result<String> {
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
-fn normalize_phonemes(raw: &str) -> String {
+pub(super) fn normalize_phonemes(raw: &str) -> String {
     raw.chars()
         .filter(|&c| {
             !matches!(
