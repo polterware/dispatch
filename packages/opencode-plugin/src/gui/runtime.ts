@@ -225,7 +225,9 @@ export function createVoiceRuntime(options: VoiceRuntimeOptions) {
     cancelSpeech,
     /** Speaks any text now (e.g. an earlier reply the user picked), replacing what is playing. */
     speakText(text: string) {
-      cancelSpeech()
+      // Drop everything queued or playing, so the picked reply starts now.
+      send({ type: "speak.cancel" })
+      speakID = undefined
       speak(text)
       return speakID!
     },
