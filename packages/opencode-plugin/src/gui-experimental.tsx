@@ -276,6 +276,13 @@ export default Plugin.define({
               }
             }}
           >
+            <div class="lv-toolbar">
+              <button class="lv-flat" onClick={() => { deactivate(); ctx.screen.current()?.composer.focus() }}>Back to text</button>
+              <div class="lv-inline">
+                <button class="lv-flat" onClick={() => ctx.layout.settings("local-voice")}>Settings</button>
+                <button class="lv-flat" onClick={toggle}>{active() ? "Turn off" : "Start"}</button>
+              </div>
+            </div>
             <div class="lv-panel__stage">
               <VoiceBlob state={blobState} levels={voice.levels} mode="expanded" size={180} theme={theme()} reducedMotion={reducedMotion()} />
             </div>
@@ -328,11 +335,6 @@ export default Plugin.define({
                   </div>
                 )}
               </For>
-            </div>
-            <div class="lv-footer">
-              <button class="lv-flat" onClick={() => { deactivate(); ctx.screen.current()?.composer.focus() }}>Back to text</button>
-              <button class="lv-flat" onClick={() => ctx.layout.settings("local-voice")}>Settings</button>
-              <button class="lv-flat" onClick={toggle}>{active() ? "Turn voice off" : "Start engine"}</button>
             </div>
           </div>
         )

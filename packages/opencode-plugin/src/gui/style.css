@@ -403,3 +403,10 @@
 .lv-panel .lv-footer {
   margin-top: 0;
 }
+/* Panel toolbar: secondary actions at the top, above the blob. */
+.lv-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: -8px -6px 0;
+}
