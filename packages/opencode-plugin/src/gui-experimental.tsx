@@ -278,16 +278,12 @@ export default Plugin.define({
           >
             <div class="lv-panel__stage">
               <VoiceBlob state={blobState} levels={voice.levels} mode="expanded" size={180} theme={theme()} reducedMotion={reducedMotion()} />
-              <span class="lv-chip" data-state={(revision(), active() ? voice.state : "off")}>
-                <span class="lv-chip__dot" />
-                {stateText()}
-              </span>
             </div>
-            <div class="lv-card" data-empty={(revision(), !voice.partial && !voice.final)}>
-              {(revision(), voice.partial)
-                ? <span class="lv-card__partial">{voice.partial}</span>
-                : voice.final || (voice.state === "disconnected" ? "Voice engine unavailable." : "Your words will appear here.")}
-            </div>
+            <Show when={(revision(), voice.partial || voice.final)}>
+              <div class="lv-card">
+                {(revision(), voice.partial) ? <span class="lv-card__partial">{voice.partial}</span> : voice.final}
+              </div>
+            </Show>
             <button
               class="lv-btn lv-btn--lg lv-btn--block"
               classList={{ "lv-btn--brand": !listening(), "lv-btn--live": listening() }}
