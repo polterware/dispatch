@@ -57,6 +57,9 @@ impl ModelManager {
                 .await
                 .retain(|key, _| !key.starts_with("kokoro:"));
         }
+        if id == "chatterbox-multilingual" {
+            self.tts.lock().await.remove("chatterbox");
+        }
         if id.starts_with("piper-") {
             self.tts.lock().await.retain(|key, _| {
                 format!("piper-{}", key.strip_prefix("piper:").unwrap_or("")) != id
@@ -82,8 +85,9 @@ impl ModelManager {
     }
     pub async fn tts(&self, voice_id: &str) -> Result<Arc<dyn Synthesizer>> {
         let mut cache = self.tts.lock().await;
-        let cached_id = if cache.contains_key(voice_id) {
-            Some(voice_id)
+        let key = tts_cache_key(voice_id);
+        let cached_id = if cache.contains_key(key) {
+            Some(key)
         } else if cache.contains_key("test") {
             Some("test")
         } else {
@@ -93,6 +97,9 @@ impl ModelManager {
             *used = Instant::now();
             return Ok(model.clone());
         }
+        // Chatterbox can consume well over a gigabyte. Keep it exclusive with
+        // every other TTS backend, including while a replacement is loading.
+        prepare_tts_cache(&mut cache, key);
         let root = self.root.clone();
         let voice = voice_id.to_string();
         let espeak = crate::backends::espeak();
@@ -129,6 +136,20 @@ impl ModelManager {
                     })?;
                     return Ok(Box::new(model) as Box<dyn voice_tts::TtsBackend>);
                 }
+                if voice.starts_with("chatterbox:") {
+                    let dir = root.join("chatterbox");
+                    anyhow::ensure!(
+                        voice_tts::chatterbox_installed(&dir),
+                        "model_missing: Chatterbox files are incomplete"
+                    );
+                    let model = voice_tts::ChatterboxTts::load(voice_tts::ChatterboxOptions {
+                        dir,
+                        reference_voice: None,
+                        exaggeration: 0.5,
+                        threads: 2,
+                    })?;
+                    return Ok(Box::new(model) as Box<dyn voice_tts::TtsBackend>);
+                }
                 if voice.starts_with("system:") && voice_tts::SystemTts::available() {
                     return Ok(
                         Box::new(voice_tts::SystemTts::new()) as Box<dyn voice_tts::TtsBackend>
@@ -147,7 +168,7 @@ impl ModelManager {
                 cache.remove(&old);
             }
         }
-        cache.insert(voice_id.to_owned(), (model.clone(), Instant::now()));
+        cache.insert(key.to_owned(), (model.clone(), Instant::now()));
         Ok(model)
     }
     pub async fn warm(self: &Arc<Self>, stt: bool, tts: bool) -> Result<()> {
@@ -176,6 +197,13 @@ impl ModelManager {
             .lock()
             .await
             .insert("test".into(), (model, Instant::now()));
+    }
+    #[cfg(test)]
+    async fn install_test_tts_at(&self, key: &str, model: Arc<dyn Synthesizer>) {
+        self.tts
+            .lock()
+            .await
+            .insert(key.into(), (model, Instant::now()));
     }
     pub async fn status(&self) -> (bool, bool, String, String) {
         let stt = self.stt.lock().await;
@@ -229,6 +257,20 @@ impl ModelManager {
     }
 }
 
+fn tts_cache_key(voice_id: &str) -> &str {
+    if voice_id.starts_with("chatterbox:") {
+        "chatterbox"
+    } else {
+        voice_id
+    }
+}
+
+fn prepare_tts_cache(cache: &mut HashMap<String, LoadedTts>, key: &str) {
+    if key == "chatterbox" || cache.contains_key("chatterbox") {
+        cache.clear();
+    }
+}
+
 pub fn list() -> anyhow::Result<()> {
     let root = voice_core::paths::models_dir();
     let catalog = crate::catalog::catalog(&root, &crate::settings::load());
@@ -262,4 +304,47 @@ pub fn remove(id: &str) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct FakeTts;
+    impl Synthesizer for FakeTts {
+        fn sample_rate(&self) -> u32 {
+            24_000
+        }
+        fn synthesize(&self, _: &str, _: &voice_tts::VoiceSpec) -> Result<Vec<f32>> {
+            Ok(vec![])
+        }
+        fn name(&self) -> &'static str {
+            "chatterbox"
+        }
+    }
+
+    #[tokio::test]
+    async fn chatterbox_voices_share_one_cached_backend() {
+        let manager = ModelManager::new(Config::default(), PathBuf::from("unused"));
+        let backend: Arc<dyn Synthesizer> = Arc::new(FakeTts);
+        manager
+            .install_test_tts_at("chatterbox", backend.clone())
+            .await;
+        let portuguese = manager.tts("chatterbox:pt").await.unwrap();
+        let english = manager.tts("chatterbox:en").await.unwrap();
+        assert!(Arc::ptr_eq(&portuguese, &english));
+        assert_eq!(manager.tts.lock().await.len(), 1);
+    }
+
+    #[test]
+    fn chatterbox_cache_policy_evicts_other_backends() {
+        let mut cache = HashMap::new();
+        let backend: Arc<dyn Synthesizer> = Arc::new(FakeTts);
+        cache.insert("kokoro:af_heart".into(), (backend.clone(), Instant::now()));
+        prepare_tts_cache(&mut cache, "chatterbox");
+        assert!(cache.is_empty());
+        cache.insert("chatterbox".into(), (backend.clone(), Instant::now()));
+        prepare_tts_cache(&mut cache, "piper:pt_BR-faber-medium");
+        assert!(cache.is_empty());
+    }
 }
