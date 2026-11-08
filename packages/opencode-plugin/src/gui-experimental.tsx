@@ -285,7 +285,7 @@ export default Plugin.define({
               </div>
             </Show>
             <button
-              class="lv-btn lv-btn--lg lv-btn--block"
+              class="lv-btn lv-btn--block"
               classList={{ "lv-btn--brand": !listening(), "lv-btn--live": listening() }}
               onPointerDown={event => { event.currentTarget.setPointerCapture(event.pointerId); onTalkDown() }}
               onPointerUp={onTalkUp}
