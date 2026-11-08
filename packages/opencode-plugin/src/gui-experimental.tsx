@@ -143,19 +143,10 @@ export default Plugin.define({
       setPlaying({ message, speak: runtime.speakText(text) })
     }
 
-    // Tap to start and tap again to send; holding longer than TAP_MS sends on release instead.
-    const TAP_MS = 350
-    let pressedAt = 0
-    let pressStartedListening = false
-    const onTalkDown = () => {
-      pressedAt = performance.now()
-      pressStartedListening = voice.state !== "listening"
-      if (pressStartedListening) startTalk()
-      else stopTalk()
-    }
-    const onTalkUp = () => {
-      if (pressStartedListening && performance.now() - pressedAt > TAP_MS && voice.state === "listening") stopTalk()
-      pressStartedListening = false
+    // One tap starts listening; the next tap sends what was said.
+    const onTalk = () => {
+      if (voice.state === "listening") stopTalk()
+      else startTalk()
     }
 
     const stateText = () => {
@@ -302,12 +293,10 @@ export default Plugin.define({
             <button
               class="lv-btn lv-btn--block"
               classList={{ "lv-btn--brand": !listening(), "lv-btn--live": listening() }}
-              onPointerDown={event => { event.currentTarget.setPointerCapture(event.pointerId); onTalkDown() }}
-              onPointerUp={onTalkUp}
-              onPointerCancel={onTalkUp}
-              disabled={(revision(), active() && voice.state === "disconnected")}
+              onClick={onTalk}
+              disabled={(revision(), voice.state === "transcribing" || voice.state === "connecting")}
             >
-              {listening() ? "Tap to send" : "Tap or hold to talk"}
+              {listening() ? "Tap to send" : (revision(), voice.state === "transcribing") ? "Transcribing…" : "Tap to talk"}
             </button>
             <div class="lv-row">
               <button class="lv-btn" aria-pressed={(revision(), voice.micMuted)} onClick={() => runtime.mute(!voice.micMuted)} disabled={!active()}>

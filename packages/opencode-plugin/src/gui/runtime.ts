@@ -140,10 +140,10 @@ export function createVoiceRuntime(options: VoiceRuntimeOptions) {
     if (message.type === "connection") {
       if (message.connected && options.controller.state === "disconnected") options.controller.dispatch({ type: "connected" })
       else if (!message.connected && options.controller.state !== "off") {
+        // The socket reconnects by itself; voice mode stays on and resumes when it is back.
+        listeningID = undefined
+        speakID = undefined
         options.controller.dispatch({ type: "disconnected" })
-        const error = new Error("Voice engine connection lost")
-        if (options.onFailure) options.onFailure(error)
-        else options.notice("Voice engine connection lost. Start the engine again from the panel.")
       }
       return
     }
