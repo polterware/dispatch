@@ -622,6 +622,29 @@ async fn test_disabled_models_apply_to_fallback_relax_and_flags() {
     );
 }
 
+#[tokio::test]
+async fn test_one_agents_disabled_model_routes_through_another() {
+    let r = routing_deps();
+    r.t.store
+        .set_agent_model_enabled("a", "gpt-small-high", false)
+        .unwrap();
+    let (cs, why) = r
+        .select(opts("easy", filters(|f| f.model = "gpt-small".into())))
+        .await;
+    assert!(
+        !cs.is_empty() && cs.iter().all(|c| c.route.agent == "b"),
+        "{cs:?} {why:?}"
+    );
+    assert!(why.iter().any(|w| w.contains("for agent a")), "{why:?}");
+    r.t.store
+        .set_agent_model_enabled("b", "gpt-small", false)
+        .unwrap();
+    let (cs, why) = r
+        .select(opts("easy", filters(|f| f.model = "gpt-small".into())))
+        .await;
+    assert!(cs.is_empty(), "{cs:?} {why:?}");
+}
+
 // From route_decision_test.go.
 #[tokio::test]
 async fn test_route_never_records_a_decision() {

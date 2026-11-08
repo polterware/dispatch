@@ -28,7 +28,7 @@ use std::time::Duration;
 
 pub(crate) const OPS_USAGE: &str = "       dispatch wait <id> [--timeout <dur>] [--json=false]
        dispatch route [--tier <auto|easy|normal|hard>] [--provider <p>] [--model <m>] [--effort <e>] [--agent <a>] [--priority speed|balanced|quality] [--relax] [--readonly] [--role <name|none>] [--card <slug>] [--dir <repo>] [--json] [<prompt>]
-       dispatch models [--json] | enable|disable <provider>[/<model>] | refresh | bench [--json]
+       dispatch models [--json] | enable|disable <model> --agent <name> | enable|disable <provider>[/<model>] | refresh | bench [--json]
        dispatch classify [--card <slug>] [--dir <repo>] [--json] <prompt>
        dispatch config get [priority|discover|roles|classifier|classifier_model|classifier_agent|classifier_keys|classifier_cli]
        dispatch config set priority <speed|balanced|quality> | discover <true|false> | roles <true|false> | classifier <off|jev|openai|cli> | classifier_model <model> | classifier_agent <agent[/model]|default>
@@ -422,15 +422,21 @@ fn role_line(profile: &str, pick: Option<&RolePick>) -> String {
     line
 }
 
-/// Prints the catalog the auto route prices models with, enables or disables a
-/// provider or base model, refreshes prices from models.dev, or prints benchmarks.
+/// Prints the catalog the auto route prices models with, enables or disables one
+/// agent's model (or, without `--agent`, the legacy provider or base model for every
+/// agent), refreshes prices from models.dev, or prints benchmarks.
 pub(super) async fn models(db_path: &Path, args: &[String]) -> CliResult {
     let mut f = Flags::new("models");
     f.bool("json", false, "print JSON");
+    f.string(
+        "agent",
+        "",
+        "with enable or disable: the agent whose card owns the model switch",
+    );
     let positional = f.parse_interspersed(args)?;
     let usage = || {
         usage_err(
-            "usage: dispatch models [--json] | enable|disable <provider>[/<model>] | refresh | bench [--json]",
+            "usage: dispatch models [--json] | enable|disable <model> --agent <name> | enable|disable <provider>[/<model>] | refresh | bench [--json]",
         )
     };
     let (sub, target) = match positional.as_slice() {
@@ -446,12 +452,19 @@ pub(super) async fn models(db_path: &Path, args: &[String]) -> CliResult {
     match sub {
         "enable" | "disable" => {
             let enabled = sub == "enable";
+            let agent = f.str("agent");
+            let (provider, model) = if agent.trim().is_empty() {
+                (target.to_owned(), String::new())
+            } else {
+                (String::new(), target.to_owned())
+            };
             let res = c
                 .dispatch
                 .set_model_enabled(&pb::SetModelEnabledRequest {
-                    provider: target.to_owned(),
-                    model: String::new(),
+                    provider,
+                    model,
                     enabled,
+                    agent,
                 })
                 .await
                 .map_err(run_error)?;
@@ -460,11 +473,14 @@ pub(super) async fn models(db_path: &Path, args: &[String]) -> CliResult {
                     "provider": res.provider,
                     "model": res.model,
                     "enabled": res.enabled,
+                    "agent": res.agent,
                 }))?;
                 return Ok(());
             }
             let state = if res.enabled { "enabled" } else { "disabled" };
-            if res.model.is_empty() {
+            if !res.agent.is_empty() {
+                println!("{}/{}: {state}", res.agent, res.model);
+            } else if res.model.is_empty() {
                 println!("{}: {state}", res.provider);
             } else {
                 println!("{}/{}: {state}", res.provider, res.model);
@@ -531,6 +547,21 @@ pub(super) async fn models(db_path: &Path, args: &[String]) -> CliResult {
                         })
                         .collect();
                     obj.insert("providers".into(), Value::Array(providers));
+                    let agents: Vec<Value> = settings
+                        .agents
+                        .iter()
+                        .map(|a| {
+                            serde_json::json!({
+                                "agent": a.agent,
+                                "enabled": a.enabled,
+                                "models": a.models.iter().map(|m| serde_json::json!({
+                                    "id": m.id,
+                                    "enabled": m.enabled,
+                                })).collect::<Vec<_>>(),
+                            })
+                        })
+                        .collect();
+                    obj.insert("agents".into(), Value::Array(agents));
                 }
                 write_json(&sort_keys(v))?;
                 return if res.ok { Ok(()) } else { Err(Fail::Exit(1)) };

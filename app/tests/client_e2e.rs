@@ -247,9 +247,10 @@ fn settings_change_the_policy_hooks_and_skills() {
     let disabled = core
         .client
         .set_model_enabled(&dispatch_app::client::SetModelEnabledRequest {
-            provider: "fake".into(),
+            agent: "fake".into(),
             model: "fake-fast".into(),
             enabled: false,
+            ..Default::default()
         })
         .unwrap();
     assert!(!disabled.enabled);
@@ -257,14 +258,17 @@ fn settings_change_the_policy_hooks_and_skills() {
         .client
         .list_model_settings(&dispatch_app::client::ListModelSettingsRequest::default())
         .unwrap();
-    assert!(settings.providers.iter().any(
-        |p| p.provider == "fake" && p.models.iter().any(|m| m.id == "fake-fast" && !m.enabled)
-    ));
+    assert!(
+        settings.agents.iter().any(
+            |a| a.agent == "fake" && a.models.iter().any(|m| m.id == "fake-fast" && !m.enabled)
+        )
+    );
     core.client
         .set_model_enabled(&dispatch_app::client::SetModelEnabledRequest {
-            provider: "fake".into(),
+            agent: "fake".into(),
             model: "fake-fast".into(),
             enabled: true,
+            ..Default::default()
         })
         .unwrap();
     let disabled = core
@@ -422,6 +426,7 @@ fn roles_and_tiers_are_saved_and_removed() {
                 provider: "openai".into(),
                 model: String::new(),
                 enabled,
+                ..Default::default()
             })
             .unwrap();
     };
@@ -467,6 +472,7 @@ fn roles_and_tiers_are_saved_and_removed() {
             provider: "openai".into(),
             model: String::new(),
             enabled: true,
+            ..Default::default()
         })
         .unwrap();
     let back = listed(&core);

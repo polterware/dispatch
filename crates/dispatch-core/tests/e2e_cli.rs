@@ -1540,3 +1540,77 @@ fn disabled_models_and_providers_leave_list_models_and_never_run() {
     env.ok(&["models", "enable", "fake"]);
     assert!(models().iter().any(|m| m.agent == "fake"));
 }
+
+#[test]
+fn an_agents_disabled_model_leaves_that_agents_card_alone() {
+    let env = Env::new();
+    let clients = coreclient::new(&runstate::read_core(env.db()).unwrap(), "e2e");
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let models = || {
+        rt.block_on(clients.dispatch.list_models(&pb::ListModelsRequest {}))
+            .unwrap()
+            .models
+    };
+    let settings = || {
+        rt.block_on(
+            clients
+                .dispatch
+                .list_model_settings(&pb::ListModelSettingsRequest {}),
+        )
+        .unwrap()
+    };
+    let off = |settings: &pb::ListModelSettingsResponse, id: &str| {
+        settings
+            .agents
+            .iter()
+            .any(|a| a.agent == "fake" && a.models.iter().any(|m| m.id == id && !m.enabled))
+    };
+    assert!(settings().agents.iter().any(|a| {
+        a.agent == "fake" && a.models.iter().any(|m| m.id == "fake-fast" && m.enabled)
+    }));
+    env.ok(&["models", "disable", "fake-fast-high", "--agent", "fake"]);
+    assert!(
+        !models()
+            .iter()
+            .any(|m| m.agent == "fake" && m.model == "fake-fast")
+    );
+    assert!(off(&settings(), "fake-fast"));
+    let listed = env.json(&["models", "--json"]);
+    assert!(
+        listed["agents"]
+            .as_array()
+            .is_some_and(|agents| agents.iter().any(|a| {
+                a["agent"] == "fake"
+                    && a["models"].as_array().is_some_and(|ms| {
+                        ms.iter()
+                            .any(|m| m["id"] == "fake-fast" && m["enabled"] == false)
+                    })
+            })),
+        "{listed}"
+    );
+    let route = env.output(&[
+        "route",
+        "--agent",
+        "fake",
+        "--model",
+        "fake-fast",
+        "--relax",
+        "--json",
+        "hello",
+    ]);
+    assert!(!route.status.success());
+    let report: Value = serde_json::from_slice(&route.stdout).unwrap();
+    assert!(
+        report["candidates"]
+            .as_array()
+            .is_none_or(|cs| cs.is_empty()),
+        "{report}"
+    );
+    env.ok(&["models", "enable", "fake-fast", "--agent", "fake"]);
+    assert!(!off(&settings(), "fake-fast"));
+    assert!(
+        models()
+            .iter()
+            .any(|m| m.agent == "fake" && m.model == "fake-fast")
+    );
+}

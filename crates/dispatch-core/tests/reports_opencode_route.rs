@@ -205,6 +205,7 @@ async fn test_opencode_tier_without_entry_ranks_its_models_for_the_tier() {
                 disabled: vec![dispatch_core::types::DisabledModel {
                     provider: "opencode".into(),
                     model: "glm-5.3".into(),
+                    ..Default::default()
                 }],
                 tier: tier.into(),
                 filters: Filters {

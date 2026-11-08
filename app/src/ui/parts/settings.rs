@@ -34,8 +34,8 @@ pub fn settings_section(
 /// What an agent card's fold does when it is pressed.
 pub type AgentFold = Rc<dyn Fn(&mut Window, &mut App)>;
 
-/// An agent's card on Settings > Models: its bot and display name over its provider groups,
-/// with its switch at the heading's right and a view-only fold before it.
+/// An agent's card on Settings > Models: its bot and display name over its models, with its
+/// switch at the heading's right and a view-only fold before it.
 pub fn agent_section(
     agent: &str,
     name: impl Into<SharedString>,
@@ -91,10 +91,19 @@ pub fn agent_section(
         .p(px(16.0))
         .flex()
         .flex_col()
-        .gap(px(12.0))
+        .gap(px(theme.space_3))
         .child(heading)
         .when(!collapsed, |card| {
-            card.child(div().w_full().flex().flex_col().gap(px(8.0)).child(body))
+            card.child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap(px(theme.space_2))
+                    // A hairline sets the header apart from its model rows.
+                    .child(div().w_full().h(px(1.0)).bg(theme.color_border_default))
+                    .child(body),
+            )
         })
         .into_any_element()
 }

@@ -396,9 +396,16 @@ message DispatchModelSetting {
   repeated string agents = 3;
 }
 
-// A provider and its base models, for Settings > Models and `dispatch models`.
+// A provider and its base models, for the legacy Settings > Models and `dispatch models`.
 message DispatchProviderModels {
   string provider = 1;
+  bool enabled = 2;
+  repeated DispatchModelSetting models = 3;
+}
+
+// One installed agent's card in Settings > Models: every model its CLI lists, flat.
+message DispatchAgentModels {
+  string agent = 1;
   bool enabled = 2;
   repeated DispatchModelSetting models = 3;
 }
@@ -408,6 +415,7 @@ message ListModelSettingsRequest {}
 message ListModelSettingsResponse {
   repeated DispatchProviderModels providers = 1;
   repeated string problems = 2;
+  repeated DispatchAgentModels agents = 3;
 }
 
 message SetModelEnabledRequest {
@@ -415,12 +423,15 @@ message SetModelEnabledRequest {
   // Empty turns the whole provider on or off; otherwise the base model id under provider.
   string model = 2;
   bool enabled = 3;
+  // The agent whose card owns the switch; empty keeps the legacy global provider/model setting.
+  string agent = 4;
 }
 
 message SetModelEnabledResponse {
   string provider = 1;
   string model = 2;
   bool enabled = 3;
+  string agent = 4;
 }
 
 message SetAgentEnabledRequest {

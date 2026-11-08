@@ -189,6 +189,7 @@ fn filters_relax_and_policy_protection() {
     opts.disabled.push(dispatch_core::types::DisabledModel {
         provider: "a".into(),
         model: String::new(),
+        ..Default::default()
     });
     let result = router::plan(&table, &policy, &agents(), &opts, &catalog());
     assert!(result.candidates.is_empty());

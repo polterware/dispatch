@@ -15,14 +15,14 @@ use gpui::{
 use crate::avatar::agent_avatar;
 use crate::client::{
     ApplyAgentSetupRequest, ClassifyRequest, ConfigRequest, CoreClient, CoreError, DispatchAgent,
-    DispatchProviderModels, GetAgentSetupRequest, ListAgentsRequest, ListModelSettingsRequest,
+    DispatchAgentModels, GetAgentSetupRequest, ListAgentsRequest, ListModelSettingsRequest,
     ListModelsRequest, ListWorktreeFoldersRequest, PruneWorktreeFoldersRequest,
     SetAgentEnabledRequest, SetModelEnabledRequest, WorktreeFolder, at_once,
 };
 use crate::models::settings::{
-    CLASSIFIERS, CliState, InstallState, ListedModel, Policy, SAMPLE_TASK, agent_label,
-    agent_model_groups, bool_wire, classifier_trailing, classify_meta, cli_description,
-    draft_ready, env_key_sentence, filter_provider_models, fixed2, folder_agents_label, hook_note,
+    AgentModelGroup, CLASSIFIERS, CliState, InstallState, ListedModel, Policy, SAMPLE_TASK,
+    agent_label, agent_model_groups, bool_wire, classifier_trailing, classify_meta,
+    cli_description, draft_ready, env_key_sentence, fixed2, folder_agents_label, hook_note,
     hook_points_elsewhere, key_chip, key_placeholder, key_test_enabled, key_uses_replace,
     keyed_classifier, opencode_description, parse_agent_setup, parse_classify, parse_cli_model,
     parse_key_map, parse_key_status_value, parse_policy, priority_label, priority_value, prob_line,
@@ -60,15 +60,13 @@ pub struct SettingsView {
     epoch: u64,
     policy: Option<Policy>,
     policy_ticket: u64,
-    model_providers: Option<Vec<DispatchProviderModels>>,
+    model_settings: Option<Vec<DispatchAgentModels>>,
     models_ticket: u64,
     models_search: Entity<TextInput>,
-    /// Each agent's provider groups on Settings > Models, by agent and provider.
-    agent_model_groups: BTreeMap<(String, String), Entity<crate::ui::CollapsibleSection>>,
     models_inflight: bool,
     models_saving: bool,
-    agent_provider_switches: BTreeMap<(String, String), Entity<Switch>>,
-    agent_model_switches: BTreeMap<(String, String, String), Entity<Switch>>,
+    /// One switch per (agent, model): the same model switches on its own in each agent's card.
+    agent_model_switches: BTreeMap<(String, String), Entity<Switch>>,
     /// The agent cards folded on this visit; the view's own, never stored.
     collapsed_agents: BTreeMap<String, bool>,
     keys: BTreeMap<String, String>,
@@ -154,13 +152,11 @@ impl SettingsView {
             epoch: 0,
             policy: None,
             policy_ticket: 0,
-            model_providers: None,
+            model_settings: None,
             models_ticket: 0,
             models_search,
-            agent_model_groups: BTreeMap::new(),
             models_inflight: false,
             models_saving: false,
-            agent_provider_switches: BTreeMap::new(),
             agent_model_switches: BTreeMap::new(),
             collapsed_agents: BTreeMap::new(),
             worktrees: None,
@@ -215,7 +211,7 @@ impl SettingsView {
                 self.started = false;
                 self.keys_ready = false;
                 self.keys_inflight = false;
-                self.model_providers = None;
+                self.model_settings = None;
                 self.models_inflight = false;
                 self.epoch = self.epoch.wrapping_add(1);
             }
@@ -232,7 +228,7 @@ impl SettingsView {
         }
         if online
             && matches!(self.page(cx), SettingsPage::Models)
-            && (self.model_providers.is_none() || self.shown != Some(SettingsPage::Models))
+            && (self.model_settings.is_none() || self.shown != Some(SettingsPage::Models))
         {
             self.load_model_settings(cx);
         }
@@ -582,9 +578,9 @@ impl SettingsView {
         .detach();
     }
 
-    /// Makes each installed agent's provider and model switches, one set per card so the
-    /// same model under two agents shows the same stored state. An agent turned off shows
-    /// them off and inert; its stored states stay as they are.
+    /// Makes each installed agent's model switches, one set per card so the same model
+    /// under two agents has a switch of its own. An agent turned off shows them off and
+    /// inert; its stored states stay as they are.
     fn sync_model_switches(&mut self, cx: &mut Context<Self>) {
         let view = cx.entity().downgrade();
         let agents: Vec<DispatchAgent> = self
@@ -593,96 +589,27 @@ impl SettingsView {
             .filter(|agent| agent.installed && !agent.name.is_empty())
             .cloned()
             .collect();
-        let providers = self.model_providers.clone().unwrap_or_default();
+        let settings = self.model_settings.clone().unwrap_or_default();
         for agent in &agents {
-            for provider in &providers {
-                let models: Vec<_> = provider
-                    .models
-                    .iter()
-                    .filter(|model| {
-                        model
-                            .agents
-                            .iter()
-                            .any(|name| name.eq_ignore_ascii_case(&agent.name))
-                    })
-                    .cloned()
-                    .collect();
-                if models.is_empty() {
-                    continue;
-                }
-                let key = (agent.name.clone(), provider.provider.clone());
-                let shown_provider = agent.enabled && provider.enabled;
+            let Some(entry) = settings
+                .iter()
+                .find(|entry| entry.agent.eq_ignore_ascii_case(&agent.name))
+            else {
+                continue;
+            };
+            for model in &entry.models {
+                let key = (agent.name.clone(), model.id.clone());
+                let shown_model = agent.enabled && model.enabled;
                 let toggle = self
-                    .agent_provider_switches
+                    .agent_model_switches
                     .entry(key.clone())
                     .or_insert_with(|| {
-                        let (agent_name, provider_name) = key.clone();
-                        switch(shown_provider, view.clone(), cx, move |this, on, cx| {
-                            this.set_agent_model_enabled(&agent_name, &provider_name, "", on, cx);
+                        let (agent_name, model_id) = key.clone();
+                        switch(shown_model, view.clone(), cx, move |this, on, cx| {
+                            this.set_agent_model_enabled(&agent_name, &model_id, on, cx);
                         })
                     });
-                toggle.update(cx, |toggle, _| toggle.set_on(shown_provider));
-                for model in &models {
-                    let key = (
-                        agent.name.clone(),
-                        provider.provider.clone(),
-                        model.id.clone(),
-                    );
-                    let shown_model = agent.enabled && model.enabled;
-                    let toggle =
-                        self.agent_model_switches
-                            .entry(key.clone())
-                            .or_insert_with(|| {
-                                let (agent_name, provider_name, model_id) = key.clone();
-                                switch(shown_model, view.clone(), cx, move |this, on, cx| {
-                                    this.set_agent_model_enabled(
-                                        &agent_name,
-                                        &provider_name,
-                                        &model_id,
-                                        on,
-                                        cx,
-                                    );
-                                })
-                            });
-                    toggle.update(cx, |toggle, _| toggle.set_on(shown_model));
-                }
-                self.agent_model_groups
-                    .entry(key.clone())
-                    .or_insert_with(|| {
-                        let body_view = view.clone();
-                        let actions_view = view.clone();
-                        let (agent_name, provider_name) = key.clone();
-                        let switch_agent = agent_name.clone();
-                        let switch_provider = provider_name.clone();
-                        cx.new(|cx| {
-                            cx.observe(&self.models_search, |_, _, cx| cx.notify())
-                                .detach();
-                            let mut group =
-                                crate::ui::CollapsibleSection::new(provider_name.clone(), cx);
-                            group.set_actions(Some(Rc::new(move |_, app| {
-                                actions_view
-                                    .upgrade()
-                                    .map(|view| {
-                                        view.read(app)
-                                            .provider_switch_slot(&switch_agent, &switch_provider)
-                                    })
-                                    .unwrap_or_else(|| div().into_any_element())
-                            })));
-                            group.set_body(Rc::new(move |_, app| {
-                                body_view
-                                    .upgrade()
-                                    .map(|view| {
-                                        view.read(app).provider_rows(
-                                            &agent_name,
-                                            &provider_name,
-                                            app,
-                                        )
-                                    })
-                                    .unwrap_or_else(|| div().into_any_element())
-                            }));
-                            group
-                        })
-                    });
+                toggle.update(cx, |toggle, _| toggle.set_on(shown_model));
             }
         }
     }
@@ -713,9 +640,9 @@ impl SettingsView {
                     return;
                 }
                 match result {
-                    Ok(response) => view.model_providers = Some(response.providers),
+                    Ok(response) => view.model_settings = Some(response.agents),
                     Err(err) => {
-                        view.model_providers = Some(Vec::new());
+                        view.model_settings = Some(Vec::new());
                         view.toast(
                             core_message(&err, "Could not read models."),
                             ToastTone::Danger,
@@ -730,14 +657,21 @@ impl SettingsView {
         .detach();
     }
 
-    fn set_model_enabled(
+    /// A model switch inside an agent's card: it changes that agent's model alone, and its
+    /// agent turned off leaves the stored state alone and the switch inert.
+    fn set_agent_model_enabled(
         &mut self,
-        provider: &str,
+        agent: &str,
         model: &str,
         enabled: bool,
         cx: &mut Context<Self>,
     ) {
-        if self.models_saving {
+        let agent_on = self
+            .agent_rows
+            .iter()
+            .find(|row| row.name == agent)
+            .is_some_and(|row| row.enabled);
+        if !agent_on || self.models_saving {
             self.sync_model_switches(cx);
             return;
         }
@@ -745,26 +679,23 @@ impl SettingsView {
             self.sync_model_switches(cx);
             return;
         };
-        let previous = self.model_providers.clone();
-        if let Some(providers) = self.model_providers.as_mut() {
-            for group in providers
-                .iter_mut()
-                .filter(|group| group.provider == provider)
-            {
-                if model.is_empty() {
-                    group.enabled = enabled;
-                } else if let Some(row) = group.models.iter_mut().find(|row| row.id == model) {
-                    row.enabled = enabled;
-                }
-            }
+        let previous = self.model_settings.clone();
+        if let Some(entry) = self
+            .model_settings
+            .as_mut()
+            .and_then(|settings| settings.iter_mut().find(|entry| entry.agent == agent))
+            && let Some(row) = entry.models.iter_mut().find(|row| row.id == model)
+        {
+            row.enabled = enabled;
         }
         self.models_saving = true;
         self.models_ticket = self.models_ticket.wrapping_add(1);
         self.models_inflight = false;
         let request = SetModelEnabledRequest {
-            provider: provider.to_string(),
+            provider: String::new(),
             model: model.to_string(),
             enabled,
+            agent: agent.to_string(),
         };
         self.sync_model_switches(cx);
         cx.spawn(async move |this, cx| {
@@ -774,7 +705,7 @@ impl SettingsView {
             let _ = this.update(cx, |view, cx| {
                 view.models_saving = false;
                 if let Err(err) = result {
-                    view.model_providers = previous;
+                    view.model_settings = previous;
                     view.toast(
                         core_message(&err, "Could not save model settings."),
                         ToastTone::Danger,
@@ -795,90 +726,30 @@ impl SettingsView {
         .detach();
     }
 
-    /// A model or provider switch inside an agent's card: its agent turned off leaves the
-    /// stored state alone and the switch reads off.
-    fn set_agent_model_enabled(
-        &mut self,
-        agent: &str,
-        provider: &str,
-        model: &str,
-        enabled: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let agent_on = self
-            .agent_rows
-            .iter()
-            .find(|row| row.name == agent)
-            .is_some_and(|row| row.enabled);
-        if !agent_on {
-            self.sync_model_switches(cx);
-            return;
-        }
-        self.set_model_enabled(provider, model, enabled, cx);
-    }
-
-    /// One agent's provider group, with only the models that agent lists.
-    fn provider_rows(&self, agent: &str, provider: &str, cx: &App) -> gpui::AnyElement {
-        let providers = filter_provider_models(
-            self.model_providers.as_deref().unwrap_or_default(),
-            self.models_search.read(cx).text(),
-        );
-        let agent_on = self
-            .agent_rows
-            .iter()
-            .find(|row| row.name == agent)
-            .is_some_and(|row| row.enabled);
+    /// One agent's models, flat, each with a switch of its own.
+    fn model_rows(&self, group: &AgentModelGroup, cx: &App) -> gpui::AnyElement {
         let mut rows = div().flex().flex_col();
-        if let Some(group) = providers.iter().find(|group| group.provider == provider) {
-            for model in group.models.iter().filter(|model| {
-                model
-                    .agents
-                    .iter()
-                    .any(|name| name.eq_ignore_ascii_case(agent))
-            }) {
-                if let Some(toggle) = self.agent_model_switches.get(&(
-                    agent.to_string(),
-                    provider.to_string(),
+        for model in &group.models {
+            if let Some(toggle) = self
+                .agent_model_switches
+                .get(&(group.agent.clone(), model.id.clone()))
+            {
+                let selector = format!("settings-model-{}-{}", group.agent, model.id);
+                rows = rows.child(settings_row(
                     model.id.clone(),
-                )) {
-                    let selector = format!("settings-model-{agent}-{provider}-{}", model.id);
-                    rows = rows.child(settings_row(
-                        model.id.clone(),
-                        None,
-                        model_switch(selector, toggle.clone(), agent_on),
-                        cx,
-                    ));
-                }
+                    None,
+                    model_switch(selector, toggle.clone(), group.enabled),
+                    cx,
+                ));
             }
         }
         rows.into_any_element()
     }
 
-    /// A provider group's switch, off and inert while its agent is off.
-    fn provider_switch_slot(&self, agent: &str, provider: &str) -> gpui::AnyElement {
-        let Some(toggle) = self
-            .agent_provider_switches
-            .get(&(agent.to_string(), provider.to_string()))
-            .cloned()
-        else {
-            return div().into_any_element();
-        };
-        let agent_on = self
-            .agent_rows
-            .iter()
-            .find(|row| row.name == agent)
-            .is_some_and(|row| row.enabled);
-        model_switch(
-            format!("settings-provider-{agent}-{provider}"),
-            toggle,
-            agent_on,
-        )
-    }
-
     fn models_page(&self, theme: Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
         let groups = agent_model_groups(
             &self.agent_rows,
-            self.model_providers.as_deref().unwrap_or_default(),
+            self.model_settings.as_deref().unwrap_or_default(),
             self.models_search.read(cx).text(),
         );
         let mut body = div()
@@ -886,14 +757,10 @@ impl SettingsView {
             .flex_col()
             .gap(px(theme.space_3))
             .child(self.models_search.clone());
-        if self.model_providers.is_none() {
+        if self.model_settings.is_none() {
             body = body.child(settings_skeleton(4));
         } else {
-            // The same provider or model is one setting for every agent that offers it.
-            body = body.child(note(
-                "A provider or model turned off is off for every agent that offers it.",
-                theme,
-            ));
+            body = body.child(note("Switches apply to that agent only.", theme));
         }
         let mut column = div()
             .w_full()
@@ -904,29 +771,22 @@ impl SettingsView {
                 Icon::Cpu,
                 TileTone::Architecture,
                 "Models",
-                "Choose the agents, providers, and models Dispatch shows and runs.",
+                "Choose the agents and models Dispatch shows and runs.",
                 None,
                 body,
                 cx,
             ));
-        if self.model_providers.is_some() && groups.is_empty() {
+        if self.model_settings.is_some() && groups.is_empty() {
             column = column.child(note("No agents to show.", theme));
         }
         for group in groups {
-            let mut providers = div().flex().flex_col().gap(px(theme.space_2));
-            if group.providers.is_empty() {
-                providers = providers.child(note("No models listed by this agent.", theme));
+            let mut models = div().flex().flex_col().gap(px(theme.space_2));
+            if group.models.is_empty() {
+                models = models.child(note("No models listed by this agent.", theme));
             }
-            for provider in &group.providers {
-                if let Some(section) = self
-                    .agent_model_groups
-                    .get(&(group.agent.clone(), provider.provider.clone()))
-                {
-                    providers = providers.child(section.clone());
-                }
-            }
+            models = models.child(self.model_rows(&group, cx));
             if !group.enabled {
-                providers = providers.opacity(0.45);
+                models = models.opacity(0.45);
             }
             let switch = self
                 .agent_switches
@@ -959,7 +819,7 @@ impl SettingsView {
                 switch.unwrap_or_else(|| div().into_any_element()),
                 collapsed,
                 on_fold,
-                providers,
+                models,
                 cx,
             ));
         }

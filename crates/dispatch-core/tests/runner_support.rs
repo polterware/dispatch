@@ -291,18 +291,54 @@ impl Store for FakeStore {
         if enabled {
             if model.is_empty() {
                 g.disabled_models.retain(|d| {
-                    !(d.provider.eq_ignore_ascii_case(&provider) && d.model.is_empty())
+                    !(d.agent.is_empty()
+                        && d.provider.eq_ignore_ascii_case(&provider)
+                        && d.model.is_empty())
                 });
             } else {
                 g.disabled_models.retain(|d| {
-                    !(d.model.eq_ignore_ascii_case(&model)
+                    !(d.agent.is_empty()
+                        && d.model.eq_ignore_ascii_case(&model)
                         && (d.provider.is_empty() || d.provider.eq_ignore_ascii_case(&provider)))
                 });
             }
         } else if !g.disabled_models.iter().any(|d| {
-            d.provider.eq_ignore_ascii_case(&provider) && d.model.eq_ignore_ascii_case(&model)
+            d.agent.is_empty()
+                && d.provider.eq_ignore_ascii_case(&provider)
+                && d.model.eq_ignore_ascii_case(&model)
         }) {
-            g.disabled_models.push(DisabledModel { provider, model });
+            g.disabled_models.push(DisabledModel {
+                provider,
+                model,
+                agent: String::new(),
+            });
+        }
+        Ok(())
+    }
+
+    fn set_agent_model_enabled(
+        &self,
+        agent: &str,
+        model: &str,
+        enabled: bool,
+    ) -> Result<(), Error> {
+        let agent = agent.trim().to_ascii_lowercase();
+        let model = dispatch_core::config::agent_model_key(model);
+        let mut g = self.lock();
+        if enabled {
+            g.disabled_models.retain(|d| {
+                !(d.agent.eq_ignore_ascii_case(&agent) && d.model.eq_ignore_ascii_case(&model))
+            });
+        } else if !g
+            .disabled_models
+            .iter()
+            .any(|d| d.agent.eq_ignore_ascii_case(&agent) && d.model.eq_ignore_ascii_case(&model))
+        {
+            g.disabled_models.push(DisabledModel {
+                provider: String::new(),
+                model,
+                agent,
+            });
         }
         Ok(())
     }

@@ -1078,6 +1078,7 @@ impl types::Store for Store {
 
     fn list_disabled_models(&self) -> Result<Vec<DisabledModel>, Error> {
         let conn = self.conn();
+        let mut out = Vec::new();
         let mut stmt = conn
             .prepare(
                 "SELECT provider, model FROM dispatch_disabled_models ORDER BY provider ASC, model ASC",
@@ -1088,10 +1089,27 @@ impl types::Store for Store {
                 Ok(DisabledModel {
                     provider: r.get(0)?,
                     model: r.get(1)?,
+                    agent: String::new(),
                 })
             })
             .map_err(db)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(db)
+        out.extend(rows.collect::<Result<Vec<_>, _>>().map_err(db)?);
+        let mut stmt = conn
+            .prepare(
+                "SELECT agent, model FROM dispatch_disabled_agent_models ORDER BY agent ASC, model ASC",
+            )
+            .map_err(db)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(DisabledModel {
+                    provider: String::new(),
+                    model: r.get(1)?,
+                    agent: r.get(0)?,
+                })
+            })
+            .map_err(db)?;
+        out.extend(rows.collect::<Result<Vec<_>, _>>().map_err(db)?);
+        Ok(out)
     }
 
     fn list_disabled_agents(&self) -> Result<Vec<String>, Error> {
@@ -1164,6 +1182,37 @@ impl types::Store for Store {
             conn.execute(
                 "INSERT OR IGNORE INTO dispatch_disabled_models (provider, model) VALUES (?1, ?2)",
                 params![provider, model],
+            )
+            .map_err(db)?;
+        }
+        Ok(())
+    }
+
+    fn set_agent_model_enabled(
+        &self,
+        agent: &str,
+        model: &str,
+        enabled: bool,
+    ) -> Result<(), Error> {
+        let agent = agent.trim().to_ascii_lowercase();
+        let model = crate::config::agent_model_key(model);
+        if agent.is_empty() {
+            return Err(Error::Message("agent is required".into()));
+        }
+        if model.is_empty() {
+            return Err(Error::Message("model is required".into()));
+        }
+        let conn = self.conn();
+        if enabled {
+            conn.execute(
+                "DELETE FROM dispatch_disabled_agent_models WHERE lower(agent) = lower(?1) AND lower(model) = lower(?2)",
+                params![agent, model],
+            )
+            .map_err(db)?;
+        } else {
+            conn.execute(
+                "INSERT OR IGNORE INTO dispatch_disabled_agent_models (agent, model) VALUES (?1, ?2)",
+                params![agent, model],
             )
             .map_err(db)?;
         }

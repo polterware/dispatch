@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
 
-use crate::client::{DispatchAgent, DispatchModelSetting, DispatchProviderModels};
+use crate::client::{DispatchAgent, DispatchAgentModels, DispatchModelSetting};
 
 pub const SAMPLE_TASK: &str = "Add pagination to the runs list API and its table, with tests";
 
@@ -154,58 +154,24 @@ impl Policy {
     }
 }
 
-/// Filters provider groups and their models by a case-insensitive search query over provider
-/// and model names.
-pub fn filter_provider_models(
-    providers: &[DispatchProviderModels],
-    query: &str,
-) -> Vec<DispatchProviderModels> {
-    let q = query.trim().to_lowercase();
-    if q.is_empty() {
-        return providers.to_vec();
-    }
-    providers
-        .iter()
-        .filter_map(|group| {
-            let provider_match = group.provider.to_lowercase().contains(&q);
-            let models: Vec<_> = group
-                .models
-                .iter()
-                .filter(|model| provider_match || model.id.to_lowercase().contains(&q))
-                .cloned()
-                .collect();
-            if provider_match || !models.is_empty() {
-                Some(DispatchProviderModels {
-                    provider: group.provider.clone(),
-                    enabled: group.enabled,
-                    models,
-                })
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
-/// One installed agent's card on Settings > Models: the providers and base models its CLI
-/// lists, as the page groups them.
+/// One installed agent's card on Settings > Models: every model its CLI lists, flat.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentModelGroup {
     pub agent: String,
     pub name: String,
     pub enabled: bool,
-    pub providers: Vec<DispatchProviderModels>,
+    pub models: Vec<DispatchModelSetting>,
 }
 
-/// Groups every installed agent's models by provider for Settings > Models.
+/// Groups every installed agent's models for Settings > Models, one flat list per agent,
+/// sorted by model name.
 ///
-/// The agents keep the order `ListAgents` gives. An agent turned off reads its providers and
-/// models off, without changing the state each of them keeps: turning it back on restores
-/// them as they were stored. With a query, a card whose agent, providers, and models hold
-/// nothing is left out.
+/// The agents keep the order `ListAgents` gives. An agent turned off reads its models off,
+/// without changing the state each of them keeps: turning it back on restores them as they
+/// were stored. With a query, a card whose agent and models hold nothing is left out.
 pub fn agent_model_groups(
     agents: &[DispatchAgent],
-    providers: &[DispatchProviderModels],
+    settings: &[DispatchAgentModels],
     query: &str,
 ) -> Vec<AgentModelGroup> {
     let q = query.trim().to_lowercase();
@@ -213,59 +179,39 @@ pub fn agent_model_groups(
         .iter()
         .filter(|agent| agent.installed && !agent.name.is_empty())
         .filter_map(|agent| {
-            let own: Vec<DispatchProviderModels> = providers
+            let mut models = settings
                 .iter()
-                .filter_map(|group| {
-                    let models: Vec<DispatchModelSetting> = group
-                        .models
-                        .iter()
-                        .filter(|model| {
-                            model
-                                .agents
-                                .iter()
-                                .any(|name| name.eq_ignore_ascii_case(&agent.name))
-                        })
-                        .cloned()
-                        .collect();
-                    (!models.is_empty()).then(|| DispatchProviderModels {
-                        provider: group.provider.clone(),
-                        enabled: group.enabled,
-                        models,
-                    })
-                })
-                .collect();
+                .find(|entry| entry.agent.eq_ignore_ascii_case(&agent.name))
+                .map(|entry| entry.models.clone())
+                .unwrap_or_default();
+            models.sort_by(|a, b| {
+                a.id.to_lowercase()
+                    .cmp(&b.id.to_lowercase())
+                    .then_with(|| a.id.cmp(&b.id))
+            });
             let agent_matches = q.is_empty()
                 || agent.name.to_lowercase().contains(&q)
                 || agent_label(&agent.name).to_lowercase().contains(&q)
                 || crate::format::agent_display_name(&agent.name)
                     .to_lowercase()
                     .contains(&q);
-            let groups = if agent_matches {
-                own
-            } else {
-                filter_provider_models(&own, &q)
-            };
-            if !agent_matches && groups.is_empty() {
+            if !agent_matches {
+                models.retain(|model| model.id.to_lowercase().contains(&q));
+            }
+            if !agent_matches && models.is_empty() {
                 return None;
             }
             let enabled = agent.enabled;
-            let providers = groups
-                .into_iter()
-                .map(|mut group| {
-                    if !enabled {
-                        group.enabled = false;
-                        for model in &mut group.models {
-                            model.enabled = false;
-                        }
-                    }
-                    group
-                })
-                .collect();
+            if !enabled {
+                for model in &mut models {
+                    model.enabled = false;
+                }
+            }
             Some(AgentModelGroup {
                 agent: agent.name.clone(),
                 name: crate::format::agent_display_name(&agent.name),
                 enabled,
-                providers,
+                models,
             })
         })
         .collect()
@@ -870,12 +816,12 @@ fn number_or(value: Option<&Value>, default: f64) -> f64 {
 mod tests {
     use super::{
         AgentSetup, CliModel, CliState, HookSetup, InstallState, ListedModel, OpenCodeSetup,
-        agent_model_groups, classifier_trailing, filter_provider_models, fixed2,
-        folder_agents_label, hook_note, hook_points_elsewhere, key_chip, model_agent,
-        parse_agent_setup, parse_classify, parse_key_status_value, parse_policy, parse_role_answer,
-        role_answer_line, skill_readers, skills_need_install,
+        agent_model_groups, classifier_trailing, fixed2, folder_agents_label, hook_note,
+        hook_points_elsewhere, key_chip, model_agent, parse_agent_setup, parse_classify,
+        parse_key_status_value, parse_policy, parse_role_answer, role_answer_line, skill_readers,
+        skills_need_install,
     };
-    use crate::client::{DispatchAgent, DispatchModelSetting, DispatchProviderModels};
+    use crate::client::{DispatchAgent, DispatchAgentModels, DispatchModelSetting};
     use serde_json::json;
 
     #[test]
@@ -1110,144 +1056,94 @@ mod tests {
         }
     }
 
-    fn model(id: &str, enabled: bool, agents: &[&str]) -> DispatchModelSetting {
+    fn model(id: &str, enabled: bool) -> DispatchModelSetting {
         DispatchModelSetting {
             id: id.into(),
             enabled,
-            agents: agents.iter().map(|name| (*name).to_string()).collect(),
+            agents: Vec::new(),
         }
     }
 
-    fn provider(
-        name: &str,
+    fn settings(
+        agent: &str,
         enabled: bool,
         models: Vec<DispatchModelSetting>,
-    ) -> DispatchProviderModels {
-        DispatchProviderModels {
-            provider: name.into(),
+    ) -> DispatchAgentModels {
+        DispatchAgentModels {
+            agent: agent.into(),
             enabled,
             models,
         }
     }
 
     #[test]
-    fn an_agents_card_groups_its_models_by_provider() {
+    fn an_agents_card_lists_its_models_flat_and_sorted() {
         let agents = [agent("fake", true, true), agent("claude", false, true)];
-        let providers = vec![
-            provider(
+        let settings = vec![
+            settings(
                 "fake",
                 true,
-                vec![
-                    model("fake-fast", true, &["fake"]),
-                    model("fake-deep", false, &["fake"]),
-                ],
+                vec![model("fake-slow", true), model("fake-fast", false)],
             ),
-            provider(
-                "anthropic",
-                true,
-                vec![model("claude-opus", true, &["claude"])],
-            ),
+            settings("claude", true, vec![model("claude-opus", true)]),
         ];
-        let groups = agent_model_groups(&agents, &providers, "");
+        let groups = agent_model_groups(&agents, &settings, "");
         assert_eq!(groups.len(), 1, "an agent not installed has no card");
         assert_eq!(groups[0].agent, "fake");
         assert_eq!(groups[0].name, "fake");
         assert!(groups[0].enabled);
-        let providers = &groups[0].providers;
-        assert_eq!(providers.len(), 1);
-        assert_eq!(providers[0].provider, "fake");
         assert_eq!(
-            providers[0]
+            groups[0]
                 .models
                 .iter()
                 .map(|model| (model.id.as_str(), model.enabled))
                 .collect::<Vec<_>>(),
-            vec![("fake-fast", true), ("fake-deep", false)]
+            vec![("fake-fast", false), ("fake-slow", true)]
         );
     }
 
     #[test]
     fn an_agent_turned_off_reads_its_rows_off_and_keeps_their_stored_state() {
         let agents = [agent("fake", true, false)];
-        let providers = vec![provider(
-            "fake",
-            true,
-            vec![model("fake-fast", true, &["fake"])],
-        )];
-        let groups = agent_model_groups(&agents, &providers, "");
+        let settings = vec![settings("fake", true, vec![model("fake-fast", true)])];
+        let groups = agent_model_groups(&agents, &settings, "");
         assert!(!groups[0].enabled);
-        assert!(!groups[0].providers[0].enabled);
-        assert!(!groups[0].providers[0].models[0].enabled);
-        assert!(providers[0].enabled, "the provider keeps its stored state");
+        assert!(!groups[0].models[0].enabled);
         assert!(
-            providers[0].models[0].enabled,
+            settings[0].models[0].enabled,
             "the model keeps its stored state"
         );
     }
 
     #[test]
-    fn a_search_leaves_out_the_cards_that_hold_nothing() {
-        let agents = [agent("fake", true, true), agent("claude", true, true)];
-        let providers = vec![
-            provider("fake", true, vec![model("fake-fast", true, &["fake"])]),
-            provider(
-                "anthropic",
-                true,
-                vec![model("claude-opus", true, &["claude"])],
-            ),
+    fn the_same_model_keeps_a_switch_of_its_own_in_each_agents_card() {
+        let agents = [agent("a", true, true), agent("b", true, true)];
+        let settings = vec![
+            settings("a", true, vec![model("shared", true)]),
+            settings("b", true, vec![model("shared", false)]),
         ];
-        let by_model = agent_model_groups(&agents, &providers, "opus");
-        assert_eq!(by_model.len(), 1);
-        assert_eq!(by_model[0].agent, "claude");
-        assert_eq!(by_model[0].providers.len(), 1);
-        assert_eq!(by_model[0].providers[0].models.len(), 1);
-
-        let by_agent = agent_model_groups(&agents, &providers, "fake");
-        assert_eq!(by_agent.len(), 1);
-        assert_eq!(by_agent[0].agent, "fake");
-        assert_eq!(by_agent[0].providers[0].models.len(), 1);
-
-        assert!(agent_model_groups(&agents, &providers, "nothing").is_empty());
+        let groups = agent_model_groups(&agents, &settings, "");
+        assert!(groups[0].models[0].enabled);
+        assert!(!groups[1].models[0].enabled);
     }
 
     #[test]
-    fn filter_provider_models_matches_provider_and_model_names() {
-        let providers = vec![
-            DispatchProviderModels {
-                provider: "anthropic".into(),
-                enabled: true,
-                models: vec![
-                    DispatchModelSetting {
-                        id: "claude-opus-4-6".into(),
-                        enabled: true,
-                        agents: vec!["claude".into()],
-                    },
-                    DispatchModelSetting {
-                        id: "claude-sonnet-4-6".into(),
-                        enabled: false,
-                        agents: vec!["claude".into()],
-                    },
-                ],
-            },
-            DispatchProviderModels {
-                provider: "openai".into(),
-                enabled: false,
-                models: vec![DispatchModelSetting {
-                    id: "gpt-5.4".into(),
-                    enabled: true,
-                    agents: vec!["codex".into()],
-                }],
-            },
+    fn a_search_leaves_out_the_cards_that_hold_nothing() {
+        let agents = [agent("fake", true, true), agent("claude", true, true)];
+        let settings = vec![
+            settings("fake", true, vec![model("fake-fast", true)]),
+            settings("claude", true, vec![model("claude-opus", true)]),
         ];
-        let by_provider = filter_provider_models(&providers, "anthropic");
-        assert_eq!(by_provider.len(), 1);
-        assert_eq!(by_provider[0].provider, "anthropic");
-        assert_eq!(by_provider[0].models.len(), 2);
-
-        let by_model = filter_provider_models(&providers, "sonnet");
+        let by_model = agent_model_groups(&agents, &settings, "opus");
         assert_eq!(by_model.len(), 1);
-        assert_eq!(by_model[0].provider, "anthropic");
+        assert_eq!(by_model[0].agent, "claude");
         assert_eq!(by_model[0].models.len(), 1);
-        assert_eq!(by_model[0].models[0].id, "claude-sonnet-4-6");
+
+        let by_agent = agent_model_groups(&agents, &settings, "fake");
+        assert_eq!(by_agent.len(), 1);
+        assert_eq!(by_agent[0].agent, "fake");
+        assert_eq!(by_agent[0].models.len(), 1);
+
+        assert!(agent_model_groups(&agents, &settings, "nothing").is_empty());
     }
 }

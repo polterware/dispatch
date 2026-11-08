@@ -206,12 +206,31 @@ pub fn normalize_model_key(provider: &str, agent: &str, model: &str) -> (String,
     (p, m)
 }
 
+/// The key Settings > Models stores for one agent's model switch: the model id the agent's
+/// CLI lists, without its effort suffix (`openai/gpt-5-high` becomes `openai/gpt-5`, and
+/// Antigravity's `gemini-4-argon-low` becomes `gemini-4-argon`).
+pub fn agent_model_key(model: &str) -> String {
+    crate::catalog::base_model(model.trim()).to_owned()
+}
+
+/// Whether this setting applies to `agent`: an empty `agent` is the legacy setting for every
+/// agent, and one with an agent applies to that agent alone.
+pub fn applies_to_agent(d: &DisabledModel, agent: &str) -> bool {
+    d.agent.is_empty() || d.agent.eq_ignore_ascii_case(agent.trim())
+}
+
+fn is_agent_model_disabled(d: &DisabledModel, agent: &str, model: &str) -> bool {
+    !d.agent.is_empty()
+        && applies_to_agent(d, agent)
+        && d.model.eq_ignore_ascii_case(&agent_model_key(model))
+}
+
 pub fn is_provider_disabled(disabled: &[DisabledModel], provider: &str) -> bool {
     let p = provider.trim();
     !p.is_empty()
         && disabled
             .iter()
-            .any(|d| d.model.is_empty() && d.provider.eq_ignore_ascii_case(p))
+            .any(|d| d.agent.is_empty() && d.model.is_empty() && d.provider.eq_ignore_ascii_case(p))
 }
 
 pub fn is_model_disabled(
@@ -252,10 +271,24 @@ pub fn disabled_reason(
     }
     if !m.is_empty()
         && disabled.iter().any(|d| {
-            d.model.eq_ignore_ascii_case(&m)
-                && (d.provider.is_empty() || d.provider.eq_ignore_ascii_case(&p))
+            if !d.agent.is_empty() {
+                is_agent_model_disabled(d, agent, model)
+            } else {
+                d.model.eq_ignore_ascii_case(&m)
+                    && (d.provider.is_empty() || d.provider.eq_ignore_ascii_case(&p))
+            }
         })
     {
+        if let Some(d) = disabled
+            .iter()
+            .find(|d| !d.agent.is_empty() && is_agent_model_disabled(d, agent, model))
+        {
+            return format!(
+                "model {} is disabled for agent {}",
+                d.model,
+                d.agent.trim().to_ascii_lowercase()
+            );
+        }
         if p.is_empty() {
             return format!("model {m} is disabled");
         }
@@ -282,12 +315,23 @@ pub fn disabled_request_reason(
         );
     }
     if !model.trim().is_empty() {
+        if let Some(d) = disabled
+            .iter()
+            .find(|d| is_agent_model_disabled(d, agent, model))
+        {
+            return format!(
+                "model {} is disabled for agent {}",
+                d.model,
+                d.agent.trim().to_ascii_lowercase()
+            );
+        }
         let (p, m) = normalize_model_key(provider, agent, model);
         if !p.is_empty() && is_provider_disabled(disabled, &p) {
             return format!("provider {p} is disabled");
         }
         if let Some(d) = disabled.iter().find(|d| {
-            !d.model.is_empty()
+            d.agent.is_empty()
+                && !d.model.is_empty()
                 && d.model.eq_ignore_ascii_case(&m)
                 && (p.is_empty() || d.provider.is_empty() || d.provider.eq_ignore_ascii_case(&p))
         }) {

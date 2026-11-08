@@ -197,7 +197,7 @@ fn conversation_migration_from_0005() {
     assert_eq!(old.session_id, "worker-session");
     assert_eq!(old.conversation_id, "");
     assert_eq!(old.caller_agent, "");
-    assert_eq!(count(&s, "PRAGMA user_version"), 12);
+    assert_eq!(count(&s, "PRAGMA user_version"), 13);
     assert_eq!(
         count(
             &s,
@@ -237,7 +237,7 @@ fn tier_speed_strength_migration_keeps_rows() {
         .unwrap();
     }
     let s = Store::new(path.to_str().unwrap()).unwrap();
-    assert_eq!(count(&s, "PRAGMA user_version"), 12);
+    assert_eq!(count(&s, "PRAGMA user_version"), 13);
     assert_eq!(
         count(
             &s,
@@ -612,6 +612,41 @@ fn disabled_models_persist_and_provider_switch_keeps_model_choices() {
     assert_eq!(store.list_disabled_models().unwrap(), disabled);
     store
         .set_model_enabled("anthropic", "claude-opus-5-5", true)
+        .unwrap();
+    assert!(store.list_disabled_models().unwrap().is_empty());
+}
+
+#[test]
+fn an_agents_disabled_model_stays_off_for_that_agent_alone() {
+    use dispatch_core::config::is_model_disabled;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("dispatch.db");
+    let path = db.to_str().unwrap();
+    let store = Store::new(path).unwrap();
+    store
+        .set_agent_model_enabled("fake", "fake-fast-high", false)
+        .unwrap();
+    let disabled = store.list_disabled_models().unwrap();
+    assert_eq!(disabled.len(), 1);
+    assert_eq!(disabled[0].agent, "fake");
+    assert_eq!(disabled[0].model, "fake-fast");
+    assert!(is_model_disabled(
+        &disabled,
+        "fake",
+        "fake",
+        "fake-fast-low"
+    ));
+    assert!(!is_model_disabled(
+        &disabled,
+        "fake",
+        "other",
+        "fake-fast-low"
+    ));
+    drop(store);
+    let store = Store::new(path).unwrap();
+    assert_eq!(store.list_disabled_models().unwrap(), disabled);
+    store
+        .set_agent_model_enabled("fake", "fake-fast", true)
         .unwrap();
     assert!(store.list_disabled_models().unwrap().is_empty());
 }

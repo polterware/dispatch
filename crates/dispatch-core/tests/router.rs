@@ -314,6 +314,7 @@ fn disabled_provider_hides_claude_in_other_clis() {
             disabled: vec![dispatch_core::types::DisabledModel {
                 provider: "anthropic".into(),
                 model: String::new(),
+                ..Default::default()
             }],
             tier: "auto".into(),
             difficulty: Some(0.0),
@@ -447,6 +448,7 @@ fn disabled_base_model_is_never_routed_on_any_agent_or_effort() {
     let disabled = vec![dispatch_core::types::DisabledModel {
         provider: "anthropic".into(),
         model: "claude-opus-5-5".into(),
+        ..Default::default()
     }];
     let agents = ["claude", "antigravity"]
         .into_iter()
@@ -483,4 +485,65 @@ fn disabled_base_model_is_never_routed_on_any_agent_or_effort() {
         );
         assert!(notes.iter().any(|n| n.contains("disabled")), "{notes:?}");
     }
+}
+
+#[test]
+fn one_agents_disabled_model_still_routes_through_another_agent() {
+    let agents = ["claude", "antigravity"]
+        .into_iter()
+        .map(|name| dispatch_core::router::Agent {
+            name: name.into(),
+            installed: true,
+            file_editing: true,
+            read_only: true,
+            discovered: vec!["claude-opus-5-5-high".into()],
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+    let route = |disabled: Vec<dispatch_core::types::DisabledModel>| {
+        let (candidates, notes) = dispatch_core::router::select_candidates(
+            &Table::default(),
+            &Policy {
+                discover: true,
+                ..Default::default()
+            },
+            &agents,
+            &RouteOptions {
+                tier: "auto".into(),
+                difficulty: Some(-1.8),
+                disabled,
+                ..Default::default()
+            },
+        );
+        (candidates, notes)
+    };
+    let (candidates, notes) = route(vec![dispatch_core::types::DisabledModel {
+        agent: "claude".into(),
+        model: "claude-opus-5-5".into(),
+        ..Default::default()
+    }]);
+    assert!(
+        candidates
+            .iter()
+            .all(|c| c.agent == "antigravity" && c.model == "claude-opus-5-5-high"),
+        "{candidates:?} {notes:?}"
+    );
+    assert!(
+        notes.iter().any(|n| n.contains("for agent claude")),
+        "{notes:?}"
+    );
+
+    let (candidates, notes) = route(vec![
+        dispatch_core::types::DisabledModel {
+            agent: "claude".into(),
+            model: "claude-opus-5-5".into(),
+            ..Default::default()
+        },
+        dispatch_core::types::DisabledModel {
+            agent: "antigravity".into(),
+            model: "claude-opus-5-5".into(),
+            ..Default::default()
+        },
+    ]);
+    assert!(candidates.is_empty(), "{candidates:?} {notes:?}");
 }

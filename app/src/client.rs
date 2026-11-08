@@ -669,6 +669,14 @@ pub struct DispatchProviderModels {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
+pub struct DispatchAgentModels {
+    pub agent: String,
+    pub enabled: bool,
+    pub models: Vec<DispatchModelSetting>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 pub struct ListModelSettingsRequest {}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -676,6 +684,7 @@ pub struct ListModelSettingsRequest {}
 pub struct ListModelSettingsResponse {
     pub providers: Vec<DispatchProviderModels>,
     pub problems: Vec<String>,
+    pub agents: Vec<DispatchAgentModels>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -684,6 +693,7 @@ pub struct SetModelEnabledRequest {
     pub provider: String,
     pub model: String,
     pub enabled: bool,
+    pub agent: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -692,6 +702,7 @@ pub struct SetModelEnabledResponse {
     pub provider: String,
     pub model: String,
     pub enabled: bool,
+    pub agent: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

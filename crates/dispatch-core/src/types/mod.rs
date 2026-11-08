@@ -343,11 +343,15 @@ pub struct WorktreeInfo {
     pub owner: String,
 }
 
-/// A disabled provider (`model` is empty) or a disabled base model under `provider`.
+/// A disabled provider (`model` is empty) or a disabled base model under `provider`, with no
+/// `agent` (the legacy setting for every agent), or one agent's disabled model (its id the CLI
+/// lists, without effort, in `model`, and `provider` empty).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DisabledModel {
     pub provider: String,
     pub model: String,
+    #[serde(default)]
+    pub agent: String,
 }
 
 /// The persistence boundary. The core implements it on SQLite; the engine
@@ -450,7 +454,8 @@ pub trait Store: Send + Sync {
     fn get_route_decision(&self, run_id: &str) -> Result<Option<RouteDecision>, Error>;
     /// Newest first; an empty `project_id` lists all.
     fn list_route_decisions(&self, project_id: &str) -> Result<Vec<RouteDecision>, Error>;
-    /// Disabled providers (`model` is empty) and base models.
+    /// Disabled providers (`model` is empty) and base models (legacy, no `agent`), and one
+    /// agent's disabled models (`agent` set, `model` the id its CLI lists without effort).
     fn list_disabled_models(&self) -> Result<Vec<DisabledModel>, Error> {
         Ok(Vec::new())
     }
@@ -458,6 +463,15 @@ pub trait Store: Send + Sync {
     fn set_model_enabled(
         &self,
         _provider: &str,
+        _model: &str,
+        _enabled: bool,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+    /// Enables or disables one agent's model, as its CLI lists it.
+    fn set_agent_model_enabled(
+        &self,
+        _agent: &str,
         _model: &str,
         _enabled: bool,
     ) -> Result<(), Error> {

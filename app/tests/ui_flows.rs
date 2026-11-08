@@ -530,7 +530,7 @@ fn settings_menus_pick_the_priority_and_classifier_model(cx: &mut TestAppContext
 }
 
 #[gpui::test]
-fn settings_models_switch_models_and_providers(cx: &mut TestAppContext) {
+fn settings_models_switch_models_one_agent_at_a_time(cx: &mut TestAppContext) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let core = Core::new();
     let mut w = open(&core, cx);
@@ -543,22 +543,22 @@ fn settings_models_switch_models_and_providers(cx: &mut TestAppContext) {
             .iter()
             .any(|m| m.agent == "fake" && m.model == id)
     };
-    w.scroll_settings_to("settings-model-fake-fake-fake-fast");
-    w.click("settings-model-fake-fake-fake-fast");
+    w.scroll_settings_to("settings-model-fake-fake-fast");
+    w.click("settings-model-fake-fake-fast");
     w.until("the model is disabled", || !enabled("fake-fast"));
     assert!(enabled("fake-deep"));
-    w.scroll_settings_to("settings-model-fake-fake-fake-fast");
-    w.click("settings-model-fake-fake-fake-fast");
+    w.scroll_settings_to("settings-model-fake-fake-fast");
+    w.click("settings-model-fake-fake-fast");
     w.until("the model is enabled", || enabled("fake-fast"));
-    w.scroll_settings_to("settings-provider-fake-fake");
-    w.click("settings-provider-fake-fake");
-    w.until("the provider is disabled", || {
-        !enabled("fake-fast") && !enabled("fake-deep")
+    w.scroll_settings_to("settings-model-fake-fake-deep");
+    w.click("settings-model-fake-fake-deep");
+    w.until("the other model is disabled alone", || {
+        !enabled("fake-deep") && enabled("fake-fast")
     });
-    w.scroll_settings_to("settings-provider-fake-fake");
-    w.click("settings-provider-fake-fake");
-    w.until("the provider is enabled", || {
-        enabled("fake-fast") && enabled("fake-deep")
+    w.scroll_settings_to("settings-model-fake-fake-deep");
+    w.click("settings-model-fake-fake-deep");
+    w.until("the other model is enabled", || {
+        enabled("fake-deep") && enabled("fake-fast")
     });
     assert!(w.toasts().is_empty(), "{:?}", w.toasts());
 }

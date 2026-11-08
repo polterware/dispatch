@@ -214,6 +214,7 @@ impl Core {
         let table =
             Table::load_from_store(Some(self.store.as_ref())).map_err(RpcError::internal)?;
         let disabled = self.disabled_models();
+        let disabled_agents = self.disabled_agents();
         let mut by_provider: BTreeMap<String, BTreeMap<String, BTreeSet<String>>> = BTreeMap::new();
         for m in &raw.models {
             let (p, base) = config::normalize_model_key(&m.provider, &m.agent, &m.model);
@@ -239,7 +240,7 @@ impl Core {
                 }
             }
         }
-        for d in &disabled {
+        for d in disabled.iter().filter(|d| d.agent.is_empty()) {
             if !d.provider.is_empty() {
                 let models = by_provider.entry(d.provider.clone()).or_default();
                 if !d.model.is_empty() {
@@ -255,7 +256,8 @@ impl Core {
                     .into_iter()
                     .map(|(id, agents)| {
                         let model_enabled = !disabled.iter().any(|d| {
-                            d.model.eq_ignore_ascii_case(&id)
+                            d.agent.is_empty()
+                                && d.model.eq_ignore_ascii_case(&id)
                                 && (d.provider.is_empty()
                                     || d.provider.eq_ignore_ascii_case(&provider))
                         });
@@ -273,9 +275,55 @@ impl Core {
                 }
             })
             .collect();
+        // One card per agent, its models flat. A stored off pair stays listed so it can be
+        // turned back on.
+        let mut by_agent: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for m in &raw.models {
+            let key = config::agent_model_key(&m.model);
+            if !m.agent.is_empty() && !key.is_empty() {
+                by_agent.entry(m.agent.clone()).or_default().insert(key);
+            }
+        }
+        for d in disabled.iter().filter(|d| !d.agent.is_empty()) {
+            by_agent
+                .entry(d.agent.clone())
+                .or_default()
+                .insert(d.model.clone());
+        }
+        let agents = by_agent
+            .into_iter()
+            .map(|(agent, models)| {
+                let mut models: Vec<_> = models
+                    .into_iter()
+                    .map(|id| {
+                        let off = disabled.iter().any(|d| {
+                            !d.agent.is_empty()
+                                && d.agent.eq_ignore_ascii_case(&agent)
+                                && d.model.eq_ignore_ascii_case(&id)
+                        });
+                        pb::DispatchModelSetting {
+                            id,
+                            enabled: !off,
+                            agents: vec![agent.clone()],
+                        }
+                    })
+                    .collect();
+                models.sort_by(|a, b| {
+                    a.id.to_lowercase()
+                        .cmp(&b.id.to_lowercase())
+                        .then_with(|| a.id.cmp(&b.id))
+                });
+                pb::DispatchAgentModels {
+                    enabled: !config::is_agent_disabled(&disabled_agents, &agent),
+                    agent,
+                    models,
+                }
+            })
+            .collect();
         Ok(pb::ListModelSettingsResponse {
             providers,
             problems: raw.problems,
+            agents,
         })
     }
 
@@ -288,6 +336,22 @@ impl Core {
             self.store.as_ref(),
         )
         .map_err(RpcError::internal)?;
+        if !m.agent.trim().is_empty() {
+            let agent = m.agent.trim().to_ascii_lowercase();
+            let model = config::agent_model_key(&m.model);
+            if model.is_empty() {
+                return Err(RpcError::invalid("model is required"));
+            }
+            self.store
+                .set_agent_model_enabled(&agent, &model, m.enabled)
+                .map_err(invalid)?;
+            return Ok(pb::SetModelEnabledResponse {
+                provider: String::new(),
+                model,
+                enabled: m.enabled,
+                agent,
+            });
+        }
         let (provider, model) = if m.model.trim().is_empty() {
             match m.provider.trim().split_once('/') {
                 Some((p, rest)) => config::normalize_model_key(p, "", rest),
@@ -306,6 +370,7 @@ impl Core {
             provider,
             model,
             enabled: m.enabled,
+            agent: String::new(),
         })
     }
 

@@ -13,7 +13,7 @@ pub use sections::{
 };
 
 /// Applied in name order, each once, recorded in `PRAGMA user_version`.
-const MIGRATIONS: [(&str, &str); 12] = [
+const MIGRATIONS: [(&str, &str); 13] = [
     (
         "0001_baseline.sql",
         include_str!("migrations/0001_baseline.sql"),
@@ -61,6 +61,10 @@ const MIGRATIONS: [(&str, &str); 12] = [
     (
         "0012_disabled_agents.sql",
         include_str!("migrations/0012_disabled_agents.sql"),
+    ),
+    (
+        "0013_disabled_agent_models.sql",
+        include_str!("migrations/0013_disabled_agent_models.sql"),
     ),
 ];
 
