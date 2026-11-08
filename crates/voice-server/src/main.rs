@@ -1,5 +1,6 @@
 mod backends;
 mod bench;
+mod catalog;
 mod cli;
 mod config;
 mod download;
@@ -7,6 +8,7 @@ mod engine;
 mod http;
 mod models;
 mod rss;
+mod settings;
 
 use anyhow::Result;
 use clap::Parser;
@@ -94,11 +96,15 @@ async fn run() -> Result<()> {
             command:
                 cli::ModelsCommand::Download {
                     yes,
+                    id,
                     stt,
                     no_tts,
                     no_vad,
                 },
-        } => download::download(yes, stt.as_deref(), no_tts, no_vad),
+        } => download::download(id.as_deref(), yes, stt.as_deref(), no_tts, no_vad),
+        cli::Command::Models {
+            command: cli::ModelsCommand::Remove { id },
+        } => models::remove(&id),
         cli::Command::Bench { wav, stt_model } => bench::run(wav, stt_model),
     }
 }

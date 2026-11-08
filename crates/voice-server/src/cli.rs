@@ -41,6 +41,7 @@ impl Default for Command {
 pub enum ModelsCommand {
     List,
     Download {
+        id: Option<String>,
         #[arg(long)]
         yes: bool,
         #[arg(long, value_parser=["small", "base", "turbo"])]
@@ -49,5 +50,8 @@ pub enum ModelsCommand {
         no_tts: bool,
         #[arg(long)]
         no_vad: bool,
+    },
+    Remove {
+        id: String,
     },
 }
