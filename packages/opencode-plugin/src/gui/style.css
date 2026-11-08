@@ -410,3 +410,8 @@
   justify-content: space-between;
   margin: -8px -6px 0;
 }
+/* Never squeeze rows to fit: the panel scrolls instead. */
+.lv-panel > *,
+.lv-history > * {
+  flex-shrink: 0;
+}
