@@ -1260,4 +1260,70 @@ mod tests {
         let _ = engine.tx.send(Input::Shutdown).await;
         server.abort();
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn missing_tts_backend_reports_error_without_system_fallback() {
+        let listener = match tokio::net::TcpListener::bind(("127.0.0.1", 0)).await {
+            Ok(listener) => listener,
+            Err(error) => {
+                eprintln!(
+                    "skipping TTS failure WebSocket test: sandbox refused local bind: {error}"
+                );
+                return;
+            }
+        };
+        let addr = listener.local_addr().unwrap();
+        let token = "tts-failure-token".to_string();
+        let root =
+            std::env::temp_dir().join(format!("voice-http-tts-failure-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let config = Config {
+            exit_after_idle_secs: 0,
+            ..Config::default()
+        };
+        let models = ModelManager::new(config.clone(), root.clone());
+        let engine = EngineHandle::spawn(
+            config,
+            Arc::new(FakeMic),
+            Arc::new(FakeSpeaker(Arc::new(SpeakerState::default()))),
+            Arc::new(FakeVad),
+            models.clone(),
+        );
+        let (stop, _) = broadcast::channel(1);
+        let app = App {
+            token: Arc::new(token.clone()),
+            engine: engine.clone(),
+            models,
+            stop,
+            events: broadcast::channel(16).0,
+            settings: Arc::new(RwLock::new(voice_core::catalog::EngineSettings::default())),
+            downloads: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            root: root.clone(),
+            settings_path: root.join("settings.json"),
+        };
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router(app)).await;
+        });
+        let (mut socket, _) =
+            tokio_tungstenite::connect_async(format!("ws://{addr}/v1/ws?token={token}"))
+                .await
+                .unwrap();
+        let _hello = socket.next().await.unwrap().unwrap();
+        socket.send(ClientMessage::Text(r#"{"type":"speak","id":"missing-voice","text":"Speak this.","format":"plain","language":"en","voice":"piper:pt_BR-faber-medium"}"#.into())).await.unwrap();
+        let mut saw_error = false;
+        let mut saw_ended = false;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !saw_error || !saw_ended {
+                let message = socket.next().await.unwrap().unwrap();
+                if let Ok(message) = serde_json::from_str::<EngineMessage>(message.to_text().unwrap()) {
+                    saw_error |= matches!(message, EngineMessage::Error { code: ErrorCode::ModelMissing, id: Some(ref id), .. } if id == "missing-voice");
+                    saw_ended |= matches!(message, EngineMessage::SpeakEnded { id, reason: SpeakEndReason::Error } if id == "missing-voice");
+                }
+            }
+        }).await.unwrap();
+        assert!(saw_error && saw_ended);
+        let _ = engine.tx.send(Input::Shutdown).await;
+        server.abort();
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

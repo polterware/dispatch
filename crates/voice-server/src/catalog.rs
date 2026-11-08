@@ -53,6 +53,20 @@ const KOKORO: &[FileSpec] = &[
  FileSpec { url: "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/voices/pm_alex.bin", path: "kokoro/voices/pm_alex.bin", size: 1_000_000 },
  FileSpec { url: "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/voices/pm_santa.bin", path: "kokoro/voices/pm_santa.bin", size: 1_000_000 },
 ];
+const CHATTERBOX: &[FileSpec] = &[
+    FileSpec { url: "https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX/resolve/main/tokenizer.json", path: "chatterbox/tokenizer.json", size: 0 },
+    FileSpec { url: "https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX/resolve/main/tokenizer_config.json", path: "chatterbox/tokenizer_config.json", size: 0 },
+    FileSpec { url: "https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX/resolve/main/generation_config.json", path: "chatterbox/generation_config.json", size: 0 },
+    FileSpec { url: "https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX/resolve/main/default_voice.wav", path: "chatterbox/default_voice.wav", size: 0 },
+    FileSpec { url: "https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX/resolve/main/onnx/speech_encoder.onnx", path: "chatterbox/onnx/speech_encoder.onnx", size: 1_184_608 },
+    FileSpec { url: "https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX/resolve/main/onnx/speech_encoder.onnx_data", path: "chatterbox/onnx/speech_encoder.onnx_data", size: 591_274_880 },
+    FileSpec { url: "https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX/resolve/main/onnx/embed_tokens.onnx", path: "chatterbox/onnx/embed_tokens.onnx", size: 13_286 },
+    FileSpec { url: "https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX/resolve/main/onnx/embed_tokens.onnx_data", path: "chatterbox/onnx/embed_tokens.onnx_data", size: 68_390_912 },
+    FileSpec { url: "https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX/resolve/main/onnx/language_model_q4.onnx", path: "chatterbox/onnx/language_model_q4.onnx", size: 227_911 },
+    FileSpec { url: "https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX/resolve/main/onnx/language_model_q4.onnx_data", path: "chatterbox/onnx/language_model_q4.onnx_data", size: 353_621_248 },
+    FileSpec { url: "https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX/resolve/main/onnx/conditional_decoder.onnx", path: "chatterbox/onnx/conditional_decoder.onnx", size: 6_350_448 },
+    FileSpec { url: "https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX/resolve/main/onnx/conditional_decoder.onnx_data", path: "chatterbox/onnx/conditional_decoder.onnx_data", size: 533_970_816 },
+];
 const VAD: &[FileSpec] = &[FileSpec { url: "https://raw.githubusercontent.com/snakers4/silero-vad/master/src/silero_vad/data/silero_vad.onnx", path: "vad/silero_vad.onnx", size: 2_000_000 }];
 pub const MODELS: &[ModelSpec] = &[
     ModelSpec {
@@ -133,6 +147,17 @@ pub const MODELS: &[ModelSpec] = &[
         files: KOKORO,
     },
     ModelSpec {
+        id: "chatterbox-multilingual",
+        kind: ModelKind::Tts,
+        backend: "chatterbox",
+        name: "Chatterbox Multilingual (most natural, large)",
+        description: "The most natural multilingual voice; about a 1.6 GB download with higher latency and RAM use",
+        languages: PT_EN,
+        size: 1_555_034_109,
+        license: "MIT",
+        files: CHATTERBOX,
+    },
+    ModelSpec {
         id: "silero-vad-v5",
         kind: ModelKind::Vad,
         backend: "silero",
@@ -156,6 +181,7 @@ pub fn is_active(model: &ModelSpec, settings: &voice_core::catalog::EngineSettin
                 v.strip_prefix("piper:")
                     .is_some_and(|id| model.id == format!("piper-{id}"))
                     || (v.starts_with("kokoro:") && model.id == "kokoro-v1")
+                    || (v.starts_with("chatterbox:") && model.id == "chatterbox-multilingual")
             }),
         ModelKind::Vad => false,
     }
@@ -185,7 +211,11 @@ pub fn catalog_with_vad(
             languages: m.languages.to_vec(),
             size_bytes: m.size,
             license: m.license.into(),
-            installed: files_installed(m, root),
+            installed: if m.id == "chatterbox-multilingual" {
+                voice_tts::chatterbox_installed(&root.join("chatterbox"))
+            } else {
+                files_installed(m, root)
+            },
             active: is_active(m, settings) || (m.kind == ModelKind::Vad && vad_in_use),
         })
         .collect();
@@ -246,6 +276,22 @@ pub fn catalog_with_vad(
             Some("kokoro-v1"),
             root,
         ),
+        voice(
+            "chatterbox:pt",
+            "chatterbox",
+            "Chatterbox · Português (Brasil)",
+            Language::PtBr,
+            Some("chatterbox-multilingual"),
+            root,
+        ),
+        voice(
+            "chatterbox:en",
+            "chatterbox",
+            "Chatterbox · English",
+            Language::En,
+            Some("chatterbox-multilingual"),
+            root,
+        ),
     ];
     voices.extend(system_voices());
     Catalog { models, voices }
@@ -264,9 +310,13 @@ fn voice(
         name: name.into(),
         language,
         model_id: model.map(str::to_owned),
-        installed: model
-            .and_then(find)
-            .is_some_and(|m| files_installed(m, root)),
+        installed: model.and_then(find).is_some_and(|m| {
+            if m.id == "chatterbox-multilingual" {
+                voice_tts::chatterbox_installed(&root.join("chatterbox"))
+            } else {
+                files_installed(m, root)
+            }
+        }),
     }
 }
 fn system_voices() -> Vec<VoiceEntry> {
@@ -333,6 +383,64 @@ mod tests {
             .unwrap();
         assert!(!piper.installed);
         assert!(piper.active);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn chatterbox_voices_are_installed_when_dummy_model_files_exist() {
+        let root =
+            std::env::temp_dir().join(format!("voice-catalog-chatterbox-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for path in [
+            "chatterbox/tokenizer.json",
+            "chatterbox/default_voice.wav",
+            "chatterbox/onnx/speech_encoder.onnx",
+            "chatterbox/onnx/speech_encoder.onnx_data",
+            "chatterbox/onnx/embed_tokens.onnx",
+            "chatterbox/onnx/embed_tokens.onnx_data",
+            "chatterbox/onnx/language_model_q4.onnx",
+            "chatterbox/onnx/language_model_q4.onnx_data",
+            "chatterbox/onnx/conditional_decoder.onnx",
+            "chatterbox/onnx/conditional_decoder.onnx_data",
+        ] {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"dummy").unwrap();
+        }
+        let catalog = catalog(&root, &EngineSettings::default());
+        assert!(
+            catalog
+                .models
+                .iter()
+                .find(|m| m.id == "chatterbox-multilingual")
+                .unwrap()
+                .installed
+        );
+        let voices = catalog
+            .voices
+            .iter()
+            .filter(|v| v.backend == "chatterbox")
+            .collect::<Vec<_>>();
+        assert_eq!(voices.len(), 2);
+        assert!(voices
+            .iter()
+            .all(|v| v.installed && v.model_id.as_deref() == Some("chatterbox-multilingual")));
+        assert_eq!(
+            voices
+                .iter()
+                .find(|v| v.id == "chatterbox:pt")
+                .unwrap()
+                .language,
+            Language::PtBr
+        );
+        assert_eq!(
+            voices
+                .iter()
+                .find(|v| v.id == "chatterbox:en")
+                .unwrap()
+                .language,
+            Language::En
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -30,7 +30,11 @@ fn normalize_voice(value: &str) -> String {
         "pm_alex" => "kokoro:pm_alex".into(),
         "af_heart" => "kokoro:af_heart".into(),
         "am_michael" => "kokoro:am_michael".into(),
-        v if v.starts_with("piper:") || v.starts_with("kokoro:") || v.starts_with("system:") => {
+        v if v.starts_with("piper:")
+            || v.starts_with("kokoro:")
+            || v.starts_with("chatterbox:")
+            || v.starts_with("system:") =>
+        {
             v.into()
         }
         v => format!("kokoro:{v}"),

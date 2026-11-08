@@ -645,7 +645,10 @@ impl Actor {
                     .and_then(|x| x);
                     (Some(synth), rate, result)
                 }
-                Err(error) => (None, 0, Err(error)),
+                Err(error) => {
+                    tracing::warn!(voice = %voice, error = %error, "TTS backend failed to load");
+                    (None, 0, Err(error))
+                }
             };
             let _ = tx
                 .send(Input::FirstSynthesized {
@@ -686,12 +689,13 @@ impl Actor {
         let (samples, synthesizer) = match (result, synthesizer) {
             (Ok(samples), Some(synth)) => (samples, synth),
             (Err(error), _) => {
-                self.error(
-                    owner,
-                    ErrorCode::TtsFailed,
-                    &error.to_string(),
-                    Some(id.clone()),
-                );
+                let detail = error.to_string();
+                let code = if detail.contains("model_missing") {
+                    ErrorCode::ModelMissing
+                } else {
+                    ErrorCode::TtsFailed
+                };
+                self.error(owner, code, &detail, Some(id.clone()));
                 self.send_to(
                     owner,
                     EngineMessage::SpeakEnded {
