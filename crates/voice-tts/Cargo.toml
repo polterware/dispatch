@@ -7,6 +7,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+tokenizers.workspace = true
 voice-core.workspace = true
 thiserror.workspace = true
 serde_json.workspace = true

@@ -464,6 +464,8 @@ pub struct KokoroOptions {
 mod kokoro;
 pub mod piper;
 pub use piper::{PiperOptions, PiperTts};
+pub mod chatterbox;
+pub use chatterbox::{chatterbox_installed, ChatterboxOptions, ChatterboxTts};
 pub use kokoro::KokoroTts;
 impl KokoroTts {
     pub fn load(options: KokoroOptions) -> Result<Self> {
