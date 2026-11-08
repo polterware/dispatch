@@ -415,3 +415,19 @@
 .lv-history > * {
   flex-shrink: 0;
 }
+/* One power toggle: off starts voice mode; on turns it off and returns to text. */
+.lv-power {
+  height: 28px;
+  padding: 0 10px 0 9px;
+}
+.lv-power__dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--lv-muted);
+  transition: background 160ms ease, box-shadow 160ms ease;
+}
+.lv-power[aria-pressed="true"] .lv-power__dot {
+  background: #5ad67d;
+  box-shadow: 0 0 0 3px color-mix(in srgb, #5ad67d 22%, transparent);
+}

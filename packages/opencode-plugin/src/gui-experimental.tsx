@@ -277,11 +277,19 @@ export default Plugin.define({
             }}
           >
             <div class="lv-toolbar">
-              <button class="lv-flat" onClick={() => { deactivate(); ctx.screen.current()?.composer.focus() }}>Back to text</button>
-              <div class="lv-inline">
-                <button class="lv-flat" onClick={() => ctx.layout.settings("local-voice")}>Settings</button>
-                <button class="lv-flat" onClick={toggle}>{active() ? "Turn off" : "Start"}</button>
-              </div>
+              <ctx.ui.IconButton icon="settings-gear" label="Voice settings" variant="ghost-muted" onClick={() => ctx.layout.settings("local-voice")} />
+              <button
+                class="lv-btn lv-power"
+                aria-pressed={active()}
+                onClick={() => {
+                  if (!active()) return void activate()
+                  deactivate()
+                  ctx.screen.current()?.composer.focus()
+                }}
+              >
+                <span class="lv-power__dot" />
+                {active() ? "Voice on" : "Start voice"}
+              </button>
             </div>
             <div class="lv-panel__stage">
               <VoiceBlob state={blobState} levels={voice.levels} mode="expanded" size={180} theme={theme()} reducedMotion={reducedMotion()} />
