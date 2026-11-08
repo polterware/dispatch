@@ -764,7 +764,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(home);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn websocket_auth_hello_busy_and_cancel() {
         let listener = match tokio::net::TcpListener::bind(("127.0.0.1", 0)).await {
             Ok(l) => l,
