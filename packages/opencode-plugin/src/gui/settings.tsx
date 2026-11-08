@@ -46,7 +46,14 @@ export function VoiceSettings(props: SettingsPageProps) {
       setSettings(nextSettings)
       setError(undefined)
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause))
+      const message = cause instanceof Error ? cause.message : String(cause)
+      setError(
+        /no method|unavailable: no/i.test(message)
+          ? "OpenCode is still running an older copy of this plugin. Restart OpenCode to finish the update."
+          : /404|not found/i.test(message)
+            ? "The installed voice engine is older than this plugin. Update voice-engine, then retry."
+            : message,
+      )
     }
   }
 
