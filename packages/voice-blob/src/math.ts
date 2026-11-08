@@ -134,7 +134,9 @@ export function easeParams(from: VisualParams, to: VisualParams, elapsedMs: numb
 export function materialColors(theme: "light" | "dark", accent: Rgb, compact = false): { body: Rgb; band: Rgb } {
   // At a few pixels a deep body reads as a hollow ring, so the compact dot is lit by its accent.
   const deep: Rgb = theme === "dark" ? [0.035, 0.04, 0.06] : [0.09, 0.1, 0.13];
-  const body: Rgb = compact ? [lerp(deep[0], accent[0], 0.55), lerp(deep[1], accent[1], 0.55), lerp(deep[2], accent[2], 0.55)] : deep;
+  // The body carries the state's colour itself, so the sphere glows from within with no halo around it.
+  const tint = compact ? 0.55 : theme === "dark" ? 0.42 : 0.34;
+  const body: Rgb = [lerp(deep[0], accent[0], tint), lerp(deep[1], accent[1], tint), lerp(deep[2], accent[2], tint)];
   const band: Rgb = [lerp(0.93, accent[0], 0.35), lerp(0.95, accent[1], 0.35), lerp(0.98, accent[2], 0.35)];
   return { body, band };
 }
