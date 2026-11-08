@@ -20,18 +20,18 @@ use crate::client::{
     SetAgentEnabledRequest, SetModelEnabledRequest, WorktreeFolder, at_once,
 };
 use crate::models::settings::{
-    CLASSIFIERS, CliState, InstallState, ListedModel, Policy, SAMPLE_TASK, agent_label, bool_wire,
-    classifier_trailing, classify_meta, cli_description, draft_ready, env_key_sentence,
-    filter_provider_models, fixed2, folder_agents_label, hook_note, hook_points_elsewhere,
-    key_chip, key_placeholder, key_test_enabled, key_uses_replace, keyed_classifier,
-    opencode_description, parse_agent_setup, parse_classify, parse_cli_model, parse_key_map,
-    parse_key_status_value, parse_policy, priority_label, priority_value, prob_line, radio_value,
-    role_answer_line, skill_readers, skills_need_install, trimmed_draft,
+    CLASSIFIERS, CliState, InstallState, ListedModel, Policy, SAMPLE_TASK, agent_label,
+    agent_model_groups, bool_wire, classifier_trailing, classify_meta, cli_description,
+    draft_ready, env_key_sentence, filter_provider_models, fixed2, folder_agents_label, hook_note,
+    hook_points_elsewhere, key_chip, key_placeholder, key_test_enabled, key_uses_replace,
+    keyed_classifier, opencode_description, parse_agent_setup, parse_classify, parse_cli_model,
+    parse_key_map, parse_key_status_value, parse_policy, priority_label, priority_value, prob_line,
+    radio_value, role_answer_line, skill_readers, skills_need_install, trimmed_draft,
 };
 use crate::motion::{Animator, Spring, SpringTier, SpringValue};
 use crate::state::{AppState, Route, SettingsPage, ToastTone};
 use crate::theme::{StatusTone, Theme};
-use crate::ui::parts::settings::{radio_mark, settings_row, settings_section, wash};
+use crate::ui::parts::settings::{agent_section, radio_mark, settings_row, settings_section, wash};
 use crate::ui::patterns::{
     AnchorSlot, SETTINGS_SECTION_GAP, SettingsNavItem, settings_dialog, window_anchor,
 };
@@ -63,11 +63,14 @@ pub struct SettingsView {
     model_providers: Option<Vec<DispatchProviderModels>>,
     models_ticket: u64,
     models_search: Entity<TextInput>,
-    model_groups: BTreeMap<String, Entity<crate::ui::CollapsibleSection>>,
+    /// Each agent's provider groups on Settings > Models, by agent and provider.
+    agent_model_groups: BTreeMap<(String, String), Entity<crate::ui::CollapsibleSection>>,
     models_inflight: bool,
     models_saving: bool,
-    provider_switches: BTreeMap<String, Entity<Switch>>,
-    model_switches: BTreeMap<(String, String), Entity<Switch>>,
+    agent_provider_switches: BTreeMap<(String, String), Entity<Switch>>,
+    agent_model_switches: BTreeMap<(String, String, String), Entity<Switch>>,
+    /// The agent cards folded on this visit; the view's own, never stored.
+    collapsed_agents: BTreeMap<String, bool>,
     keys: BTreeMap<String, String>,
     keys_ready: bool,
     keys_inflight: bool,
@@ -154,11 +157,12 @@ impl SettingsView {
             model_providers: None,
             models_ticket: 0,
             models_search,
-            model_groups: BTreeMap::new(),
+            agent_model_groups: BTreeMap::new(),
             models_inflight: false,
             models_saving: false,
-            provider_switches: BTreeMap::new(),
-            model_switches: BTreeMap::new(),
+            agent_provider_switches: BTreeMap::new(),
+            agent_model_switches: BTreeMap::new(),
+            collapsed_agents: BTreeMap::new(),
             worktrees: None,
             worktrees_inflight: false,
             keys: BTreeMap::new(),
@@ -459,6 +463,7 @@ impl SettingsView {
                         .map(|agent| agent.name.clone())
                         .collect();
                     view.sync_agent_switches(cx);
+                    view.sync_model_switches(cx);
                 }
                 if let Some(response) = listed.1 {
                     view.models = response
@@ -547,6 +552,7 @@ impl SettingsView {
             enabled,
         };
         self.sync_agent_switches(cx);
+        self.sync_model_switches(cx);
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move { client.set_agent_enabled(&request) })
@@ -569,64 +575,115 @@ impl SettingsView {
                     });
                 }
                 view.sync_agent_switches(cx);
+                view.sync_model_switches(cx);
                 cx.notify();
             });
         })
         .detach();
     }
 
+    /// Makes each installed agent's provider and model switches, one set per card so the
+    /// same model under two agents shows the same stored state. An agent turned off shows
+    /// them off and inert; its stored states stay as they are.
     fn sync_model_switches(&mut self, cx: &mut Context<Self>) {
         let view = cx.entity().downgrade();
-        for provider in self.model_providers.clone().unwrap_or_default() {
-            let name = provider.provider.clone();
-            let toggle = self
-                .provider_switches
-                .entry(name.clone())
-                .or_insert_with(|| {
-                    let name = name.clone();
-                    switch(provider.enabled, view.clone(), cx, move |this, on, cx| {
-                        this.set_model_enabled(&name, "", on, cx);
+        let agents: Vec<DispatchAgent> = self
+            .agent_rows
+            .iter()
+            .filter(|agent| agent.installed && !agent.name.is_empty())
+            .cloned()
+            .collect();
+        let providers = self.model_providers.clone().unwrap_or_default();
+        for agent in &agents {
+            for provider in &providers {
+                let models: Vec<_> = provider
+                    .models
+                    .iter()
+                    .filter(|model| {
+                        model
+                            .agents
+                            .iter()
+                            .any(|name| name.eq_ignore_ascii_case(&agent.name))
                     })
-                });
-            toggle.update(cx, |toggle, _| toggle.set_on(provider.enabled));
-            for model in provider.models {
-                let name = name.clone();
-                let id = model.id.clone();
+                    .cloned()
+                    .collect();
+                if models.is_empty() {
+                    continue;
+                }
+                let key = (agent.name.clone(), provider.provider.clone());
+                let shown_provider = agent.enabled && provider.enabled;
                 let toggle = self
-                    .model_switches
-                    .entry((name.clone(), id.clone()))
+                    .agent_provider_switches
+                    .entry(key.clone())
                     .or_insert_with(|| {
-                        switch(model.enabled, view.clone(), cx, move |this, on, cx| {
-                            this.set_model_enabled(&name, &id, on, cx);
+                        let (agent_name, provider_name) = key.clone();
+                        switch(shown_provider, view.clone(), cx, move |this, on, cx| {
+                            this.set_agent_model_enabled(&agent_name, &provider_name, "", on, cx);
                         })
                     });
-                toggle.update(cx, |toggle, _| toggle.set_on(model.enabled));
+                toggle.update(cx, |toggle, _| toggle.set_on(shown_provider));
+                for model in &models {
+                    let key = (
+                        agent.name.clone(),
+                        provider.provider.clone(),
+                        model.id.clone(),
+                    );
+                    let shown_model = agent.enabled && model.enabled;
+                    let toggle =
+                        self.agent_model_switches
+                            .entry(key.clone())
+                            .or_insert_with(|| {
+                                let (agent_name, provider_name, model_id) = key.clone();
+                                switch(shown_model, view.clone(), cx, move |this, on, cx| {
+                                    this.set_agent_model_enabled(
+                                        &agent_name,
+                                        &provider_name,
+                                        &model_id,
+                                        on,
+                                        cx,
+                                    );
+                                })
+                            });
+                    toggle.update(cx, |toggle, _| toggle.set_on(shown_model));
+                }
+                self.agent_model_groups
+                    .entry(key.clone())
+                    .or_insert_with(|| {
+                        let body_view = view.clone();
+                        let actions_view = view.clone();
+                        let (agent_name, provider_name) = key.clone();
+                        let switch_agent = agent_name.clone();
+                        let switch_provider = provider_name.clone();
+                        cx.new(|cx| {
+                            cx.observe(&self.models_search, |_, _, cx| cx.notify())
+                                .detach();
+                            let mut group =
+                                crate::ui::CollapsibleSection::new(provider_name.clone(), cx);
+                            group.set_actions(Some(Rc::new(move |_, app| {
+                                actions_view
+                                    .upgrade()
+                                    .map(|view| {
+                                        view.read(app)
+                                            .provider_switch_slot(&switch_agent, &switch_provider)
+                                    })
+                                    .unwrap_or_else(|| div().into_any_element())
+                            })));
+                            group.set_body(Rc::new(move |_, app| {
+                                body_view
+                                    .upgrade()
+                                    .map(|view| {
+                                        view.read(app).provider_rows(
+                                            &agent_name,
+                                            &provider_name,
+                                            app,
+                                        )
+                                    })
+                                    .unwrap_or_else(|| div().into_any_element())
+                            }));
+                            group
+                        })
+                    });
             }
-            self.model_groups.entry(name.clone()).or_insert_with(|| {
-                let body_view = view.clone();
-                let body_name = name.clone();
-                let switch_name = name.clone();
-                let toggle = self.provider_switches[&name].clone();
-                cx.new(|cx| {
-                    cx.observe(&self.models_search, |_, _, cx| cx.notify())
-                        .detach();
-                    let mut group = crate::ui::CollapsibleSection::new(name, cx);
-                    group.set_actions(Some(Rc::new(move |_, _| {
-                        let selector = format!("settings-provider-{}", switch_name);
-                        div()
-                            .debug_selector(move || selector)
-                            .child(toggle.clone())
-                            .into_any_element()
-                    })));
-                    group.set_body(Rc::new(move |_, app| {
-                        body_view
-                            .upgrade()
-                            .map(|view| view.read(app).provider_rows(&body_name, app))
-                            .unwrap_or_else(|| div().into_any_element())
-                    }));
-                    group
-                })
-            });
         }
     }
 
@@ -738,23 +795,57 @@ impl SettingsView {
         .detach();
     }
 
-    fn provider_rows(&self, provider: &str, cx: &App) -> gpui::AnyElement {
+    /// A model or provider switch inside an agent's card: its agent turned off leaves the
+    /// stored state alone and the switch reads off.
+    fn set_agent_model_enabled(
+        &mut self,
+        agent: &str,
+        provider: &str,
+        model: &str,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let agent_on = self
+            .agent_rows
+            .iter()
+            .find(|row| row.name == agent)
+            .is_some_and(|row| row.enabled);
+        if !agent_on {
+            self.sync_model_switches(cx);
+            return;
+        }
+        self.set_model_enabled(provider, model, enabled, cx);
+    }
+
+    /// One agent's provider group, with only the models that agent lists.
+    fn provider_rows(&self, agent: &str, provider: &str, cx: &App) -> gpui::AnyElement {
         let providers = filter_provider_models(
             self.model_providers.as_deref().unwrap_or_default(),
-            self.models_search.read(cx).text().as_ref(),
+            self.models_search.read(cx).text(),
         );
+        let agent_on = self
+            .agent_rows
+            .iter()
+            .find(|row| row.name == agent)
+            .is_some_and(|row| row.enabled);
         let mut rows = div().flex().flex_col();
         if let Some(group) = providers.iter().find(|group| group.provider == provider) {
-            for model in &group.models {
-                if let Some(toggle) = self
-                    .model_switches
-                    .get(&(provider.to_string(), model.id.clone()))
-                {
-                    let selector = format!("settings-model-{provider}-{}", model.id);
+            for model in group.models.iter().filter(|model| {
+                model
+                    .agents
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(agent))
+            }) {
+                if let Some(toggle) = self.agent_model_switches.get(&(
+                    agent.to_string(),
+                    provider.to_string(),
+                    model.id.clone(),
+                )) {
+                    let selector = format!("settings-model-{agent}-{provider}-{}", model.id);
                     rows = rows.child(settings_row(
                         model.id.clone(),
                         None,
-                        div().debug_selector(move || selector).child(toggle.clone()),
+                        model_switch(selector, toggle.clone(), agent_on),
                         cx,
                     ));
                 }
@@ -763,10 +854,32 @@ impl SettingsView {
         rows.into_any_element()
     }
 
+    /// A provider group's switch, off and inert while its agent is off.
+    fn provider_switch_slot(&self, agent: &str, provider: &str) -> gpui::AnyElement {
+        let Some(toggle) = self
+            .agent_provider_switches
+            .get(&(agent.to_string(), provider.to_string()))
+            .cloned()
+        else {
+            return div().into_any_element();
+        };
+        let agent_on = self
+            .agent_rows
+            .iter()
+            .find(|row| row.name == agent)
+            .is_some_and(|row| row.enabled);
+        model_switch(
+            format!("settings-provider-{agent}-{provider}"),
+            toggle,
+            agent_on,
+        )
+    }
+
     fn models_page(&self, theme: Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let providers = filter_provider_models(
+        let groups = agent_model_groups(
+            &self.agent_rows,
             self.model_providers.as_deref().unwrap_or_default(),
-            self.models_search.read(cx).text().as_ref(),
+            self.models_search.read(cx).text(),
         );
         let mut body = div()
             .flex()
@@ -775,23 +888,82 @@ impl SettingsView {
             .child(self.models_search.clone());
         if self.model_providers.is_none() {
             body = body.child(settings_skeleton(4));
-        } else if providers.is_empty() {
-            body = body.child(note("No models to show.", theme));
+        } else {
+            // The same provider or model is one setting for every agent that offers it.
+            body = body.child(note(
+                "A provider or model turned off is off for every agent that offers it.",
+                theme,
+            ));
         }
-        for provider in providers {
-            if let Some(group) = self.model_groups.get(&provider.provider) {
-                body = body.child(group.clone());
+        let mut column = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(SETTINGS_SECTION_GAP))
+            .child(settings_section(
+                Icon::Cpu,
+                TileTone::Architecture,
+                "Models",
+                "Choose the agents, providers, and models Dispatch shows and runs.",
+                None,
+                body,
+                cx,
+            ));
+        if self.model_providers.is_some() && groups.is_empty() {
+            column = column.child(note("No agents to show.", theme));
+        }
+        for group in groups {
+            let mut providers = div().flex().flex_col().gap(px(theme.space_2));
+            if group.providers.is_empty() {
+                providers = providers.child(note("No models listed by this agent.", theme));
             }
+            for provider in &group.providers {
+                if let Some(section) = self
+                    .agent_model_groups
+                    .get(&(group.agent.clone(), provider.provider.clone()))
+                {
+                    providers = providers.child(section.clone());
+                }
+            }
+            if !group.enabled {
+                providers = providers.opacity(0.45);
+            }
+            let switch = self
+                .agent_switches
+                .get(&group.agent)
+                .cloned()
+                .map(|toggle| {
+                    let selector = format!("settings-agent-{}", group.agent);
+                    div()
+                        .debug_selector(move || selector)
+                        .child(toggle)
+                        .into_any_element()
+                });
+            let fold_agent = group.agent.clone();
+            let on_fold = click(cx.entity().downgrade(), move |this, cx| {
+                let collapsed = this
+                    .collapsed_agents
+                    .entry(fold_agent.clone())
+                    .or_insert(false);
+                *collapsed = !*collapsed;
+                cx.notify();
+            });
+            let collapsed = self
+                .collapsed_agents
+                .get(&group.agent)
+                .copied()
+                .unwrap_or(false);
+            column = column.child(agent_section(
+                &group.agent,
+                group.name,
+                switch.unwrap_or_else(|| div().into_any_element()),
+                collapsed,
+                on_fold,
+                providers,
+                cx,
+            ));
         }
-        settings_section(
-            Icon::Cpu,
-            TileTone::Architecture,
-            "Models",
-            "Choose which providers and models Dispatch shows and runs.",
-            None,
-            body,
-            cx,
-        )
+        column.into_any_element()
     }
 
     fn load_policy(&mut self, cx: &mut Context<Self>) {
@@ -1495,38 +1667,6 @@ impl SettingsView {
             .flex()
             .flex_col()
             .gap(px(SETTINGS_SECTION_GAP));
-        let mut agent_body = div().flex().flex_col();
-        if self.agent_rows.is_empty() {
-            agent_body = agent_body.child(settings_row("No agents to show", None, div(), cx));
-        }
-        for agent in &self.agent_rows {
-            if let Some(toggle) = self.agent_switches.get(&agent.name) {
-                let selector = format!("settings-agent-{}", agent.name);
-                agent_body = agent_body.child(settings_row(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(theme.space_2))
-                        .child(agent_avatar(&agent.name, "", 20.0))
-                        .child(agent_label(&agent.name)),
-                    text_or_none(if agent.installed { "" } else { "Not installed" }),
-                    div()
-                        .debug_selector(move || selector)
-                        .when(!enabled, |row| row.opacity(0.45))
-                        .child(toggle.clone()),
-                    cx,
-                ));
-            }
-        }
-        column = column.child(settings_section(
-            Icon::Bot,
-            TileTone::Identity,
-            "Agents",
-            "Turn off an agent to keep Dispatch from routing runs to it.",
-            None,
-            agent_body,
-            cx,
-        ));
         let cli_tone = cli_tone(setup.cli.state);
         let mut cli_trailing = div()
             .flex()
@@ -2444,6 +2584,21 @@ fn note(text: &str, theme: Theme) -> gpui::AnyElement {
         .text_color(theme.color_text_muted)
         .child(text.to_string())
         .into_any_element()
+}
+
+/// A switch at a row's end, held inert while its agent is off so only the agent's own
+/// switch brings its rows back.
+fn model_switch(selector: String, toggle: Entity<Switch>, enabled: bool) -> gpui::AnyElement {
+    let slot = div()
+        .relative()
+        .debug_selector(move || selector)
+        .child(toggle);
+    if enabled {
+        slot.into_any_element()
+    } else {
+        slot.child(div().absolute().inset_0().occlude())
+            .into_any_element()
+    }
 }
 
 /// A path under the home folder as `~/…`.

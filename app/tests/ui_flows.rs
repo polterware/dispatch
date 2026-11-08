@@ -426,7 +426,7 @@ fn settings_switch_an_agent_on_and_off(cx: &mut TestAppContext) {
     };
     assert!(enabled("fake"));
     let mut w = open(&core, cx);
-    w.go(Route::Settings(SettingsPage::Agents));
+    w.go(Route::Settings(SettingsPage::Models));
 
     w.scroll_settings_to("settings-agent-fake");
     w.click("settings-agent-fake");
@@ -543,18 +543,20 @@ fn settings_models_switch_models_and_providers(cx: &mut TestAppContext) {
             .iter()
             .any(|m| m.agent == "fake" && m.model == id)
     };
-    w.scroll_settings_to("settings-model-fake-fake-fast");
-    w.click("settings-model-fake-fake-fast");
+    w.scroll_settings_to("settings-model-fake-fake-fake-fast");
+    w.click("settings-model-fake-fake-fake-fast");
     w.until("the model is disabled", || !enabled("fake-fast"));
     assert!(enabled("fake-deep"));
-    w.click("settings-model-fake-fake-fast");
+    w.scroll_settings_to("settings-model-fake-fake-fake-fast");
+    w.click("settings-model-fake-fake-fake-fast");
     w.until("the model is enabled", || enabled("fake-fast"));
-    w.scroll_settings_to("settings-provider-fake");
-    w.click("settings-provider-fake");
+    w.scroll_settings_to("settings-provider-fake-fake");
+    w.click("settings-provider-fake-fake");
     w.until("the provider is disabled", || {
         !enabled("fake-fast") && !enabled("fake-deep")
     });
-    w.click("settings-provider-fake");
+    w.scroll_settings_to("settings-provider-fake-fake");
+    w.click("settings-provider-fake-fake");
     w.until("the provider is enabled", || {
         enabled("fake-fast") && enabled("fake-deep")
     });
