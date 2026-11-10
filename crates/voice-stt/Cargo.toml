@@ -1,0 +1,21 @@
+[package]
+name = "voice-stt"
+description = "Speech-to-text (whisper.cpp) and voice activity detection for the voice engine."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+voice-core.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+ort.workspace = true
+whisper-rs = { version = "0.16.0", features = ["tracing_backend"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+whisper-rs = { version = "0.16.0", features = ["metal", "tracing_backend"] }
+
+[dev-dependencies]
+hound = "3.5"
+tracing-subscriber.workspace = true

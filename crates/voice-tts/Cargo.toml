@@ -1,0 +1,19 @@
+[package]
+name = "voice-tts"
+description = "Text-to-speech (Kokoro via ONNX Runtime, macOS system voice) and speech text preparation."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tokenizers.workspace = true
+voice-core.workspace = true
+thiserror.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+ort.workspace = true
+hound = "3.5"
+
+[dev-dependencies]
+tracing-subscriber.workspace = true

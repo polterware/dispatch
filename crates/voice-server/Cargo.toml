@@ -1,0 +1,34 @@
+[package]
+name = "voice-server"
+description = "The voice engine daemon: local HTTP + WebSocket API over audio, STT, and TTS."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "voice-engine"
+path = "src/main.rs"
+
+[dependencies]
+voice-core.workspace = true
+voice-audio.workspace = true
+voice-stt.workspace = true
+voice-tts.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+axum = { version = "0.7", features = ["ws"] }
+clap = { version = "4", features = ["derive"] }
+futures-util = "0.3"
+cpal = "0.16"
+rand = "0.8"
+subtle = "2"
+libc = "0.2"
+ureq = { version = "2", default-features = false, features = ["tls"] }
+
+[dev-dependencies]
+tokio-tungstenite = "0.24"
