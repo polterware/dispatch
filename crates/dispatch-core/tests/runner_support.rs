@@ -375,6 +375,7 @@ pub struct Fake {
     pub live_quota: Arc<Mutex<Option<Quota>>>,
     pub model_quotas: Option<HashMap<String, Quota>>,
     pub quota_calls: Arc<AtomicUsize>,
+    pub quota_delay: Duration,
     pub models: Vec<String>,
     pub probe: Option<ProbeReport>,
     pub env: Arc<Mutex<Vec<String>>>,
@@ -406,6 +407,7 @@ impl Fake {
             live_quota: Arc::new(Mutex::new(None)),
             model_quotas: None,
             quota_calls: Arc::new(AtomicUsize::new(0)),
+            quota_delay: Duration::ZERO,
             models: Vec::new(),
             probe: None,
             env: Arc::new(Mutex::new(Vec::new())),
@@ -523,7 +525,11 @@ impl AgentAdapter for Fake {
             .unwrap()
             .clone()
             .or_else(|| self.quota.clone());
-        Box::pin(async move { q.ok_or_else(|| Error::Message(ERR_NO_QUOTA.into())) })
+        let delay = self.quota_delay;
+        Box::pin(async move {
+            tokio::time::sleep(delay).await;
+            q.ok_or_else(|| Error::Message(ERR_NO_QUOTA.into()))
+        })
     }
 
     fn model_quotas(

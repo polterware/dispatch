@@ -436,7 +436,7 @@ impl Deps {
         self.reconcile(cancel).await?;
 
         let mut cool = store_cooldowns(self.store.as_deref(), self.now());
-        self.phase(&rec, "Preparing worktree");
+        let original_branch = rec.branch.clone();
         let work_deps = self.clone();
         let mut work_rec = rec.clone();
         let work = tokio::task::spawn_blocking(move || {
@@ -451,7 +451,30 @@ impl Deps {
         rec = prepared;
         let (cands, resume_session) = match planned {
             Ok(v) => v,
-            Err(fail) => return self.finish_run(rec, None, STATUS_FAILED, &fail),
+            Err(fail) => {
+                if !rec.branch.is_empty() && rec.branch != original_branch {
+                    for linked in &rec.linked {
+                        if !linked.worktree.is_empty() && linked.branch.starts_with("dispatch/") {
+                            let _ = worktree::remove(
+                                &linked.repo,
+                                linked.worktree_top(),
+                                &linked.branch,
+                                true,
+                            );
+                        }
+                    }
+                    if self.owns_worktree(&rec.repo, &rec.worktree)
+                        && worktree::remove(&rec.repo, &rec.worktree, &rec.branch, true).is_ok()
+                        && let Some(st) = self.store.as_deref()
+                    {
+                        let _ = st.save_worktree(&super::ops::worktree_info(
+                            &rec,
+                            crate::types::WORKTREE_REMOVED,
+                        ));
+                    }
+                }
+                return self.finish_run(rec, None, STATUS_FAILED, &fail);
+            }
         };
         let dir = match work_result {
             Ok(dir) => dir,
@@ -516,9 +539,7 @@ impl Deps {
             let has_next_candidate = cands[idx + 1..]
                 .iter()
                 .any(|next| cooling(&cool, next.agent(), &candidate_provider(next)).is_none());
-            if agent_start.is_none() {
-                self.phase(&rec, &format!("Starting {} ({})", c.agent(), c.route.model));
-            }
+            let first_attempt = agent_start.is_none();
             let attempt_start = self.now();
             agent_start = Some(attempt_start);
             let (res, run_err, near_limit_used) = self
@@ -532,6 +553,7 @@ impl Deps {
                     &child_env,
                     handoff.as_deref(),
                     has_next_candidate,
+                    first_attempt,
                 )
                 .await?;
             // The agent ended its turn with only the provider's limit notice: the account is
@@ -668,7 +690,10 @@ impl Deps {
         if o.filters.priority.is_empty() {
             o.filters.priority = PRIORITY_BALANCED.into();
         }
-        let planned = self.plan_with_cooldowns(&o, true, cool).await;
+        let deps = self.clone();
+        let phase_run = rec.clone();
+        let phase = Arc::new(move |text: String| deps.phase(&phase_run, &text));
+        let planned = self.plan_with_cooldowns(&o, true, cool, Some(phase)).await;
         if planned.ordered.is_empty() {
             if !planned.rejected.is_empty() {
                 return Err(planned.rejected.join("; "));
@@ -728,6 +753,7 @@ impl Deps {
             // Forget the old registration, should the folder have gone by hand.
             let _ = worktree::git_exit(&root, &["worktree", "prune"]);
         }
+        self.phase(rec, "Preparing worktree");
         let branch =
             worktree::create(&root, &path, &rec.id).map_err(|e| format!("worktree: {e}"))?;
         rec.repo.clone_from(&root);
@@ -776,6 +802,7 @@ impl Deps {
         child_env: &[String],
         handoff: Option<&str>,
         has_next_candidate: bool,
+        first_attempt: bool,
     ) -> Result<(RunResult, Option<AttemptError>, Option<f64>), Error> {
         rec.agent_pid = 0;
         rec.status = STATUS_RUNNING.into();
@@ -926,6 +953,9 @@ impl Deps {
             cancel: attempt_cancel,
             started,
         };
+        if first_attempt && c.adapter.is_some() {
+            self.phase(rec, &format!("Starting {} ({})", c.agent(), c.route.model));
+        }
         let out = match &c.adapter {
             Some(a) if !resume_session.is_empty() => a.resume(call).await,
             Some(a) => a.run(call).await,

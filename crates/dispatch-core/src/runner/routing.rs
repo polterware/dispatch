@@ -16,8 +16,41 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 use serde::{Serialize, Serializer};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
+
+const LIVE_QUOTA_DEADLINE: Duration = Duration::from_millis(1500);
+const LIVE_QUOTA_TTL: Duration = Duration::from_secs(60);
+const LIVE_QUOTA_FETCH_LIMIT: Duration = Duration::from_secs(100);
+
+type Phase = Arc<dyn Fn(String) + Send + Sync>;
+type QuotaResult = Option<Option<Quota>>;
+
+#[derive(Default)]
+struct LiveQuota {
+    value: Option<(DateTime<Utc>, Quota)>,
+    flight: Option<tokio::sync::watch::Receiver<QuotaResult>>,
+    adapter: Option<Arc<dyn super::AgentAdapter>>,
+}
+
+fn live_quotas() -> &'static Mutex<HashMap<String, LiveQuota>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, LiveQuota>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn quota_key(agent: &str, model: &str) -> String {
+    if agent == "antigravity" {
+        let group = if model.to_lowercase().contains("gemini") {
+            "Gemini Models"
+        } else {
+            "Claude and GPT models"
+        };
+        format!("{agent}:{group}")
+    } else {
+        agent.to_owned()
+    }
+}
 
 pub type Cooldowns = HashMap<String, DateTime<Utc>>;
 
@@ -496,7 +529,7 @@ impl Deps {
     /// filtered one.
     pub(crate) async fn plan(&self, o: &Options, live: bool) -> Planned {
         let cool = store_cooldowns(self.store.as_deref(), self.now());
-        self.plan_with_cooldowns(o, live, &cool).await
+        self.plan_with_cooldowns(o, live, &cool, None).await
     }
 
     pub(crate) async fn plan_with_cooldowns(
@@ -504,6 +537,7 @@ impl Deps {
         o: &Options,
         live: bool,
         cool: &Cooldowns,
+        phase: Option<Phase>,
     ) -> Planned {
         let mut o = o.clone();
         if o.tier == TIER_AUTO && o.difficulty.is_none() {
@@ -552,7 +586,7 @@ impl Deps {
                 c.route.note = join_note(&c.route.note, &role_note);
             }
         }
-        let all = d.observe_with_cooldowns(all, live, cool).await;
+        let all = d.observe_with_cooldowns(all, live, cool, phase).await;
         if o.tier == TIER_AUTO {
             let diff = o.difficulty.as_ref().map_or(-1.8, |c| c.difficulty.d);
             let cat = d.catalog();
@@ -588,7 +622,7 @@ impl Deps {
 
     pub async fn observe(&self, cs: Vec<Candidate>, live: bool) -> Vec<Candidate> {
         let cool = store_cooldowns(self.store.as_deref(), self.now());
-        self.observe_with_cooldowns(cs, live, &cool).await
+        self.observe_with_cooldowns(cs, live, &cool, None).await
     }
 
     pub(crate) async fn observe_with_cooldowns(
@@ -596,52 +630,36 @@ impl Deps {
         mut cs: Vec<Candidate>,
         live: bool,
         cool: &Cooldowns,
+        phase: Option<Phase>,
     ) -> Vec<Candidate> {
         if cs.is_empty() {
             return cs;
         }
         if live {
-            // One quota fetch per agent, in parallel; per-model adapters
-            // resolve per model, others share one quota across their models.
-            let mut by_agent: Vec<(String, Vec<usize>)> = Vec::new();
+            let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
             for (i, c) in cs.iter().enumerate() {
-                match by_agent.iter_mut().find(|(a, _)| *a == c.route.agent) {
-                    Some((_, idxs)) => idxs.push(i),
-                    None => by_agent.push((c.route.agent.clone(), vec![i])),
+                let key = quota_key(&c.route.agent, &c.route.model);
+                if let Some((_, indices)) = groups.iter_mut().find(|(k, _)| *k == key) {
+                    indices.push(i);
+                } else {
+                    groups.push((key, vec![i]));
                 }
             }
-            let fetches = by_agent.iter().map(|(_, idxs)| {
-                let a = cs[idxs[0]].adapter.clone();
-                let models: Vec<String> = idxs.iter().map(|&i| cs[i].route.model.clone()).collect();
-                async move {
-                    let a = a?;
-                    let limit = Duration::from_secs(100);
-                    if let Some(f) = a.model_quotas(models) {
-                        let qs = tokio::time::timeout(limit, f).await.ok()?.ok()?;
-                        return Some((None, qs));
-                    }
-                    let mut q = tokio::time::timeout(limit, a.quota()).await.ok()?.ok()?;
-                    if q.key.is_empty() {
-                        q.key = a.name();
-                    }
-                    Some((Some(q), HashMap::new()))
-                }
+            let fetches = groups.iter().map(|(key, indices)| {
+                let c = cs[indices[0]].clone();
+                let deps = self.clone();
+                let phase = phase.clone();
+                let key = key.clone();
+                async move { deps.live_quota(&key, &c, phase.as_ref()).await }
             });
-            let results = futures::future::join_all(fetches).await;
-            for ((_, idxs), res) in by_agent.iter().zip(results) {
-                let Some((shared, per_model)) = res else {
-                    continue;
-                };
-                for &i in idxs {
-                    cs[i].quota = match &shared {
-                        Some(q) => Some(q.clone()),
-                        None => per_model.get(&cs[i].route.model).cloned(),
-                    };
+            for ((_, indices), quota) in groups.iter().zip(futures::future::join_all(fetches).await)
+            {
+                for &i in indices {
+                    cs[i].quota.clone_from(&quota);
                 }
             }
         }
         let now = self.now();
-        let mut recorded = HashSet::new();
         let mut snaps: HashMap<String, Vec<QuotaSnapshot>> = HashMap::new();
         let store = self.store.as_deref();
         let mut snapshots = |key: &str| -> Vec<QuotaSnapshot> {
@@ -660,55 +678,142 @@ impl Deps {
         };
         for c in &mut cs {
             c.route.cooled_down = cooling(cool, &c.route.agent, &candidate_provider(c)).is_some();
-            if !live {
-                let mut key = c.route.agent.clone();
-                if key == "antigravity" {
-                    key.push_str(":Claude and GPT models");
-                    if c.route.model.to_lowercase().contains("gemini") {
-                        key = "antigravity:Gemini Models".into();
-                    }
-                }
-                for snap in snapshots(&key) {
-                    let resets = parse_time(&snap.resets_at);
-                    if resets.is_some_and(|r| r > now) {
-                        c.quota = Some(Quota {
-                            key: key.clone(),
-                            used_percent: snap.used_percent.unwrap_or_default(),
-                            resets_at: resets,
-                            window_minutes: snap.window_minutes,
-                            ..Quota::default()
-                        });
-                    }
+            if c.quota.is_none() {
+                let key = quota_key(&c.route.agent, &c.route.model);
+                let latest = snapshots(&key)
+                    .into_iter()
+                    .filter(|s| parse_time(&s.resets_at).is_some_and(|r| r > now))
+                    .fold(None, |latest: Option<QuotaSnapshot>, snap| match latest {
+                        Some(current)
+                            if parse_time(&current.sampled_at) >= parse_time(&snap.sampled_at) =>
+                        {
+                            Some(current)
+                        }
+                        _ => Some(snap),
+                    });
+                if let Some(snap) = latest {
+                    c.quota = Some(Quota {
+                        key,
+                        used_percent: snap.used_percent.unwrap_or_default(),
+                        resets_at: parse_time(&snap.resets_at),
+                        window_minutes: snap.window_minutes,
+                        ..Quota::default()
+                    });
                 }
             }
-            let Some(q) = c.quota.clone() else {
+            if c.quota.is_none() {
                 continue;
-            };
-            evaluate_pace(c, now);
-            if live
-                && let Some(st) = store
-                && recorded.insert(q.key.clone())
-            {
-                let source = match c.route.agent.as_str() {
-                    "codex" => SOURCE_CODEX_APP_SERVER,
-                    "antigravity" => SOURCE_AGY_USAGE,
-                    "claude" => SOURCE_CLAUDE_STREAM,
-                    _ => "",
-                };
-                let _ = st.save_quota(&QuotaSnapshot {
-                    agent: q.key.clone(),
-                    provider: c.route.provider.clone(),
-                    window: String::new(),
-                    source: source.into(),
-                    confidence: "official".into(),
-                    used_percent: Some(q.used_percent),
-                    window_minutes: q.window_minutes,
-                    resets_at: q.resets_at.map(fmt_time).unwrap_or_default(),
-                    sampled_at: fmt_time(q.sampled_at.unwrap_or(now)),
-                });
             }
+            evaluate_pace(c, now);
         }
         cs
+    }
+
+    async fn live_quota(&self, key: &str, c: &Candidate, phase: Option<&Phase>) -> Option<Quota> {
+        let adapter = c.adapter.clone()?;
+        // Injected clocks isolate independently configured adapters.
+        let cache_key = if self.now.is_some() {
+            format!("{key}@{:p}", Arc::as_ptr(&adapter))
+        } else {
+            key.to_owned()
+        };
+        let now = self.now();
+        let mut receiver = {
+            let mut cache = live_quotas().lock().unwrap();
+            let entry = cache.entry(cache_key.clone()).or_default();
+            if let Some((at, quota)) = &entry.value
+                && now >= *at
+                && (now - *at).to_std().unwrap_or_default() < LIVE_QUOTA_TTL
+            {
+                if let Some(phase) = phase {
+                    phase(format!("Using cached quota: {}", c.route.agent));
+                }
+                return Some(quota.clone());
+            }
+            if let Some(receiver) = &entry.flight {
+                receiver.clone()
+            } else {
+                if let Some(phase) = phase {
+                    phase(format!("Checking quota: {}", c.route.agent));
+                }
+                let (sender, receiver) = tokio::sync::watch::channel(None);
+                entry.flight = Some(receiver.clone());
+                entry.adapter = Some(adapter.clone());
+                let deps = self.clone();
+                let candidate = c.clone();
+                tokio::spawn(async move {
+                    let model = candidate.route.model.clone();
+                    let result = tokio::time::timeout(LIVE_QUOTA_FETCH_LIMIT, async {
+                        if let Some(future) = adapter.model_quotas(vec![model.clone()]) {
+                            future
+                                .await
+                                .ok()
+                                .and_then(|mut quotas| quotas.remove(&model))
+                        } else {
+                            adapter.quota().await.ok().map(|mut q| {
+                                if q.key.is_empty() {
+                                    q.key = adapter.name();
+                                }
+                                q
+                            })
+                        }
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+                    let now = deps.now();
+                    if let Some(q) = &result
+                        && let Some(st) = deps.store.as_deref()
+                    {
+                        let source = match candidate.route.agent.as_str() {
+                            "codex" => SOURCE_CODEX_APP_SERVER,
+                            "antigravity" => SOURCE_AGY_USAGE,
+                            "claude" => SOURCE_CLAUDE_STREAM,
+                            _ => "",
+                        };
+                        let _ = st.save_quota(&QuotaSnapshot {
+                            agent: q.key.clone(),
+                            provider: candidate.route.provider.clone(),
+                            window: String::new(),
+                            source: source.into(),
+                            confidence: "official".into(),
+                            used_percent: Some(q.used_percent),
+                            window_minutes: q.window_minutes,
+                            resets_at: q.resets_at.map(fmt_time).unwrap_or_default(),
+                            sampled_at: fmt_time(q.sampled_at.unwrap_or(now)),
+                        });
+                    }
+                    let mut cache = live_quotas().lock().unwrap();
+                    if let Some(entry) = cache.get_mut(&cache_key) {
+                        if let Some(q) = &result {
+                            entry.value = Some((now, q.clone()));
+                        }
+                        entry.flight = None;
+                    }
+                    let _ = sender.send(Some(result));
+                });
+                receiver
+            }
+        };
+        let wait = async {
+            loop {
+                if let Some(value) = receiver.borrow().clone() {
+                    return value;
+                }
+                if receiver.changed().await.is_err() {
+                    return None;
+                }
+            }
+        };
+        match tokio::time::timeout(LIVE_QUOTA_DEADLINE, wait).await {
+            Ok(value) => value,
+            Err(_) => {
+                if let Some(phase) = phase {
+                    phase(format!("Using cached quota: {}", c.route.agent));
+                }
+                None
+            }
+        }
     }
 
     /// Reads cached quota and cooldown state. It never records a snapshot or
