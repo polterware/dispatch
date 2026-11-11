@@ -90,7 +90,6 @@ impl Profile {
                 model: e.model.clone(),
                 provider: e.provider.clone(),
                 position: i as i64,
-                ..Default::default()
             })
             .collect();
         table_from_rows(&rows)

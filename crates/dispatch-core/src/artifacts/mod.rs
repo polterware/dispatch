@@ -125,7 +125,7 @@ fn webp(b: &[u8]) -> Option<Image> {
             u24_le(&b[27..30]) + 1,
         )),
         // Lossy: a frame tag and the start code, then 14-bit width and height.
-        b"VP8 " if b.len() >= 30 && &b[23..26] == [0x9D, 0x01, 0x2A] => Some(Image::new(
+        b"VP8 " if b.len() >= 30 && b[23..26] == [0x9D, 0x01, 0x2A] => Some(Image::new(
             "webp",
             u16_le(&b[26..28]) & 0x3FFF,
             u16_le(&b[28..30]) & 0x3FFF,

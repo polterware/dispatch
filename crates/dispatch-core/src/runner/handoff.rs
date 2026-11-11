@@ -253,10 +253,8 @@ fn extract_stream_digest(log_slice: &str, result_output: &str, limit_err: &str) 
 
 fn flush_delta(messages: &mut Vec<String>, current_delta: &mut String) {
     let trimmed = current_delta.trim();
-    if !trimmed.is_empty() {
-        if messages.last().map(|s| s.trim()) != Some(trimmed) {
-            messages.push(trimmed.to_owned());
-        }
+    if !trimmed.is_empty() && messages.last().map(|s| s.trim()) != Some(trimmed) {
+        messages.push(trimmed.to_owned());
     }
     current_delta.clear();
 }
