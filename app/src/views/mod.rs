@@ -2,6 +2,7 @@
 
 mod commander;
 mod conversation_usage;
+mod images;
 mod intelligence;
 pub mod repository_actions;
 mod roles;
@@ -23,6 +24,7 @@ pub(crate) fn core_message(error: crate::client::CoreError) -> String {
         crate::client::CoreError::Rpc(message) => message,
     }
 }
+pub use images::ImagesView;
 pub use intelligence::IntelligenceView;
 pub use roles::RolesView;
 pub use run_page::RunPageView;

@@ -6,7 +6,9 @@ mod common;
 
 use common::*;
 use dispatch_app::app::AppView;
+use dispatch_app::client::{AddWorkspaceRequest, ListArtifactsRequest, StartRunRequest};
 use dispatch_app::state::{AppState, ConnectionState, Route, SettingsPage};
+use dispatch_app::views::ImagesView;
 use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext};
 use std::path::Path;
 use std::sync::Mutex;
@@ -17,6 +19,7 @@ static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 struct Window<'a> {
     cx: &'a mut VisualTestContext,
     state: Entity<AppState>,
+    images: Entity<ImagesView>,
 }
 
 /// Opens the app's window on `core`.
@@ -31,9 +34,10 @@ fn open<'a>(core: &Core, cx: &'a mut TestAppContext) -> Window<'a> {
     });
     let (view, cx) = cx.add_window_view(AppView::new);
     let state = view.read_with(cx, |view, _| view.state());
+    let images = view.read_with(cx, |view, _| view.images());
     // Tall enough that every row of a page is on screen, where a click lands.
     cx.simulate_resize(gpui::size(gpui::px(1400.0), gpui::px(4000.0)));
-    let mut window = Window { cx, state };
+    let mut window = Window { cx, state, images };
     window.settle();
     assert_eq!(
         window
@@ -199,6 +203,7 @@ fn every_page_opens_with_data(cx: &mut TestAppContext) {
         Route::Intelligence,
         Route::Spend,
         Route::Stats,
+        Route::Images,
         Route::Runs,
         Route::Run(write.clone()),
         Route::Run(read.clone()),
@@ -912,4 +917,100 @@ fn settings_voice_shows_the_engine_and_downloads_a_model(cx: &mut TestAppContext
             .any(|hit| hit == "POST /v1/models/kokoro-v1/download")
     });
     assert!(w.toasts().is_empty(), "{:?}", w.toasts());
+}
+
+#[gpui::test]
+fn the_images_page_filters_delegated_images_and_deletes_one(cx: &mut TestAppContext) {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let core = Core::new();
+    // One image a delegated run made, and one the app's own run did.
+    let delegated = core.start("IMAGE draw a chart", true);
+    core.wait_for(&delegated, "COMPLETED");
+    let workspace = core
+        .client
+        .add_workspace(&AddWorkspaceRequest {
+            path: core.repo.to_string_lossy().into_owned(),
+            name: String::new(),
+        })
+        .expect("add workspace")
+        .workspace;
+    let app = core
+        .client
+        .start_run(&StartRunRequest {
+            project_id: workspace.id,
+            prompt: "IMAGE make a logo".into(),
+            agent: "fake".into(),
+            dir: core.repo.to_string_lossy().into_owned(),
+            read_only: true,
+            ..StartRunRequest::default()
+        })
+        .expect("start the app's run")
+        .run
+        .id;
+    core.wait_for(&app, "COMPLETED");
+    let artifacts = || {
+        core.client
+            .list_artifacts(&ListArtifactsRequest::default())
+            .expect("list artifacts")
+            .artifacts
+    };
+    wait_until("both images are indexed", || artifacts().len() == 2);
+    let listed = artifacts();
+    let mine = listed
+        .iter()
+        .find(|artifact| artifact.run_id == delegated)
+        .expect("the delegated image")
+        .clone();
+    let apps = listed
+        .iter()
+        .find(|artifact| artifact.run_id == app)
+        .expect("the app's image")
+        .clone();
+    assert_eq!(mine.origin, "delegated");
+    assert_eq!(apps.origin, "app");
+
+    let mut w = open(&core, cx);
+    w.click("sidebar-nav-Images");
+    assert_eq!(w.route(), Route::Images);
+    let mine_tile = format!("image-tile-{}", mine.id);
+    let app_tile = format!("image-tile-{}", apps.id);
+    for _ in 0..30 {
+        w.settle();
+        if w.shows(&mine_tile) && w.shows(&app_tile) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        w.shows(&mine_tile) && w.shows(&app_tile),
+        "the gallery never showed both images"
+    );
+
+    // Origin: Delegated leaves the app's image out.
+    let filters = w.images.read_with(w.cx, |view, _| view.filters().clone());
+    filters.update(w.cx, |filters, cx| {
+        filters.add_filter("origin", &["delegated".into()], cx);
+    });
+    w.settle();
+    assert!(w.shows(&mine_tile), "the delegated tile went away");
+    assert!(!w.shows(&app_tile), "the app's tile stayed");
+
+    // The viewer opens on the tile, and Delete asks before removing the copy.
+    w.click(&mine_tile);
+    w.pump();
+    assert!(w.shows("image-viewer"), "no viewer opened");
+    w.click("image-delete");
+    w.pump();
+    w.click("delete-image-confirm");
+    w.until("the image is gone", || artifacts().len() == 1);
+    w.settle();
+    assert_eq!(
+        w.images.read_with(w.cx, |view, _| view.tile_count()),
+        1,
+        "the deleted tile stayed"
+    );
+
+    filters.update(w.cx, |filters, cx| filters.clear(cx));
+    w.settle();
+    assert!(w.shows(&app_tile), "the other image went with it");
 }

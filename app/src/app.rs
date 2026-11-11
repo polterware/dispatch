@@ -12,8 +12,8 @@ use crate::theme::Theme;
 use crate::ui::patterns::{main_surface, modal_layer};
 use crate::ui::{toast_lifetime, toast_stack};
 use crate::views::{
-    CommanderView, IntelligenceView, RolesView, RunPageView, RunsView, SettingsView, SidebarView,
-    SpendView, StatsView,
+    CommanderView, ImagesView, IntelligenceView, RolesView, RunPageView, RunsView, SettingsView,
+    SidebarView, SpendView, StatsView,
 };
 
 actions!(
@@ -50,6 +50,7 @@ pub struct AppView {
     intelligence: gpui::Entity<IntelligenceView>,
     spend: gpui::Entity<SpendView>,
     stats: gpui::Entity<StatsView>,
+    images: gpui::Entity<ImagesView>,
     settings: gpui::Entity<SettingsView>,
     run_page: gpui::Entity<RunPageView>,
     runs: gpui::Entity<RunsView>,
@@ -75,6 +76,11 @@ impl AppView {
     /// The run page, which also draws the new conversation (the tests read it).
     pub fn run_page(&self) -> gpui::Entity<RunPageView> {
         self.run_page.clone()
+    }
+
+    /// The Images page, which the tests read.
+    pub fn images(&self) -> gpui::Entity<ImagesView> {
+        self.images.clone()
     }
 
     /// Starts the countdown of every toast that has none yet, and forgets the ones gone.
@@ -132,6 +138,7 @@ impl AppView {
             intelligence: cx.new(|cx| IntelligenceView::new(state.clone(), cx)),
             spend: cx.new(|cx| SpendView::new(state.clone(), cx)),
             stats: cx.new(|cx| StatsView::new(state.clone(), cx)),
+            images: cx.new(|cx| ImagesView::new(state.clone(), cx)),
             settings: cx.new(|cx| SettingsView::new(state.clone(), cx)),
             run_page: cx.new(|cx| RunPageView::new(state.clone(), cx)),
             runs: cx.new(|cx| RunsView::new(state.clone(), cx)),
@@ -251,6 +258,7 @@ impl Render for AppView {
             &self.intelligence,
             &self.spend,
             &self.stats,
+            &self.images,
             &self.run_page,
             &self.runs,
         );
@@ -319,6 +327,7 @@ impl Render for AppView {
                     Route::Runs => this.runs.read(cx).filters().clone(),
                     Route::Intelligence => this.intelligence.read(cx).filters().clone(),
                     Route::Spend => this.spend.read(cx).filters().clone(),
+                    Route::Images => this.images.read(cx).filters().clone(),
                     _ => return,
                 };
                 if filters.update(cx, |filters, cx| filters.open_from_shortcut(cx)) {
@@ -443,6 +452,7 @@ fn page_for_route(
     intelligence: &gpui::Entity<IntelligenceView>,
     spend: &gpui::Entity<SpendView>,
     stats: &gpui::Entity<StatsView>,
+    images: &gpui::Entity<ImagesView>,
     run_page: &gpui::Entity<RunPageView>,
     runs: &gpui::Entity<RunsView>,
 ) -> AnyElement {
@@ -451,6 +461,7 @@ fn page_for_route(
         Route::Intelligence => intelligence.clone().into(),
         Route::Spend => spend.clone().into(),
         Route::Stats => stats.clone().into(),
+        Route::Images => images.clone().into(),
         // Never the backdrop: Settings draws in its dialog.
         Route::Settings(_) => roles.clone().into(),
         Route::Run(_) | Route::NewRun => run_page.clone().into(),
