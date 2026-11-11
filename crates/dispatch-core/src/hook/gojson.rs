@@ -3,13 +3,6 @@
 
 use serde_json::Value;
 
-/// Marshal is Go's json.Marshal.
-pub(crate) fn marshal(v: &Value) -> String {
-    let mut out = String::new();
-    write(&mut out, v, None, 0);
-    out
-}
-
 /// marshal_indent is Go's json.MarshalIndent(v, "", indent).
 pub(crate) fn marshal_indent(v: &Value, indent: &str) -> String {
     let mut out = String::new();

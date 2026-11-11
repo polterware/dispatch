@@ -895,8 +895,7 @@ impl Core {
     }
 
     /// How the agent CLIs reach dispatch: the command on the PATH, the skill
-    /// in each skills folder, each agent's SessionStart hook, and the OpenCode
-    /// plugin.
+    /// in each skills folder, and each agent's SessionStart hook.
     pub(crate) async fn get_agent_setup(
         &self,
         _: pb::GetAgentSetupRequest,
@@ -907,9 +906,9 @@ impl Core {
         })
     }
 
-    /// Links the command, installs or removes the skill, switches an agent's hook, or
-    /// installs, removes, or switches the OpenCode plugin, pointing each at
-    /// this core's binary, and answers the setup after it.
+    /// Links the command, installs or removes the skill, or switches an
+    /// agent's hook, pointing each at this core's binary, and answers the
+    /// setup after it.
     pub(crate) async fn apply_agent_setup(
         &self,
         m: pb::ApplyAgentSetupRequest,
@@ -922,16 +921,6 @@ impl Core {
             "remove_skill" => setup::remove_skill(&home, &m.agent).map(|_| ()),
             "hook_on" | "hook_off" => {
                 setup::set_hook(&home, &binary, &state, &m.agent, m.action == "hook_on")
-            }
-            "install_opencode" => setup::install_opencode_plugin(
-                &home,
-                &setup::opencode_binary(&home, &binary),
-                &state,
-            )
-            .map(|_| ()),
-            "remove_opencode" => setup::remove_opencode_plugin(&home, &state),
-            "opencode_on" | "opencode_off" => {
-                setup::set_opencode_delegation(&state, m.action == "opencode_on")
             }
             _ => return Err(RpcError::invalid("unknown setup action")),
         };

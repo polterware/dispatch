@@ -93,6 +93,17 @@ async fn serve(db_path: &Path, listen: String, token: String, idle: Duration) ->
         Ok(n) if n > 0 => eprintln!("imported {n} tier entries from Polterware"),
         Ok(_) => {}
     }
+    // OpenCode reaches dispatch through the CLI and the skill; the plugin an
+    // earlier version installed is gone.
+    if let Some(home) = dirs::home_dir() {
+        match crate::setup::remove_legacy_opencode_plugin(&home, &core.state_dir()) {
+            Ok(true) => {
+                eprintln!("removed the Dispatch plugin an earlier version installed in OpenCode")
+            }
+            Ok(false) => {}
+            Err(e) => eprintln!("OpenCode plugin cleanup: {e}"),
+        }
+    }
     let server = tokio::spawn(server::serve(listener, core.clone()));
     // The prices and benchmarks age out by themselves, never in a request's way.
     core.spawn_catalog_refresh();

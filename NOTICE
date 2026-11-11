@@ -5,8 +5,6 @@ Licensed under the Apache License, Version 2.0 (LICENSE).
 
 Third-party code and data in this repository:
 
-- plugins/opencode-gui/vendor/bot-avatars: bot-avatars by Jakub Antalik, MIT License
-  (plugins/opencode-gui/vendor/bot-avatars/LICENSE).
 - crates/dispatch-core/src/models_snapshot.json, gathered by tooling/models.mjs:
   CursorBench scores and the Epoch Capabilities Index from Epoch AI's Benchmarking Hub
   (CC BY 4.0, https://epoch.ai/benchmarks), and prices and limits from models.dev (MIT).

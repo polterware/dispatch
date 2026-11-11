@@ -1,15 +1,11 @@
 //! Agent setup: reports and changes how the agent CLIs on this machine reach
 //! dispatch: the `dispatch` command on the PATH, the dispatch skill in the
-//! skills folders they read, each agent's SessionStart hook, and the Dispatch
-//! plugin in OpenCode.
+//! skills folders they read, and each agent's SessionStart hook.
 
 mod jsonc;
 mod opencode;
 
-pub use opencode::{
-    OPENCODE_SWITCH, OpenCode, OpenCodeEntry, edit_opencode_config, install_opencode_plugin,
-    opencode_config_path, opencode_plugin_dir, remove_opencode_plugin, set_opencode_delegation,
-};
+pub use opencode::{opencode_config_path, opencode_plugin_dir, remove_legacy_opencode_plugin};
 
 use std::collections::HashSet;
 use std::fs;
@@ -70,7 +66,6 @@ pub struct Report {
     pub hooks: Vec<Hook>,
     /// The agents whose config folder is on this machine.
     pub agents: Vec<String>,
-    pub opencode: OpenCode,
 }
 
 pub const LINKED: &str = "linked";
@@ -108,7 +103,6 @@ pub fn cli_path(home: &Path) -> PathBuf {
 pub fn read(home: &Path, binary: &str, state_dir: &Path) -> Report {
     let mut r = Report {
         cli: read_cli(home, binary),
-        opencode: opencode::read_opencode(home, &opencode_binary(home, binary), state_dir),
         ..Report::default()
     };
     let mut seen = HashSet::new();
@@ -192,15 +186,6 @@ pub fn present_agents(home: &Path) -> Vec<String> {
         .filter(|(_, paths)| paths.iter().any(|p| fs::metadata(p).is_ok()))
         .map(|(agent, _)| agent.to_string())
         .collect()
-}
-
-/// The dispatch the OpenCode plugin runs: the linked command when it is this
-/// binary, so it follows the link, else binary itself.
-pub fn opencode_binary(home: &Path, binary: &str) -> String {
-    if read_cli(home, binary).state == LINKED {
-        return lossy(&cli_path(home));
-    }
-    binary.to_string()
 }
 
 fn read_cli(home: &Path, binary: &str) -> Cli {
