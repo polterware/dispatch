@@ -15,6 +15,8 @@ libc = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 smallvec = "1.6"
+# An async channel, so a transcript awaits its run's events instead of blocking a thread.
+futures = { version = "0.3", default-features = false, features = ["std"] }
 ureq = { version = "2.12", default-features = false }
 pulldown-cmark = { version = "0.12", default-features = false }
 syntect = { version = "5", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy", "parsing"] }

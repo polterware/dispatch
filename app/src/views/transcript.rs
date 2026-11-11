@@ -11,8 +11,10 @@
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex, mpsc};
-use std::time::{Duration, Instant};
+
+use futures::StreamExt as _;
+use futures::channel::mpsc;
+use std::time::Duration;
 
 use std::cell::Cell;
 
@@ -539,15 +541,15 @@ impl TranscriptView {
         };
         self.started = true;
         let generation = self.generation;
-        let (tx, rx) = mpsc::channel();
-        let rx = Arc::new(Mutex::new(rx));
+        // An async channel: the loop below awaits the next event, so it never holds a thread
+        // the producer needs (gpui's test executor runs every task on one thread).
+        let (tx, mut rx) = mpsc::unbounded();
         let run_id = self.run_id.clone();
         let watch_client = client.clone();
         self.watch_task = Some(cx.background_spawn(async move {
             produce_watch(watch_client, run_id, tx);
         }));
         let run_id = self.run_id.clone();
-        let rx_for_loop = rx.clone();
         cx.spawn(async move |this, cx| {
             let stored = cx
                 .background_spawn(async move {
@@ -578,9 +580,7 @@ impl TranscriptView {
                 return;
             }
             loop {
-                let rx = rx_for_loop.clone();
-                let batch = cx.background_spawn(async move { recv_batch(&rx) }).await;
-                let Some(batch) = batch else {
+                let Some(batch) = next_batch(&mut rx).await else {
                     break;
                 };
                 let mut events = Vec::new();
@@ -1569,7 +1569,7 @@ fn split_stable(log: &str) -> (&str, &str) {
 /// Streams the run's log into `tx`, opening at its last [`TAIL_BYTES`]. A core from before
 /// pages rejects the tail and ends the stream before any event: the watch then asks again
 /// for the whole log, as that core expects.
-fn produce_watch(client: CoreClient, run_id: String, tx: mpsc::Sender<StreamMsg>) {
+fn produce_watch(client: CoreClient, run_id: String, tx: mpsc::UnboundedSender<StreamMsg>) {
     for tail in [TAIL_BYTES, 0] {
         let request = WatchRunRequest {
             id: run_id.clone(),
@@ -1582,7 +1582,7 @@ fn produce_watch(client: CoreClient, run_id: String, tx: mpsc::Sender<StreamMsg>
             _ => break,
         }
     }
-    let _ = tx.send(StreamMsg::End);
+    let _ = tx.unbounded_send(StreamMsg::End);
 }
 
 enum Watched {
@@ -1597,7 +1597,7 @@ enum Watched {
 fn stream_watch(
     client: &CoreClient,
     request: &WatchRunRequest,
-    tx: &mpsc::Sender<StreamMsg>,
+    tx: &mpsc::UnboundedSender<StreamMsg>,
 ) -> Watched {
     let Ok(iter) = client.watch_run(request) else {
         return Watched::Rejected;
@@ -1606,7 +1606,7 @@ fn stream_watch(
     for item in iter {
         match item {
             Ok(event) => {
-                if tx.send(StreamMsg::Event(paged(event))).is_err() {
+                if tx.unbounded_send(StreamMsg::Event(paged(event))).is_err() {
                     return Watched::Gone;
                 }
                 sent = true;
@@ -1618,17 +1618,13 @@ fn stream_watch(
     Watched::Ended
 }
 
-fn recv_batch(rx: &Mutex<mpsc::Receiver<StreamMsg>>) -> Option<Vec<StreamMsg>> {
-    let rx = rx.lock().ok()?;
-    let first = rx.recv().ok()?;
+/// The next message and every one already waiting behind it, up to [`WATCH_BATCH`]; `None`
+/// once the producer is gone.
+async fn next_batch(rx: &mut mpsc::UnboundedReceiver<StreamMsg>) -> Option<Vec<StreamMsg>> {
+    let first = rx.next().await?;
     let mut batch = vec![first];
-    let deadline = Instant::now() + Duration::from_millis(16);
     while batch.len() < WATCH_BATCH {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            break;
-        }
-        match rx.recv_timeout(left) {
+        match rx.try_recv() {
             Ok(message) => batch.push(message),
             Err(_) => break,
         }

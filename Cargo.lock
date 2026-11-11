@@ -1935,6 +1935,7 @@ name = "dispatch-app"
 version = "0.1.0"
 dependencies = [
  "dispatch-core",
+ "futures",
  "gpui",
  "image",
  "libc",
