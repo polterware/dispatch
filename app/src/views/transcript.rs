@@ -31,7 +31,8 @@ use crate::format::is_active_status;
 use crate::models::run_page::attempt_switches;
 use crate::models::transcript::{
     LogEvent, PagedEvent, PromptBubble, StreamedLog, TranscriptBuilder, TranscriptEntry,
-    TranscriptImage, build_transcript, enrich_transcript_switches, prompt_bubble, run_images,
+    TranscriptImage, build_transcript, enrich_transcript_switches, live_phase, prompt_bubble,
+    run_images,
 };
 use crate::motion::{Animator, SpringTier, SpringValue};
 use crate::state::{AppState, observe};
@@ -137,6 +138,7 @@ pub struct TranscriptView {
     stored: String,
     /// What the stream has sent, written once per event as it arrives.
     streamed: StreamedLog,
+    phase: Option<String>,
     pinned: bool,
     held_start: usize,
     shown_live: bool,
@@ -259,6 +261,7 @@ impl TranscriptView {
             processed: String::new(),
             stored: String::new(),
             streamed: StreamedLog::default(),
+            phase: None,
             pinned: true,
             held_start: 0,
             shown_live: false,
@@ -597,7 +600,15 @@ impl TranscriptView {
                             return false;
                         }
                         if !events.is_empty() {
+                            for event in &events {
+                                if event.event.kind == "phase" {
+                                    view.phase = Some(event.event.text.clone());
+                                }
+                            }
                             view.streamed.extend_paged(&events);
+                            if view.streamed.has_output() {
+                                view.phase = None;
+                            }
                             if !view.opened {
                                 view.opened = true;
                                 view.earlier_more = view.streamed.may_have_earlier();
@@ -761,6 +772,18 @@ impl TranscriptView {
                         .run(&self.run_id)
                         .map(|run| run.agent.clone())
                         .unwrap_or_default(),
+                    phase: if self.entries.iter().any(|entry| {
+                        matches!(
+                            entry,
+                            TranscriptEntry::Output { .. }
+                                | TranscriptEntry::Step { .. }
+                                | TranscriptEntry::Message { .. }
+                        )
+                    }) {
+                        String::new()
+                    } else {
+                        self.phase.clone().unwrap_or_else(|| "Routing".to_string()) + "…"
+                    },
                 },
             });
         }

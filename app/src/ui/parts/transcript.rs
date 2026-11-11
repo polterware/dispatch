@@ -80,6 +80,7 @@ pub enum RowBody {
     /// The end of a live run: its agent's bot, thinking.
     Live {
         agent: String,
+        phase: String,
     },
     Step {
         entry: usize,
@@ -456,7 +457,7 @@ pub fn render_row(
             .text_color(theme.color_text_muted)
             .child(text.clone())
             .into_any_element(),
-        RowBody::Live { agent } => live_row(agent).into_any_element(),
+        RowBody::Live { agent, phase } => live_row(agent, phase, theme).into_any_element(),
         RowBody::Step {
             entry,
             verb,
@@ -1033,17 +1034,23 @@ const LIVE_BOT_PX: f32 = 28.0;
 
 /// A live run's end: its agent's bot thinking, its body folded into bouncing dots, as a
 /// chat app shows its agent is still at it.
-fn live_row(agent: &str) -> gpui::Div {
+fn live_row(agent: &str, phase: &str, theme: Theme) -> gpui::Div {
     div()
         .w_full()
         .py(px(6.0))
         .flex()
         .items_center()
+        .gap(px(8.0))
         .child(agent_avatar_playing(
             agent,
             BotAvatarState::Thinking,
             LIVE_BOT_PX,
         ))
+        .child(
+            div()
+                .text_color(theme.color_text_muted)
+                .child(phase.to_string()),
+        )
 }
 
 fn code_row(
@@ -1414,9 +1421,10 @@ fn body_signature(body: &RowBody) -> u64 {
             3u8.hash(&mut hasher);
             text.hash(&mut hasher);
         }
-        RowBody::Live { agent } => {
+        RowBody::Live { agent, phase } => {
             4u8.hash(&mut hasher);
             agent.hash(&mut hasher);
+            phase.hash(&mut hasher);
         }
         RowBody::Step {
             entry,
@@ -1904,6 +1912,46 @@ mod tests {
             failed: None,
             output: None,
         }
+    }
+
+    #[test]
+    fn phase_events_are_not_transcript_rows() {
+        use crate::models::transcript::{LogEvent, StreamedLog};
+        let events = [LogEvent {
+            kind: "phase".into(),
+            text: "Preparing worktree".into(),
+        }];
+        let mut log = StreamedLog::default();
+        log.extend(&events);
+        assert!(log.join("").is_empty());
+        assert!(flatten_transcript(&[], &HashSet::new(), None).is_empty());
+    }
+
+    #[test]
+    fn latest_phase_is_used_until_first_output() {
+        use crate::models::transcript::{LogEvent, live_phase};
+        let events = [
+            LogEvent {
+                kind: "phase".into(),
+                text: "Preparing worktree".into(),
+            },
+            LogEvent {
+                kind: "phase".into(),
+                text: "Starting codex (gpt-6)".into(),
+            },
+        ];
+        assert_eq!(
+            live_phase(&events).as_deref(),
+            Some("Starting codex (gpt-6)")
+        );
+        let with_output = [
+            events[1].clone(),
+            LogEvent {
+                kind: "output".into(),
+                text: "hello".into(),
+            },
+        ];
+        assert_eq!(live_phase(&with_output), None);
     }
 
     fn said(text: &str) -> TranscriptEntry {
