@@ -1,44 +1,64 @@
-//! Settings › Voice's client of the local voice engine: its discovery file and token, its
-//! HTTP endpoints (catalog, models, settings), and the little of its WebSocket this page
-//! needs (a download's progress, and the test phrase a voice speaks). Everything here is
-//! blocking and is called on the app's background executor.
+//! Settings › Voice's side of the local voice engine: its catalog, its settings, and its
+//! models, the two chat switches this app keeps, and the little of the engine's WebSocket
+//! this page needs (a download's progress, and the test phrase a voice speaks).
 //!
-//! The chat's own client (the live microphone and playback socket) is separate; this file
-//! keeps to what these settings ask of the engine, so both can be written apart.
+//! The engine itself is `crate::voice`'s: the discovery file, the binary started on demand,
+//! and the HTTP client are found there, and so is the only type in the app called
+//! `VoiceEngine`. Everything here is blocking and is called on the app's background
+//! executor.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
+
+pub use voice_core::catalog::{
+    Catalog, CatalogEntry, EngineSettings, ModelKind, SettingsPatch, VoiceEntry,
+};
+use voice_core::discovery::EngineInfo;
+pub use voice_core::protocol::Language;
+use voice_core::protocol::{ClientMessage, EngineMessage, TextFormat};
 
 use crate::client::resolve_data_dir;
 use crate::state::{read_preference, write_preference};
+use crate::voice::VoiceEngine;
 
-/// The languages the engine hears and speaks. The wire values are `voice-core`'s
-/// `Language` in kebab case.
-pub const LANGUAGES: [(&str, &str); 3] = [
-    ("pt-br", "Portuguese (Brazil)"),
-    ("en", "English"),
-    ("auto", "Detect per utterance"),
+/// The languages the engine hears and speaks, with the labels the page shows.
+pub const LANGUAGES: [(Language, &str); 3] = [
+    (Language::PtBr, "Portuguese (Brazil)"),
+    (Language::En, "English"),
+    (Language::Auto, "Detect per utterance"),
 ];
-
-/// The language the settings start on, as the engine does.
-pub const DEFAULT_LANGUAGE: &str = "pt-br";
 
 /// The engine's answer when its settings are being changed by another client.
 const BUSY: &str = "The engine is busy. Try again.";
 
+/// The id the test phrase speaks under, so its end is told apart from other speaks.
+const TEST_SPEAK_ID: &str = "settings-test";
+
 /// A language's label, or its code when nothing names it.
-pub fn language_label(code: &str) -> String {
+pub fn language_label(language: Language) -> String {
     LANGUAGES
         .iter()
-        .find(|(value, _)| *value == code)
-        .map_or_else(|| code.to_string(), |(_, label)| (*label).to_string())
+        .find(|(value, _)| *value == language)
+        .map_or_else(
+            || language_code(language).to_string(),
+            |(_, label)| (*label).to_string(),
+        )
+}
+
+/// A language as the engine's wire names it.
+fn language_code(language: Language) -> &'static str {
+    match language {
+        Language::PtBr => "pt-br",
+        Language::En => "en",
+        Language::Auto => "auto",
+    }
 }
 
 /// The speaking speeds the page offers, in the engine's 0.5–2.0 range.
@@ -51,113 +71,35 @@ pub fn speed_label(speed: f32) -> String {
     format!("{trimmed}×")
 }
 
-/// One downloadable model, as `GET /v1/catalog` lists it.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
-pub struct CatalogEntry {
-    pub id: String,
-    /// `stt`, `tts`, or `vad`.
-    pub kind: String,
-    pub backend: String,
-    pub name: String,
-    #[serde(default)]
-    pub description: String,
-    #[serde(default)]
-    pub languages: Vec<String>,
-    #[serde(default)]
-    pub size_bytes: u64,
-    #[serde(default)]
-    pub license: String,
-    #[serde(default)]
-    pub installed: bool,
-    /// The current settings use it: Delete is refused.
-    #[serde(default)]
-    pub active: bool,
+/// The voices that speak `language` (a piper or kokoro voice is one language's).
+pub fn voices_for(catalog: &Catalog, language: Language) -> Vec<&VoiceEntry> {
+    catalog
+        .voices
+        .iter()
+        .filter(|voice| voice.language == language)
+        .collect()
 }
 
-/// A voice the engine can speak with.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
-pub struct VoiceEntry {
-    pub id: String,
-    #[serde(default)]
-    pub backend: String,
-    pub name: String,
-    pub language: String,
-    #[serde(default)]
-    pub model_id: Option<String>,
-    #[serde(default)]
-    pub installed: bool,
+/// The model the catalog lists by `id`.
+pub fn model<'a>(catalog: &'a Catalog, id: &str) -> Option<&'a CatalogEntry> {
+    catalog.models.iter().find(|model| model.id == id)
 }
 
-/// `GET /v1/catalog`.
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
-pub struct Catalog {
-    #[serde(default)]
-    pub models: Vec<CatalogEntry>,
-    #[serde(default)]
-    pub voices: Vec<VoiceEntry>,
+/// The STT models settings may pick.
+pub fn stt_models(catalog: &Catalog) -> Vec<&CatalogEntry> {
+    catalog
+        .models
+        .iter()
+        .filter(|model| model.kind == ModelKind::Stt)
+        .collect()
 }
 
-impl Catalog {
-    /// The voices that speak `language` (a piper or kokoro voice is one language's).
-    pub fn voices_for(&self, language: &str) -> Vec<&VoiceEntry> {
-        self.voices
-            .iter()
-            .filter(|voice| voice.language == language)
-            .collect()
-    }
-
-    /// The model a voice needs, when the catalog lists it.
-    pub fn model(&self, id: &str) -> Option<&CatalogEntry> {
-        self.models.iter().find(|model| model.id == id)
-    }
-
-    /// The STT models settings may pick.
-    pub fn stt_models(&self) -> Vec<&CatalogEntry> {
-        self.models
-            .iter()
-            .filter(|model| model.kind == "stt")
-            .collect()
-    }
-}
-
-/// `GET /v1/settings`: what every client shares, stored by the engine.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default, rename_all = "snake_case")]
-pub struct EngineSettings {
-    pub language: String,
-    pub stt_model: String,
-    pub voice_pt: String,
-    pub voice_en: String,
-    pub speed: f32,
-    /// Live partial transcripts while listening.
-    pub partials: bool,
-    pub model_idle_secs: u64,
-    pub exit_after_idle_secs: u64,
-}
-
-impl Default for EngineSettings {
-    fn default() -> Self {
-        Self {
-            language: DEFAULT_LANGUAGE.to_string(),
-            stt_model: "whisper-small-q5_1".to_string(),
-            voice_pt: "piper:pt_BR-faber-medium".to_string(),
-            voice_en: "kokoro:af_heart".to_string(),
-            speed: 1.0,
-            partials: true,
-            model_idle_secs: 600,
-            exit_after_idle_secs: 1800,
-        }
-    }
-}
-
-impl EngineSettings {
-    /// The voice the settings speak a language with.
-    pub fn voice(&self, language: &str) -> &str {
-        if language == "en" {
-            &self.voice_en
-        } else {
-            &self.voice_pt
-        }
+/// The voice the settings speak a language with.
+pub fn voice_for(settings: &EngineSettings, language: Language) -> &str {
+    if language == Language::En {
+        &settings.voice_en
+    } else {
+        &settings.voice_pt
     }
 }
 
@@ -185,225 +127,69 @@ pub fn write_chat(data_dir: &Path, chat: &ChatVoice) -> Result<(), String> {
     write_preference(data_dir, CHAT_PREFERENCE, chat)
 }
 
-/// A running engine: where it answers and the token it was discovered with.
-#[derive(Clone, Debug, PartialEq)]
-pub struct VoiceEngine {
-    pub base_url: String,
-    token: String,
+/// The engine's failure in the page's words: its status alone says what happened for a token
+/// it refuses, and `conflict` says what a 409 means for the call that got it.
+fn failure(error: String, conflict: &str) -> String {
+    match error.as_str() {
+        "HTTP 401" | "HTTP 403" => {
+            "The engine refused the discovery token. Restart it.".to_string()
+        }
+        "HTTP 409" if !conflict.is_empty() => conflict.to_string(),
+        "HTTP 409" => BUSY.to_string(),
+        _ => error,
+    }
 }
 
-impl VoiceEngine {
-    /// The engine the discovery file names, when it is there and readable.
-    pub fn discover() -> Option<Self> {
-        let raw = std::fs::read(discovery_file()).ok()?;
-        let info: Value = serde_json::from_slice(&raw).ok()?;
-        let port = info.get("port")?.as_u64()?;
-        if port == 0 || port > u16::MAX as u64 {
-            return None;
-        }
-        let token = info.get("token")?.as_str()?.to_string();
-        if token.is_empty() {
-            return None;
-        }
-        Some(Self {
-            base_url: format!("http://127.0.0.1:{port}"),
-            token,
-        })
-    }
+/// `PATCH /v1/settings`, answering the settings it stored.
+pub fn patch(engine: &VoiceEngine, patch: &SettingsPatch) -> Result<EngineSettings, String> {
+    engine
+        .set_engine_settings(patch)
+        .map_err(|error| failure(error, ""))
+}
 
-    /// `GET /v1/catalog`, with each model's installed and active flags.
-    pub fn catalog(&self) -> Result<Catalog, String> {
-        let body = self.query("GET", "/v1/catalog", None, BUSY)?;
-        serde_json::from_str(&body).map_err(|err| format!("The catalog did not parse: {err}"))
-    }
-
-    /// `GET /v1/settings`.
-    pub fn settings(&self) -> Result<EngineSettings, String> {
-        let body = self.query("GET", "/v1/settings", None, BUSY)?;
-        serde_json::from_str(&body).map_err(|err| format!("The settings did not parse: {err}"))
-    }
-
-    /// `PATCH /v1/settings`, answering the settings it stored.
-    pub fn patch(&self, patch: Value) -> Result<EngineSettings, String> {
-        let body = self.query("PATCH", "/v1/settings", Some(patch), BUSY)?;
-        serde_json::from_str(&body).map_err(|err| format!("The settings did not parse: {err}"))
-    }
-
-    /// `POST /v1/models/{id}/download`: the download runs in the engine.
-    pub fn download(&self, id: &str) -> Result<(), String> {
-        self.query(
-            "POST",
-            &format!("/v1/models/{}/download", encode(id)),
-            None,
-            "This model is already downloading.",
-        )
-        .map(|_| ())
-    }
-
-    /// `DELETE /v1/models/{id}`; an in-use model answers 409.
-    pub fn delete(&self, id: &str) -> Result<(), String> {
-        self.query(
-            "DELETE",
-            &format!("/v1/models/{}", encode(id)),
-            None,
+/// `DELETE /v1/models/{id}`; an in-use model answers 409, and the engine refuses it.
+pub fn delete_model(engine: &VoiceEngine, id: &str) -> Result<(), String> {
+    engine.remove_model(id).map_err(|error| {
+        failure(
+            error,
             "The engine is using this model. Pick another model or voice first.",
         )
-        .map(|_| ())
-    }
+    })
+}
 
-    /// Speaks a test phrase and holds the socket until the engine says it ended.
-    pub fn speak(&self, text: &str, language: &str, voice: &str) -> Result<(), String> {
-        let mut socket = Socket::connect(self, Duration::from_secs(8))?;
-        socket.send_text(
-            &json!({
-                "type": "speak",
-                "id": "settings-test",
-                "text": text,
-                "format": "plain",
-                "language": language,
-                "voice": voice,
-            })
-            .to_string(),
-        )?;
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while Instant::now() < deadline {
-            let Some(message) = socket.read_message()? else {
-                return Ok(());
-            };
-            if message.get("type").and_then(Value::as_str) == Some("speak.ended")
-                && message.get("id").and_then(Value::as_str) == Some("settings-test")
-            {
-                return Ok(());
-            }
-        }
-        Ok(())
-    }
-
-    /// One HTTP call, answering its body; a status outside the 2xx range is an error.
-    fn query(
-        &self,
-        method: &str,
-        path: &str,
-        body: Option<Value>,
-        conflict: &str,
-    ) -> Result<String, String> {
-        let url = format!("{}{path}", self.base_url);
-        let request = match method {
-            "GET" => ureq::get(&url),
-            "POST" => ureq::post(&url),
-            "DELETE" => ureq::delete(&url),
-            other => ureq::request(other, &url),
-        }
-        .set("authorization", &format!("Bearer {}", self.token))
-        .timeout(Duration::from_secs(30));
-        let result = match body {
-            Some(body) => request
-                .set("content-type", "application/json")
-                .send_string(&body.to_string()),
-            None => request.call(),
+/// Speaks a test phrase and holds the socket until the engine says it ended.
+pub fn speak(
+    engine: &VoiceEngine,
+    text: &str,
+    language: Language,
+    voice: &str,
+) -> Result<(), String> {
+    let info = engine
+        .info()
+        .ok_or_else(|| "The voice engine is not running.".to_string())?;
+    let mut socket = Socket::connect(&info, Duration::from_secs(8))?;
+    let message = ClientMessage::Speak {
+        id: TEST_SPEAK_ID.to_string(),
+        text: text.to_string(),
+        format: TextFormat::Plain,
+        language,
+        voice: Some(voice.to_string()),
+    };
+    let body = serde_json::to_string(&message).map_err(|err| err.to_string())?;
+    socket.send_text(&body)?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        let Some(message) = socket.read_message()? else {
+            return Ok(());
         };
-        match result {
-            Ok(response) => Ok(response.into_string().unwrap_or_default()),
-            Err(ureq::Error::Status(code, response)) => {
-                let detail = response.into_string().unwrap_or_default();
-                Err(match (code, detail.trim()) {
-                    (409, _) => conflict.to_string(),
-                    (401, _) | (403, _) => {
-                        "The engine refused the discovery token. Restart it.".to_string()
-                    }
-                    (_, "") => format!("The engine answered {code}."),
-                    (_, detail) => detail.to_string(),
-                })
-            }
-            Err(err) => Err(format!("The voice engine did not answer: {err}")),
-        }
-    }
-}
-
-/// Percent-encodes a model id for a path (ids are plain, so only `%`, `/`, `?`, and `#`
-/// change).
-fn encode(id: &str) -> String {
-    let mut out = String::with_capacity(id.len());
-    for byte in id.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(byte as char)
-            }
-            other => out.push_str(&format!("%{other:02X}")),
-        }
-    }
-    out
-}
-
-/// Where the engine writes its discovery file, read as `voice_core::paths` computes it.
-pub fn discovery_file() -> PathBuf {
-    if let Some(root) = std::env::var_os("VOICE_ENGINE_HOME")
-        && !root.is_empty()
-    {
-        return PathBuf::from(root).join("engine.json");
-    }
-    if !cfg!(target_os = "macos")
-        && let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR")
-        && !runtime.is_empty()
-    {
-        return PathBuf::from(runtime)
-            .join("Polterware Dispatch")
-            .join("voice")
-            .join("engine.json");
-    }
-    resolve_data_dir().join("voice").join("engine.json")
-}
-
-/// Starts `dispatch-voice` detached, as the app starts its core, so the page's Start can
-/// bring it up.
-pub fn start_engine() -> Result<(), String> {
-    let binary = engine_binary();
-    std::process::Command::new(&binary)
-        .args(["serve", "--if-not-running"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map(|_| ())
-        .map_err(|err| format!("Could not start the voice engine: {err}"))
-}
-
-/// The engine's binary: the one the environment names, the bundle's resource, one beside
-/// the app, else the one on the PATH.
-fn engine_binary() -> PathBuf {
-    if let Some(path) = std::env::var_os("VOICE_ENGINE_BIN")
-        && !path.is_empty()
-    {
-        return PathBuf::from(path);
-    }
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
-        for candidate in [
-            dir.join("dispatch-voice"),
-            dir.join("../Resources/dispatch-voice"),
-            dir.join("Resources/dispatch-voice"),
-        ] {
-            if candidate.is_file() {
-                return candidate;
-            }
-        }
-    }
-    PathBuf::from("dispatch-voice")
-}
-
-/// Waits for a just-started engine to write its discovery file and answer, up to about
-/// twenty seconds.
-pub fn wait_for_engine() -> Option<VoiceEngine> {
-    for _ in 0..100 {
-        if let Some(engine) = VoiceEngine::discover()
-            && engine.catalog().is_ok()
+        if let Ok(EngineMessage::SpeakEnded { id, .. }) =
+            serde_json::from_value::<EngineMessage>(message)
+            && id == TEST_SPEAK_ID
         {
-            return Some(engine);
+            return Ok(());
         }
-        std::thread::sleep(Duration::from_millis(200));
     }
-    None
+    Ok(())
 }
 
 /// A download's completion, as the WebSocket reports it.
@@ -427,13 +213,16 @@ pub fn new_progress() -> Progress {
 /// until the engine says it installed it, failed, or went quiet. A socket that never opens
 /// leaves the engine downloading; the caller reloads the catalog to see.
 pub fn download_and_watch(engine: &VoiceEngine, id: &str, progress: &Progress) -> Watched {
-    if let Err(err) = engine.download(id) {
-        return Watched::Failed(err);
+    if let Err(error) = engine.download_model(id) {
+        return Watched::Failed(failure(error, "This model is already downloading."));
     }
     if let Ok(mut map) = progress.lock() {
         map.insert(id.to_string(), 0.0);
     }
-    let mut socket = match Socket::connect(engine, Duration::from_secs(10)) {
+    let Some(info) = engine.info() else {
+        return Watched::Unknown;
+    };
+    let mut socket = match Socket::connect(&info, Duration::from_secs(10)) {
         Ok(socket) => socket,
         Err(_) => return Watched::Unknown,
     };
@@ -443,43 +232,29 @@ pub fn download_and_watch(engine: &VoiceEngine, id: &str, progress: &Progress) -
             Ok(Some(message)) => message,
             _ => break,
         };
-        let kind = message
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let which = message
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if which != id {
+        let Ok(message) = serde_json::from_value::<EngineMessage>(message) else {
             continue;
-        }
-        match kind {
-            "model.progress" => {
-                let done = message
-                    .get("downloaded_bytes")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                let total = message
-                    .get("total_bytes")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                let fraction = if total == 0 {
+        };
+        match message {
+            EngineMessage::ModelProgress {
+                id: which,
+                downloaded_bytes,
+                total_bytes,
+            } if which == id => {
+                let fraction = if total_bytes == 0 {
                     0.0
                 } else {
-                    (done as f64 / total as f64).clamp(0.0, 1.0)
+                    (downloaded_bytes as f64 / total_bytes as f64).clamp(0.0, 1.0)
                 };
                 if let Ok(mut map) = progress.lock() {
                     map.insert(id.to_string(), fraction);
                 }
             }
-            "model.installed" => return Watched::Installed,
-            "model.failed" => {
-                let reason = message
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("The download failed.");
-                return Watched::Failed(reason.to_string());
+            EngineMessage::ModelInstalled { id: which } if which == id => {
+                return Watched::Installed;
+            }
+            EngineMessage::ModelFailed { id: which, message } if which == id => {
+                return Watched::Failed(message);
             }
             _ => {}
         }
@@ -506,20 +281,20 @@ pub struct VoiceData {
 
 /// Reads the engine's catalog and settings, and the app's chat choices, in one blocking
 /// call on the background executor.
-pub fn load() -> Loaded {
-    let Some(engine) = VoiceEngine::discover() else {
+pub fn load(engine: &VoiceEngine) -> Loaded {
+    if engine.info().is_none() {
         return Loaded::Stopped;
-    };
-    let catalog = match engine.catalog() {
+    }
+    let catalog = match engine.catalog().map_err(|error| failure(error, "")) {
         Ok(catalog) => catalog,
         Err(err) => return Loaded::Unreachable(err),
     };
-    let settings = match engine.settings() {
+    let settings = match engine.engine_settings().map_err(|error| failure(error, "")) {
         Ok(settings) => settings,
         Err(err) => return Loaded::Unreachable(err),
     };
     Loaded::Running(Box::new(VoiceData {
-        engine,
+        engine: engine.clone(),
         catalog,
         settings,
         chat: read_chat(&resolve_data_dir()),
@@ -549,10 +324,10 @@ impl VoiceField {
     }
 
     /// The language whose voices it picks, if it picks one.
-    pub fn voice_language(self) -> Option<&'static str> {
+    pub fn voice_language(self) -> Option<Language> {
         match self {
-            VoiceField::VoicePt => Some("pt-br"),
-            VoiceField::VoiceEn => Some("en"),
+            VoiceField::VoicePt => Some(Language::PtBr),
+            VoiceField::VoiceEn => Some(Language::En),
             _ => None,
         }
     }
@@ -586,12 +361,9 @@ struct Socket {
 }
 
 impl Socket {
-    fn connect(engine: &VoiceEngine, timeout: Duration) -> Result<Self, String> {
-        let host = engine
-            .base_url
-            .strip_prefix("http://")
-            .unwrap_or(&engine.base_url)
-            .to_string();
+    fn connect(info: &EngineInfo, timeout: Duration) -> Result<Self, String> {
+        let url = info.base_url();
+        let host = url.strip_prefix("http://").unwrap_or(&url).to_string();
         let addrs = host
             .to_socket_addrs()
             .map_err(|err| format!("The voice engine's address did not resolve: {err}"))?;
@@ -607,7 +379,7 @@ impl Socket {
             .map_err(|err| err.to_string())?;
         let request = format!(
             "GET /v1/ws?token={} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
-            engine.token
+            info.token
         );
         let mut writer = stream.try_clone().map_err(|err| err.to_string())?;
         writer
@@ -736,5 +508,94 @@ impl Socket {
             Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
             Err(err) => Err(format!("The voice engine's socket stopped: {err}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(id: &str, kind: ModelKind, installed: bool) -> CatalogEntry {
+        CatalogEntry {
+            id: id.to_string(),
+            kind,
+            backend: "whisper".to_string(),
+            name: id.to_string(),
+            description: String::new(),
+            languages: vec![Language::En],
+            size_bytes: 151 * 1024 * 1024,
+            license: "MIT".to_string(),
+            installed,
+            active: false,
+        }
+    }
+
+    fn voice(id: &str, language: Language) -> VoiceEntry {
+        VoiceEntry {
+            id: id.to_string(),
+            backend: "kokoro".to_string(),
+            name: id.to_string(),
+            language,
+            model_id: None,
+            installed: true,
+        }
+    }
+
+    fn catalog() -> Catalog {
+        Catalog {
+            models: vec![
+                entry("whisper-small", ModelKind::Stt, true),
+                entry("kokoro-v1", ModelKind::Tts, false),
+            ],
+            voices: vec![
+                voice("kokoro:af_heart", Language::En),
+                voice("piper:pt_BR-faber-medium", Language::PtBr),
+            ],
+        }
+    }
+
+    #[test]
+    fn the_catalog_lists_a_languages_voices_and_the_speech_models() {
+        let catalog = catalog();
+        let english: Vec<&str> = voices_for(&catalog, Language::En)
+            .iter()
+            .map(|voice| voice.id.as_str())
+            .collect();
+        assert_eq!(english, ["kokoro:af_heart"]);
+        let speech: Vec<&str> = stt_models(&catalog)
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect();
+        assert_eq!(speech, ["whisper-small"]);
+        assert_eq!(
+            model(&catalog, "kokoro-v1").map(|model| model.kind),
+            Some(ModelKind::Tts)
+        );
+        assert!(model(&catalog, "missing").is_none());
+    }
+
+    #[test]
+    fn a_language_speaks_with_its_own_voice_setting() {
+        let settings = EngineSettings::default();
+        assert_eq!(voice_for(&settings, Language::En), "kokoro:af_heart");
+        assert_eq!(
+            voice_for(&settings, Language::PtBr),
+            "piper:pt_BR-faber-medium"
+        );
+        assert_eq!(
+            voice_for(&settings, Language::Auto),
+            "piper:pt_BR-faber-medium"
+        );
+        assert_eq!(language_label(Language::PtBr), "Portuguese (Brazil)");
+        assert_eq!(language_label(Language::En), "English");
+    }
+
+    #[test]
+    fn sizes_and_speeds_read_as_people_say_them() {
+        assert_eq!(human_size(151 * 1024 * 1024), "151 MB");
+        assert_eq!(human_size(1024), "1 KB");
+        assert_eq!(speed_label(1.0), "1×");
+        assert_eq!(speed_label(1.25), "1.25×");
+        assert_eq!(speed_label(2.0), "2×");
     }
 }

@@ -625,6 +625,24 @@ fn engine_binary() -> Option<PathBuf> {
     candidates.into_iter().find(|path| path.is_file())
 }
 
+/// The last engine Settings › Voice started, which has no client of its own to keep the time
+/// in.
+static SETTINGS_START: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// The running engine's discovery, starting one when none answers (Settings › Voice's
+/// Start), and waiting at most [`START_WAIT`] for it. Blocking: call it from the background
+/// executor. It reads the same discovery file and starts the same binary as the app's engine,
+/// without needing a [`VoiceEngine`].
+pub(crate) fn ensure_engine() -> Option<EngineInfo> {
+    let discovery = paths::discovery_file();
+    if let Ok(info) = discovery::read(&discovery)
+        && healthy(&info)
+    {
+        return Some(info);
+    }
+    start_engine(&discovery, &SETTINGS_START)
+}
+
 /// Starts the engine (it exits at once when one already runs) and waits for its discovery
 /// file.
 fn start_engine(discovery_file: &Path, last_start: &Mutex<Option<Instant>>) -> Option<EngineInfo> {
