@@ -2,27 +2,25 @@
 
 ## What stays local
 
-- Microphone audio is captured, processed, and discarded inside the
-  `voice-engine` process. It is never written to disk, never sent to a client,
-  and never sent to OpenCode or any model provider.
-- Only the final transcript text is submitted, as a normal prompt of the
-  session the user is looking at. From there it follows the user's OpenCode
-  configuration like any typed prompt.
-- Spoken replies are synthesized locally from the assistant text the plugin
-  already received from OpenCode.
-- No telemetry, analytics, or crash reporting exists in the engine or the
-  plugin.
+- Microphone audio is captured, processed, and discarded inside
+  `dispatch-voice`. It is never written to disk, never sent to a client, and
+  never sent to a model provider.
+- Only the final transcript text reaches the app, which puts it in the composer
+  like typed text. From there it follows the run's normal routing.
+- Spoken replies are synthesized locally from the reply text the app already
+  holds.
+- No telemetry, analytics, or crash reporting exists in the engine or the app.
 
 ## External network traffic
 
-The runtime makes no network requests. Traffic happens only when you ask for
-it:
+The runtime makes no network requests of its own. Traffic happens only when you
+ask for it:
 
 | When | Destination | What |
 |---|---|---|
-| `voice-engine models download` (explicit confirmation) | `huggingface.co` (ggerganov/whisper.cpp, onnx-community/Kokoro-82M-v1.0-ONNX), `raw.githubusercontent.com` (snakers4/silero-vad) | Model files |
-| Building from source | crates.io, npm, and the ONNX Runtime prebuilt binaries the `ort` crate fetches at build time | Dependencies |
-| Installing tools | Homebrew (`cmake`, `espeak-ng`) | Build tool and phonemizer |
+| **Download** in Settings › Voice (explicit confirmation) | `huggingface.co`, `raw.githubusercontent.com` (Silero VAD) | Model files |
+| Building from source | crates.io and the ONNX Runtime prebuilt binaries the `ort` crate fetches at build time | Dependencies |
+| Installing tools | Homebrew (`espeak-ng`) | Phonemizer |
 
 ## Local API protection
 
@@ -33,8 +31,6 @@ it:
   the microphone even if it finds the port.
 - Message sizes are capped and every message is validated against the typed
   protocol; malformed input gets an error, never a crash.
-- Voice never answers OpenCode permission prompts: approvals stay in
-  OpenCode's own UI.
 
 ## Licenses of runtime components
 
@@ -42,7 +38,9 @@ it:
 |---|---|
 | whisper.cpp / whisper-rs | MIT / Unlicense |
 | Whisper model weights | MIT |
+| Piper voices | CC0 dataset; Piper MIT |
 | Kokoro-82M weights | Apache-2.0 |
+| Chatterbox weights | MIT |
 | Silero VAD | MIT |
 | ONNX Runtime | MIT |
 | espeak-ng (separate executable, not linked) | GPL-3.0 |

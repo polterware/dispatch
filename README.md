@@ -55,7 +55,7 @@ cargo build -p dispatch-core --bin dispatch
 cargo run -p dispatch-app
 ```
 
-The `dispatch` bin target is the same CLI the app binary runs, on its own for development. `crates/dispatch-core` compiles the protos with `protoc` (`PROTOC` names it when it is not on `PATH`).
+The `dispatch` bin target is the same CLI the app binary runs, on its own for development. `crates/dispatch-core` compiles the protos with `protoc` (`PROTOC` names it when it is not on `PATH`). The voice engine runs alone the same way: `cargo run -p voice-server --bin dispatch-voice`.
 
 ## Checks
 

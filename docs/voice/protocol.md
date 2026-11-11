@@ -1,8 +1,7 @@
-# Voice Engine protocol v1
+# Voice engine protocol v1
 
-The normative types are `crates/voice-core/src/protocol.rs` (Rust) and
-`packages/voice-client/src/protocol.ts` (TypeScript). They must stay identical
-on the wire. This document explains the behavior around them.
+The normative types are `crates/voice-core/src/protocol.rs`. This document
+explains the behavior around them.
 
 ## Transport and security
 
@@ -15,9 +14,10 @@ on the wire. This document explains the behavior around them.
   { "protocol": 1, "engine_version": "0.1.0", "pid": 123, "port": 49152, "token": "…" }
   ```
 
+  On macOS that is `~/Library/Application Support/Polterware Dispatch/voice/engine.json`.
 - Every endpoint except `GET /v1/health` requires the token:
-  `Authorization: Bearer <token>`, or `?token=<token>` on `/v1/ws` (browser
-  WebSockets cannot set headers). Comparison is constant-time.
+  `Authorization: Bearer <token>`, or `?token=<token>` on `/v1/ws`. Comparison
+  is constant-time.
 - Requests whose `Origin` header is present and is not `null`, `file://`, or
   an `http(s)://127.0.0.1|localhost` origin are refused (403). This blocks a
   web page from driving the engine even if it guessed the port.
@@ -94,7 +94,7 @@ Text frames, one JSON message each, tagged by `type`.
 
 ## Catalog, models, and settings
 
-Types: `crates/voice-core/src/catalog.rs` (TS: `packages/voice-client/src/protocol.ts`).
+Types: `crates/voice-core/src/catalog.rs`.
 
 | Method | Path | Answer |
 |---|---|---|
@@ -104,10 +104,10 @@ Types: `crates/voice-core/src/catalog.rs` (TS: `packages/voice-client/src/protoc
 | GET | `/v1/settings` | `EngineSettings` |
 | PATCH | `/v1/settings` | `SettingsPatch` in, new `EngineSettings` out; persisted and broadcast as `settings.changed` |
 
-Downloads run only on an explicit request from a client (the UI shows the size and
-license before the user confirms). Files go to `.part` and are renamed when complete;
-one download per model at a time.
+Downloads run only on an explicit request (Settings › Voice shows the size and
+license before the user confirms). Files go to `.part` and are renamed when
+complete; one download per model at a time.
 
-Voice ids name the backend: `piper:pt_BR-faber-medium`, `kokoro:af_heart`,
-`system:Luciana`. A `speak` request may name a voice id; otherwise the engine uses
-`voice_pt` or `voice_en` from the settings for the text's language.
+Voice ids name the backend: `piper:pt_BR-jeff-medium`, `kokoro:af_heart`,
+`system:Luciana`. A `speak` request may name a voice id; otherwise the engine
+uses `voice_pt` or `voice_en` from the settings for the text's language.
