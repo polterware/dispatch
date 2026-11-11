@@ -78,6 +78,7 @@ impl Core {
         let mut opts = Options {
             tier: m.tier.trim().into(),
             read_only: m.read_only,
+            images: m.images,
             dir,
             prompt: m.prompt.trim().into(),
             area: run_area(&hints),

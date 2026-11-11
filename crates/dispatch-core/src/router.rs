@@ -392,6 +392,8 @@ pub struct Agent {
     pub installed: bool,
     pub read_only: bool,
     pub file_editing: bool,
+    /// The agent can make images and save them where it is told.
+    pub images: bool,
     pub effort_mode: String,
     pub efforts: Vec<String>,
     pub discovered: Vec<String>,
@@ -405,6 +407,8 @@ pub struct RouteOptions {
     pub difficulty: Option<f64>,
     pub filters: Filters,
     pub read_only: bool,
+    /// Image mode: only an agent that can make images may run the task.
+    pub images: bool,
     pub prefer: Vec<String>,
     pub avoid: Vec<String>,
     pub role_board: crate::tiers::Table,
@@ -445,6 +449,11 @@ pub fn select_candidates(
         tiers::{Entry, provider_of},
     };
     let f = &options.filters;
+    // Image mode can only run on an agent that makes images: saying so once is clearer than
+    // naming every candidate it drops.
+    if options.images && !agents.iter().any(|a| a.installed && a.images) {
+        return (Vec::new(), vec!["no image-capable agent installed".into()]);
+    }
     let mut all = Vec::<(Entry, String, bool)>::new();
     let mut entries = Vec::new();
     let mut rejected = Vec::new();
@@ -569,6 +578,10 @@ pub fn select_candidates(
         }
         if !options.read_only && !a.file_editing {
             rejected.push(format!("{label}: does not support fileEditing"));
+            continue;
+        }
+        if options.images && !a.images {
+            rejected.push(format!("{label}: cannot make images"));
             continue;
         }
         let mut model = e.model.clone();

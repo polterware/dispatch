@@ -55,6 +55,9 @@ message DispatchRun {
   // which records caller_agent "dispatch", or "delegated" for an agent that
   // ran it with the CLI. Read off caller_agent, never stored.
   string origin = 44;
+  // The run asked for images: it routes only to agents that can make them, and
+  // its brief names its artifacts folder for them.
+  bool images = 45;
 }
 
 // Tokens a run spent as its agent CLIs reported them, summed over attempts:
@@ -75,6 +78,10 @@ message DispatchUsage {
   int64 context_window = 9;
   // Some attempt could not be priced: cost_usd covers only the ones that could.
   bool cost_partial = 10;
+  // Images the CLI said it made, and the price it gave them, if any: no
+  // catalog prices images, so an unreported one leaves cost_usd as it was.
+  int64 image_generations = 11;
+  optional double image_cost_usd = 12;
 }
 
 message DispatchAttempt {
@@ -144,6 +151,8 @@ message DispatchAgent {
   bool installed = 9;
   // Whether Settings > Agents lets Dispatch route runs to it.
   bool enabled = 10;
+  // Whether the agent can make images, for image mode's routing.
+  bool images = 11;
 }
 
 message ListRunsRequest {
@@ -201,6 +210,9 @@ message StartRunRequest {
   // Other repositories' folders the task spans. Each gets a worktree of its own on the
   // run's branch name, committed, merged, and cleaned with the run's.
   repeated string with = 21;
+  // images routes only to agents that can make images, from a prompt that asks for
+  // them, and names the run's artifacts folder for them in the brief.
+  bool images = 22;
 }
 
 // One more repository a run works in, with its worktree of it.
@@ -631,6 +643,8 @@ message RouteRequest {
   // project_id and card_slug name the card whose text the classifier reads.
   string project_id = 12;
   string card_slug = 13;
+  // images keeps only agents that can make images.
+  bool images = 14;
 }
 
 message ClassifyRequest {

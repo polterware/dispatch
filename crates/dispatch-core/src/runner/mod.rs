@@ -270,6 +270,9 @@ pub struct Options {
     pub prompt: String,
     pub dir: String,
     pub read_only: bool,
+    /// Image mode: only an agent that makes images may run the task, and its brief names the
+    /// run's artifacts folder.
+    pub images: bool,
     pub timeout: Duration,
     pub no_worktree: bool,
     pub resume: String,

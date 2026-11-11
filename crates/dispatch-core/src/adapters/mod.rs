@@ -29,6 +29,8 @@ pub struct Capabilities {
     pub read_only: bool,
     pub file_editing: bool,
     pub usage: bool,
+    /// The CLI can make images and save them where it is told: image mode routes only here.
+    pub images: bool,
 }
 
 /// Persists the agent's process group leader before the run waits for it;

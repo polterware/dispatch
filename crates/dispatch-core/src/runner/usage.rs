@@ -37,32 +37,40 @@ pub fn load_catalog(state_dir: &str) -> Catalog {
 /// Prices one attempt: the CLI's own price when it gave one, else its tokens
 /// at the model's list prices. A model with no cache price pays input price
 /// for cache tokens; an attempt whose context passed a price tier's size pays
-/// that tier. None when nothing prices it.
+/// that tier. An image price the CLI named is added where it gave no total of
+/// its own, which already covers whatever it billed. None when nothing prices it.
 pub fn usage_cost(c: &Catalog, model: &str, u: &AgentUsage) -> Option<(f64, &'static str)> {
     if let Some(cost) = u.cost_usd {
         return Some((cost, COST_AGENT));
     }
-    let m = c.price(&catalog_key(model))?;
-    let mut p = PriceTier {
-        size: 0,
-        input: m.input,
-        output: m.output,
-        cache_read: m.cache_read,
-        cache_write: m.cache_write,
-    };
-    for t in &m.tiers {
-        if u.context_tokens > t.size {
-            p = t.clone();
+    let images = u.image_cost_usd.filter(|c| c.is_finite() && *c > 0.0);
+    let tokens = c.price(&catalog_key(model)).map(|m| {
+        let mut p = PriceTier {
+            size: 0,
+            input: m.input,
+            output: m.output,
+            cache_read: m.cache_read,
+            cache_write: m.cache_write,
+        };
+        for t in &m.tiers {
+            if u.context_tokens > t.size {
+                p = t.clone();
+            }
         }
+        let read = p.cache_read.unwrap_or(p.input);
+        let write = p.cache_write.unwrap_or(p.input);
+        (u.input_tokens as f64 * p.input
+            + u.cache_read_tokens as f64 * read
+            + u.cache_write_tokens as f64 * write
+            + u.output_tokens as f64 * p.output)
+            / 1e6
+    });
+    match (tokens, images) {
+        (Some(tokens), Some(images)) => Some((tokens + images, COST_MIXED)),
+        (Some(tokens), None) => Some((tokens, COST_CATALOG)),
+        (None, Some(images)) => Some((images, COST_AGENT)),
+        (None, None) => None,
     }
-    let read = p.cache_read.unwrap_or(p.input);
-    let write = p.cache_write.unwrap_or(p.input);
-    let cost = (u.input_tokens as f64 * p.input
-        + u.cache_read_tokens as f64 * read
-        + u.cache_write_tokens as f64 * write
-        + u.output_tokens as f64 * p.output)
-        / 1e6;
-    Some((cost, COST_CATALOG))
 }
 
 /// The window an attempt ran in: the CLI's, else the catalog's for its
@@ -82,6 +90,8 @@ pub fn add_usage(r: &mut Run, model: &str, u: Option<&AgentUsage>, cat: &Catalog
         return;
     };
     let priced = usage_cost(cat, model, u);
+    // Tokens no price covers stay unpriced even when an image price covered the images.
+    let tokens_unpriced = u.cost_usd.is_none() && cat.price(&catalog_key(model)).is_none();
     let s = r.usage.get_or_insert_with(Default::default);
     let unpriced_before = s.cost_usd.is_none()
         && s.input_tokens + s.cache_read_tokens + s.cache_write_tokens + s.output_tokens > 0;
@@ -90,6 +100,7 @@ pub fn add_usage(r: &mut Run, model: &str, u: Option<&AgentUsage>, cat: &Catalog
     s.cache_write_tokens += u.cache_write_tokens;
     s.output_tokens += u.output_tokens;
     s.reasoning_tokens += u.reasoning_tokens;
+    s.image_generations += u.image_generations;
     if u.context_tokens > 0 {
         s.context_tokens = u.context_tokens;
         s.context_window = context_window(cat, model, u);
@@ -109,6 +120,9 @@ pub fn add_usage(r: &mut Run, model: &str, u: Option<&AgentUsage>, cat: &Catalog
                 s.cost_partial |= unpriced_before;
             }
         },
+    }
+    if tokens_unpriced && u.image_cost_usd.is_some() && priced.is_some() {
+        s.cost_partial = true;
     }
 }
 
@@ -140,6 +154,11 @@ pub fn attempt_usage_from_log(agent: &str, log: &str) -> Option<AgentUsage> {
                 .filter(|c| c.is_finite()),
             context_tokens: n("context"),
             context_window: n("window"),
+            image_generations: n("images"),
+            image_cost_usd: v
+                .get("imageCostUsd")
+                .and_then(serde_json::Value::as_f64)
+                .filter(|c| c.is_finite()),
         });
     }
     use crate::adapters::usage::{usage_claude, usage_cursor, usage_grok, usage_pi};
@@ -186,6 +205,34 @@ mod log_tests {
             (30, 4, 7)
         );
         assert!(attempt_usage_from_log("acp-agent", "no usage here").is_none());
+    }
+
+    #[test]
+    fn an_image_price_counts_only_where_the_cli_gave_no_total() {
+        let catalog = Catalog::embedded().expect("embedded catalog");
+        // A CLI that names an image price and no total is priced by that price.
+        let named = AgentUsage {
+            image_generations: 2,
+            image_cost_usd: Some(0.08),
+            ..AgentUsage::default()
+        };
+        let (cost, source) = usage_cost(&catalog, "no-such-provider/no-such-model", &named)
+            .expect("the image price");
+        assert_eq!(source, super::COST_AGENT);
+        assert!((cost - 0.08).abs() < 1e-9, "{cost}");
+        // Its own total already covers its images, so a named price is not added again.
+        let totalled = AgentUsage {
+            cost_usd: Some(0.50),
+            image_cost_usd: Some(0.08),
+            ..AgentUsage::default()
+        };
+        let (cost, _) = usage_cost(
+            &catalog,
+            "opencode/opencode-go/deepseek-v4.1-flash",
+            &totalled,
+        )
+        .expect("the CLI's total");
+        assert!((cost - 0.50).abs() < 1e-9, "{cost}");
     }
 
     #[test]

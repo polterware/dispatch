@@ -153,6 +153,8 @@ pub struct DispatchRun {
     pub linked: Vec<DispatchLinkedRepo>,
     /// `app` for a conversation started here, `delegated` for an agent's run.
     pub origin: String,
+    /// The run asked for images: it routed only to agents that make them.
+    pub images: bool,
 }
 
 /// One more repository a run works in, with its worktree of it.
@@ -317,6 +319,9 @@ pub struct StartRunRequest {
     /// leaves it to the core (a worktree in a git checkout with commits).
     #[serde(skip_serializing_if = "String::is_empty")]
     pub worktree_mode: String,
+    /// Ask for images: routes only to agents that make them, and names the run's
+    /// artifacts folder in the brief.
+    pub images: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

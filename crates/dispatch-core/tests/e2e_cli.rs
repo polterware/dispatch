@@ -1255,6 +1255,42 @@ fn run_images_land_in_artifacts_and_go_with_the_run() {
 }
 
 #[test]
+fn an_image_run_is_told_where_to_write_its_images() {
+    let env = Env::new();
+    // A normal run hears of the folder only through its environment.
+    let plain = env.run("say hi", &[]);
+    env.wait_for(&plain, "COMPLETED");
+    let log = read(env.root.join("agent.log"));
+    assert!(
+        !log.contains("Write any images you make in"),
+        "a run that did not ask for images was told where to put them: {log}"
+    );
+
+    // With image mode on, the brief names the run's own folder, and its PNG is indexed.
+    let id = env.run("IMAGE draw a chart", &["--images"]);
+    env.wait_for(&id, "COMPLETED");
+    let meta = env.json(&["result", &id, "--section", "meta", "--json"]);
+    assert_eq!(meta["Images"], true, "{meta}");
+    let log = read(env.root.join("agent.log"));
+    assert!(
+        log.contains("Write any images you make in"),
+        "the image run was not told where to put its images: {log}"
+    );
+    assert!(
+        log.contains(&format!("{}/artifacts/{id}", env.data.display())),
+        "the brief names no folder of this run's own: {log}"
+    );
+    wait_until("the run's image is indexed", || {
+        env.json(&["artifacts", "--json"])["total"] == 1
+    });
+    let listed = env.json(&["artifacts", "--json"]);
+    let item = &items(&listed["artifacts"])[0];
+    assert_eq!(item["runId"], id.as_str(), "{listed}");
+    assert_eq!(item["kind"], "png", "{listed}");
+    assert_eq!(item["relPath"], "chart.png", "{listed}");
+}
+
+#[test]
 fn a_conversation_is_renamed_and_named_by_its_prompt_again() {
     let env = Env::new();
     let named = env.ok(&["rename", "conv-1", "Release", "notes"]);
