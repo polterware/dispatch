@@ -48,7 +48,7 @@ use crate::state::{read_preference, write_preference};
 /// The preference file holding voice's own switches (`gpui-preferences/voice.json`).
 pub const VOICE_PREFERENCE: &str = "voice";
 /// The longest the app waits for an engine it started to write its discovery file.
-const START_WAIT: Duration = Duration::from_secs(8);
+const START_WAIT: Duration = Duration::from_secs(20);
 /// The least time between two engines started from here, so one that fails is not retried on
 /// every tick.
 const START_GAP: Duration = Duration::from_secs(30);
@@ -609,6 +609,10 @@ fn healthy(info: &EngineInfo) -> bool {
 /// `PATH`.
 fn engine_binary() -> Option<PathBuf> {
     let mut candidates = Vec::new();
+    // `VOICE_ENGINE_BIN` names the engine first, as the voice repository's docs say.
+    if let Some(path) = std::env::var_os("VOICE_ENGINE_BIN") {
+        candidates.push(PathBuf::from(path));
+    }
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {
@@ -623,6 +627,24 @@ fn engine_binary() -> Option<PathBuf> {
         }
     }
     candidates.into_iter().find(|path| path.is_file())
+}
+
+/// The last engine Settings › Voice started, which has no client of its own to keep the time
+/// in.
+static SETTINGS_START: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// The running engine's discovery, starting one when none answers (Settings › Voice's
+/// Start), and waiting at most [`START_WAIT`] for it. Blocking: call it from the background
+/// executor. It reads the same discovery file and starts the same binary as the app's engine,
+/// without needing a [`VoiceEngine`].
+pub(crate) fn ensure_engine() -> Option<EngineInfo> {
+    let discovery = paths::discovery_file();
+    if let Ok(info) = discovery::read(&discovery)
+        && healthy(&info)
+    {
+        return Some(info);
+    }
+    start_engine(&discovery, &SETTINGS_START)
 }
 
 /// Starts the engine (it exits at once when one already runs) and waits for its discovery

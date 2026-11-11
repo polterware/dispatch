@@ -40,7 +40,10 @@ use crate::ui::{
     ButtonKind, Icon, Menu, MenuItem, Popover, Switch, TextInput, TileTone, button, chip, icon,
 };
 use crate::ui::{SkeletonLayout, page_skeleton};
-use crate::voice_settings::{self, ChatVoice, Loaded, VoiceField};
+use crate::voice;
+use crate::voice_settings::{
+    self, ChatVoice, Language, Loaded, ModelKind, SettingsPatch, VoiceField,
+};
 
 const RAIL_ROW: f32 = 32.0;
 const RAIL_GAP: f32 = 2.0;
@@ -370,8 +373,11 @@ impl SettingsView {
         self.voice_inflight = true;
         self.voice_ticket = self.voice_ticket.wrapping_add(1);
         let ticket = self.voice_ticket;
+        let engine = voice::engine(cx);
         cx.spawn(async move |this, cx| {
-            let loaded = cx.background_spawn(async { voice_settings::load() }).await;
+            let loaded = cx
+                .background_spawn(async move { voice_settings::load(&engine) })
+                .await;
             let _ = this.update(cx, |view, cx| {
                 if view.voice_ticket != ticket {
                     return;
@@ -416,7 +422,7 @@ impl SettingsView {
         }
     }
 
-    fn voice_engine(&self) -> Option<voice_settings::VoiceEngine> {
+    fn voice_engine(&self) -> Option<voice::VoiceEngine> {
         self.voice_data().map(|data| data.engine.clone())
     }
 
@@ -430,8 +436,7 @@ impl SettingsView {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async {
-                    voice_settings::start_engine()?;
-                    voice_settings::wait_for_engine().ok_or_else(|| {
+                    voice::ensure_engine().ok_or_else(|| {
                         "The voice engine did not answer after starting.".to_string()
                     })
                 })
@@ -452,7 +457,7 @@ impl SettingsView {
     }
 
     /// Sends one settings patch to the engine, newest wins, and keeps what it answers.
-    fn patch_voice(&mut self, patch: serde_json::Value, cx: &mut Context<Self>) {
+    fn patch_voice(&mut self, patch: SettingsPatch, cx: &mut Context<Self>) {
         let Some(engine) = self.voice_engine() else {
             return;
         };
@@ -460,7 +465,7 @@ impl SettingsView {
         let ticket = self.voice_save;
         cx.spawn(async move |this, cx| {
             let result = cx
-                .background_spawn(async move { engine.patch(patch) })
+                .background_spawn(async move { voice_settings::patch(&engine, &patch) })
                 .await;
             let _ = this.update(cx, |view, cx| {
                 if view.voice_save != ticket {
@@ -485,26 +490,53 @@ impl SettingsView {
         .detach();
     }
 
-    fn choose_voice_language(&mut self, language: &str, cx: &mut Context<Self>) {
-        self.patch_voice(serde_json::json!({ "language": language }), cx);
+    fn choose_voice_language(&mut self, language: Language, cx: &mut Context<Self>) {
+        self.patch_voice(
+            SettingsPatch {
+                language: Some(language),
+                ..SettingsPatch::default()
+            },
+            cx,
+        );
     }
 
     fn choose_voice(&mut self, field: VoiceField, id: &str, cx: &mut Context<Self>) {
         let patch = match field {
-            VoiceField::VoicePt => serde_json::json!({ "voice_pt": id }),
-            VoiceField::VoiceEn => serde_json::json!({ "voice_en": id }),
-            VoiceField::Stt => serde_json::json!({ "stt_model": id }),
+            VoiceField::VoicePt => SettingsPatch {
+                voice_pt: Some(id.to_string()),
+                ..SettingsPatch::default()
+            },
+            VoiceField::VoiceEn => SettingsPatch {
+                voice_en: Some(id.to_string()),
+                ..SettingsPatch::default()
+            },
+            VoiceField::Stt => SettingsPatch {
+                stt_model: Some(id.to_string()),
+                ..SettingsPatch::default()
+            },
             _ => return,
         };
         self.patch_voice(patch, cx);
     }
 
     fn choose_voice_speed(&mut self, speed: f32, cx: &mut Context<Self>) {
-        self.patch_voice(serde_json::json!({ "speed": speed }), cx);
+        self.patch_voice(
+            SettingsPatch {
+                speed: Some(speed),
+                ..SettingsPatch::default()
+            },
+            cx,
+        );
     }
 
     fn on_voice_partials(&mut self, on: bool, cx: &mut Context<Self>) {
-        self.patch_voice(serde_json::json!({ "partials": on }), cx);
+        self.patch_voice(
+            SettingsPatch {
+                partials: Some(on),
+                ..SettingsPatch::default()
+            },
+            cx,
+        );
     }
 
     fn on_voice_read_aloud(&mut self, on: bool, cx: &mut Context<Self>) {
@@ -541,20 +573,18 @@ impl SettingsView {
         let mut items = Vec::new();
         match field {
             VoiceField::Language => {
-                for (code, label) in voice_settings::LANGUAGES {
-                    let code = code.to_string();
-                    let picked = data.settings.language == code;
+                for (language, label) in voice_settings::LANGUAGES {
+                    let picked = data.settings.language == language;
                     let view = view.clone();
                     items.push(MenuItem::radio(
                         label,
                         picked,
                         Rc::new(move |_, app| {
                             let view = view.clone();
-                            let code = code.clone();
                             app.defer(move |app| {
                                 if let Some(view) = view.upgrade() {
                                     view.update(app, |this, cx| {
-                                        this.choose_voice_language(&code, cx)
+                                        this.choose_voice_language(language, cx)
                                     });
                                 }
                             });
@@ -563,9 +593,9 @@ impl SettingsView {
                 }
             }
             VoiceField::VoicePt | VoiceField::VoiceEn => {
-                let language = field.voice_language().unwrap_or("pt-br");
-                let current = data.settings.voice(language).to_string();
-                for voice in data.catalog.voices_for(language) {
+                let language = field.voice_language().unwrap_or(Language::PtBr);
+                let current = voice_settings::voice_for(&data.settings, language).to_string();
+                for voice in voice_settings::voices_for(&data.catalog, language) {
                     let id = voice.id.clone();
                     let label = if voice.installed {
                         voice.name.clone()
@@ -616,7 +646,7 @@ impl SettingsView {
             }
             VoiceField::Stt => {
                 let current = data.settings.stt_model.clone();
-                for model in data.catalog.stt_models() {
+                for model in voice_settings::stt_models(&data.catalog) {
                     let id = model.id.clone();
                     let label = if model.installed {
                         model.name.clone()
@@ -697,7 +727,9 @@ impl SettingsView {
             return;
         };
         cx.spawn(async move |this, cx| {
-            let result = cx.background_spawn(async move { engine.delete(&id) }).await;
+            let result = cx
+                .background_spawn(async move { voice_settings::delete_model(&engine, &id) })
+                .await;
             let _ = this.update(cx, |view, cx| {
                 match result {
                     Ok(()) => view.toast("Model deleted.", ToastTone::Success, cx),
@@ -713,7 +745,7 @@ impl SettingsView {
     /// Speaks a phrase with a voice, as Test does.
     fn test_voice(
         &mut self,
-        language: String,
+        language: Language,
         voice: String,
         name: String,
         cx: &mut Context<Self>,
@@ -724,7 +756,9 @@ impl SettingsView {
         cx.spawn(async move |this, cx| {
             let text = voice_settings::sample_text(&name);
             let result = cx
-                .background_spawn(async move { engine.speak(&text, &language, &voice) })
+                .background_spawn(
+                    async move { voice_settings::speak(&engine, &text, language, &voice) },
+                )
                 .await;
             if let Err(err) = result {
                 let _ = this.update(cx, |view, cx| {
@@ -1990,7 +2024,7 @@ impl SettingsView {
             Some("The language you speak and hear.".into()),
             menu_trigger(
                 "settings-voice-language",
-                voice_settings::language_label(&settings.language).into(),
+                voice_settings::language_label(settings.language).into(),
                 &self.voice_anchors[VoiceField::Language.index()],
                 gated(true, view.clone(), |this, cx| {
                     this.open_voice_menu(VoiceField::Language, cx)
@@ -2001,25 +2035,25 @@ impl SettingsView {
             cx,
         ));
         for field in [VoiceField::VoicePt, VoiceField::VoiceEn] {
-            let language = field.voice_language().unwrap_or("pt-br");
-            let id = settings.voice(language).to_string();
+            let language = field.voice_language().unwrap_or(Language::PtBr);
+            let id = voice_settings::voice_for(settings, language).to_string();
             let name = data
                 .catalog
                 .voices
                 .iter()
                 .find(|voice| voice.id == id)
                 .map_or_else(|| id.clone(), |voice| voice.name.clone());
-            let label = if language == "en" {
+            let label = if language == Language::En {
                 "English voice"
             } else {
                 "Portuguese voice"
             };
-            let test_id = if language == "en" {
+            let test_id = if language == Language::En {
                 "settings-voice-test-en"
             } else {
                 "settings-voice-test-pt"
             };
-            let speak = (language.to_string(), id.clone(), name.clone());
+            let speak = (language, id.clone(), name.clone());
             let test = dim_button(
                 test_id,
                 "Test",
@@ -2040,7 +2074,7 @@ impl SettingsView {
                     .gap(px(theme.space_2))
                     .child(test)
                     .child(menu_trigger(
-                        if language == "en" {
+                        if language == Language::En {
                             "settings-voice-voice-en"
                         } else {
                             "settings-voice-voice-pt"
@@ -2071,9 +2105,7 @@ impl SettingsView {
             ),
             cx,
         ));
-        let stt = data
-            .catalog
-            .model(&settings.stt_model)
+        let stt = voice_settings::model(&data.catalog, &settings.stt_model)
             .map_or_else(|| settings.stt_model.clone(), |model| model.name.clone());
         rows = rows.child(settings_row(
             "Speech recognition model",
@@ -2194,7 +2226,7 @@ impl SettingsView {
             Some(
                 format!(
                     "{} · {} · {}",
-                    model_kind_label(&model.kind),
+                    model_kind_label(model.kind),
                     voice_settings::human_size(model.size_bytes),
                     model.license,
                 )
@@ -3133,12 +3165,11 @@ fn model_tone(model: &voice_settings::CatalogEntry, downloading: Option<f64>) ->
     }
 }
 
-fn model_kind_label(kind: &str) -> &'static str {
+fn model_kind_label(kind: ModelKind) -> &'static str {
     match kind {
-        "stt" => "Speech recognition",
-        "tts" => "Speech",
-        "vad" => "Voice detection",
-        _ => "Model",
+        ModelKind::Stt => "Speech recognition",
+        ModelKind::Tts => "Speech",
+        ModelKind::Vad => "Voice detection",
     }
 }
 
