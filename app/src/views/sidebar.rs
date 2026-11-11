@@ -1493,14 +1493,11 @@ impl SidebarView {
                 cx,
             ));
         if !collapsed {
-            // A row that needs attention stays past the page, and the order the Display gives.
+            // Five rows, strictly: only the open run stays past the page, in the Display order.
+            // A running row or one with an unseen update keeps its dot and bot state but does
+            // not bypass the page.
             let page = page_sidebar_rows(&group.runs, self.revealed_limit(&group.id), |run| {
                 selected == Some(run.id.as_str())
-                    || crate::models::runs::is_run_active(&run.status)
-                    || self
-                        .seen
-                        .as_ref()
-                        .is_some_and(|seen| has_unseen_update(run, seen))
             });
             for run in page.rows.iter().copied() {
                 let row = self.run_row(run, selected == Some(run.id.as_str()), theme, cx);
