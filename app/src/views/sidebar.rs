@@ -72,6 +72,7 @@ const NAV: &[(&str, Icon, Route)] = &[
     ("Intelligence", Icon::AiBrain01Icon, Route::Intelligence),
     ("Spend", Icon::CreditCard, Route::Spend),
     ("Stats", Icon::Activity, Route::Stats),
+    ("Images", Icon::GridTableIcon, Route::Images),
 ];
 
 pub struct SidebarView {
@@ -1277,21 +1278,27 @@ impl SidebarView {
         for (label, icon_name, target) in NAV.iter() {
             let view = view.clone();
             let target = target.clone();
-            let id = SharedString::from(format!("sidebar-nav-{label}"));
+            let selector = format!("sidebar-nav-{label}");
+            let id = SharedString::from(selector.clone());
             let item = SidebarItem::new(id.clone(), *label)
                 .icon(*icon_name)
                 .active(page_selected(route, label))
                 .on_click(move |_, cx| {
                     let _ = view.update(cx, |this, cx| this.go(target.clone(), false, cx));
                 });
-            column = column.child(fade_item(
-                id,
-                &self.scroll,
-                fade_edges(theme),
-                item,
-                window,
-                cx,
-            ));
+            column = column.child(
+                div()
+                    .w_full()
+                    .debug_selector(move || selector.clone())
+                    .child(fade_item(
+                        id,
+                        &self.scroll,
+                        fade_edges(theme),
+                        item,
+                        window,
+                        cx,
+                    )),
+            );
         }
         column.into_any_element()
     }
@@ -1944,6 +1951,7 @@ fn page_selected(route: &Route, label: &str) -> bool {
         "Intelligence" => matches!(route, Route::Intelligence),
         "Spend" => matches!(route, Route::Spend),
         "Stats" => matches!(route, Route::Stats),
+        "Images" => matches!(route, Route::Images),
         _ => false,
     }
 }
