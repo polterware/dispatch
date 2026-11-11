@@ -215,6 +215,20 @@ pub fn place_label(place: &RunPlace, folders: &[FolderChoice], workspaces: &[Wor
 
 /// The folder picker's last row, which asks for a repository to add rather than picking one.
 pub const ADD_REPOSITORY: &str = "add-repository";
+
+/// The composer's Image pill: on, the run asks for images and routes to the agents that
+/// make them (`StartRunRequest.images`).
+pub const IMAGE_PILL: &str = "Image";
+
+/// The Image pill's tooltip, which says what the mode does either way.
+pub fn image_hint(on: bool) -> &'static str {
+    if on {
+        "The run asks for images and routes only to agents that make them"
+    } else {
+        "Ask for images: routes only to agents that make them"
+    }
+}
+
 /// Whether a refusal to start says another run is editing the folder in place and offers a
 /// new worktree (the core's `IN_PLACE_BUSY_HINT`), so Worktree can retry it.
 pub fn offers_worktree(message: &str) -> bool {
@@ -406,13 +420,15 @@ pub fn run_label(agent: &str, model: &str, started: Option<&str>) -> RouteLabel 
     pick_label(started.unwrap_or(AUTO))
 }
 
-/// The run a new conversation's first message starts, on route `value`, in `place`.
-pub fn start_request(value: &str, prompt: &str, place: &RunPlace) -> StartRunRequest {
+/// The run a new conversation's first message starts, on route `value`, in `place`, asking
+/// for images when `images`.
+pub fn start_request(value: &str, prompt: &str, place: &RunPlace, images: bool) -> StartRunRequest {
     let mut request = StartRunRequest {
         project_id: place.workspace_id.clone(),
         prompt: prompt.to_string(),
         dir: place.dir.clone(),
         worktree_mode: place.mode.wire().to_string(),
+        images,
         ..StartRunRequest::default()
     };
     match parse_pick(value) {
@@ -484,7 +500,7 @@ mod tests {
             workspace_id: "ws-1".into(),
             ..RunPlace::default()
         };
-        let request = start_request(&value, "hi", &place);
+        let request = start_request(&value, "hi", &place, false);
         assert_eq!(
             (
                 request.agent.as_str(),
@@ -494,7 +510,7 @@ mod tests {
             ("codex", "gpt-6-luna", "")
         );
         assert_eq!(request.project_id, "ws-1");
-        assert_eq!(start_request(AUTO, "hi", &place).tier, "auto");
+        assert_eq!(start_request(AUTO, "hi", &place, false).tier, "auto");
     }
 
     fn workspace(id: &str, name: &str, path: &str, project: &str) -> Workspace {
@@ -598,7 +614,7 @@ mod tests {
             dir: "/code/web".into(),
             mode: PlaceMode::Worktree,
         };
-        let request = start_request(NORMAL, "fix it", &place);
+        let request = start_request(NORMAL, "fix it", &place, false);
         assert_eq!(
             (
                 request.project_id.as_str(),
@@ -612,11 +628,24 @@ mod tests {
             mode: PlaceMode::InPlace,
             ..place
         };
-        assert_eq!(start_request(NORMAL, "x", &here).worktree_mode, "in_place");
+        assert_eq!(
+            start_request(NORMAL, "x", &here, false).worktree_mode,
+            "in_place"
+        );
         assert_eq!(
             PlaceMode::from_value(PlaceMode::Worktree.value()),
             Some(PlaceMode::Worktree)
         );
+    }
+
+    #[test]
+    fn an_image_conversation_asks_for_images() {
+        let place = RunPlace::default();
+        assert!(!start_request(NORMAL, "draw a chart", &place, false).images);
+        assert!(start_request(NORMAL, "draw a chart", &place, true).images);
+        assert_eq!(IMAGE_PILL, "Image");
+        assert!(image_hint(true).contains("asks for images"));
+        assert!(image_hint(false).contains("Ask for images"));
     }
 
     #[test]

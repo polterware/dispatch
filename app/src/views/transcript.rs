@@ -22,13 +22,14 @@ use gpui::{
 };
 
 use crate::client::{
-    CoreClient, DispatchRun, ProtoI64, ReadRunEventsRequest, ResultRequest, WatchRunRequest,
+    CoreClient, DispatchRun, ListArtifactsRequest, ProtoI64, ReadRunEventsRequest, ResultRequest,
+    WatchRunRequest,
 };
 use crate::format::is_active_status;
 use crate::models::run_page::attempt_switches;
 use crate::models::transcript::{
     LogEvent, PagedEvent, PromptBubble, StreamedLog, TranscriptBuilder, TranscriptEntry,
-    build_transcript, enrich_transcript_switches, prompt_bubble,
+    TranscriptImage, build_transcript, enrich_transcript_switches, prompt_bubble, run_images,
 };
 use crate::motion::{Animator, SpringTier, SpringValue};
 use crate::state::{AppState, observe};
@@ -204,6 +205,14 @@ pub struct TranscriptView {
     glide: bool,
     /// The last motion frame's step, which the glide moves by.
     frame_dt: f32,
+    /// The images the open run made, oldest first, shown under its reply.
+    images: Vec<TranscriptImage>,
+    /// The run whose images were asked of the core.
+    images_for: String,
+    /// The open run's images were asked for.
+    images_asked: bool,
+    /// The viewer a thumbnail opens.
+    viewer: Entity<super::image_viewer::ImageViewerView>,
 }
 
 impl TranscriptView {
@@ -232,6 +241,7 @@ impl TranscriptView {
             }
         });
         observe(&state, cx);
+        let viewer = cx.new(|cx| super::image_viewer::ImageViewerView::new(state.clone(), cx));
         let mut view = Self {
             state,
             run_id,
@@ -283,6 +293,10 @@ impl TranscriptView {
             continued: false,
             glide: false,
             frame_dt: 0.0,
+            images: Vec::new(),
+            images_for: String::new(),
+            images_asked: false,
+            viewer,
         };
         view.ensure_stream(cx);
         view.ensure_earlier_runs(cx);
@@ -335,6 +349,10 @@ impl TranscriptView {
         self.rows_before_page = None;
         self.opened = false;
         self.open_at_end = false;
+        self.images.clear();
+        self.images_for.clear();
+        self.images_asked = false;
+        self.viewer.update(cx, |viewer, cx| viewer.close(cx));
         self.stick = true;
         self.glide = false;
         self.follow = Follow::Pending;
@@ -436,6 +454,60 @@ impl TranscriptView {
                 if view.stick {
                     view.follow = Follow::Pending;
                 }
+                view.rebuild_rows(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Asks the core for the images the open run made, once it has ended: the core indexes
+    /// them as a run ends, so a run still working has none yet. A read that comes back empty
+    /// is asked once more a moment later, since the status can land a beat before the index.
+    fn ensure_images(&mut self, cx: &mut Context<Self>) {
+        if self.compact || self.images_asked || self.images_for == self.run_id {
+            return;
+        }
+        let Some(run) = self.state.read(cx).run(&self.run_id).cloned() else {
+            return;
+        };
+        if crate::format::is_active_status(&run.status) {
+            return;
+        }
+        let Some(client) = self.state.read(cx).client() else {
+            return;
+        };
+        self.images_for = self.run_id.clone();
+        self.images_asked = true;
+        let run_id = run.id.clone();
+        // The core filters by the run's repository and conversation, which its images carry,
+        // and the app keeps the run's own from that list: the RPC has no run filter.
+        let request = ListArtifactsRequest {
+            repo: run.repo.clone(),
+            conversation_id: run.conversation_id.clone(),
+            ..ListArtifactsRequest::default()
+        };
+        cx.spawn(async move |this, cx| {
+            let mut images = Vec::new();
+            for attempt in 0..2 {
+                let (client, request) = (client.clone(), request.clone());
+                let artifacts = cx
+                    .background_spawn(async move {
+                        client
+                            .list_artifacts(&request)
+                            .map(|response| response.artifacts)
+                            .unwrap_or_default()
+                    })
+                    .await;
+                images = run_images(&artifacts, &run_id);
+                if !images.is_empty() || attempt == 1 {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(900))
+                    .await;
+            }
+            let _ = this.update(cx, |view, cx| {
+                view.images = images;
                 view.rebuild_rows(cx);
             });
         })
@@ -662,6 +734,16 @@ impl TranscriptView {
                     "No agent output recorded.".to_string(),
                 ),
             });
+        }
+        // The images the run made close its transcript, under its reply. A run with none
+        // adds no row, so the layout is the one it had.
+        if !self.images.is_empty() {
+            if !rows.is_empty() {
+                rows.push(gap_row());
+            }
+            rows.push(crate::ui::parts::transcript::images_transcript_row(
+                &self.images,
+            ));
         }
         if self.shown_live {
             if !rows.is_empty() {
@@ -1133,6 +1215,14 @@ impl TranscriptView {
         self.on_scroll(true, first, cx);
         cx.notify();
     }
+
+    /// Opens one of the run's images whole, by its artifact id.
+    fn open_image(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(image) = self.images.iter().find(|image| image.id == id).cloned() else {
+            return;
+        };
+        self.viewer.update(cx, |viewer, cx| viewer.open(image, cx));
+    }
 }
 
 impl Render for TranscriptView {
@@ -1148,6 +1238,7 @@ impl Render for TranscriptView {
         .max(0.0);
         self.ensure_stream(cx);
         self.ensure_earlier_runs(cx);
+        self.ensure_images(cx);
         let live = self.live_now(cx);
         let switches_len = self.switches_len(cx);
         if live != self.shown_live
@@ -1179,6 +1270,12 @@ impl Render for TranscriptView {
                 entity.update(cx, |view, cx| view.set_prompt_expanded(open, cx));
             }
         });
+        let on_image: Rc<dyn Fn(String, &mut Window, &mut App)> = Rc::new({
+            let entity = entity.clone();
+            move |id, _, cx| {
+                entity.update(cx, |view, cx| view.open_image(&id, cx));
+            }
+        });
         let count = rows.borrow().len();
         let enter = self.enter.value();
         let reveal = self.reveal.value();
@@ -1201,6 +1298,7 @@ impl Render for TranscriptView {
                 on_read: Rc::new(|text: String, _, cx: &mut App| {
                     crate::voice::read_aloud(&text, cx);
                 }),
+                on_image: on_image.clone(),
             };
             let row = render_row(&frame, &row, window, cx);
             if compact {
@@ -1380,6 +1478,9 @@ impl Render for TranscriptView {
                     .child(bar),
             );
         }
+        // The viewer a thumbnail opens: deferred over the whole window, and nothing at all
+        // while it is closed.
+        area = area.child(self.viewer.clone());
         area.into_any_element()
     }
 }

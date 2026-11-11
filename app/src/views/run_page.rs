@@ -26,9 +26,9 @@ use crate::client::{
 };
 use crate::models::avatar::avatar_status;
 use crate::models::new_run::{
-    FolderChoice, PLACE_PREFERENCE, PlaceMode, RouteChoice, RouteLabel, RunPlace, default_pick,
-    default_place, folder_choices, offers_worktree, pick_label, place_label, route_choices,
-    run_label, start_request,
+    FolderChoice, IMAGE_PILL, PLACE_PREFERENCE, PlaceMode, RouteChoice, RouteLabel, RunPlace,
+    default_pick, default_place, folder_choices, image_hint, offers_worktree, pick_label,
+    place_label, route_choices, run_label, start_request,
 };
 use crate::models::run_page::{
     AttemptCard, AttemptSwitch, CandidateExplain, CandidateOutcome, ClassifierBands, LinkedRow,
@@ -191,6 +191,8 @@ struct Draft {
     /// The last start was refused because another run edits the folder itself: the core's
     /// message, over Worktree, which starts it again in a worktree of its own.
     busy: Option<String>,
+    /// The Image mode: on, the run asks for images and routes to the agents that make them.
+    images: bool,
 }
 
 /// The header pill's key for a new conversation's route, which the run it starts keeps.
@@ -333,6 +335,7 @@ impl RunPageView {
                 place_picker,
                 folder_anchor: AnchorSlot::default(),
                 busy: None,
+                images: false,
             },
         };
         view.install_bodies(cx);
@@ -597,6 +600,7 @@ impl RunPageView {
         self.draft.asked = false;
         self.draft.place = None;
         self.draft.busy = None;
+        self.draft.images = false;
         self.draft.repos_asked = false;
         self.draft.remembered = self
             .state
@@ -983,7 +987,7 @@ impl RunPageView {
         };
         let pick = self.draft.pick.clone();
         let generation = self.draft.generation;
-        let request = start_request(&pick, &prompt, &place);
+        let request = start_request(&pick, &prompt, &place, self.draft.images);
         self.draft.busy = None;
         self.sending = true;
         cx.notify();
@@ -1085,7 +1089,31 @@ impl RunPageView {
             self.draft.anchor.clone(),
         );
         self.load_folders(cx);
-        let mut pills = div().flex().items_center().gap(px(6.0)).child(route);
+        // Image mode: beside the route, on when the conversation asks for images.
+        let image = {
+            let on = self.draft.images;
+            let toggle = weak.clone();
+            let click: PillClick = Rc::new(move |_, cx| {
+                let _ = toggle.update(cx, |view, cx| {
+                    view.draft.images = !view.draft.images;
+                    cx.notify();
+                });
+            });
+            toggle_pill(
+                "draft-images",
+                Icon::Eye,
+                IMAGE_PILL,
+                image_hint(on),
+                on,
+                click,
+            )
+        };
+        let mut pills = div()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .child(route)
+            .child(image);
         if let Some(place) = self.place(cx) {
             let folder_label = {
                 let state = self.state.read(cx);
@@ -1284,6 +1312,8 @@ impl RunPageView {
             project_id: run.project_id.clone(),
             prompt,
             resume: run.id.clone(),
+            // A follow-up keeps the mode its run was started with.
+            images: run.images,
             ..StartRunRequest::default()
         };
         cx.spawn(async move |this, cx| {
@@ -2045,7 +2075,16 @@ impl Render for RunPageView {
                     None,
                     cx,
                 ))
-                .children(worktree);
+                .children(worktree)
+                .children(run.images.then(|| {
+                    place_pill(
+                        "run-images",
+                        Icon::Eye,
+                        IMAGE_PILL,
+                        "This run asked for images",
+                        None,
+                    )
+                }));
             rail_page_header(start, end, cx).into_any_element()
         } else {
             toolbar(div(), div(), cx).into_any_element()
@@ -2320,6 +2359,28 @@ fn place_pill(
             .into_any_element(),
         None => pill.inert().into_any_element(),
     }
+}
+
+/// A header pill that is a switch: Image mode, and anything else the header toggles. It takes
+/// the raised secondary face while on, and its tooltip says what it does either way.
+fn toggle_pill(
+    id: &'static str,
+    icon: Icon,
+    label: &str,
+    detail: &str,
+    on: bool,
+    on_click: PillClick,
+) -> AnyElement {
+    Button::new(id, ButtonKind::Secondary)
+        .size(ButtonSize::Sm)
+        .pill()
+        .pad_x(10.0)
+        .icon(icon)
+        .label(label.to_string())
+        .selected(on)
+        .tooltip(detail.to_string())
+        .on_click(move |window, cx| on_click(window, cx))
+        .into_any_element()
 }
 
 /// The header pill: the route's bot (the Polterware ghost for a tier, the agent's live bot

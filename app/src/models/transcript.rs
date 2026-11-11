@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 use serde_json::{Map, Value};
 
+use crate::client::DispatchArtifact;
 use crate::models::run_page::{AttemptSwitch, parse_switch_line, switch_divider_label};
 use crate::models::sidebar::local_clock;
 
@@ -1151,6 +1152,84 @@ pub fn prompt_meta_label(caller_agent: &str) -> String {
         other => other,
     };
     format!("You \u{b7} via {label}")
+}
+
+/// One image a run made, as its transcript shows it under the reply: its thumbnail and what
+/// the viewer says about it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TranscriptImage {
+    /// The artifact's id, which names its thumbnail.
+    pub id: String,
+    /// The file's name.
+    pub title: String,
+    /// Its format, pixels, and size, for the viewer's caption.
+    pub caption: String,
+    /// The copy's absolute path.
+    pub path: String,
+    pub width: i32,
+    pub height: i32,
+}
+
+/// The images `run_id` made among `artifacts`, oldest first, as the transcript shows them.
+/// The core lists them newest first, and a run with none adds no row.
+pub fn run_images(artifacts: &[DispatchArtifact], run_id: &str) -> Vec<TranscriptImage> {
+    let mut images: Vec<TranscriptImage> = artifacts
+        .iter()
+        .filter(|artifact| artifact.run_id == run_id && !artifact.path.trim().is_empty())
+        .map(|artifact| {
+            let title = artifact
+                .rel_path
+                .rsplit('/')
+                .next()
+                .filter(|name| !name.trim().is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    artifact
+                        .path
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or_default()
+                        .to_string()
+                });
+            TranscriptImage {
+                id: artifact.id.clone(),
+                title,
+                caption: image_caption(artifact),
+                path: artifact.path.clone(),
+                width: artifact.width,
+                height: artifact.height,
+            }
+        })
+        .collect();
+    images.reverse();
+    images
+}
+
+/// "PNG · 1024×768 · 1.2 MB": the format, the pixels, and the bytes, as the viewer says them.
+fn image_caption(artifact: &DispatchArtifact) -> String {
+    let mut parts = Vec::new();
+    if !artifact.kind.trim().is_empty() {
+        parts.push(artifact.kind.to_ascii_uppercase());
+    }
+    if artifact.width > 0 && artifact.height > 0 {
+        parts.push(format!("{}\u{d7}{}", artifact.width, artifact.height));
+    }
+    if artifact.bytes.0 > 0 {
+        parts.push(file_size(artifact.bytes.0));
+    }
+    parts.join(" \u{b7} ")
+}
+
+/// A byte count in KB or MB, as a file manager says it.
+pub fn file_size(bytes: i64) -> String {
+    let bytes = bytes.max(0) as f64;
+    if bytes >= 1_000_000.0 {
+        format!("{:.1} MB", bytes / 1_000_000.0)
+    } else if bytes >= 1_000.0 {
+        format!("{:.1} KB", bytes / 1_000.0)
+    } else {
+        format!("{} B", bytes as i64)
+    }
 }
 
 /// Reads `log` the way the agent's CLI would show it.
@@ -2393,5 +2472,47 @@ mod tests {
                 handoff: "## Original task\nFinish it".into(),
             }
         );
+    }
+
+    #[test]
+    fn a_runs_images_are_named_and_kept_in_the_order_they_were_made() {
+        use crate::client::{DispatchArtifact, ProtoI64};
+        use crate::models::transcript::run_images;
+
+        let artifact = |id: &str, run: &str, rel: &str, kind: &str, bytes: i64| DispatchArtifact {
+            id: id.into(),
+            run_id: run.into(),
+            rel_path: rel.into(),
+            path: format!("/data/artifacts/{run}/{rel}"),
+            kind: kind.into(),
+            bytes: ProtoI64(bytes),
+            width: 1024,
+            height: 768,
+            ..DispatchArtifact::default()
+        };
+        // Newest first, as the core lists them, with another run's and a copy-less one.
+        let artifacts = [
+            artifact("a2", "run-1", "shots/b.png", "png", 1_500_000),
+            artifact("a1", "run-1", "shots/a.png", "png", 900),
+            artifact("x1", "run-2", "other.png", "jpeg", 10),
+            DispatchArtifact {
+                id: "gone".into(),
+                run_id: "run-1".into(),
+                ..DispatchArtifact::default()
+            },
+        ];
+        let images = run_images(&artifacts, "run-1");
+        assert_eq!(
+            images
+                .iter()
+                .map(|image| (image.id.as_str(), image.title.as_str()))
+                .collect::<Vec<_>>(),
+            [("a1", "a.png"), ("a2", "b.png")]
+        );
+        assert_eq!(images[0].caption, "PNG \u{b7} 1024\u{d7}768 \u{b7} 900 B");
+        assert_eq!(images[1].caption, "PNG \u{b7} 1024\u{d7}768 \u{b7} 1.5 MB");
+        assert_eq!(images[0].path, "/data/artifacts/run-1/shots/a.png");
+        assert_eq!((images[0].width, images[0].height), (1024, 768));
+        assert!(run_images(&artifacts, "run-3").is_empty());
     }
 }
