@@ -914,10 +914,17 @@ impl Inner {
         self.push_event(message);
     }
 
+    /// Follows the engine's microphone for this client's own utterance only: another
+    /// client listening is not this composer's dictation, and a microphone the engine says is
+    /// closed ends one this client thought was open.
     fn apply_state(&self, state: &EngineState) {
-        if state.mic == MicState::Listening {
-            self.listening.store(true, Ordering::SeqCst);
-        }
+        let ours = self
+            .listening_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some();
+        let open = ours && state.mic == MicState::Listening;
+        self.listening.store(open, Ordering::SeqCst);
     }
 
     fn finish_utterance(&self, id: &str) {
