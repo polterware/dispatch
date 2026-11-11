@@ -329,18 +329,28 @@ impl Deps {
         // Discovery only augments normal routing and only asks the model-list
         // endpoint; it never invokes a model.
         let discover = self.policy.discover && matches!(o.tier.as_str(), "" | TIER_AUTO | "normal");
+        let installed: Vec<bool> = self
+            .adapters
+            .iter()
+            .map(|a| self.is_installed(&a.binary()))
+            .collect();
+        // Every agent CLI is asked at once, so the slowest one bounds discovery.
+        let lists = futures::future::join_all(self.adapters.iter().zip(&installed).map(
+            |(a, &installed)| async move {
+                if discover && installed {
+                    a.models()
+                        .await
+                        .map(|ms| ms.into_iter().map(|m| m.id).collect())
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                }
+            },
+        ))
+        .await;
         let mut agents = Vec::with_capacity(self.adapters.len());
-        for a in &self.adapters {
+        for ((a, installed), discovered) in self.adapters.iter().zip(installed).zip(lists) {
             let caps = a.capabilities();
-            let installed = self.is_installed(&a.binary());
-            let discovered = if discover && installed {
-                a.models()
-                    .await
-                    .map(|ms| ms.into_iter().map(|m| m.id).collect())
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
             agents.push(router::Agent {
                 name: a.name(),
                 installed,

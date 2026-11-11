@@ -31,8 +31,7 @@ use crate::format::is_active_status;
 use crate::models::run_page::attempt_switches;
 use crate::models::transcript::{
     LogEvent, PagedEvent, PromptBubble, StreamedLog, TranscriptBuilder, TranscriptEntry,
-    TranscriptImage, build_transcript, enrich_transcript_switches, live_phase, prompt_bubble,
-    run_images,
+    TranscriptImage, build_transcript, enrich_transcript_switches, prompt_bubble, run_images,
 };
 use crate::motion::{Animator, SpringTier, SpringValue};
 use crate::state::{AppState, observe};

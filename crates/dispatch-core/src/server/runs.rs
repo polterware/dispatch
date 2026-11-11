@@ -466,9 +466,13 @@ impl Core {
                 && edits_in_place(r.read_only, r.no_worktree, &r.worktree, &r.dir)
                 && same_dir(&r.dir, dir)
                 && run.is_none_or(|run| {
+                    // A run that is not waiting in line has the folder; between two that
+                    // wait, the earlier goes first. created_at is kept to the second, so
+                    // it alone cannot order a run launched in the same second.
                     r.id != run.id
-                        && (r.created_at.as_str(), r.id.as_str())
-                            < (run.created_at.as_str(), run.id.as_str())
+                        && (!r.note.contains(WAITING_PREFIX)
+                            || (r.created_at.as_str(), r.id.as_str())
+                                < (run.created_at.as_str(), run.id.as_str()))
                 })
         }))
     }

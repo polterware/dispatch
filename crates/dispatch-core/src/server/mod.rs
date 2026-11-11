@@ -78,7 +78,7 @@ pub struct Core {
     cancels: Mutex<HashMap<String, CancellationToken>>,
     finish: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     watch: Mutex<WatchState>,
-    agent_models: agent_models::Cache,
+    agent_models: Arc<agent_models::Cache>,
     probes: tokio::sync::Mutex<HashMap<String, Instant>>,
 }
 
@@ -111,7 +111,7 @@ impl Core {
             cancels: Mutex::new(HashMap::new()),
             finish: Mutex::new(HashMap::new()),
             watch: Mutex::new(WatchState::default()),
-            agent_models: agent_models::Cache::default(),
+            agent_models: Arc::default(),
             probes: tokio::sync::Mutex::new(HashMap::new()),
         })
     }
@@ -184,7 +184,7 @@ impl Core {
     pub(crate) fn deps(&self) -> Result<Deps, Error> {
         let table = Table::load_from_store(Some(self.store.as_ref()))?;
         Ok(Deps {
-            adapters: known::known(),
+            adapters: self.cached_adapters(known::known()),
             table,
             store: Some(self.store_dyn()),
             state_dir: self.state_dir().to_string_lossy().into_owned(),
