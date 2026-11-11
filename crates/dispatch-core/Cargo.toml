@@ -42,4 +42,5 @@ prost-build = "0.14"
 pbjson-build = "0.8"
 
 [dev-dependencies]
+filetime = "0.2.29"
 tempfile = "3.27.0"
