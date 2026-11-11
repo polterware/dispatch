@@ -1089,31 +1089,7 @@ impl RunPageView {
             self.draft.anchor.clone(),
         );
         self.load_folders(cx);
-        // Image mode: beside the route, on when the conversation asks for images.
-        let image = {
-            let on = self.draft.images;
-            let toggle = weak.clone();
-            let click: PillClick = Rc::new(move |_, cx| {
-                let _ = toggle.update(cx, |view, cx| {
-                    view.draft.images = !view.draft.images;
-                    cx.notify();
-                });
-            });
-            toggle_pill(
-                "draft-images",
-                Icon::Eye,
-                IMAGE_PILL,
-                image_hint(on),
-                on,
-                click,
-            )
-        };
-        let mut pills = div()
-            .flex()
-            .items_center()
-            .gap(px(6.0))
-            .child(route)
-            .child(image);
+        let mut pills = div().flex().items_center().gap(px(6.0)).child(route);
         if let Some(place) = self.place(cx) {
             let folder_label = {
                 let state = self.state.read(cx);
@@ -1156,7 +1132,7 @@ impl RunPageView {
         if let Some(place) = self.place(cx) {
             let on = place.mode == PlaceMode::Worktree;
             let toggle = weak.clone();
-            // A small neutral toggle at its own width, at the right beside Send: the raised
+            // A small neutral toggle at its own width, at the footer's start: the raised
             // secondary face when on.
             let button = Button::new(
                 "draft-worktree",
@@ -1181,14 +1157,35 @@ impl RunPageView {
                 };
                 let _ = toggle.update(cx, |view, cx| view.pick_place(mode.value(), cx));
             });
-            card = card.footer_start(
-                div()
-                    .w_full()
-                    .flex()
-                    .justify_end()
-                    .child(div().flex_none().child(button)),
-            );
+            card = card.footer_start(div().flex().child(div().flex_none().child(button)));
         }
+        // Image mode, beside the microphone in Worktree's style: on, the conversation asks
+        // for images.
+        let images_on = self.draft.images;
+        let toggle = weak.clone();
+        card = card.footer_end(
+            Button::new(
+                "draft-images",
+                if images_on {
+                    ButtonKind::Secondary
+                } else {
+                    ButtonKind::Ghost
+                },
+            )
+            .size(ButtonSize::Sm)
+            .height(24.0)
+            .pad_x(8.0)
+            .icon(Icon::Eye)
+            .label(IMAGE_PILL)
+            .selected(images_on)
+            .tooltip(image_hint(images_on))
+            .on_click(move |_, cx| {
+                let _ = toggle.update(cx, |view, cx| {
+                    view.draft.images = !view.draft.images;
+                    cx.notify();
+                });
+            }),
+        );
         // Another run edits the folder itself: say so over the composer, with Worktree.
         let busy = self.draft.busy.clone().map(|message| {
             let retry = weak.clone();
@@ -1230,6 +1227,8 @@ impl RunPageView {
             .min_w(px(0.0))
             .flex()
             .flex_col()
+            // Nothing is said yet: the composer waits in the middle of the page, and the
+            // conversation's page puts it at the bottom once the first message starts it.
             .child(div().flex_1().min_h(px(0.0)))
             .child(
                 div()
@@ -1238,9 +1237,9 @@ impl RunPageView {
                     .flex()
                     .justify_center()
                     .px(px(16.0))
-                    .pb(px(16.0))
                     .child(div().w_full().max_w(px(WIDE_MEASURE)).child(card)),
-            );
+            )
+            .child(div().flex_1().min_h(px(0.0)));
         // Nothing has run yet, so the rail has nothing to hold.
         let (row, _) = rail_page_body_under(
             column,

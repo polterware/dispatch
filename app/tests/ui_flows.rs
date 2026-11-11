@@ -225,6 +225,37 @@ fn every_page_opens_with_data(cx: &mut TestAppContext) {
     assert!(w.toasts().is_empty(), "a page complained: {:?}", w.toasts());
 }
 
+/// The new conversation's composer: Worktree at its footer's start, Image beside the
+/// microphone before Send, and the composer in the middle of the empty page.
+#[gpui::test]
+fn the_new_conversations_composer_waits_in_the_middle_with_its_toggles(cx: &mut TestAppContext) {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let core = Core::new();
+    core.cli(&["workspace", "add", &core.repo.to_string_lossy()]);
+    let mut w = open(&core, cx);
+    assert_eq!(w.route(), Route::NewRun);
+    let composer = w.cx.debug_bounds("run-message").expect("the composer");
+    let worktree = w.cx.debug_bounds("draft-worktree").expect("Worktree");
+    let image = w.cx.debug_bounds("draft-images").expect("Image");
+    let send = w.cx.debug_bounds("run-message-send").expect("Send");
+    assert!(
+        worktree.left() - composer.left() < composer.size.width * 0.25,
+        "Worktree starts the footer: {worktree:?} in {composer:?}"
+    );
+    assert!(
+        worktree.right() < image.left() && image.right() < send.left(),
+        "Image sits after Worktree and before Send: {worktree:?} {image:?} {send:?}"
+    );
+    // The window is 4000 tall: the composer's middle is near the page's, not its bottom.
+    let middle = (composer.top() + composer.bottom()) / 2.0;
+    assert!(
+        (f32::from(middle) - 2000.0).abs() < 200.0,
+        "the empty page holds the composer in its middle: {composer:?}"
+    );
+    // Image left the header: it is inside the composer.
+    assert!(image.top() >= composer.top() && image.bottom() <= composer.bottom());
+}
+
 #[gpui::test]
 fn a_core_with_no_runs_refreshes_without_an_error(cx: &mut TestAppContext) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
