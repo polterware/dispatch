@@ -5,16 +5,15 @@
 //! and shows (remembered as `polterware.run.rail`). Header actions call the core on the
 //! background executor; they use the same button colors with fast hover and press springs.
 
-use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    AnyElement, AnyView, App, AppContext as _, Bounds, Context, Entity, Font, FontWeight, Hsla,
-    IntoElement, MouseButton, Pixels, ScrollHandle, SharedString, StyleRefinement, StyledText,
-    TextRun, WeakEntity, Window, canvas, div, prelude::*, px,
+    AnyElement, AnyView, App, AppContext as _, Context, Entity, Font, FontWeight, Hsla,
+    IntoElement, MouseButton, ScrollHandle, SharedString, StyleRefinement, StyledText, TextRun,
+    WeakEntity, Window, div, prelude::*, px,
 };
 
 use super::repository_actions;
@@ -47,9 +46,9 @@ use crate::state::{AppState, ConnectionState, Route, observe};
 use crate::theme::{Theme, status_tone, tw};
 use crate::ui::ellipsis;
 use crate::ui::parts::run_page::{context_meter, file_change_line};
-use crate::ui::patterns::trailing_toolbar;
-use crate::ui::patterns::window_layer;
-use crate::ui::patterns::{message_composer, message_input};
+use crate::ui::patterns::{
+    AnchorSlot, message_composer, message_input, trailing_toolbar, window_anchor,
+};
 use crate::ui::{
     Button, ButtonKind, ButtonSize, Icon, MascotMood, Menu, MenuEntry, PageWidth, RailGroup,
     RailPresence, ToastTone, button, chip, mono, page_empty_with, rail_page_body_flush,
@@ -158,7 +157,7 @@ struct Draft {
     asked: bool,
     picker: Entity<PropertyPicker>,
     /// Where the header pill is, which the picker hangs from.
-    anchor: Rc<Cell<Option<Bounds<Pixels>>>>,
+    anchor: AnchorSlot,
     /// The run the last new conversation started: its id, the conversation's generation, and
     /// the route it was started on, which its header shows until the run has an agent and
     /// then turns into it.
@@ -173,7 +172,7 @@ struct Draft {
     repos_asked: bool,
     /// The folder picker, hung from the folder pill.
     place_picker: Entity<PropertyPicker>,
-    folder_anchor: Rc<Cell<Option<Bounds<Pixels>>>>,
+    folder_anchor: AnchorSlot,
     /// The last start was refused because another run edits the folder itself: the core's
     /// message, over Worktree, which starts it again in a worktree of its own.
     busy: Option<String>,
@@ -304,14 +303,14 @@ impl RunPageView {
                 models_loading: false,
                 asked: false,
                 picker,
-                anchor: Rc::new(Cell::new(None)),
+                anchor: AnchorSlot::default(),
                 started: None,
                 place: None,
                 remembered: HashMap::new(),
                 repos: HashMap::new(),
                 repos_asked: false,
                 place_picker,
-                folder_anchor: Rc::new(Cell::new(None)),
+                folder_anchor: AnchorSlot::default(),
                 busy: None,
             },
         };
@@ -1003,12 +1002,12 @@ impl RunPageView {
         let overlay = (picker.read(cx).is_presented())
             .then(|| self.draft.anchor.get())
             .flatten()
-            .map(|anchor| hang(anchor, picker.into_any_element()));
+            .map(|anchor| window_anchor(anchor, picker.into_any_element()));
         let place_picker = self.draft.place_picker.clone();
         let place_overlay = (place_picker.read(cx).is_presented())
             .then(|| self.draft.folder_anchor.get())
             .flatten()
-            .map(|anchor| hang(anchor, place_picker.into_any_element()));
+            .map(|anchor| window_anchor(anchor, place_picker.into_any_element()));
         div()
             .relative()
             .size_full()
@@ -2054,32 +2053,8 @@ fn worktree_badge(run: &DispatchRun) -> Option<bool> {
     }
 }
 
-fn anchored(element: AnyElement, anchor: Rc<Cell<Option<Bounds<Pixels>>>>) -> gpui::Div {
-    div().relative().child(element).child(
-        canvas(
-            move |bounds, _, _| anchor.set(Some(bounds)),
-            |_, _, _, _| {},
-        )
-        .absolute()
-        .top_0()
-        .left_0()
-        .size_full(),
-    )
-}
-
-/// `panel` laid over the window at `anchor`, the trigger it hangs from.
-fn hang(anchor: Bounds<Pixels>, panel: AnyElement) -> AnyElement {
-    window_layer(
-        div().size_full().child(
-            div()
-                .absolute()
-                .left(anchor.origin.x)
-                .top(anchor.origin.y)
-                .w(anchor.size.width)
-                .h(anchor.size.height)
-                .child(panel),
-        ),
-    )
+fn anchored(element: AnyElement, anchor: AnchorSlot) -> gpui::Div {
+    div().relative().child(element).child(anchor.probe())
 }
 
 /// A header pill for where a run works: its folder, or its mode. A run's is inert; the

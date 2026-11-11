@@ -630,3 +630,78 @@ fn the_conversation_menu_opens_its_usage_dialog(cx: &mut TestAppContext) {
         w.toasts()
     );
 }
+
+/// The repository picker's row menu: it hangs from the row's ⋯, under its row and inside
+/// the window, so its first rows are never cut off, and the picker's last row (Add
+/// repository) stays whole at the end of the list.
+#[gpui::test]
+fn the_repository_pickers_row_menu_hangs_from_its_row(cx: &mut TestAppContext) {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let core = Core::new();
+    core.cli(&["workspace", "add", &core.repo.to_string_lossy()]);
+    let mut w = open(&core, cx);
+    // The app opens on a new conversation, whose folder pill opens the repository picker.
+    assert_eq!(w.route(), Route::NewRun);
+    w.click("draft-folder");
+    w.pump();
+
+    // The picker lists the one repository and, at its end, Add repository, whole.
+    let panel =
+        w.cx.debug_bounds("property-picker-panel")
+            .expect("the repository picker");
+    let add =
+        w.cx.debug_bounds("property-action-1")
+            .expect("Add repository at the list's end");
+    assert!(
+        add.top() >= panel.top() && add.bottom() <= panel.bottom(),
+        "Add repository is cut by the list's end: {add:?} outside {panel:?}"
+    );
+
+    // A row's ⋯ shows on hover; its menu hangs from the button, under the row.
+    let row =
+        w.cx.debug_bounds("property-option-0")
+            .expect("the repository row");
+    w.cx.simulate_mouse_move(row.center(), None, Modifiers::none());
+    w.settle();
+    let more =
+        w.cx.debug_bounds("property-option-more-0")
+            .expect("the row's ⋯");
+    w.click("property-option-more-0");
+    w.pump();
+
+    let menu =
+        w.cx.debug_bounds("menu-panel")
+            .expect("the row's menu never opened");
+    assert_eq!(menu.left(), more.left(), "the menu left the ⋯ it came from");
+    assert!(
+        menu.top() >= more.bottom(),
+        "the menu covers the ⋯ it came from: {menu:?} over {more:?}"
+    );
+    assert!(
+        menu.top() >= row.bottom() && menu.top() <= row.bottom() + gpui::px(12.0),
+        "the menu is not under its row: {menu:?} under {row:?}"
+    );
+    // The window: X inside it, and its first rows are on screen, not cut at the top.
+    let (width, height) = (gpui::px(1400.0), gpui::px(4000.0));
+    assert!(
+        menu.left() >= gpui::px(0.0) && menu.right() <= width,
+        "the menu hangs out of the window's sides: {menu:?}"
+    );
+    assert!(
+        menu.top() >= gpui::px(0.0) && menu.bottom() <= height,
+        "the menu hangs out of the window's ends: {menu:?}"
+    );
+    for (label, id) in [
+        ("Reveal in Finder", "menu-item-0"),
+        ("Copy path", "menu-item-1"),
+    ] {
+        let item =
+            w.cx.debug_bounds(id)
+                .unwrap_or_else(|| panic!("the menu has no {label}"));
+        assert!(
+            item.top() >= gpui::px(0.0) && item.bottom() <= height,
+            "{label} is cut off: {item:?}"
+        );
+    }
+    assert!(w.toasts().is_empty(), "{:?}", w.toasts());
+}
