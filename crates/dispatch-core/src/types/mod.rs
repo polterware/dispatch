@@ -35,6 +35,24 @@ pub const WORKTREE_MERGED: &str = "merged";
 pub const WORKTREE_REMOVED: &str = "removed";
 pub const WORKTREE_ABANDONED: &str = "abandoned";
 
+/// The caller agent a run started from the desktop app records; a delegating agent records its
+/// own name (claude, codex, ...).
+pub const CALLER_APP: &str = "dispatch";
+/// Where a run was started: the app's conversations, or an agent's delegation.
+pub const ORIGIN_APP: &str = "app";
+pub const ORIGIN_DELEGATED: &str = "delegated";
+
+/// A run's origin, read off its caller agent: the app records [`CALLER_APP`] for the
+/// conversations it starts. A run from an older app, which sent no caller, has no way to say
+/// where it came from and reads as delegated.
+pub fn origin(caller_agent: &str) -> &'static str {
+    if caller_agent.trim() == CALLER_APP {
+        ORIGIN_APP
+    } else {
+        ORIGIN_DELEGATED
+    }
+}
+
 pub const ERR_UNKNOWN_RUN: &str = "unknown dispatch run";
 pub const ERR_UNKNOWN_WORKTREE: &str = "unknown worktree";
 
@@ -247,6 +265,53 @@ pub struct LinkedRepo {
     /// Set once merged.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub merge_sha: String,
+}
+
+/// One image a run made, copied into its folder under the data directory's artifacts so a
+/// cleaned worktree keeps it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Artifact {
+    pub id: String,
+    pub run_id: String,
+    pub project_id: String,
+    pub conversation_id: String,
+    pub caller_agent: String,
+    pub agent: String,
+    pub model: String,
+    /// The run's repository: its checkout, else its folder.
+    pub repo: String,
+    /// The copy's path under `<data dir>/artifacts/<run id>/`.
+    pub rel_path: String,
+    /// png, jpeg, webp, or gif, read from the file's header.
+    pub kind: String,
+    pub bytes: i64,
+    pub width: i32,
+    pub height: i32,
+    pub created_at: String,
+    /// The making run's prompt, read with the row and never stored on it.
+    pub prompt: String,
+}
+
+impl Artifact {
+    pub fn origin(&self) -> &'static str {
+        origin(&self.caller_agent)
+    }
+}
+
+/// What a gallery lists: every field empty matches every artifact, and `limit` 0 is every row.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ArtifactFilter {
+    /// [`ORIGIN_APP`], [`ORIGIN_DELEGATED`], or empty.
+    pub origin: String,
+    pub repo: String,
+    pub agent: String,
+    pub conversation_id: String,
+    /// The images of one run only.
+    pub run_id: String,
+    /// Searched in the run's prompt, case-insensitively.
+    pub query: String,
+    pub limit: i64,
+    pub offset: i64,
 }
 
 /// An append-only fact about a run. `seq` is assigned by the store when zero.
@@ -484,5 +549,17 @@ pub trait Store: Send + Sync {
     /// Enables or disables an agent.
     fn set_agent_enabled(&self, _agent: &str, _enabled: bool) -> Result<(), Error> {
         Ok(())
+    }
+    /// Indexes one image a run made, newest first for [`Store::list_artifacts`].
+    fn save_artifact(&self, _artifact: &Artifact) -> Result<(), Error> {
+        Ok(())
+    }
+    /// The artifacts matching `filter`, newest first, with how many match in all.
+    fn list_artifacts(&self, _filter: &ArtifactFilter) -> Result<(Vec<Artifact>, i64), Error> {
+        Ok((Vec::new(), 0))
+    }
+    /// Forgets an artifact and answers what it was, for its copy to go with it.
+    fn delete_artifact(&self, _id: &str) -> Result<Option<Artifact>, Error> {
+        Ok(None)
     }
 }

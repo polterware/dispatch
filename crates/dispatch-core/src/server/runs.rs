@@ -56,6 +56,28 @@ fn required(id: &str, what: &str) -> RpcResult<String> {
     Ok(id.into())
 }
 
+/// The caller a start records. The desktop app is the caller `dispatch`: a New-page run gets a
+/// conversation id of its own (`dispatch:<id>`), while a follow-up sends none and so keeps the
+/// earlier run's. A delegation keeps the caller its agent named.
+fn caller_of(caller: Option<pb::DispatchCaller>, client: &str, fresh_conversation: bool) -> Caller {
+    let caller = caller.unwrap_or_default();
+    let mut out = Caller {
+        agent: caller.agent,
+        session_id: caller.session_id,
+        conversation_id: caller.conversation_id,
+        label: caller.label,
+    };
+    if client.trim().eq_ignore_ascii_case(super::APP_CLIENT) {
+        if out.agent.trim().is_empty() {
+            out.agent = types::CALLER_APP.into();
+        }
+        if fresh_conversation && out.conversation_id.trim().is_empty() {
+            out.conversation_id = format!("{}:{}", types::CALLER_APP, types::new_id());
+        }
+    }
+    out
+}
+
 pub(crate) fn installed(a: &dyn AgentAdapter) -> bool {
     which(&a.binary())
 }
@@ -331,9 +353,10 @@ impl Core {
     pub(crate) async fn start_run(
         self: &Arc<Self>,
         m: pb::StartRunRequest,
+        client: &str,
     ) -> RpcResult<pb::StartRunResponse> {
         if !m.resume.trim().is_empty() {
-            return self.start_follow_up(m).await;
+            return self.start_follow_up(m, client).await;
         }
         let project_id = required(&m.project_id, "project id")?;
         let tier = m.tier.trim().to_owned();
@@ -380,7 +403,7 @@ impl Core {
         let deps = self.deps_in(&dir).map_err(RpcError::internal)?;
 
         let start = self.start_mu.lock().await;
-        let caller = m.caller.unwrap_or_default();
+        let caller = caller_of(m.caller, client, true);
         let mut opts = Options {
             caller: Caller {
                 agent: caller.agent,
@@ -520,6 +543,7 @@ impl Core {
     async fn start_follow_up(
         self: &Arc<Self>,
         m: pb::StartRunRequest,
+        client: &str,
     ) -> RpcResult<pb::StartRunResponse> {
         let prompt = m.prompt.trim().to_owned();
         if prompt.is_empty() {
@@ -583,7 +607,7 @@ impl Core {
                 short_run(&active.id)
             )));
         }
-        let caller = m.caller.unwrap_or_default();
+        let caller = caller_of(m.caller, client, false);
         let (conversation_id, agent) = if caller.conversation_id.trim().is_empty() {
             (prev.conversation_id.clone(), prev.caller_agent.clone())
         } else {
@@ -1013,13 +1037,15 @@ impl Core {
             )
             .await;
         }
-        let mut w = lock(&self.watch);
-        if !w.finalized.insert(run.id.clone()) {
-            return;
+        {
+            let mut w = lock(&self.watch);
+            if !w.finalized.insert(run.id.clone()) {
+                return;
+            }
+            w.log_off.remove(&run.id);
+            w.log_ready.remove(&run.id);
         }
-        w.log_off.remove(&run.id);
-        w.log_ready.remove(&run.id);
-        drop(w);
+        self.index_artifacts(&run).await;
         let events = self.store.list_events(&run.id, 0, 0).unwrap_or_default();
         let _ = save_run_worktree(self.store.as_ref(), &run);
         let has = |kind: &str| events.iter().any(|e| e.kind == kind);
@@ -1041,6 +1067,34 @@ impl Core {
             let _ = self
                 .store
                 .append_event(&event(&run, EVENT_MERGED, &run.merge_sha));
+        }
+    }
+
+    /// Indexes the images an ended run made, from its artifacts folder and its changed files.
+    /// Copies are filesystem work, so they run off the async workers; a failure is logged and
+    /// never fails the run.
+    async fn index_artifacts(&self, run: &Run) {
+        if run.id.is_empty() {
+            return;
+        }
+        let store = self.store.clone();
+        let base = self.artifacts_dir();
+        let record = run.clone();
+        let indexed = tokio::task::spawn_blocking(move || {
+            // A core that saw this run's end once already leaves its images as they are.
+            let filter = types::ArtifactFilter {
+                run_id: record.id.clone(),
+                ..types::ArtifactFilter::default()
+            };
+            if store.list_artifacts(&filter).is_ok_and(|(_, n)| n > 0) {
+                return Ok(0);
+            }
+            crate::artifacts::index_run(store.as_ref(), &base, &record)
+        })
+        .await;
+        match indexed {
+            Ok(Ok(_)) | Err(_) => {}
+            Ok(Err(e)) => eprintln!("index artifacts of run {}: {e}", short_run(&run.id)),
         }
     }
 
@@ -1540,4 +1594,49 @@ fn tokio_stream_from<T: Send + 'static>(
     mut rx: tokio::sync::mpsc::Receiver<T>,
 ) -> impl Stream<Item = T> + Send + 'static {
     futures::stream::poll_fn(move |cx| rx.poll_recv(cx))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn caller(agent: &str, session: &str, conversation: &str) -> pb::DispatchCaller {
+        pb::DispatchCaller {
+            agent: agent.into(),
+            session_id: session.into(),
+            conversation_id: conversation.into(),
+            label: String::new(),
+        }
+    }
+
+    #[test]
+    fn the_apps_requests_record_the_apps_caller_and_a_conversation_of_their_own() {
+        let app = super::super::APP_CLIENT;
+        let fresh = caller_of(None, app, true);
+        assert_eq!(fresh.agent, types::CALLER_APP);
+        assert!(
+            fresh
+                .conversation_id
+                .starts_with(&format!("{}:", types::CALLER_APP)),
+            "{}",
+            fresh.conversation_id
+        );
+        // A follow-up sends no conversation of its own: the core keeps the earlier run's.
+        assert!(caller_of(None, app, false).conversation_id.is_empty());
+
+        // A delegation keeps the caller its agent named; a bare terminal run keeps none.
+        let sent = caller_of(Some(caller("claude", "s1", "claude:s1")), "cli", true);
+        assert_eq!(sent.agent, "claude");
+        assert_eq!(sent.conversation_id, "claude:s1");
+        let bare = caller_of(None, "cli", true);
+        assert!(bare.agent.is_empty() && bare.conversation_id.is_empty());
+
+        // A caller the app named itself is left as it is.
+        let named = caller_of(
+            Some(caller(types::CALLER_APP, "s1", "dispatch:s1")),
+            app,
+            true,
+        );
+        assert_eq!(named.conversation_id, "dispatch:s1");
+    }
 }

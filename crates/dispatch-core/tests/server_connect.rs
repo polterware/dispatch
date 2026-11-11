@@ -7,9 +7,10 @@ use dispatch_core::{
     coreclient,
     host::NoHost,
     proto::{
-        AddWorkspaceRequest, CheckRequest, CheckResponse, DeleteRunsRequest, GetRunRequest,
-        ListRunsRequest, ListSectionsRequest, ListWorkspacesRequest, ReadRunEventsRequest,
-        RenameConversationRequest, ShutdownRequest, WatchRunRequest,
+        AddWorkspaceRequest, CheckRequest, CheckResponse, DeleteArtifactRequest, DeleteRunsRequest,
+        GetRunRequest, ListArtifactsRequest, ListRunsRequest, ListSectionsRequest,
+        ListWorkspacesRequest, ReadRunEventsRequest, RenameConversationRequest, ShutdownRequest,
+        WatchRunRequest,
     },
     runstate,
     server::{self, Core},
@@ -416,6 +417,135 @@ async fn deletes_a_conversation_and_its_runs_but_not_a_working_one() {
         "{err}"
     );
     assert!(r.core.store.get_run("live").is_ok());
+}
+
+#[tokio::test]
+async fn lists_artifacts_by_origin_and_deletes_their_copies() {
+    let store = Store::new(":memory:").unwrap();
+    let run = |id: &str, caller: &str, conversation: &str, prompt: &str| types::Run {
+        id: id.into(),
+        project_id: "p".into(),
+        conversation_id: conversation.into(),
+        caller_agent: caller.into(),
+        prompt: prompt.into(),
+        status: types::STATUS_COMPLETED.into(),
+        ..Default::default()
+    };
+    store
+        .save_run(&run("r1", types::CALLER_APP, "dispatch:one", "draw a fox"))
+        .unwrap();
+    store
+        .save_run(&run("r2", "claude", "claude:two", "chart the week"))
+        .unwrap();
+    let r = start_with(store).await;
+    let base = r._dir.path().join("artifacts");
+    for (run, caller, conversation, rel) in [
+        ("r1", types::CALLER_APP, "dispatch:one", "out/fox.png"),
+        ("r2", "claude", "claude:two", "worktree/chart.png"),
+    ] {
+        let path = base.join(run).join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"png").unwrap();
+        r.core
+            .store
+            .save_artifact(&types::Artifact {
+                id: format!("a-{run}"),
+                run_id: run.into(),
+                project_id: "p".into(),
+                conversation_id: conversation.into(),
+                caller_agent: caller.into(),
+                agent: "fake".into(),
+                model: "fake-fast".into(),
+                repo: "/repo".into(),
+                rel_path: rel.into(),
+                kind: "png".into(),
+                bytes: 3,
+                width: 2,
+                height: 3,
+                created_at: "2026-11-10T10:00:00Z".into(),
+                prompt: String::new(),
+            })
+            .unwrap();
+    }
+    let c = clients(&r);
+    let all = c
+        .dispatch
+        .list_artifacts(&ListArtifactsRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(all.total, 2);
+    // Newest first; the row written last comes first.
+    let first = &all.artifacts[0];
+    assert_eq!(first.run_id, "r2");
+    assert_eq!(first.origin, "delegated");
+    assert_eq!(first.prompt, "chart the week");
+    assert!(
+        first.path.ends_with("r2/worktree/chart.png"),
+        "{}",
+        first.path
+    );
+    assert_eq!(first.width, 2);
+    assert_eq!(all.artifacts[1].origin, "app");
+
+    let app = c
+        .dispatch
+        .list_artifacts(&ListArtifactsRequest {
+            origin: "app".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(app.total, 1);
+    assert_eq!(app.artifacts[0].run_id, "r1");
+    let by_prompt = c
+        .dispatch
+        .list_artifacts(&ListArtifactsRequest {
+            query: "FOX".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(by_prompt.total, 1);
+    let paged = c
+        .dispatch
+        .list_artifacts(&ListArtifactsRequest {
+            limit: 1,
+            offset: 1,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(paged.total, 2);
+    assert_eq!(paged.artifacts.len(), 1);
+
+    let err = c
+        .dispatch
+        .list_artifacts(&ListArtifactsRequest {
+            origin: "elsewhere".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("origin must be"), "{err}");
+
+    c.dispatch
+        .delete_artifact(&DeleteArtifactRequest { id: "a-r1".into() })
+        .await
+        .unwrap();
+    assert!(!base.join("r1/out/fox.png").exists());
+    assert!(!base.join("r1/out").exists(), "the emptied folder stayed");
+    let left = c
+        .dispatch
+        .list_artifacts(&ListArtifactsRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(left.total, 1);
+    let err = c
+        .dispatch
+        .delete_artifact(&DeleteArtifactRequest { id: "a-r1".into() })
+        .await
+        .unwrap_err();
+    assert!(err.to_string().starts_with("not_found: "), "{err}");
 }
 
 #[tokio::test]

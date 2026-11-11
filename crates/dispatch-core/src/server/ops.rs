@@ -557,6 +557,7 @@ impl Core {
         let deps = self.deps_in("").map_err(RpcError::internal)?;
         let store = self.store.clone();
         let state_dir = self.state_dir().to_string_lossy().into_owned();
+        let artifacts_dir = self.artifacts_dir();
         let doomed = ids.clone();
         let worktrees = tokio::task::spawn_blocking(move || {
             let mut removed = Vec::new();
@@ -579,6 +580,8 @@ impl Core {
                 if !log.is_empty() {
                     let _ = std::fs::remove_file(log);
                 }
+                // The images the run kept go with it, as its events and route decision do.
+                crate::artifacts::remove_run_dir(&artifacts_dir, id);
             }
             removed
         })

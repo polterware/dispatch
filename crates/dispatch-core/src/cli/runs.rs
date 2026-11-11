@@ -64,6 +64,8 @@ struct RunView {
     conversation_id: String,
     #[serde(rename = "CallerAgent")]
     caller_agent: String,
+    #[serde(rename = "Origin")]
+    origin: String,
     #[serde(rename = "ID")]
     id: String,
     #[serde(rename = "ProjectID")]
@@ -117,6 +119,7 @@ impl From<&Run> for RunView {
         Self {
             conversation_id: r.conversation_id.clone(),
             caller_agent: r.caller_agent.clone(),
+            origin: crate::types::origin(&r.caller_agent).into(),
             id: r.id.clone(),
             project_id: r.project_id.clone(),
             status: r.status.clone(),
@@ -229,6 +232,8 @@ struct Summary {
     conversation_id: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     caller_agent: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    origin: String,
     id: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     project_id: String,
@@ -316,6 +321,7 @@ fn summarize(run: &RunView) -> Summary {
     Summary {
         conversation_id: run.conversation_id.clone(),
         caller_agent: run.caller_agent.clone(),
+        origin: run.origin.clone(),
         id: run.id.clone(),
         project_id: run.project_id.clone(),
         status: run.status.clone(),

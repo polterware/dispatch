@@ -235,6 +235,9 @@ pub struct Deps {
     pub worktree_dir: String,
     /// The directory for file-backed sidecars (the catalog prices and live logs).
     pub state_dir: String,
+    /// Where run artifacts are kept (the data directory's `artifacts`), exported to every
+    /// agent as `DISPATCH_ARTIFACTS_DIR`; empty keeps none.
+    pub artifacts_dir: String,
     /// The effective global/project routing policy.
     pub policy: Policy,
     /// Judges a task's difficulty for Auto; None leaves Auto off.
@@ -395,6 +398,15 @@ impl Deps {
             return self.state_dir.clone();
         }
         self.env("DISPATCH_HOME")
+    }
+
+    /// The folder a run's artifacts go in, created for the agent; None without a data
+    /// directory.
+    pub(crate) fn artifacts_for(&self, run_id: &str) -> Option<std::path::PathBuf> {
+        if self.artifacts_dir.is_empty() {
+            return None;
+        }
+        crate::artifacts::prepare(std::path::Path::new(&self.artifacts_dir), run_id)
     }
 
     pub(crate) fn catalog(&self) -> Catalog {

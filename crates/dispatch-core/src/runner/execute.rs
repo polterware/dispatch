@@ -763,13 +763,31 @@ impl Deps {
                 super::linked::linked_env(rec)
             ));
         }
+        // Every adapter gets the run's folder for the images it makes.
+        let artifacts = self.artifacts_for(&rec.id);
+        if let Some(dir) = &artifacts {
+            env.push(format!(
+                "{}={}",
+                crate::artifacts::ARTIFACTS_ENV,
+                dir.display()
+            ));
+        }
         let base_prompt = match handoff {
             Some(h) if !h.is_empty() => super::handoff::prompt_with_handoff(h),
             _ => rec.prompt.clone(),
         };
+        // The image mode of a later phase asks for images; until then only the folder is passed.
+        let wants_images = false;
+        let artifacts_note = artifacts
+            .as_deref()
+            .map(|dir| crate::artifacts::brief_note(wants_images, dir))
+            .unwrap_or_default();
         let request = Request {
             effort: rec.effort.clone(),
-            prompt: format!("{base_prompt}{}", super::linked::prompt_note(rec)),
+            prompt: format!(
+                "{base_prompt}{}{artifacts_note}",
+                super::linked::prompt_note(rec)
+            ),
             tier: rec.tier.clone(),
             dir: dir.into(),
             read_only: rec.read_only,

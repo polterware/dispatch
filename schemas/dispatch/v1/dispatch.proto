@@ -51,6 +51,10 @@ message DispatchRun {
   // its own (worktree_mode in_place, --worktree, or a folder outside git).
   bool in_place = 42;
   repeated DispatchLinkedRepo linked = 43;
+  // Where the run was started: "app" for a conversation in the desktop app,
+  // which records caller_agent "dispatch", or "delegated" for an agent that
+  // ran it with the CLI. Read off caller_agent, never stored.
+  string origin = 44;
 }
 
 // Tokens a run spent as its agent CLIs reported them, summed over attempts:
@@ -813,6 +817,57 @@ message PruneWorktreeFoldersResponse {
   repeated WorktreeFolder kept = 2;
 }
 
+// An image a run made: one it wrote into its artifacts folder (DISPATCH_ARTIFACTS_DIR), or one
+// of its changed files, copied there so a cleaned worktree keeps it. path is the copy.
+message DispatchArtifact {
+  string id = 1;
+  string run_id = 2;
+  string workspace_id = 3;
+  string conversation_id = 4;
+  string caller_agent = 5;
+  string agent = 6;
+  string model = 7;
+  // The repository the run worked in: its checkout, else its folder.
+  string repo = 8;
+  // Where the copy is, absolute, and its path under the run's artifacts folder.
+  string path = 9;
+  string rel_path = 10;
+  // png, jpeg, webp, or gif, read from the file's header.
+  string kind = 11;
+  int64 bytes = 12;
+  int32 width = 13;
+  int32 height = 14;
+  string created_at = 15;
+  // The prompt of the run that made it, which a gallery searches.
+  string prompt = 16;
+  string origin = 17;
+}
+
+// Newest first. Every filter is optional; origin is "app" or "delegated", and
+// query searches the run's prompt.
+message ListArtifactsRequest {
+  string origin = 1;
+  string repo = 2;
+  string agent = 3;
+  string conversation_id = 4;
+  string query = 5;
+  int32 limit = 6;
+  int32 offset = 7;
+}
+
+message ListArtifactsResponse {
+  repeated DispatchArtifact artifacts = 1;
+  // How many artifacts the filters match, across every page.
+  int32 total = 2;
+}
+
+// Removes one artifact and its copy.
+message DeleteArtifactRequest {
+  string id = 1;
+}
+
+message DeleteArtifactResponse {}
+
 // ok is false when the operation ran but reports a failure; json is its body.
 message CleanRunResponse {
   bool ok = 1;
@@ -853,6 +908,8 @@ service DispatchService {
   rpc ListWorktrees(ListWorktreesRequest) returns (ListWorktreesResponse);
   rpc ListWorktreeFolders(ListWorktreeFoldersRequest) returns (ListWorktreeFoldersResponse);
   rpc PruneWorktreeFolders(PruneWorktreeFoldersRequest) returns (PruneWorktreeFoldersResponse);
+  rpc ListArtifacts(ListArtifactsRequest) returns (ListArtifactsResponse);
+  rpc DeleteArtifact(DeleteArtifactRequest) returns (DeleteArtifactResponse);
   rpc ListQuota(ListQuotaRequest) returns (ListQuotaResponse);
   rpc ListTiers(ListTiersRequest) returns (ListTiersResponse);
   rpc ListAgents(ListAgentsRequest) returns (ListAgentsResponse);

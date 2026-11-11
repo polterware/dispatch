@@ -151,6 +151,8 @@ pub struct DispatchRun {
     pub in_place: bool,
     /// The other repositories the run spans, each with a worktree of its own.
     pub linked: Vec<DispatchLinkedRepo>,
+    /// `app` for a conversation started here, `delegated` for an agent's run.
+    pub origin: String,
 }
 
 /// One more repository a run works in, with its worktree of it.
@@ -404,6 +406,65 @@ pub struct PruneWorktreeFoldersResponse {
     pub removed: Vec<WorktreeFolder>,
     pub kept: Vec<WorktreeFolder>,
 }
+
+/// An image a run made, copied into the data directory's artifacts.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DispatchArtifact {
+    pub id: String,
+    pub run_id: String,
+    pub workspace_id: String,
+    pub conversation_id: String,
+    pub caller_agent: String,
+    pub agent: String,
+    pub model: String,
+    /// The repository the run worked in: its checkout, else its folder.
+    pub repo: String,
+    /// The copy, absolute, and its path under the run's artifacts folder.
+    pub path: String,
+    pub rel_path: String,
+    /// png, jpeg, webp, or gif.
+    pub kind: String,
+    pub bytes: ProtoI64,
+    pub width: i32,
+    pub height: i32,
+    pub created_at: String,
+    /// The prompt of the run that made it.
+    pub prompt: String,
+    /// `app` or `delegated`.
+    pub origin: String,
+}
+
+/// Newest first; every filter is optional, and `query` searches the run's prompt.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ListArtifactsRequest {
+    pub origin: String,
+    pub repo: String,
+    pub agent: String,
+    pub conversation_id: String,
+    pub query: String,
+    pub limit: i32,
+    pub offset: i32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ListArtifactsResponse {
+    pub artifacts: Vec<DispatchArtifact>,
+    /// How many artifacts the filters match, across every page.
+    pub total: i32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DeleteArtifactRequest {
+    pub id: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DeleteArtifactResponse {}
 
 /// Names a conversation; an empty name gives back its first message's title.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -1799,6 +1860,20 @@ impl CoreClient {
         request: &PruneWorktreeFoldersRequest,
     ) -> Result<PruneWorktreeFoldersResponse, CoreError> {
         self.rpc("dispatch.v1.DispatchService/PruneWorktreeFolders", request)
+    }
+
+    pub fn list_artifacts(
+        &self,
+        request: &ListArtifactsRequest,
+    ) -> Result<ListArtifactsResponse, CoreError> {
+        self.rpc("dispatch.v1.DispatchService/ListArtifacts", request)
+    }
+
+    pub fn delete_artifact(
+        &self,
+        request: &DeleteArtifactRequest,
+    ) -> Result<DeleteArtifactResponse, CoreError> {
+        self.rpc("dispatch.v1.DispatchService/DeleteArtifact", request)
     }
 
     pub fn recover_run(

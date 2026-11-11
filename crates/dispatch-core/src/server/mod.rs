@@ -3,6 +3,7 @@
 //! through core.json over Connect.
 
 mod agent_models;
+mod artifacts;
 mod connect;
 pub(crate) mod convert;
 mod event_pages;
@@ -36,6 +37,10 @@ use tokio_util::sync::CancellationToken;
 
 /// Header naming the calling client; the app is the default.
 pub const CLIENT_HEADER: &str = crate::coreclient::CLIENT_HEADER;
+
+/// The value the desktop app sends in `Polterware-Client` (`app/src/client.rs`): its runs
+/// are the app's own conversations, not a delegation.
+pub(crate) const APP_CLIENT: &str = "dispatch-desktop";
 
 /// How often the core checks whether its stored catalog is a day old.
 const CATALOG_REFRESH_GAP: Duration = Duration::from_secs(60 * 60);
@@ -148,6 +153,16 @@ impl Core {
         std::env::temp_dir().join("polterware-dispatch")
     }
 
+    /// The folder holding each run's artifacts, beside the database.
+    pub fn artifacts_dir(&self) -> PathBuf {
+        if !self.db_dir.as_os_str().is_empty() {
+            return self.db_dir.join(crate::artifacts::DIR);
+        }
+        std::env::temp_dir()
+            .join("polterware-dispatch")
+            .join(crate::artifacts::DIR)
+    }
+
     pub(crate) fn store_dyn(&self) -> Arc<dyn types::Store> {
         self.store.clone()
     }
@@ -173,6 +188,7 @@ impl Core {
             table,
             store: Some(self.store_dyn()),
             state_dir: self.state_dir().to_string_lossy().into_owned(),
+            artifacts_dir: self.artifacts_dir().to_string_lossy().into_owned(),
             ..Deps::default()
         })
     }

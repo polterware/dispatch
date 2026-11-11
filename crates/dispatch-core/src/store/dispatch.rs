@@ -40,6 +40,31 @@ const ROUTE_DECISION_COLUMNS: &str =
     "run_id, project_id, policy_version, route, priority, classifier,
 			probs_json, difficulty, candidates_json, chosen, created_at, area_json";
 
+/// The columns a gallery reads, with the making run's prompt joined in last.
+const ARTIFACT_ROWS: &str = "SELECT a.id, a.run_id, a.project_id, a.conversation_id,
+	a.caller_agent, a.agent, a.model, a.repo, a.rel_path, a.kind, a.bytes, a.width, a.height,
+	a.created_at, COALESCE(r.prompt, '')
+	FROM dispatch_artifacts a LEFT JOIN dispatch_runs r ON r.id = a.run_id";
+fn scan_artifact(r: &Row<'_>) -> rusqlite::Result<types::Artifact> {
+    Ok(types::Artifact {
+        id: r.get(0)?,
+        run_id: r.get(1)?,
+        project_id: r.get(2)?,
+        conversation_id: r.get(3)?,
+        caller_agent: r.get(4)?,
+        agent: r.get(5)?,
+        model: r.get(6)?,
+        repo: r.get(7)?,
+        rel_path: r.get(8)?,
+        kind: r.get(9)?,
+        bytes: r.get(10)?,
+        width: r.get(11)?,
+        height: r.get(12)?,
+        created_at: parse_time(&r.get::<_, String>(13)?),
+        prompt: r.get(14)?,
+    })
+}
+
 /// `Filters` as Go encodes it: no tags, so Go field names in declaration order.
 #[derive(Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -1217,5 +1242,111 @@ impl types::Store for Store {
             .map_err(db)?;
         }
         Ok(())
+    }
+
+    fn save_artifact(&self, artifact: &types::Artifact) -> Result<(), Error> {
+        let id = if artifact.id.is_empty() {
+            new_id()
+        } else {
+            artifact.id.clone()
+        };
+        let created = if artifact.created_at.is_empty() {
+            now()
+        } else {
+            artifact.created_at.clone()
+        };
+        self.conn()
+            .execute(
+                "INSERT INTO dispatch_artifacts (
+                    id, run_id, project_id, conversation_id, caller_agent, agent, model, repo,
+                    rel_path, kind, bytes, width, height, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    id,
+                    artifact.run_id,
+                    artifact.project_id,
+                    artifact.conversation_id,
+                    artifact.caller_agent,
+                    artifact.agent,
+                    artifact.model,
+                    artifact.repo,
+                    artifact.rel_path,
+                    artifact.kind,
+                    artifact.bytes,
+                    artifact.width,
+                    artifact.height,
+                    format_time(&created),
+                ],
+            )
+            .map_err(db)?;
+        Ok(())
+    }
+
+    fn list_artifacts(
+        &self,
+        filter: &types::ArtifactFilter,
+    ) -> Result<(Vec<types::Artifact>, i64), Error> {
+        // The origin is read off the caller agent, as a run's is: `dispatch` is the app's.
+        let origin = match filter.origin.trim() {
+            types::ORIGIN_APP => Value::Text(types::ORIGIN_APP.into()),
+            types::ORIGIN_DELEGATED => Value::Text(types::ORIGIN_DELEGATED.into()),
+            _ => Value::Null,
+        };
+        let matched = "WHERE (?1 IS NULL
+                    OR (CASE WHEN a.caller_agent = 'dispatch' THEN 'app' ELSE 'delegated' END) = ?1)
+               AND (?2 = '' OR a.repo = ?2)
+               AND (?3 = '' OR a.agent = ?3)
+               AND (?4 = '' OR a.conversation_id = ?4)
+               AND (?5 = '' OR instr(lower(COALESCE(r.prompt, '')), ?5) > 0)
+               AND (?6 = '' OR a.run_id = ?6)";
+        let mut args: Vec<Value> = vec![
+            origin,
+            Value::Text(filter.repo.trim().into()),
+            Value::Text(filter.agent.trim().into()),
+            Value::Text(filter.conversation_id.trim().into()),
+            Value::Text(filter.query.trim().to_ascii_lowercase()),
+            Value::Text(filter.run_id.trim().into()),
+        ];
+        let conn = self.conn();
+        let total: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM dispatch_artifacts a
+                     LEFT JOIN dispatch_runs r ON r.id = a.run_id {matched}"
+                ),
+                params_from_iter(args.iter()),
+                |row| row.get(0),
+            )
+            .map_err(db)?;
+        let mut sql = format!("{ARTIFACT_ROWS} {matched} ORDER BY a.created_at DESC, a.rowid DESC");
+        if filter.limit > 0 {
+            sql.push_str(" LIMIT ? OFFSET ?");
+            args.push(filter.limit.into());
+            args.push(filter.offset.max(0).into());
+        }
+        let mut stmt = conn.prepare(&sql).map_err(db)?;
+        let artifacts = stmt
+            .query_map(params_from_iter(args.iter()), scan_artifact)
+            .map_err(db)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db)?;
+        Ok((artifacts, total))
+    }
+
+    fn delete_artifact(&self, id: &str) -> Result<Option<types::Artifact>, Error> {
+        let conn = self.conn();
+        let artifact = conn
+            .query_row(
+                &format!("{ARTIFACT_ROWS} WHERE a.id = ?"),
+                [id],
+                scan_artifact,
+            )
+            .optional()
+            .map_err(db)?;
+        if artifact.is_some() {
+            conn.execute("DELETE FROM dispatch_artifacts WHERE id = ?", [id])
+                .map_err(db)?;
+        }
+        Ok(artifact)
     }
 }
