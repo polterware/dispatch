@@ -2,7 +2,7 @@ use crate::{
     backends::{RealSynthesizer, RealTranscriber, Synthesizer, Transcriber},
     config::{self, Config},
 };
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use std::{
     collections::HashMap,
     path::PathBuf,

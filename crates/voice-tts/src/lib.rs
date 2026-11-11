@@ -393,7 +393,11 @@ pub mod text {
         }
         #[test]
         fn english_markup_and_urls() {
-            let got = speakable("# Summary\nThe fix in `src/lib.rs` is ready. https://example.com\n\n```rust\nfn main() {}\n```", TextFormat::Markdown, Language::En);
+            let got = speakable(
+                "# Summary\nThe fix in `src/lib.rs` is ready. https://example.com\n\n```rust\nfn main() {}\n```",
+                TextFormat::Markdown,
+                Language::En,
+            );
             assert_eq!(got, "Summary The fix in lib.rs is ready. code omitted");
         }
         #[test]
@@ -465,7 +469,7 @@ mod kokoro;
 pub mod piper;
 pub use piper::{PiperOptions, PiperTts};
 pub mod chatterbox;
-pub use chatterbox::{chatterbox_installed, ChatterboxOptions, ChatterboxTts};
+pub use chatterbox::{ChatterboxOptions, ChatterboxTts, chatterbox_installed};
 pub use kokoro::KokoroTts;
 impl KokoroTts {
     pub fn load(options: KokoroOptions) -> Result<Self> {

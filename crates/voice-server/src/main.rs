@@ -43,17 +43,17 @@ impl Write for TeeWriter {
 #[tokio::main]
 async fn main() {
     if let Err(error) = run().await {
-        eprintln!("voice-engine: {error:#}");
+        eprintln!("dispatch-voice: {error:#}");
         std::process::exit(1);
     }
 }
 
 async fn run() -> Result<()> {
-    let subscriber = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,ort=warn,whisper_rs=warn")),
-        );
+    let subscriber = tracing_subscriber::fmt().with_env_filter(
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            tracing_subscriber::EnvFilter::new("info,ort=warn,whisper_rs=warn")
+        }),
+    );
     if std::io::stderr().is_terminal() {
         let _ = subscriber.try_init();
     } else {
@@ -67,7 +67,10 @@ async fn run() -> Result<()> {
             .with_writer(move || TeeWriter(file.clone()))
             .try_init();
     }
-    match cli::Cli::parse().command.unwrap_or_default() {
+
+    let command = cli::Cli::parse().command.unwrap_or_default();
+    paths::migrate_legacy_models();
+    match command {
         cli::Command::Serve {
             port,
             if_not_running,

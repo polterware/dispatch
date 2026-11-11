@@ -98,14 +98,8 @@ fn current_rss_kb() -> String {
         }
         let mut info = mem::MaybeUninit::<TaskBasicInfo64>::uninit();
         let mut count = (mem::size_of::<TaskBasicInfo64>() / mem::size_of::<i32>()) as u32;
-        let status = unsafe {
-            task_info(
-                mach_task_self_,
-                20,
-                info.as_mut_ptr().cast(),
-                &mut count,
-            )
-        };
+        let status =
+            unsafe { task_info(mach_task_self_, 20, info.as_mut_ptr().cast(), &mut count) };
         if status == 0 {
             let info = unsafe { info.assume_init() };
             (info.resident_size / 1024).to_string()

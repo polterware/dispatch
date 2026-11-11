@@ -6,7 +6,11 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
-use ort::{ep::CPU, session::{builder::AutoDevicePolicy, Session}, value::Tensor};
+use ort::{
+    ep::CPU,
+    session::{Session, builder::AutoDevicePolicy},
+    value::Tensor,
+};
 use serde_json::Value;
 use voice_core::protocol::Language;
 

@@ -256,7 +256,7 @@ pub enum EngineMessage {
 pub enum ErrorCode {
     /// Another client holds the microphone.
     Busy,
-    /// A required model file is missing; run `voice-engine models download`.
+    /// A required model file is missing; run `dispatch-voice models download`.
     ModelMissing,
     /// No input or output device, or the device failed.
     AudioDevice,

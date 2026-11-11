@@ -4,7 +4,10 @@
 
 use std::{collections::HashMap, path::PathBuf, sync::Mutex};
 
-use ort::{session::{builder::AutoDevicePolicy, Session}, value::Tensor};
+use ort::{
+    session::{Session, builder::AutoDevicePolicy},
+    value::Tensor,
+};
 use serde_json::Value;
 
 use crate::{Result, TtsBackend, TtsError, VoiceSpec};

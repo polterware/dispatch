@@ -11,14 +11,15 @@
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ringbuf::{
-    traits::{Consumer, Observer, Producer, Split},
     HeapRb,
+    traits::{Consumer, Observer, Producer, Split},
 };
 use std::{
     collections::VecDeque,
     sync::{
+        Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        mpsc, Arc,
+        mpsc,
     },
     thread,
     time::{Duration, Instant},
@@ -741,9 +742,11 @@ mod tests {
         }
         assert_eq!(samples.len(), 16_000);
         assert_eq!(samples.chunks_exact(CAPTURE_CHUNK).len(), 31);
-        assert!(samples
-            .chunks_exact(CAPTURE_CHUNK)
-            .all(|chunk| chunk.iter().all(|v| *v == 0.25)));
+        assert!(
+            samples
+                .chunks_exact(CAPTURE_CHUNK)
+                .all(|chunk| chunk.iter().all(|v| *v == 0.25))
+        );
 
         let mut interpolated = Vec::new();
         let mut phase = 0.0;

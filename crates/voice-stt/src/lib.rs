@@ -9,7 +9,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ort::{session::{builder::AutoDevicePolicy, Session}, value::Tensor};
+use ort::{
+    session::{Session, builder::AutoDevicePolicy},
+    value::Tensor,
+};
 use voice_core::protocol::Language;
 use whisper_rs::{
     FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState,
@@ -121,11 +124,10 @@ impl SttEngine {
                 .map_err(|e| SttError::Inference(e.to_string()))?;
             let pt_id = whisper_rs::get_lang_id("pt").unwrap_or(-1) as usize;
             let en_id = whisper_rs::get_lang_id("en").unwrap_or(-1) as usize;
-            let code = match (probs.get(pt_id), probs.get(en_id)) {
+            match (probs.get(pt_id), probs.get(en_id)) {
                 (Some(pt), Some(en)) if pt >= en => "pt",
                 _ => "pt",
-            };
-            code
+            }
         } else {
             language.whisper_code().unwrap_or("en")
         };
