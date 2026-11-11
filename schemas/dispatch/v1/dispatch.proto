@@ -596,8 +596,8 @@ message BuildTiersRequest {
   string role = 3;
   // Who ranks each tier's candidates: empty for the catalog's order (skill,
   // then cost), "jev" for TypeSafe's Jev, asked once which candidates fit
-  // the role's work, or "classifier" for the classifier the policy picked
-  // (Jev, an OpenAI model, or an agent CLI's model), asked the same.
+  // the role's work, or "local" for the local model, the agent CLI model the
+  // policy's CLI classifier names, asked the same.
   string judge = 4;
 }
 

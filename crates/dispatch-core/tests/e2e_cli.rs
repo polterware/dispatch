@@ -1757,14 +1757,16 @@ fn an_agents_disabled_model_leaves_that_agents_card_alone() {
     );
 }
 
-/// Classifier recommendation asks the classifier Settings › Classifier picked, so with none it
-/// says where to pick one; the old cheapest judge is gone.
+/// Ranked by a local model asks the CLI classifier's agent (here the fake one), which must
+/// answer with a ranking; the cheapest and classifier judges are gone.
 #[test]
-fn a_tier_build_judged_by_the_classifier_needs_one() {
+fn a_tier_build_ranked_by_the_local_model_asks_its_agent() {
     let env = Env::new();
-    env.ok(&["config", "set", "classifier", "off"]);
-    let none = env.fails(&["tiers", "build", "--judge", "classifier"]);
-    assert!(none.contains("Settings › Classifier"), "{none}");
-    let gone = env.fails(&["tiers", "build", "--judge", "cheapest"]);
-    assert!(gone.contains("unknown judge"), "{gone}");
+    env.ok(&["config", "set", "classifier_agent", "fake/fake-mini"]);
+    let unranked = env.fails(&["tiers", "build", "--judge", "local"]);
+    assert!(unranked.contains("local model"), "{unranked}");
+    for gone in ["cheapest", "classifier"] {
+        let refused = env.fails(&["tiers", "build", "--judge", gone]);
+        assert!(refused.contains("unknown judge"), "{refused}");
+    }
 }

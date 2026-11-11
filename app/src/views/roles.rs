@@ -1037,8 +1037,8 @@ impl RolesView {
     }
 
     /// Proposes `role`'s board (General's name for the tier table), ranked by the catalog or,
-    /// with `judge` "jev", by Jev, or with "classifier", by the classifier Settings ›
-    /// Classifier picked.
+    /// with `judge` "jev", by the Decision API (Jev), or with "local", by the local model, the
+    /// agent CLI model Settings › Classifier names.
     fn open_build(&mut self, role: &str, judge: &str, cx: &mut Context<Self>) {
         let Some(client) = self.state.read(cx).client() else {
             self.toast("The local core is not running.", ToastTone::Danger, cx);
@@ -1755,13 +1755,13 @@ impl RolesView {
                 Rc::new(move |this, cx| this.open_build(&catalog, "", cx)),
             ),
             item(
-                "Classifier recommendation",
-                Icon::AiBrain01Icon,
-                Rc::new(move |this, cx| this.open_build(&judged, "classifier", cx)),
+                "Ranked by a local model",
+                Icon::Laptop,
+                Rc::new(move |this, cx| this.open_build(&judged, "local", cx)),
             ),
             item(
-                "Decision API recommendation",
-                Icon::AiBrain01Icon,
+                "Ranked by the Decision API",
+                Icon::Cloud,
                 Rc::new(move |this, cx| this.open_build(&jev, "jev", cx)),
             ),
             MenuItem::Separator,
@@ -1807,17 +1807,11 @@ impl RolesView {
     fn build_title(&self) -> String {
         let general = self.build_role == GENERAL_ROLE;
         match (general, self.build_judge.as_str()) {
-            (true, "jev") => "Tiers the Decision API recommends".to_string(),
-            (true, "classifier") => "Tiers your classifier recommends".to_string(),
-            (false, "classifier") => format!(
-                "{}'s board, as your classifier recommends it",
-                self.build_role
-            ),
+            (true, "jev") => "Tiers ranked by the Decision API".to_string(),
+            (true, "local") => "Tiers ranked by your local model".to_string(),
+            (false, "local") => format!("{}'s board, ranked by your local model", self.build_role),
             (true, _) => "Build tiers from the model".to_string(),
-            (false, "jev") => format!(
-                "{}'s board, as the Decision API recommends it",
-                self.build_role
-            ),
+            (false, "jev") => format!("{}'s board, ranked by the Decision API", self.build_role),
             (false, _) => format!("{}'s board from the catalog", self.build_role),
         }
     }

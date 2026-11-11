@@ -35,26 +35,6 @@ pub fn for_policy(deps: &Deps) -> Option<Arc<dyn Classifier>> {
     }
 }
 
-/// Asks the policy's classifier the choice `questions` about `state`: how well each candidate
-/// fits each question, by candidate. Jev and OpenAI answer through their decision APIs, an
-/// agent CLI with ranks from one read-only call.
-pub async fn choices(
-    deps: &Deps,
-    state: serde_json::Value,
-    questions: std::collections::BTreeMap<String, JevChoice>,
-) -> Result<std::collections::BTreeMap<String, std::collections::BTreeMap<String, f64>>, crate::Error>
-{
-    let model = deps.policy.classifier_model.clone();
-    match deps.policy.classifier.as_str() {
-        CLASSIFIER_JEV => Jev::new(model).choices(state, questions).await,
-        CLASSIFIER_OPENAI => OpenAi::new(model).choices(state, questions).await,
-        CLASSIFIER_CLI => cli_for(deps).choices(state, questions).await,
-        _ => Err(crate::Error::Message(
-            "no classifier is set: choose one in Settings › Classifier".into(),
-        )),
-    }
-}
-
 /// The agent and model the CLI classifier asks, whether or not it is the
 /// policy's; with no easy-tier agent installed it has no agent and fails.
 pub fn cli_for(deps: &Deps) -> Cli {

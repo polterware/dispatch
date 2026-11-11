@@ -254,33 +254,6 @@ fn tier_question() -> BTreeMap<String, JevChoice> {
     .collect()
 }
 
-#[tokio::test]
-async fn openai_choices_asks_each_tier_as_a_score_over_its_candidates() {
-    let (url, seen) = fake_api(json!({"type": "answer", "answers": [{
-        "name": "hard",
-        "probabilities": [
-            {"index": 0, "label": "a/one", "probability": 0.3},
-            {"index": 1, "label": "b/two", "probability": 0.7},
-        ],
-    }]}))
-    .await;
-    let openai = OpenAi {
-        url,
-        ..OpenAi::default()
-    };
-    let answers = openai
-        .choices(json!({"role": "reviewer"}), tier_question())
-        .await
-        .unwrap();
-    assert_eq!(answers["hard"]["b/two"], 0.7);
-    assert_eq!(answers["hard"]["a/one"], 0.3);
-    let seen = seen.lock().unwrap();
-    let question = &seen[0].1["questions"][0];
-    assert_eq!(question["name"], "hard");
-    assert_eq!(question["type"], "score");
-    assert_eq!(question["levels"][1]["label"], "b/two");
-}
-
 #[test]
 fn a_cli_classifier_ranks_candidates_as_json_and_unknown_names_drop() {
     let questions = tier_question();

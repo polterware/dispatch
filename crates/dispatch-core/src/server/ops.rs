@@ -1011,9 +1011,9 @@ impl Core {
             .unwrap_or_else(|| PRIORITY_BALANCED.into());
         let role = m.role.trim().to_owned();
         let judge = m.judge.trim().to_owned();
-        if !judge.is_empty() && judge != JUDGE_JEV && judge != JUDGE_CLASSIFIER {
+        if !judge.is_empty() && judge != JUDGE_JEV && judge != JUDGE_LOCAL {
             return Err(RpcError::invalid(format!(
-                "unknown judge {judge} (want {JUDGE_JEV} or {JUDGE_CLASSIFIER})"
+                "unknown judge {judge} (want {JUDGE_JEV} or {JUDGE_LOCAL})"
             )));
         }
         if !role.is_empty() && m.apply {
@@ -1032,7 +1032,7 @@ impl Core {
                     .ok_or_else(|| RpcError::invalid(format!("unknown role {role}")))?,
             )
         };
-        let per_tier = if judge == JUDGE_JEV || judge == JUDGE_CLASSIFIER {
+        let per_tier = if judge == JUDGE_JEV || judge == JUDGE_LOCAL {
             JEV_POOL
         } else {
             tiers_build::BUILD_PER_TIER
@@ -1048,7 +1048,7 @@ impl Core {
         for tier in tiers_under(&floor) {
             tiers_build::clear_tier(&mut built, tier);
         }
-        if judge == JUDGE_JEV || judge == JUDGE_CLASSIFIER {
+        if judge == JUDGE_JEV || judge == JUDGE_LOCAL {
             let (state, questions) = judge_questions(&built, &role, profile.as_ref());
             let answers = if questions.is_empty() {
                 BTreeMap::new()
@@ -1058,10 +1058,13 @@ impl Core {
                     .await
                     .map_err(|e| RpcError::invalid(format!("jev: {e}")))?
             } else {
+                // The local model: the agent CLI and model Settings › Classifier names for its
+                // CLI classifier, else the easy tier's first installed agent.
                 let deps = self.deps_in("").map_err(RpcError::internal)?;
-                classifier::choices(&deps, state, questions)
+                classifier::cli_for(&deps)
+                    .choices(state, questions)
                     .await
-                    .map_err(|e| RpcError::invalid(format!("classifier: {e}")))?
+                    .map_err(|e| RpcError::invalid(format!("local model: {e}")))?
             };
             keep_judged(&mut built, &answers);
         }
@@ -1089,9 +1092,9 @@ impl Core {
 
 /// The judge that asks TypeSafe's Jev which candidates fit a role.
 const JUDGE_JEV: &str = "jev";
-/// The judge that asks the classifier Settings › Classifier picked (Jev, an OpenAI model,
-/// or an agent CLI's model) which candidates fit a role.
-const JUDGE_CLASSIFIER: &str = "classifier";
+/// The judge that asks the local model, the agent CLI's model Settings › Classifier names for
+/// its CLI classifier (a cheap one, such as Haiku or GPT Luna), which candidates fit a role.
+const JUDGE_LOCAL: &str = "local";
 /// How many candidates per tier a judge chooses among; it keeps the build's usual three.
 const JEV_POOL: usize = 8;
 
