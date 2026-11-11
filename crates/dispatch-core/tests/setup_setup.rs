@@ -323,7 +323,8 @@ fn legacy_opencode_plugin_is_removed() {
     let left = fs::read_to_string(&config).unwrap();
     assert!(left.contains("// plugins"), "comment kept:\n{left}");
     assert!(left.contains("/* theirs */"), "comment kept:\n{left}");
-    let parsed: Value = serde_json::from_str(&left).expect("config is JSON");
+    let plain = left.replace("// plugins", "").replace("/* theirs */", "");
+    let parsed: Value = serde_json::from_str(&plain).expect("config is JSON");
     assert_eq!(parsed["plugins"], serde_json::json!(["acme"]), "{left}");
     assert_eq!(parsed["model"], "a/b");
     assert!(

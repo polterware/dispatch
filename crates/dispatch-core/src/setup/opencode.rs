@@ -116,21 +116,48 @@ fn remove_all(path: &Path) -> std::io::Result<bool> {
     }
 }
 
-// remove_element cuts plugins element i with the comma that joined it to its
-// neighbor and the space before it.
+// remove_element cuts plugins element i out with the comma that joined it to
+// its neighbor and its indentation, and keeps every comment around it.
 fn remove_element(src: &[u8], doc: &super::jsonc::JsoncDoc, i: usize) -> Vec<u8> {
     let els = &doc.plugins;
-    let Span { mut start, mut end } = els[i];
-    if i + 1 < els.len() {
-        end = els[i + 1].start;
-    } else if i > 0 {
-        start = els[i - 1].end;
-    } else if let Some(arr) = doc.plugins_array {
-        (start, end) = (arr.start + 1, arr.end - 1);
+    let Span {
+        start: el_start,
+        end,
+    } = els[i];
+    let mut cuts: Vec<(usize, usize)> = Vec::new();
+    if let (1, Some(arr)) = (els.len(), doc.plugins_array) {
+        cuts.push((arr.start + 1, arr.end));
+    } else if els.len() == 1 {
+        cuts.push((el_start, end));
+    } else {
+        let mut start = el_start;
+        while start > 0 && src[start - 1].is_ascii_whitespace() {
+            start -= 1;
+        }
+        cuts.push((start, end));
+        // The separator sits right after the element, or right before it when
+        // it is the last one; a comma inside a comment nearby is the other
+        // end of the gap, so the one closest to the element is the separator.
+        let (from, to) = if i + 1 < els.len() {
+            (end, els[i + 1].start)
+        } else {
+            (els[i - 1].end, el_start)
+        };
+        let gap = &src[from..to];
+        let at = if i + 1 < els.len() {
+            gap.iter().position(|b| *b == b',')
+        } else {
+            gap.iter().rposition(|b| *b == b',')
+        };
+        if let Some(at) = at {
+            cuts.push((from + at, from + at + 1));
+        }
     }
-    let mut out = Vec::with_capacity(src.len() - (end - start));
-    out.extend_from_slice(&src[..start]);
-    out.extend_from_slice(&src[end..]);
+    cuts.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut out = src.to_vec();
+    for (start, end) in cuts {
+        out.drain(start..end);
+    }
     out
 }
 

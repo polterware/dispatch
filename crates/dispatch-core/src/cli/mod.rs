@@ -3,7 +3,7 @@
 //! other command is a client of the core and starts it when none is running.
 //!
 //! Its arguments, text, JSON, and exit statuses are the ones the Go binary had,
-//! because agents, the skill, the OpenCode plugin, and Polterware call it.
+//! because agents, the skill, and Polterware call it.
 
 mod caller;
 mod flags;

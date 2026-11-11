@@ -354,14 +354,6 @@ pub fn hook_note(agent: &str) -> Option<&'static str> {
     }
 }
 
-pub fn opencode_description(item: &OpenCodeSetup) -> &str {
-    if item.state == InstallState::Missing {
-        &item.config
-    } else {
-        &item.path
-    }
-}
-
 pub fn parse_agent_setup(json: &str) -> AgentSetup {
     let root = json_object(json);
     let cli = record(root.get("cli"));
