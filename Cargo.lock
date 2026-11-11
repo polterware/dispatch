@@ -1963,6 +1963,7 @@ dependencies = [
  "clap",
  "core-foundation 0.10.0",
  "dirs 7.0.0",
+ "filetime",
  "futures",
  "hyper",
  "hyper-util",
