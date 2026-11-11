@@ -47,6 +47,7 @@ pub enum SettingsPage {
     PickRole,
     RoutingPolicy,
     Worktrees,
+    Voice,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

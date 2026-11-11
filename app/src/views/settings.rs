@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::rc::Rc;
+use std::time::Duration;
 
 use gpui::{
     App, AppContext as _, Context, Entity, IntoElement, MouseButton, Render, SharedString,
@@ -17,7 +18,7 @@ use crate::client::{
     ApplyAgentSetupRequest, ClassifyRequest, ConfigRequest, CoreClient, CoreError, DispatchAgent,
     DispatchAgentModels, GetAgentSetupRequest, ListAgentsRequest, ListModelSettingsRequest,
     ListModelsRequest, ListWorktreeFoldersRequest, PruneWorktreeFoldersRequest,
-    SetAgentEnabledRequest, SetModelEnabledRequest, WorktreeFolder, at_once,
+    SetAgentEnabledRequest, SetModelEnabledRequest, WorktreeFolder, at_once, resolve_data_dir,
 };
 use crate::models::settings::{
     AgentModelGroup, CLASSIFIERS, CliState, InstallState, ListedModel, Policy, SAMPLE_TASK,
@@ -39,19 +40,21 @@ use crate::ui::{
     ButtonKind, Icon, Menu, MenuItem, Popover, Switch, TextInput, TileTone, button, chip, icon,
 };
 use crate::ui::{SkeletonLayout, page_skeleton};
+use crate::voice_settings::{self, ChatVoice, Loaded, VoiceField};
 
 const RAIL_ROW: f32 = 32.0;
 const RAIL_GAP: f32 = 2.0;
 /// The editor's height before a frame has measured it: one row of controls.
 const EDITOR_HEIGHT: f32 = 44.0;
 
-const RAIL: [(SettingsPage, &str, Icon); 6] = [
+const RAIL: [(SettingsPage, &str, Icon); 7] = [
     (SettingsPage::Agents, "Agents", Icon::Settings),
     (SettingsPage::Models, "Models", Icon::Cpu),
     (SettingsPage::Classifier, "Classifier", Icon::AiBrain01Icon),
     (SettingsPage::PickRole, "Pick a role", Icon::Route),
     (SettingsPage::RoutingPolicy, "Routing policy", Icon::Sliders),
     (SettingsPage::Worktrees, "Worktrees", Icon::GitBranch),
+    (SettingsPage::Voice, "Voice", Icon::Globe),
 ];
 
 pub struct SettingsView {
@@ -84,6 +87,25 @@ pub struct SettingsView {
     /// The worktree folders runs left, once read for the Worktrees page.
     worktrees: Option<Vec<WorktreeFolder>>,
     worktrees_inflight: bool,
+    /// The voice engine as the Voice page found it, with its catalog, settings, and the
+    /// app's chat choices.
+    voice: Option<Loaded>,
+    voice_inflight: bool,
+    voice_ticket: u64,
+    /// The settings patch in flight, newest wins.
+    voice_save: u64,
+    voice_starting: bool,
+    /// The models downloading now, by id, and their last fraction.
+    voice_downloads: BTreeMap<String, f64>,
+    voice_progress: voice_settings::Progress,
+    voice_polling: bool,
+    voice_menu: Entity<Menu>,
+    voice_anchors: [AnchorSlot; 5],
+    /// Which setting the open voice menu changes.
+    voice_field: Option<VoiceField>,
+    voice_partials: Entity<Switch>,
+    voice_read_aloud: Entity<Switch>,
+    voice_send_when_stop: Entity<Switch>,
     busy: String,
     busy_ticket: u64,
     classify_report: Option<crate::models::settings::ClassifyView>,
@@ -130,6 +152,16 @@ impl SettingsView {
         let discover = switch(true, view.clone(), cx, |this, on, cx| {
             this.on_discover(on, cx)
         });
+        let voice_partials = switch(true, view.clone(), cx, |this, on, cx| {
+            this.on_voice_partials(on, cx)
+        });
+        let voice_read_aloud = switch(false, view.clone(), cx, |this, on, cx| {
+            this.on_voice_read_aloud(on, cx)
+        });
+        let voice_send_when_stop = switch(false, view.clone(), cx, |this, on, cx| {
+            this.on_voice_send_when_stop(on, cx)
+        });
+        let voice_menu = cx.new(Menu::new);
         let priority_menu = cx.new(Menu::new);
         let cli_filter = cli_filter_input(view.clone(), cx);
         let cli_popover = cx.new(Popover::new);
@@ -161,6 +193,26 @@ impl SettingsView {
             collapsed_agents: BTreeMap::new(),
             worktrees: None,
             worktrees_inflight: false,
+            voice: None,
+            voice_inflight: false,
+            voice_ticket: 0,
+            voice_save: 0,
+            voice_starting: false,
+            voice_downloads: BTreeMap::new(),
+            voice_progress: voice_settings::new_progress(),
+            voice_polling: false,
+            voice_menu,
+            voice_anchors: [
+                AnchorSlot::default(),
+                AnchorSlot::default(),
+                AnchorSlot::default(),
+                AnchorSlot::default(),
+                AnchorSlot::default(),
+            ],
+            voice_field: None,
+            voice_partials,
+            voice_read_aloud,
+            voice_send_when_stop,
             keys: BTreeMap::new(),
             keys_ready: false,
             keys_inflight: false,
@@ -251,6 +303,19 @@ impl SettingsView {
         } else if online && self.worktrees.is_none() && !self.worktrees_inflight {
             self.load_worktrees(false, cx);
         }
+        let on_voice = matches!(
+            self.state.read(cx).route(),
+            Route::Settings(SettingsPage::Voice)
+        );
+        if !on_voice {
+            // Read again on the next visit: the engine comes and goes.
+            if !self.voice_inflight {
+                self.voice = None;
+                self.voice_downloads.clear();
+            }
+        } else if self.voice.is_none() && !self.voice_inflight {
+            self.load_voice(cx);
+        }
     }
 
     /// Reads the worktree folders runs left, or with `prune` removes the ones Clean up
@@ -298,6 +363,419 @@ impl SettingsView {
                         );
                     }
                 }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Reads the voice engine's catalog and settings, and the app's chat choices, off the
+    /// UI thread.
+    fn load_voice(&mut self, cx: &mut Context<Self>) {
+        self.voice_inflight = true;
+        self.voice_ticket = self.voice_ticket.wrapping_add(1);
+        let ticket = self.voice_ticket;
+        cx.spawn(async move |this, cx| {
+            let loaded = cx.background_spawn(async { voice_settings::load() }).await;
+            let _ = this.update(cx, |view, cx| {
+                if view.voice_ticket != ticket {
+                    return;
+                }
+                view.voice_inflight = false;
+                view.voice = Some(loaded);
+                view.sync_voice_switches(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The three voice switches follow what the engine or this computer holds.
+    fn sync_voice_switches(&mut self, cx: &mut Context<Self>) {
+        let Some(voice_settings::VoiceData { settings, chat, .. }) = self.voice_data() else {
+            return;
+        };
+        let (partials, read, send) = (
+            settings.partials,
+            chat.read_replies_aloud,
+            chat.send_when_stop,
+        );
+        self.voice_partials.update(cx, |switch, cx| {
+            switch.set_on(partials);
+            cx.notify();
+        });
+        self.voice_read_aloud.update(cx, |switch, cx| {
+            switch.set_on(read);
+            cx.notify();
+        });
+        self.voice_send_when_stop.update(cx, |switch, cx| {
+            switch.set_on(send);
+            cx.notify();
+        });
+    }
+
+    fn voice_data(&self) -> Option<&voice_settings::VoiceData> {
+        match self.voice.as_ref()? {
+            Loaded::Running(data) => Some(data),
+            _ => None,
+        }
+    }
+
+    fn voice_engine(&self) -> Option<voice_settings::VoiceEngine> {
+        self.voice_data().map(|data| data.engine.clone())
+    }
+
+    /// Starts `dispatch-voice` and waits for its discovery file, as the app starts its core.
+    fn start_voice_engine(&mut self, cx: &mut Context<Self>) {
+        if self.voice_starting {
+            return;
+        }
+        self.voice_starting = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async {
+                    voice_settings::start_engine()?;
+                    voice_settings::wait_for_engine().ok_or_else(|| {
+                        "The voice engine did not answer after starting.".to_string()
+                    })
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                view.voice_starting = false;
+                match result {
+                    Ok(_) => {
+                        view.voice = None;
+                        view.load_voice(cx);
+                    }
+                    Err(err) => view.toast(err, ToastTone::Danger, cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Sends one settings patch to the engine, newest wins, and keeps what it answers.
+    fn patch_voice(&mut self, patch: serde_json::Value, cx: &mut Context<Self>) {
+        let Some(engine) = self.voice_engine() else {
+            return;
+        };
+        self.voice_save = self.voice_save.wrapping_add(1);
+        let ticket = self.voice_save;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { engine.patch(patch) })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if view.voice_save != ticket {
+                    return;
+                }
+                match result {
+                    Ok(settings) => {
+                        if let Some(Loaded::Running(data)) = view.voice.as_mut() {
+                            data.settings = settings;
+                        }
+                        view.sync_voice_switches(cx);
+                    }
+                    Err(err) => {
+                        view.toast(err, ToastTone::Danger, cx);
+                        view.voice = None;
+                        view.load_voice(cx);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn choose_voice_language(&mut self, language: &str, cx: &mut Context<Self>) {
+        self.patch_voice(serde_json::json!({ "language": language }), cx);
+    }
+
+    fn choose_voice(&mut self, field: VoiceField, id: &str, cx: &mut Context<Self>) {
+        let patch = match field {
+            VoiceField::VoicePt => serde_json::json!({ "voice_pt": id }),
+            VoiceField::VoiceEn => serde_json::json!({ "voice_en": id }),
+            VoiceField::Stt => serde_json::json!({ "stt_model": id }),
+            _ => return,
+        };
+        self.patch_voice(patch, cx);
+    }
+
+    fn choose_voice_speed(&mut self, speed: f32, cx: &mut Context<Self>) {
+        self.patch_voice(serde_json::json!({ "speed": speed }), cx);
+    }
+
+    fn on_voice_partials(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.patch_voice(serde_json::json!({ "partials": on }), cx);
+    }
+
+    fn on_voice_read_aloud(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.update_chat(|chat| chat.read_replies_aloud = on, cx);
+    }
+
+    fn on_voice_send_when_stop(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.update_chat(|chat| chat.send_when_stop = on, cx);
+    }
+
+    /// Keeps the chat's own voice choices on this computer.
+    fn update_chat(&mut self, change: impl Fn(&mut ChatVoice), cx: &mut Context<Self>) {
+        let Some(Loaded::Running(data)) = self.voice.as_mut() else {
+            return;
+        };
+        change(&mut data.chat);
+        let chat = data.chat.clone();
+        if let Err(err) = voice_settings::write_chat(&resolve_data_dir(), &chat) {
+            self.toast(
+                format!("Could not keep that choice: {err}"),
+                ToastTone::Danger,
+                cx,
+            );
+        }
+        cx.notify();
+    }
+
+    /// Opens a voice menu under its own trigger, with the choices it offers now.
+    fn open_voice_menu(&mut self, field: VoiceField, cx: &mut Context<Self>) {
+        let Some(data) = self.voice_data().cloned() else {
+            return;
+        };
+        let view = cx.entity().downgrade();
+        let mut items = Vec::new();
+        match field {
+            VoiceField::Language => {
+                for (code, label) in voice_settings::LANGUAGES {
+                    let code = code.to_string();
+                    let picked = data.settings.language == code;
+                    let view = view.clone();
+                    items.push(MenuItem::radio(
+                        label,
+                        picked,
+                        Rc::new(move |_, app| {
+                            let view = view.clone();
+                            let code = code.clone();
+                            app.defer(move |app| {
+                                if let Some(view) = view.upgrade() {
+                                    view.update(app, |this, cx| {
+                                        this.choose_voice_language(&code, cx)
+                                    });
+                                }
+                            });
+                        }),
+                    ));
+                }
+            }
+            VoiceField::VoicePt | VoiceField::VoiceEn => {
+                let language = field.voice_language().unwrap_or("pt-br");
+                let current = data.settings.voice(language).to_string();
+                for voice in data.catalog.voices_for(language) {
+                    let id = voice.id.clone();
+                    let label = if voice.installed {
+                        voice.name.clone()
+                    } else {
+                        format!("{} (needs its model)", voice.name)
+                    };
+                    let picked = current == id;
+                    let view = view.clone();
+                    items.push(MenuItem::radio(
+                        label,
+                        picked,
+                        Rc::new(move |_, app| {
+                            let view = view.clone();
+                            let id = id.clone();
+                            app.defer(move |app| {
+                                if let Some(view) = view.upgrade() {
+                                    view.update(app, |this, cx| this.choose_voice(field, &id, cx));
+                                }
+                            });
+                        }),
+                    ));
+                }
+                if items.is_empty() {
+                    items.push(MenuItem::action(
+                        "No voice for this language.",
+                        None,
+                        Rc::new(|_, _| {}),
+                    ));
+                }
+            }
+            VoiceField::Speed => {
+                for speed in voice_settings::SPEEDS {
+                    let picked = (data.settings.speed - speed).abs() < 0.001;
+                    let view = view.clone();
+                    items.push(MenuItem::radio(
+                        voice_settings::speed_label(speed),
+                        picked,
+                        Rc::new(move |_, app| {
+                            let view = view.clone();
+                            app.defer(move |app| {
+                                if let Some(view) = view.upgrade() {
+                                    view.update(app, |this, cx| this.choose_voice_speed(speed, cx));
+                                }
+                            });
+                        }),
+                    ));
+                }
+            }
+            VoiceField::Stt => {
+                let current = data.settings.stt_model.clone();
+                for model in data.catalog.stt_models() {
+                    let id = model.id.clone();
+                    let label = if model.installed {
+                        model.name.clone()
+                    } else {
+                        format!("{} (not downloaded)", model.name)
+                    };
+                    let picked = current == id;
+                    let view = view.clone();
+                    items.push(MenuItem::radio(
+                        label,
+                        picked,
+                        Rc::new(move |_, app| {
+                            let view = view.clone();
+                            let id = id.clone();
+                            app.defer(move |app| {
+                                if let Some(view) = view.upgrade() {
+                                    view.update(app, |this, cx| this.choose_voice(field, &id, cx));
+                                }
+                            });
+                        }),
+                    ));
+                }
+                if items.is_empty() {
+                    items.push(MenuItem::action(
+                        "No speech model in the catalog.",
+                        None,
+                        Rc::new(|_, _| {}),
+                    ));
+                }
+            }
+        }
+        self.voice_field = Some(field);
+        self.voice_anchors[field.index()].clear();
+        self.voice_menu.update(cx, |menu, cx| {
+            menu.set_menu(items);
+            menu.set_open(true);
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    /// Asks the engine to download a model and shows its progress until it ends.
+    fn download_voice_model(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(engine) = self.voice_engine() else {
+            return;
+        };
+        if self.voice_downloads.contains_key(&id) {
+            return;
+        }
+        self.voice_downloads.insert(id.clone(), 0.0);
+        if let Ok(mut map) = self.voice_progress.lock() {
+            map.remove(&id);
+        }
+        let progress = self.voice_progress.clone();
+        let remove = id.clone();
+        cx.spawn(async move |this, cx| {
+            let watched = cx
+                .background_spawn(async move {
+                    voice_settings::download_and_watch(&engine, &id, &progress)
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                view.voice_downloads.remove(&remove);
+                if let voice_settings::Watched::Failed(err) = watched {
+                    view.toast(err, ToastTone::Danger, cx);
+                }
+                view.load_voice(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+        self.poll_voice_progress(cx);
+        cx.notify();
+    }
+
+    fn delete_voice_model(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(engine) = self.voice_engine() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let result = cx.background_spawn(async move { engine.delete(&id) }).await;
+            let _ = this.update(cx, |view, cx| {
+                match result {
+                    Ok(()) => view.toast("Model deleted.", ToastTone::Success, cx),
+                    Err(err) => view.toast(err, ToastTone::Danger, cx),
+                }
+                view.load_voice(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Speaks a phrase with a voice, as Test does.
+    fn test_voice(
+        &mut self,
+        language: String,
+        voice: String,
+        name: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(engine) = self.voice_engine() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let text = voice_settings::sample_text(&name);
+            let result = cx
+                .background_spawn(async move { engine.speak(&text, &language, &voice) })
+                .await;
+            if let Err(err) = result {
+                let _ = this.update(cx, |view, cx| {
+                    view.toast(err, ToastTone::Danger, cx);
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Reads a downloading model's progress from its socket's shared map while one runs.
+    fn poll_voice_progress(&mut self, cx: &mut Context<Self>) {
+        if self.voice_polling {
+            return;
+        }
+        self.voice_polling = true;
+        let progress = self.voice_progress.clone();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(400))
+                    .await;
+                let snapshot = progress.lock().map(|map| map.clone()).unwrap_or_default();
+                let keep_going = this
+                    .update(cx, |view, cx| {
+                        let mut changed = false;
+                        for (id, fraction) in &snapshot {
+                            if let Some(slot) = view.voice_downloads.get_mut(id)
+                                && (*slot - fraction).abs() > f64::EPSILON
+                            {
+                                *slot = *fraction;
+                                changed = true;
+                            }
+                        }
+                        if changed {
+                            cx.notify();
+                        }
+                        !view.voice_downloads.is_empty()
+                    })
+                    .unwrap_or(false);
+                if !keep_going {
+                    break;
+                }
+            }
+            let _ = this.update(cx, |view, cx| {
+                view.voice_polling = false;
                 cx.notify();
             });
         })
@@ -1457,7 +1935,295 @@ impl SettingsView {
             SettingsPage::PickRole => self.roles_page(theme, cx),
             SettingsPage::RoutingPolicy => self.policy_page(theme, cx),
             SettingsPage::Worktrees => self.worktrees_page(theme, cx),
+            SettingsPage::Voice => self.voice_page(theme, cx),
         }
+    }
+
+    /// Voice: what the engine hears and speaks with, the app's own chat choices, and the
+    /// models it can download. Without a running engine it says so, with Start.
+    fn voice_page(&self, theme: Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(loaded) = &self.voice else {
+            return if self.voice_starting {
+                note("Starting the voice engine…", theme)
+            } else {
+                settings_skeleton(4)
+            };
+        };
+        match loaded {
+            Loaded::Stopped => self.voice_notice(
+                "The voice engine is not running.",
+                "Speaking and listening need Dispatch's local engine, which keeps the audio on this computer."
+                    .to_string(),
+                theme,
+                cx,
+            ),
+            Loaded::Unreachable(err) => self.voice_notice(
+                "The voice engine did not answer.",
+                err.clone(),
+                theme,
+                cx,
+            ),
+            Loaded::Running(data) => self.voice_form(data, theme, cx),
+        }
+    }
+
+    /// The Voice page's notice with a Start for the engine.
+    fn voice_notice(
+        &self,
+        title: &str,
+        detail: String,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let view = cx.entity().downgrade();
+        let start = dim_button(
+            "settings-voice-start",
+            "Start",
+            ButtonKind::Secondary,
+            !self.voice_starting,
+            gated(!self.voice_starting, view, |this, cx| {
+                this.start_voice_engine(cx);
+            }),
+            cx,
+        );
+        settings_section(
+            Icon::Globe,
+            TileTone::Integration,
+            "Voice",
+            detail,
+            Some(start),
+            note(title, theme),
+            cx,
+        )
+    }
+
+    fn voice_form(
+        &self,
+        data: &voice_settings::VoiceData,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let view = cx.entity().downgrade();
+        let settings = &data.settings;
+        let mut rows = div().flex().flex_col();
+        rows = rows.child(settings_row(
+            "Language",
+            Some("The language you speak and hear.".into()),
+            menu_trigger(
+                "settings-voice-language",
+                voice_settings::language_label(&settings.language).into(),
+                &self.voice_anchors[VoiceField::Language.index()],
+                gated(true, view.clone(), |this, cx| {
+                    this.open_voice_menu(VoiceField::Language, cx)
+                }),
+                theme,
+                cx,
+            ),
+            cx,
+        ));
+        for field in [VoiceField::VoicePt, VoiceField::VoiceEn] {
+            let language = field.voice_language().unwrap_or("pt-br");
+            let id = settings.voice(language).to_string();
+            let name = data
+                .catalog
+                .voices
+                .iter()
+                .find(|voice| voice.id == id)
+                .map_or_else(|| id.clone(), |voice| voice.name.clone());
+            let label = if language == "en" {
+                "English voice"
+            } else {
+                "Portuguese voice"
+            };
+            let test_id = if language == "en" {
+                "settings-voice-test-en"
+            } else {
+                "settings-voice-test-pt"
+            };
+            let speak = (language.to_string(), id.clone(), name.clone());
+            let test = dim_button(
+                test_id,
+                "Test",
+                ButtonKind::Ghost,
+                true,
+                gated(true, view.clone(), move |this, cx| {
+                    let (language, id, name) = speak.clone();
+                    this.test_voice(language, id, name, cx);
+                }),
+                cx,
+            );
+            rows = rows.child(settings_row(
+                label,
+                Some("Which voice speaks this language.".into()),
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(theme.space_2))
+                    .child(test)
+                    .child(menu_trigger(
+                        if language == "en" {
+                            "settings-voice-voice-en"
+                        } else {
+                            "settings-voice-voice-pt"
+                        },
+                        name.into(),
+                        &self.voice_anchors[field.index()],
+                        gated(true, view.clone(), move |this, cx| {
+                            this.open_voice_menu(field, cx)
+                        }),
+                        theme,
+                        cx,
+                    )),
+                cx,
+            ));
+        }
+        rows = rows.child(settings_row(
+            "Speaking speed",
+            Some("How fast replies are read aloud.".into()),
+            menu_trigger(
+                "settings-voice-speed",
+                voice_settings::speed_label(settings.speed).into(),
+                &self.voice_anchors[VoiceField::Speed.index()],
+                gated(true, view.clone(), |this, cx| {
+                    this.open_voice_menu(VoiceField::Speed, cx)
+                }),
+                theme,
+                cx,
+            ),
+            cx,
+        ));
+        let stt = data
+            .catalog
+            .model(&settings.stt_model)
+            .map_or_else(|| settings.stt_model.clone(), |model| model.name.clone());
+        rows = rows.child(settings_row(
+            "Speech recognition model",
+            Some("The model that transcribes what you say.".into()),
+            menu_trigger(
+                "settings-voice-stt",
+                stt.into(),
+                &self.voice_anchors[VoiceField::Stt.index()],
+                gated(true, view.clone(), |this, cx| {
+                    this.open_voice_menu(VoiceField::Stt, cx)
+                }),
+                theme,
+                cx,
+            ),
+            cx,
+        ));
+        rows = rows.child(settings_row(
+            "Live transcript",
+            Some("Show words while you speak, before the utterance ends.".into()),
+            div()
+                .debug_selector(|| "settings-voice-partials".to_string())
+                .child(self.voice_partials.clone()),
+            cx,
+        ));
+        rows = rows.child(settings_row(
+            "Read replies aloud",
+            Some("Speak a run's reply when a spoken turn ends.".into()),
+            div()
+                .debug_selector(|| "settings-voice-read-aloud".to_string())
+                .child(self.voice_read_aloud.clone()),
+            cx,
+        ));
+        rows = rows.child(settings_row(
+            "Send when I stop",
+            Some("Send the transcript as soon as the microphone stops.".into()),
+            div()
+                .debug_selector(|| "settings-voice-send-when-stop".to_string())
+                .child(self.voice_send_when_stop.clone()),
+            cx,
+        ));
+        let mut models = div().flex().flex_col();
+        for model in &data.catalog.models {
+            models = models.child(self.voice_model_row(model, theme, cx));
+        }
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(SETTINGS_SECTION_GAP))
+            .child(settings_section(
+                Icon::Globe,
+                TileTone::Integration,
+                "Voice",
+                "What Dispatch hears and speaks with. Everything stays on this computer: the engine listens on the loopback address only.",
+                None,
+                rows,
+                cx,
+            ))
+            .child(settings_section(
+                Icon::HardDrive,
+                TileTone::Data,
+                "Models",
+                "Downloads are explicit: each model shows its size and license first, and a model in use cannot be deleted.",
+                None,
+                models,
+                cx,
+            ))
+            .into_any_element()
+    }
+
+    /// One model's row: what it is and its size, then Download or Delete, or its progress.
+    fn voice_model_row(
+        &self,
+        model: &voice_settings::CatalogEntry,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let view = cx.entity().downgrade();
+        let downloading = self.voice_downloads.get(&model.id).copied();
+        let mut trailing = div()
+            .flex()
+            .items_center()
+            .gap(px(theme.space_2))
+            .child(chip(
+                model_state_label(model, downloading),
+                model_tone(model, downloading),
+                cx,
+            ));
+        if !model.installed && downloading.is_none() {
+            let id = model.id.clone();
+            trailing = trailing.child(dim_button(
+                SharedString::from(format!("settings-voice-download-{}", model.id)),
+                "Download",
+                ButtonKind::Secondary,
+                true,
+                gated(true, view.clone(), move |this, cx| {
+                    this.download_voice_model(id.clone(), cx)
+                }),
+                cx,
+            ));
+        }
+        if model.installed {
+            let id = model.id.clone();
+            let allowed = !model.active;
+            trailing = trailing.child(dim_button(
+                SharedString::from(format!("settings-voice-delete-{}", model.id)),
+                "Delete",
+                ButtonKind::Ghost,
+                allowed,
+                gated(allowed, view, move |this, cx| {
+                    this.delete_voice_model(id.clone(), cx)
+                }),
+                cx,
+            ));
+        }
+        settings_row(
+            model.name.clone(),
+            Some(
+                format!(
+                    "{} · {} · {}",
+                    model_kind_label(&model.kind),
+                    voice_settings::human_size(model.size_bytes),
+                    model.license,
+                )
+                .into(),
+            ),
+            trailing,
+            cx,
+        )
     }
 
     /// Worktrees: every folder runs left under a repository's `.dispatch/worktrees`, with
@@ -2355,6 +3121,13 @@ impl SettingsView {
                     self.cli_popover.clone().into_any_element(),
                 )]
             }
+            SettingsPage::Voice => match self.voice_field {
+                Some(field) => vec![(
+                    &self.voice_anchors[field.index()],
+                    self.voice_menu.clone().into_any_element(),
+                )],
+                None => Vec::new(),
+            },
             _ => Vec::new(),
         };
         hung.into_iter()
@@ -2432,6 +3205,38 @@ fn worktree_row(folder: &WorktreeFolder) -> (String, String, &'static str, Statu
         ("In use", StatusTone::Syncing)
     };
     (title, description, label, tone)
+}
+
+/// A model's state, as its chip reads it.
+fn model_state_label(model: &voice_settings::CatalogEntry, downloading: Option<f64>) -> String {
+    if let Some(fraction) = downloading {
+        format!("{:.0}%", fraction * 100.0)
+    } else if model.active {
+        "In use".to_string()
+    } else if model.installed {
+        "Installed".to_string()
+    } else {
+        "Not downloaded".to_string()
+    }
+}
+
+fn model_tone(model: &voice_settings::CatalogEntry, downloading: Option<f64>) -> StatusTone {
+    if downloading.is_some() || model.active {
+        StatusTone::Syncing
+    } else if model.installed {
+        StatusTone::Ok
+    } else {
+        StatusTone::Muted
+    }
+}
+
+fn model_kind_label(kind: &str) -> &'static str {
+    match kind {
+        "stt" => "Speech recognition",
+        "tts" => "Speech",
+        "vad" => "Voice detection",
+        _ => "Model",
+    }
 }
 
 fn note(text: &str, theme: Theme) -> gpui::AnyElement {
