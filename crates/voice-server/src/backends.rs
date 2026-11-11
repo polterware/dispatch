@@ -64,7 +64,8 @@ struct WavMicHandle {
 }
 impl MicHandle for WavMicHandle {
     fn set_muted(&self, muted: bool) {
-        self.muted.store(muted, std::sync::atomic::Ordering::Relaxed);
+        self.muted
+            .store(muted, std::sync::atomic::Ordering::Relaxed);
     }
     fn stop(self: Box<Self>) {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);

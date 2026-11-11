@@ -7,7 +7,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [[bin]]
-name = "voice-engine"
+name = "dispatch-voice"
 path = "src/main.rs"
 
 [dependencies]

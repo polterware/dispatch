@@ -1,0 +1,4 @@
+[env]
+# ONNX Runtime's prebuilt binaries require macOS 13.4; the voice crates link
+# against them. The app builds with the same (older) deployment target.
+MACOSX_DEPLOYMENT_TARGET = "13.4"

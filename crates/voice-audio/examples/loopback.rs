@@ -4,8 +4,8 @@ use std::{
     time::Duration,
 };
 use voice_audio::{
-    start_capture, start_playback, CaptureConfig, LevelMeter, PlaybackConfig, PlaybackEvent,
-    CAPTURE_RATE,
+    CAPTURE_RATE, CaptureConfig, LevelMeter, PlaybackConfig, PlaybackEvent, start_capture,
+    start_playback,
 };
 
 fn main() -> voice_audio::Result<()> {

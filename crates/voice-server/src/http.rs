@@ -6,14 +6,14 @@ use crate::{
     rss,
 };
 use axum::{
+    Json, Router,
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
         Query, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
-    Json, Router,
 };
 use futures_util::{SinkExt, StreamExt};
 use rand::RngCore;
@@ -23,7 +23,7 @@ use std::{
     time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
-use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 use voice_core::{
     discovery::{self, EngineInfo},
     paths,
@@ -447,7 +447,7 @@ pub async fn serve(port: Option<u16>, if_not_running: bool) -> anyhow::Result<()
             println!("{}", info.port);
             return Ok(());
         }
-        anyhow::bail!("voice-engine is already running on port {}", info.port);
+        anyhow::bail!("dispatch-voice is already running on port {}", info.port);
     }
     let cfg = config::load();
     let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port.unwrap_or(0))).await {
@@ -518,7 +518,7 @@ fn healthy() -> Option<EngineInfo> {
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         if let Ok(mut sig) = signal(SignalKind::terminate()) {
             tokio::select! {_=tokio::signal::ctrl_c()=>{},_=sig.recv()=>{}}
         }
@@ -600,11 +600,11 @@ mod tests {
     };
     use futures_util::{SinkExt, StreamExt};
     use std::sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
     };
-    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::Message as ClientMessage;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
     struct FakeMic;
     struct FakeMicHandle;
@@ -732,12 +732,12 @@ mod tests {
     }
 
     #[test]
-    fn discovery_file_uses_test_home_owner_permissions_and_is_removed() {
+    fn discovery_file_has_owner_permissions_and_is_removed() {
         let home = std::env::temp_dir().join(format!("voice-server-home-{}", std::process::id()));
         std::fs::create_dir_all(&home).unwrap();
-        let old_home = std::env::var_os("VOICE_ENGINE_HOME");
-        std::env::set_var("VOICE_ENGINE_HOME", &home);
-        let path = paths::discovery_file();
+        // The test writes where `paths::discovery_file` writes under a data
+        // folder of its own, without changing the process environment.
+        let path = home.join("engine.json");
         let info = EngineInfo {
             protocol: PROTOCOL_VERSION,
             engine_version: env!("CARGO_PKG_VERSION").into(),
@@ -757,10 +757,6 @@ mod tests {
         }
         discovery::remove_if_owned(&path, std::process::id()).unwrap();
         assert!(!path.exists());
-        match old_home {
-            Some(value) => std::env::set_var("VOICE_ENGINE_HOME", value),
-            None => std::env::remove_var("VOICE_ENGINE_HOME"),
-        }
         let _ = std::fs::remove_dir_all(home);
     }
 
@@ -825,10 +821,12 @@ mod tests {
             .unwrap();
         let catalog_json: voice_core::catalog::Catalog =
             serde_json::from_str(&catalog_response.into_string().unwrap()).unwrap();
-        assert!(catalog_json
-            .models
-            .iter()
-            .any(|m| m.id == "whisper-small-q5_1" && m.active));
+        assert!(
+            catalog_json
+                .models
+                .iter()
+                .any(|m| m.id == "whisper-small-q5_1" && m.active)
+        );
         let active_delete = ureq::delete(&format!("http://{addr}/v1/models/whisper-small-q5_1"))
             .set("Authorization", &bearer)
             .call()

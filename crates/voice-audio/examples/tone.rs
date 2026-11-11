@@ -1,5 +1,5 @@
 use std::{f32::consts::TAU, sync::mpsc, time::Instant};
-use voice_audio::{start_playback, PlaybackConfig, PlaybackEvent};
+use voice_audio::{PlaybackConfig, PlaybackEvent, start_playback};
 
 fn main() -> voice_audio::Result<()> {
     const SAMPLE_RATE: u32 = 48_000;

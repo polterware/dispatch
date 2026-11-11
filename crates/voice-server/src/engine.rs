@@ -6,8 +6,8 @@ use crate::{
 use std::{
     collections::{HashMap, VecDeque},
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -1291,18 +1291,20 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(tokio::time::timeout(Duration::from_millis(100), async {
-            loop {
-                if matches!(
-                    rx1.recv().await,
-                    Some(EngineMessage::TranscriptFinal { .. })
-                ) {
-                    return true;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), async {
+                loop {
+                    if matches!(
+                        rx1.recv().await,
+                        Some(EngineMessage::TranscriptFinal { .. })
+                    ) {
+                        return true;
+                    }
                 }
-            }
-        })
-        .await
-        .is_err());
+            })
+            .await
+            .is_err()
+        );
         handle
             .tx
             .send(Input::Message(

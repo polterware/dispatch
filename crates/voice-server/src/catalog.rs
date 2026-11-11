@@ -40,34 +40,151 @@ const STT_TURBO: &[FileSpec] = &[FileSpec {
     path: "whisper/ggml-large-v3-turbo-q5_0.bin",
     size: 574_000_000,
 }];
-const PIPER_FABER: &[FileSpec] = &[FileSpec { url: "https://huggingface.co/rhasspy/piper-voices/resolve/main/pt/pt_BR/faber/medium/pt_BR-faber-medium.onnx", path: "piper/pt_BR-faber-medium.onnx", size: 63_000_000 }, FileSpec { url: "https://huggingface.co/rhasspy/piper-voices/resolve/main/pt/pt_BR/faber/medium/pt_BR-faber-medium.onnx.json", path: "piper/pt_BR-faber-medium.onnx.json", size: 0 }];
-const PIPER_CADU: &[FileSpec] = &[FileSpec { url: "https://huggingface.co/rhasspy/piper-voices/resolve/main/pt/pt_BR/cadu/medium/pt_BR-cadu-medium.onnx", path: "piper/pt_BR-cadu-medium.onnx", size: 63_000_000 }, FileSpec { url: "https://huggingface.co/rhasspy/piper-voices/resolve/main/pt/pt_BR/cadu/medium/pt_BR-cadu-medium.onnx.json", path: "piper/pt_BR-cadu-medium.onnx.json", size: 0 }];
-const PIPER_JEFF: &[FileSpec] = &[FileSpec { url: "https://huggingface.co/rhasspy/piper-voices/resolve/main/pt/pt_BR/jeff/medium/pt_BR-jeff-medium.onnx", path: "piper/pt_BR-jeff-medium.onnx", size: 63_000_000 }, FileSpec { url: "https://huggingface.co/rhasspy/piper-voices/resolve/main/pt/pt_BR/jeff/medium/pt_BR-jeff-medium.onnx.json", path: "piper/pt_BR-jeff-medium.onnx.json", size: 0 }];
+const PIPER_FABER: &[FileSpec] = &[
+    FileSpec {
+        url: "https://huggingface.co/rhasspy/piper-voices/resolve/main/pt/pt_BR/faber/medium/pt_BR-faber-medium.onnx",
+        path: "piper/pt_BR-faber-medium.onnx",
+        size: 63_000_000,
+    },
+    FileSpec {
+        url: "https://huggingface.co/rhasspy/piper-voices/resolve/main/pt/pt_BR/faber/medium/pt_BR-faber-medium.onnx.json",
+        path: "piper/pt_BR-faber-medium.onnx.json",
+        size: 0,
+    },
+];
+const PIPER_CADU: &[FileSpec] = &[
+    FileSpec {
+        url: "https://huggingface.co/rhasspy/piper-voices/resolve/main/pt/pt_BR/cadu/medium/pt_BR-cadu-medium.onnx",
+        path: "piper/pt_BR-cadu-medium.onnx",
+        size: 63_000_000,
+    },
+    FileSpec {
+        url: "https://huggingface.co/rhasspy/piper-voices/resolve/main/pt/pt_BR/cadu/medium/pt_BR-cadu-medium.onnx.json",
+        path: "piper/pt_BR-cadu-medium.onnx.json",
+        size: 0,
+    },
+];
+const PIPER_JEFF: &[FileSpec] = &[
+    FileSpec {
+        url: "https://huggingface.co/rhasspy/piper-voices/resolve/main/pt/pt_BR/jeff/medium/pt_BR-jeff-medium.onnx",
+        path: "piper/pt_BR-jeff-medium.onnx",
+        size: 63_000_000,
+    },
+    FileSpec {
+        url: "https://huggingface.co/rhasspy/piper-voices/resolve/main/pt/pt_BR/jeff/medium/pt_BR-jeff-medium.onnx.json",
+        path: "piper/pt_BR-jeff-medium.onnx.json",
+        size: 0,
+    },
+];
 const KOKORO: &[FileSpec] = &[
- FileSpec { url: "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/onnx/model_quantized.onnx", path: "kokoro/model_quantized.onnx", size: 92_000_000 },
- FileSpec { url: "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/tokenizer.json", path: "kokoro/tokenizer.json", size: 1_000_000 },
- FileSpec { url: "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/config.json", path: "kokoro/config.json", size: 100_000 },
- FileSpec { url: "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/voices/af_heart.bin", path: "kokoro/voices/af_heart.bin", size: 1_000_000 },
- FileSpec { url: "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/voices/am_michael.bin", path: "kokoro/voices/am_michael.bin", size: 1_000_000 },
- FileSpec { url: "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/voices/pf_dora.bin", path: "kokoro/voices/pf_dora.bin", size: 1_000_000 },
- FileSpec { url: "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/voices/pm_alex.bin", path: "kokoro/voices/pm_alex.bin", size: 1_000_000 },
- FileSpec { url: "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/voices/pm_santa.bin", path: "kokoro/voices/pm_santa.bin", size: 1_000_000 },
+    FileSpec {
+        url: "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/onnx/model_quantized.onnx",
+        path: "kokoro/model_quantized.onnx",
+        size: 92_000_000,
+    },
+    FileSpec {
+        url: "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/tokenizer.json",
+        path: "kokoro/tokenizer.json",
+        size: 1_000_000,
+    },
+    FileSpec {
+        url: "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/config.json",
+        path: "kokoro/config.json",
+        size: 100_000,
+    },
+    FileSpec {
+        url: "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/voices/af_heart.bin",
+        path: "kokoro/voices/af_heart.bin",
+        size: 1_000_000,
+    },
+    FileSpec {
+        url: "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/voices/am_michael.bin",
+        path: "kokoro/voices/am_michael.bin",
+        size: 1_000_000,
+    },
+    FileSpec {
+        url: "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/voices/pf_dora.bin",
+        path: "kokoro/voices/pf_dora.bin",
+        size: 1_000_000,
+    },
+    FileSpec {
+        url: "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/voices/pm_alex.bin",
+        path: "kokoro/voices/pm_alex.bin",
+        size: 1_000_000,
+    },
+    FileSpec {
+        url: "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/voices/pm_santa.bin",
+        path: "kokoro/voices/pm_santa.bin",
+        size: 1_000_000,
+    },
 ];
 const CHATTERBOX: &[FileSpec] = &[
-    FileSpec { url: "https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX/resolve/main/tokenizer.json", path: "chatterbox/tokenizer.json", size: 0 },
-    FileSpec { url: "https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX/resolve/main/tokenizer_config.json", path: "chatterbox/tokenizer_config.json", size: 0 },
-    FileSpec { url: "https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX/resolve/main/generation_config.json", path: "chatterbox/generation_config.json", size: 0 },
-    FileSpec { url: "https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX/resolve/main/default_voice.wav", path: "chatterbox/default_voice.wav", size: 0 },
-    FileSpec { url: "https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX/resolve/main/onnx/speech_encoder.onnx", path: "chatterbox/onnx/speech_encoder.onnx", size: 1_184_608 },
-    FileSpec { url: "https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX/resolve/main/onnx/speech_encoder.onnx_data", path: "chatterbox/onnx/speech_encoder.onnx_data", size: 591_274_880 },
-    FileSpec { url: "https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX/resolve/main/onnx/embed_tokens.onnx", path: "chatterbox/onnx/embed_tokens.onnx", size: 13_286 },
-    FileSpec { url: "https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX/resolve/main/onnx/embed_tokens.onnx_data", path: "chatterbox/onnx/embed_tokens.onnx_data", size: 68_390_912 },
-    FileSpec { url: "https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX/resolve/main/onnx/language_model_q4.onnx", path: "chatterbox/onnx/language_model_q4.onnx", size: 227_911 },
-    FileSpec { url: "https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX/resolve/main/onnx/language_model_q4.onnx_data", path: "chatterbox/onnx/language_model_q4.onnx_data", size: 353_621_248 },
-    FileSpec { url: "https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX/resolve/main/onnx/conditional_decoder.onnx", path: "chatterbox/onnx/conditional_decoder.onnx", size: 6_350_448 },
-    FileSpec { url: "https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX/resolve/main/onnx/conditional_decoder.onnx_data", path: "chatterbox/onnx/conditional_decoder.onnx_data", size: 533_970_816 },
+    FileSpec {
+        url: "https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX/resolve/main/tokenizer.json",
+        path: "chatterbox/tokenizer.json",
+        size: 0,
+    },
+    FileSpec {
+        url: "https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX/resolve/main/tokenizer_config.json",
+        path: "chatterbox/tokenizer_config.json",
+        size: 0,
+    },
+    FileSpec {
+        url: "https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX/resolve/main/generation_config.json",
+        path: "chatterbox/generation_config.json",
+        size: 0,
+    },
+    FileSpec {
+        url: "https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX/resolve/main/default_voice.wav",
+        path: "chatterbox/default_voice.wav",
+        size: 0,
+    },
+    FileSpec {
+        url: "https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX/resolve/main/onnx/speech_encoder.onnx",
+        path: "chatterbox/onnx/speech_encoder.onnx",
+        size: 1_184_608,
+    },
+    FileSpec {
+        url: "https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX/resolve/main/onnx/speech_encoder.onnx_data",
+        path: "chatterbox/onnx/speech_encoder.onnx_data",
+        size: 591_274_880,
+    },
+    FileSpec {
+        url: "https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX/resolve/main/onnx/embed_tokens.onnx",
+        path: "chatterbox/onnx/embed_tokens.onnx",
+        size: 13_286,
+    },
+    FileSpec {
+        url: "https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX/resolve/main/onnx/embed_tokens.onnx_data",
+        path: "chatterbox/onnx/embed_tokens.onnx_data",
+        size: 68_390_912,
+    },
+    FileSpec {
+        url: "https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX/resolve/main/onnx/language_model_q4.onnx",
+        path: "chatterbox/onnx/language_model_q4.onnx",
+        size: 227_911,
+    },
+    FileSpec {
+        url: "https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX/resolve/main/onnx/language_model_q4.onnx_data",
+        path: "chatterbox/onnx/language_model_q4.onnx_data",
+        size: 353_621_248,
+    },
+    FileSpec {
+        url: "https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX/resolve/main/onnx/conditional_decoder.onnx",
+        path: "chatterbox/onnx/conditional_decoder.onnx",
+        size: 6_350_448,
+    },
+    FileSpec {
+        url: "https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX/resolve/main/onnx/conditional_decoder.onnx_data",
+        path: "chatterbox/onnx/conditional_decoder.onnx_data",
+        size: 533_970_816,
+    },
 ];
-const VAD: &[FileSpec] = &[FileSpec { url: "https://raw.githubusercontent.com/snakers4/silero-vad/master/src/silero_vad/data/silero_vad.onnx", path: "vad/silero_vad.onnx", size: 2_000_000 }];
+const VAD: &[FileSpec] = &[FileSpec {
+    url: "https://raw.githubusercontent.com/snakers4/silero-vad/master/src/silero_vad/data/silero_vad.onnx",
+    path: "vad/silero_vad.onnx",
+    size: 2_000_000,
+}];
 pub const MODELS: &[ModelSpec] = &[
     ModelSpec {
         id: "whisper-base",
@@ -422,9 +539,11 @@ mod tests {
             .filter(|v| v.backend == "chatterbox")
             .collect::<Vec<_>>();
         assert_eq!(voices.len(), 2);
-        assert!(voices
-            .iter()
-            .all(|v| v.installed && v.model_id.as_deref() == Some("chatterbox-multilingual")));
+        assert!(
+            voices
+                .iter()
+                .all(|v| v.installed && v.model_id.as_deref() == Some("chatterbox-multilingual"))
+        );
         assert_eq!(
             voices
                 .iter()

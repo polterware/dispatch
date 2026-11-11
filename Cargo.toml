@@ -1,17 +1,50 @@
 [workspace]
 resolver = "3"
-members = ["app", "crates/dispatch-core"]
+members = [
+    "app",
+    "crates/dispatch-core",
+    "crates/voice-core",
+    "crates/voice-audio",
+    "crates/voice-stt",
+    "crates/voice-tts",
+    "crates/voice-server",
+]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/polterware/dispatch"
+rust-version = "1.85"
 
 [workspace.dependencies]
 gpui = { version = "0.2.2", default-features = false, features = ["runtime_shaders", "font-kit"] }
 # A sibling checkout replaces it through the workspace's .cargo/config.toml [patch].
 polterware-ui = { git = "https://github.com/polterware/ui" }
+
+# The voice engine's crates.
+voice-core = { path = "crates/voice-core" }
+voice-audio = { path = "crates/voice-audio" }
+voice-stt = { path = "crates/voice-stt" }
+voice-tts = { path = "crates/voice-tts" }
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "process", "fs", "net"] }
+directories = "6"
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
+ort = { version = "=2.0.0-rc.15", default-features = false, features = [
+    "std",
+    "ndarray",
+    "tracing",
+    "download-binaries",
+    "tls-rustls",
+    "copy-dylibs",
+    "api-22",
+] }
 
 [workspace.lints.rust]
 # objc 0.2 msg_send! checks a `cargo-clippy` feature in the calling crate.

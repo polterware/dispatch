@@ -1,6 +1,6 @@
 use std::{mem, path::PathBuf, time::Instant};
 use voice_core::protocol::{Language, TextFormat};
-use voice_tts::{text, KokoroOptions, KokoroTts, SystemTts, TtsBackend, VoiceSpec};
+use voice_tts::{KokoroOptions, KokoroTts, SystemTts, TtsBackend, VoiceSpec, text};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1).peekable();
@@ -46,7 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let t = KokoroTts::load(KokoroOptions {
                 dir: PathBuf::from(std::env::var("VOICE_KOKORO_DIR").unwrap_or_else(|_| {
                     format!(
-                        "{}/Library/Application Support/voice-engine/models/kokoro",
+                        "{}/Library/Application Support/Polterware Dispatch/voice/models/kokoro",
                         std::env::var("HOME").unwrap_or_default()
                     )
                 })),
@@ -97,7 +97,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     writer.finalize()?;
     let cold_audio_ms = cold_samples.len() as f64 / model.sample_rate() as f64 * 1000.0;
-    println!("phonemes: {phonemes}\nload_ms: {load_ms:.1}\ncold_synthesis_ms: {cold_ms:.1}\nwarm_synthesis_ms: {warm_ms:.1}\nthird_synthesis_ms: {third_ms:.1}\naudio_ms: {audio_ms:.1}\ncold_rtf: {:.3}\nwarm_rtf: {:.3}\npeak: {peak:.4}\noutput: {}",cold_ms/cold_audio_ms.max(1.0),warm_ms/audio_ms.max(1.0),out.display());
+    println!(
+        "phonemes: {phonemes}\nload_ms: {load_ms:.1}\ncold_synthesis_ms: {cold_ms:.1}\nwarm_synthesis_ms: {warm_ms:.1}\nthird_synthesis_ms: {third_ms:.1}\naudio_ms: {audio_ms:.1}\ncold_rtf: {:.3}\nwarm_rtf: {:.3}\npeak: {peak:.4}\noutput: {}",
+        cold_ms / cold_audio_ms.max(1.0),
+        warm_ms / audio_ms.max(1.0),
+        out.display()
+    );
     Ok(())
 }
 
@@ -127,14 +132,8 @@ fn current_rss_kb() -> String {
         }
         let mut info = mem::MaybeUninit::<TaskBasicInfo64>::uninit();
         let mut count = (mem::size_of::<TaskBasicInfo64>() / mem::size_of::<i32>()) as u32;
-        let status = unsafe {
-            task_info(
-                mach_task_self_,
-                20,
-                info.as_mut_ptr().cast(),
-                &mut count,
-            )
-        };
+        let status =
+            unsafe { task_info(mach_task_self_, 20, info.as_mut_ptr().cast(), &mut count) };
         if status == 0 {
             let info = unsafe { info.assume_init() };
             (info.resident_size / 1024).to_string()
