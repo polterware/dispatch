@@ -755,6 +755,38 @@ fn the_sidebar_pages_a_groups_runs(cx: &mut TestAppContext) {
     w.click(&more);
     assert_eq!(w.visible_rows(&ids), 15, "the second Show more fell short");
     assert!(w.shows(&more), "two rows are still left out");
+    // Closed and opened again, the group starts over at its first page: closing it forgets
+    // the pages its Show more opened. (A test frame keeps the bounds of rows it no longer
+    // draws, so the rows are read from what the sidebar keeps, not from the screen.)
+    let group = format!("conversation:{conversation}");
+    let revealed = |w: &mut Window| {
+        w.state.read_with(w.cx, |s, _| {
+            s.read_preference::<std::collections::HashMap<String, usize>>(
+                dispatch_app::models::sidebar::REVEALED_PREFERENCE,
+            )
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+        })
+    };
+    assert!(revealed(&mut w).contains_key(&group), "Show more is kept");
+    let heading = format!("sidebar-group-{group}");
+    let heading: &'static str = Box::leak(heading.into_boxed_str());
+    let toggle = |w: &mut Window| {
+        let bounds =
+            w.cx.debug_bounds(heading)
+                .expect("the conversation's heading");
+        // On its title, where a person clicks to fold it.
+        let at = gpui::point(bounds.left() + gpui::px(24.0), bounds.center().y);
+        w.cx.simulate_click(at, Modifiers::none());
+        w.settle();
+    };
+    toggle(&mut w);
+    assert!(
+        !revealed(&mut w).contains_key(&group),
+        "closing the group kept its extra pages"
+    );
+    toggle(&mut w);
     assert!(w.toasts().is_empty(), "{:?}", w.toasts());
 }
 

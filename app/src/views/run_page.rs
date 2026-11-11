@@ -207,11 +207,9 @@ fn draft_key(generation: u64) -> String {
 
 /// The composer's placeholder.
 const MESSAGE_PLACEHOLDER: &str = "Send a message to the agent";
-/// The voice blob's size, and how far in from the composer's right end it floats over it,
-/// centered over the microphone (Send and the gaps after it differ in the compact composer).
+/// The voice blob's size, and the room between it and the composer it floats over, centered.
 const VOICE_MARK_SIZE: f32 = 22.0;
-const VOICE_MARK_INSET: f32 = 61.0;
-const VOICE_MARK_INSET_COMPACT: f32 = 53.0;
+const VOICE_MARK_GAP: f32 = 40.0;
 /// The field's placeholder once a conversation is under way.
 const FOLLOW_UP_PLACEHOLDER: &str = "Send follow-up";
 
@@ -593,10 +591,9 @@ impl RunPageView {
         }
     }
 
-    /// The composer with the voice blob over its right end, over the microphone, while a
-    /// dictation or a reply is playing; it floats there, so the page does not move as it comes
-    /// and goes.
-    fn with_voice_mark(&self, card: impl IntoElement, inset: f32, cx: &Context<Self>) -> gpui::Div {
+    /// The composer with the voice blob centered over it while a dictation or a reply is
+    /// playing; it floats there, so the page does not move as it comes and goes.
+    fn with_voice_mark(&self, card: impl IntoElement, cx: &Context<Self>) -> gpui::Div {
         div()
             .relative()
             .w_full()
@@ -604,8 +601,11 @@ impl RunPageView {
             .children(self.voice_mark(cx).map(|mark| {
                 div()
                     .absolute()
-                    .right(px(inset))
-                    .top(px(-(VOICE_MARK_SIZE + 8.0)))
+                    .left_0()
+                    .right_0()
+                    .top(px(-(VOICE_MARK_SIZE + VOICE_MARK_GAP)))
+                    .flex()
+                    .justify_center()
                     .child(mark)
             }))
     }
@@ -1326,7 +1326,7 @@ impl RunPageView {
             .w_full()
             .children(busy)
             .child(div().w_full().pl(px(6.0)).pb(px(6.0)).child(places))
-            .child(self.with_voice_mark(card, VOICE_MARK_INSET, cx));
+            .child(self.with_voice_mark(card, cx));
         let column = div()
             .flex_1()
             .min_h(px(0.0))
@@ -1504,7 +1504,7 @@ impl RunPageView {
                     div()
                         .w_full()
                         .max_w(px(WIDE_MEASURE))
-                        .child(self.with_voice_mark(card, VOICE_MARK_INSET_COMPACT, cx)),
+                        .child(self.with_voice_mark(card, cx)),
                 )
                 .into_any_element(),
         )

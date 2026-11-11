@@ -604,11 +604,15 @@ impl SidebarView {
         }
     }
 
-    /// Collapsing a group hides its runs at once, as `<Show>` unmounts them.
+    /// Collapsing a group hides its runs at once, as `<Show>` unmounts them, and forgets the
+    /// pages its Show more opened: opened again, it shows its first rows only.
     fn toggle_group(&mut self, id: String, cx: &mut Context<Self>) {
         if let Some(pos) = self.collapsed.iter().position(|item| item == &id) {
             self.collapsed.remove(pos);
         } else {
+            if self.revealed.remove(&id).is_some() {
+                self.persist_revealed(cx);
+            }
             self.collapsed.push(id);
         }
         self.persist_collapsed(cx);
