@@ -1526,18 +1526,11 @@ impl SidebarView {
                 let reveal_id = group.id.clone();
                 let next = page.next_limit;
                 let reveal_view = view.clone();
-                let more = SidebarItem::new(
-                    SharedString::from(more_id.clone()),
-                    format!(
-                        "Show {} more · {} hidden",
-                        page.hidden.min(SIDEBAR_PAGE_ROWS),
-                        page.hidden
-                    ),
-                )
-                .on_click(move |_, cx| {
-                    let id = reveal_id.clone();
-                    let _ = reveal_view.update(cx, |this, cx| this.reveal_more(id, next, cx));
-                });
+                let more = SidebarItem::new(SharedString::from(more_id.clone()), "Show more")
+                    .on_click(move |_, cx| {
+                        let id = reveal_id.clone();
+                        let _ = reveal_view.update(cx, |this, cx| this.reveal_more(id, next, cx));
+                    });
                 let debug_id = more_id.clone();
                 section = section.child(fade_item(
                     more_id,

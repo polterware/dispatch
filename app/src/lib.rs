@@ -26,50 +26,57 @@ use ui::IconAssets;
 
 /// Opens the Dispatch window and runs the app until it quits.
 pub fn run() {
-    Application::new()
-        .with_assets(IconAssets)
-        .run(|cx: &mut App| {
-            dock_icon::install();
-            cx.activate(true);
-            theme::set_root_rem(theme::REM);
-            theme::set_status_tones(theme::dispatch_status_tone);
-            cx.set_global(Theme::dark());
-            polterware_ui::init(cx);
-            voice::init(cx);
-            register_key_bindings(cx);
-            let updates = updater::start().is_ok();
-            let mut items = vec![
-                MenuItem::action("New Conversation", NewConversation),
-                MenuItem::action("Settings…", OpenSettings),
-                MenuItem::separator(),
-            ];
-            if updates {
-                items.push(MenuItem::action("Check for Updates…", CheckForUpdates));
-                items.push(MenuItem::separator());
+    let app = Application::new().with_assets(IconAssets);
+    // A click on the Dock icon brings back the window that closing hid.
+    app.on_reopen(|cx| cx.activate(true));
+    app.run(|cx: &mut App| {
+        dock_icon::install();
+        cx.activate(true);
+        theme::set_root_rem(theme::REM);
+        theme::set_status_tones(theme::dispatch_status_tone);
+        cx.set_global(Theme::dark());
+        polterware_ui::init(cx);
+        voice::init(cx);
+        register_key_bindings(cx);
+        let updates = updater::start().is_ok();
+        let mut items = vec![
+            MenuItem::action("New Conversation", NewConversation),
+            MenuItem::action("Settings…", OpenSettings),
+            MenuItem::separator(),
+        ];
+        if updates {
+            items.push(MenuItem::action("Check for Updates…", CheckForUpdates));
+            items.push(MenuItem::separator());
+        }
+        items.push(MenuItem::action("Quit", Quit));
+        cx.set_menus(vec![Menu {
+            name: "Dispatch".into(),
+            items,
+        }]);
+        cx.on_window_closed(|cx| {
+            if cx.windows().is_empty() {
+                cx.quit();
             }
-            items.push(MenuItem::action("Quit", Quit));
-            cx.set_menus(vec![Menu {
-                name: "Dispatch".into(),
-                items,
-            }]);
-            cx.on_window_closed(|cx| {
-                if cx.windows().is_empty() {
-                    cx.quit();
-                }
-            })
-            .detach();
+        })
+        .detach();
 
-            let options = polterware_ui::window::window_options(
-                "Dispatch",
-                size(px(1200.0), px(800.0)),
-                size(px(800.0), px(560.0)),
-                cx,
-            );
+        let options = polterware_ui::window::window_options(
+            "Dispatch",
+            size(px(1200.0), px(800.0)),
+            size(px(800.0), px(560.0)),
+            cx,
+        );
 
-            cx.open_window(options, |window, cx| {
-                vibrancy::install(window);
-                cx.new(|cx| app::AppView::new(window, cx))
-            })
-            .expect("failed to open GPUI window");
-        });
+        cx.open_window(options, |window, cx| {
+            vibrancy::install(window);
+            // The close button hides the app instead of closing its one window, so the
+            // window keeps its state until the app quits.
+            window.on_window_should_close(cx, |_, cx| {
+                cx.hide();
+                false
+            });
+            cx.new(|cx| app::AppView::new(window, cx))
+        })
+        .expect("failed to open GPUI window");
+    });
 }

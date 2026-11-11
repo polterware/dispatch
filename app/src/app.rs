@@ -334,8 +334,10 @@ impl Render for AppView {
                     cx.stop_propagation();
                 }
             }))
-            .on_action(cx.listener(|_this, _: &CloseWindow, window, _cx| {
-                window.remove_window();
+            // As a Mac app does, closing the window hides the app: it stays in the Dock with
+            // the window as it was, and Quit (⌘Q) is what ends it.
+            .on_action(cx.listener(|_this, _: &CloseWindow, _window, cx| {
+                cx.hide();
             }))
             .on_action(cx.listener(|this, _: &GoBack, _window, cx| {
                 this.state.update(cx, |state, cx| {
