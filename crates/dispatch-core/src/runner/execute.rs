@@ -210,6 +210,18 @@ fn own_pid() -> i64 {
     i64::from(std::process::id())
 }
 
+async fn sample_candidate_quota(a: &dyn super::AgentAdapter, model: &str) -> Option<f64> {
+    if let Some(fut) = a.model_quotas(vec![model.to_owned()]) {
+        if let Ok(map) = fut.await
+            && let Some(q) = map.get(model)
+        {
+            return Some(q.used_percent);
+        }
+        return None;
+    }
+    a.quota().await.ok().map(|q| q.used_percent)
+}
+
 impl Deps {
     /// Probes the CLI when it can. DEGRADED still runs and returns a note via
     /// the record. A missing flag for a capability this run requires is refused.
@@ -451,7 +463,7 @@ impl Deps {
         let mut skipped = Vec::new();
         let mut last_attempt_output = String::new();
 
-        for c in &cands {
+        for (idx, c) in cands.iter().enumerate() {
             if let Some(key) = cooling(&cool, c.agent(), &candidate_provider(c)) {
                 skipped.push(format!("{key} in cooldown"));
                 continue;
@@ -461,28 +473,35 @@ impl Deps {
                 skipped.push(blocked);
                 continue;
             }
-            let handoff = if let Some(prev) = rec.attempts.last()
-                && super::handoff::is_limit_class(&prev.exit_class)
-            {
-                let log_slice = last_attempt_log(&log_path);
-                let built = super::handoff::build_handoff(
-                    &rec,
-                    prev,
-                    &dir,
-                    &log_slice,
-                    &last_attempt_output,
-                );
-                super::handoff::write_worktree_handoff(&rec, &dir, &built);
-                if let Some(last_mut) = rec.attempts.last_mut() {
-                    last_mut.handoff.clone_from(&built);
+            let handoff = if let Some(prev) = rec.attempts.last() {
+                if !prev.handoff.trim().is_empty() {
+                    Some(prev.handoff.clone())
+                } else if super::handoff::is_limit_class(&prev.exit_class) {
+                    let log_slice = last_attempt_log(&log_path);
+                    let built = super::handoff::build_handoff(
+                        &rec,
+                        prev,
+                        &dir,
+                        &log_slice,
+                        &last_attempt_output,
+                    );
+                    super::handoff::write_worktree_handoff(&rec, &dir, &built);
+                    if let Some(last_mut) = rec.attempts.last_mut() {
+                        last_mut.handoff.clone_from(&built);
+                    }
+                    Some(built)
+                } else {
+                    None
                 }
-                Some(built)
             } else {
                 None
             };
+            let has_next_candidate = cands[idx + 1..]
+                .iter()
+                .any(|next| cooling(&cool, next.agent(), &candidate_provider(next)).is_none());
             let attempt_start = self.now();
             agent_start = Some(attempt_start);
-            let (res, run_err) = self
+            let (res, run_err, near_limit_used) = self
                 .run_attempt(
                     cancel,
                     &mut rec,
@@ -492,6 +511,7 @@ impl Deps {
                     timeout,
                     &child_env,
                     handoff.as_deref(),
+                    has_next_candidate,
                 )
                 .await?;
             // The agent ended its turn with only the provider's limit notice: the account is
@@ -511,6 +531,20 @@ impl Deps {
                 }
                 Some(_) if cancel.is_cancelled() => {
                     return self.finish_run(rec, agent_start, STATUS_CANCELLED, "context canceled");
+                }
+                Some(_) if near_limit_used.is_some() => {
+                    self.handle_near_limit(
+                        cancel,
+                        &mut rec,
+                        c,
+                        &dir,
+                        &child_env,
+                        &log_path,
+                        &res,
+                        attempt_start,
+                        near_limit_used.unwrap_or(super::handoff::HANDOFF_NEAR_LIMIT_PERCENT),
+                    )
+                    .await;
                 }
                 Some(AttemptError::DeadlineExceeded) => {
                     let e = format!("timeout after {}", go_duration(timeout));
@@ -706,7 +740,8 @@ impl Deps {
         timeout: Duration,
         child_env: &[String],
         handoff: Option<&str>,
-    ) -> Result<(RunResult, Option<AttemptError>), Error> {
+        has_next_candidate: bool,
+    ) -> Result<(RunResult, Option<AttemptError>, Option<f64>), Error> {
         rec.agent_pid = 0;
         rec.status = STATUS_RUNNING.into();
         rec.agent = c.agent().into();
@@ -798,10 +833,64 @@ impl Deps {
             started: None,
         };
         mark_attempt(&request.log_path, &rec.attempts, c);
+        let attempt_cancel = cancel.child_token();
+        let near_limit = Arc::new(Mutex::new(None::<f64>));
+        let watch_task = if has_next_candidate && let Some(adapter) = c.adapter.clone() {
+            let watch_cancel = attempt_cancel.clone();
+            let near_limit_cell = near_limit.clone();
+            let model = c.model().to_owned();
+            let poll = self.quota_poll();
+            let is_claude_stream =
+                adapter.usage_source() == Some(crate::adapters::quota::SOURCE_CLAUDE_STREAM);
+            Some(tokio::spawn(async move {
+                if is_claude_stream {
+                    let mut rx = crate::adapters::claude_limits::subscribe();
+                    loop {
+                        tokio::select! {
+                            () = watch_cancel.cancelled() => break,
+                            res = rx.changed() => {
+                                if res.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        let Some(used) = sample_candidate_quota(adapter.as_ref(), &model).await
+                        else {
+                            continue;
+                        };
+                        if used >= super::handoff::HANDOFF_NEAR_LIMIT_PERCENT {
+                            *near_limit_cell.lock().unwrap_or_else(|e| e.into_inner()) =
+                                Some(used);
+                            watch_cancel.cancel();
+                            break;
+                        }
+                    }
+                } else {
+                    loop {
+                        tokio::select! {
+                            () = watch_cancel.cancelled() => break,
+                            () = tokio::time::sleep(poll) => {}
+                        }
+                        let Some(used) = sample_candidate_quota(adapter.as_ref(), &model).await
+                        else {
+                            continue;
+                        };
+                        if used >= super::handoff::HANDOFF_NEAR_LIMIT_PERCENT {
+                            *near_limit_cell.lock().unwrap_or_else(|e| e.into_inner()) =
+                                Some(used);
+                            watch_cancel.cancel();
+                            break;
+                        }
+                    }
+                }
+            }))
+        } else {
+            None
+        };
         let call = AgentCall {
             request,
             model: c.model().into(),
-            cancel: cancel.clone(),
+            cancel: attempt_cancel,
             started,
         };
         let out = match &c.adapter {
@@ -815,11 +904,123 @@ impl Deps {
                 ))),
             },
         };
+        if let Some(task) = watch_task {
+            task.abort();
+        }
         rec.agent_pid = shared.lock().unwrap_or_else(|e| e.into_inner()).agent_pid;
         rec.exit_code = i64::from(out.result.exit_code);
         rec.session_id.clone_from(&out.result.session_id);
         add_usage(rec, c.model(), out.result.usage.as_ref(), &self.catalog());
-        Ok((out.result, out.error))
+        let near_limit_used = if cancel.is_cancelled() {
+            None
+        } else {
+            *near_limit.lock().unwrap_or_else(|e| e.into_inner())
+        };
+        Ok((out.result, out.error, near_limit_used))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_near_limit(
+        &self,
+        cancel: &CancellationToken,
+        rec: &mut Run,
+        c: &Candidate,
+        dir: &str,
+        child_env: &[String],
+        log_path: &str,
+        res: &RunResult,
+        attempt_start: DateTime<Utc>,
+        used_pct: f64,
+    ) {
+        let log_slice = last_attempt_log(log_path);
+        let limit_err = format!("{}% of usage limit", used_pct.round() as i64);
+        let model_reply = self
+            .resume_for_handoff(cancel, rec, c, dir, child_env, &res.session_id)
+            .await;
+        let mut attempt = Attempt {
+            agent: c.agent().into(),
+            model: c.model().into(),
+            error: limit_err,
+            exit_class: super::handoff::EXIT_NEAR_LIMIT.into(),
+            duration_ms: Some(non_neg_ms(self.now() - attempt_start)),
+            handoff: String::new(),
+        };
+        let handoff = model_reply
+            .as_deref()
+            .and_then(super::handoff::model_handoff)
+            .unwrap_or_else(|| {
+                super::handoff::build_handoff(rec, &attempt, dir, &log_slice, &res.output)
+            });
+        super::handoff::write_worktree_handoff(rec, dir, &handoff);
+        attempt.handoff = handoff;
+        rec.attempts.push(attempt);
+        if let Some(st) = self.store.as_deref() {
+            let _ = st.save_run(rec);
+        }
+    }
+
+    async fn resume_for_handoff(
+        &self,
+        cancel: &CancellationToken,
+        rec: &mut Run,
+        c: &Candidate,
+        dir: &str,
+        child_env: &[String],
+        session_id: &str,
+    ) -> Option<String> {
+        let a = c.adapter.as_ref()?;
+        if session_id.trim().is_empty() || !a.capabilities().session_resume {
+            return None;
+        }
+        if !self.block(rec, c, true).await.is_empty() {
+            return None;
+        }
+        let mut env = child_env.to_vec();
+        if !rec.linked.is_empty() {
+            env.push(format!(
+                "{}={}",
+                super::linked::LINKED_ENV,
+                super::linked::linked_env(rec)
+            ));
+        }
+        let run_timeout = Duration::from_secs(u64::try_from(rec.timeout_sec).unwrap_or(0));
+        let timeout = if run_timeout.is_zero() {
+            super::handoff::HANDOFF_RESUME_TIMEOUT
+        } else {
+            run_timeout.min(super::handoff::HANDOFF_RESUME_TIMEOUT)
+        };
+        let request = Request {
+            effort: rec.effort.clone(),
+            prompt: super::handoff::HANDOFF_MODEL_PROMPT.into(),
+            tier: rec.tier.clone(),
+            dir: dir.into(),
+            read_only: rec.read_only,
+            timeout,
+            resume_session: session_id.trim().into(),
+            env,
+            log_path: String::new(),
+            started: None,
+        };
+        let resume_cancel = cancel.child_token();
+        let started: Started = Arc::new(|_| Ok(()));
+        let call = AgentCall {
+            request,
+            model: c.model().into(),
+            cancel: resume_cancel.clone(),
+            started,
+        };
+        let out = match tokio::time::timeout(timeout, a.resume(call)).await {
+            Ok(out) => out,
+            Err(_) => {
+                resume_cancel.cancel();
+                return None;
+            }
+        };
+        add_usage(rec, c.model(), out.result.usage.as_ref(), &self.catalog());
+        if out.error.is_some() {
+            return None;
+        }
+        Some(out.result.output)
     }
 
     /// Stores a successful attempt's output and commits the worktree.

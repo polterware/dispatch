@@ -13,6 +13,12 @@ struct Observed {
     loaded: bool,
 }
 static OBSERVED: LazyLock<Mutex<Observed>> = LazyLock::new(|| Mutex::new(Observed::default()));
+static UPDATES: LazyLock<tokio::sync::watch::Sender<u64>> =
+    LazyLock::new(|| tokio::sync::watch::channel(0).0);
+
+pub fn subscribe() -> tokio::sync::watch::Receiver<u64> {
+    UPDATES.subscribe()
+}
 
 pub fn set_state_dir(dir: impl Into<PathBuf>) {
     if let Ok(mut state) = OBSERVED.lock() {
@@ -84,6 +90,7 @@ pub fn remember(samples: Vec<QuotaSample>) {
             }
         }
     }
+    UPDATES.send_modify(|n| *n = n.wrapping_add(1));
 }
 pub fn observed(now: DateTime<Utc>) -> Vec<QuotaSample> {
     let Ok(mut state) = OBSERVED.lock() else {

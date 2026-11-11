@@ -16,12 +16,40 @@ pub const HANDOFF_FILE: &str = ".dispatch/handoff.md";
 /// Maximum character count kept for the failed attempt's last assistant messages.
 pub const HANDOFF_MAX_CHARS: usize = 4_000;
 
+/// Usage-limit percentage at which a running attempt stops cleanly so the model
+/// can write its own hand-off before the account is exhausted.
+pub const HANDOFF_NEAR_LIMIT_PERCENT: f64 = 95.0;
+
+/// Default interval between live quota polls while an attempt runs.
+pub const HANDOFF_QUOTA_POLL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Maximum time allowed for the resumed session to write its hand-off.
+pub const HANDOFF_RESUME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// Exit class recorded when an attempt is stopped at [`HANDOFF_NEAR_LIMIT_PERCENT`].
+pub const EXIT_NEAR_LIMIT: &str = "near_limit";
+
+/// Prompt sent when resuming the stopped session to write its own hand-off.
+pub const HANDOFF_MODEL_PROMPT: &str = "Your account is at 95% of its usage limit, so Dispatch is switching this task to the next model. Do not run tools or edit files. Reply with a concise hand-off in under 300 words covering: what is done, what is left, files touched, key decisions, and the immediate next step.";
+
 /// Maximum character count kept for the failed attempt's todo/plan section.
 const HANDOFF_PLAN_MAX_CHARS: usize = 2_000;
 
 /// Reports whether an attempt exit class represents a usage or credit limit.
 pub fn is_limit_class(exit_class: &str) -> bool {
     matches!(exit_class.trim(), "rate_limit" | "credits")
+}
+
+/// Bounds and redacts the model's own hand-off reply, returning `None` when
+/// empty or when the reply is itself a usage-limit notice.
+pub fn model_handoff(reply: &str) -> Option<String> {
+    let trimmed = reply.trim();
+    if trimmed.is_empty() || super::summary::limit_notice(trimmed).is_some() {
+        return None;
+    }
+    let bounded = tail_chars(trimmed, HANDOFF_MAX_CHARS);
+    let redacted = sandbox::redact(bounded.trim());
+    (!redacted.trim().is_empty()).then_some(redacted)
 }
 
 /// Builds the prompt sent to the next candidate when continuing from a hand-off.
@@ -592,5 +620,13 @@ mod tests {
         let bounded = tail_chars(&long, HANDOFF_MAX_CHARS);
         assert!(bounded.starts_with('…'));
         assert!(bounded.chars().count() <= HANDOFF_MAX_CHARS + 1);
+    }
+
+    #[test]
+    fn model_handoff_bounds_and_rejects_limit_notice() {
+        assert!(model_handoff("   ").is_none());
+        assert!(model_handoff("You've hit your usage limit. Try again in 2h.").is_none());
+        let ok = model_handoff("Done: parser. Left: tests. Next: cargo test.").unwrap();
+        assert!(ok.contains("Done: parser."));
     }
 }

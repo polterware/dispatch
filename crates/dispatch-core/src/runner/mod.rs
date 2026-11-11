@@ -21,8 +21,9 @@ pub use execute::{
     agent_log_path, child_environ, complete_telemetry, exit_class, join_note, terminal_status,
 };
 pub use handoff::{
-    HANDOFF_FILE, HANDOFF_INSTRUCTION, HANDOFF_MAX_CHARS, build_handoff, is_limit_class,
-    prompt_with_handoff, write_worktree_handoff,
+    EXIT_NEAR_LIMIT, HANDOFF_FILE, HANDOFF_INSTRUCTION, HANDOFF_MAX_CHARS, HANDOFF_MODEL_PROMPT,
+    HANDOFF_NEAR_LIMIT_PERCENT, HANDOFF_QUOTA_POLL, HANDOFF_RESUME_TIMEOUT, build_handoff,
+    is_limit_class, model_handoff, prompt_with_handoff, write_worktree_handoff,
 };
 pub use host::{AgentRunHost, HOST_TIMEOUT, complete_linked_agent_run, dispatch_run_task};
 pub use lifecycle::{pid_alive, process_start};
@@ -250,6 +251,9 @@ pub struct Deps {
     pub work_dir: String,
     /// Overrides the catalog read from the state directory.
     pub catalog: Option<Catalog>,
+    /// Overrides the live quota poll interval while an attempt runs; zero uses
+    /// [`HANDOFF_QUOTA_POLL`].
+    pub quota_poll: Duration,
 }
 
 /// A request. For resumes, `resume` names the earlier run.
@@ -436,6 +440,14 @@ impl Deps {
 
     pub(crate) fn recursive(&self) -> bool {
         !self.env(DEPTH_ENV).is_empty() || !self.env(NO_DELEGATE_ENV).is_empty()
+    }
+
+    pub(crate) fn quota_poll(&self) -> Duration {
+        if self.quota_poll.is_zero() {
+            HANDOFF_QUOTA_POLL
+        } else {
+            self.quota_poll
+        }
     }
 }
 

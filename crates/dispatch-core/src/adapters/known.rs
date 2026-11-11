@@ -91,15 +91,7 @@ impl Agent {
                 }
             }
             Driver::Cli => {
-                let r = if resume {
-                    cli::resume(&self.name, &req, &call.model, cancel.clone()).await
-                } else {
-                    cli::run(&self.name, &req, &call.model, cancel.clone()).await
-                };
-                match r {
-                    Ok(r) => (r, Ok(())),
-                    Err(e) => (RunResult::default(), Err(e)),
-                }
+                cli::run_outcome(&self.name, &req, &call.model, cancel.clone(), resume).await
             }
             Driver::Acp => {
                 if resume && req.resume_session.is_empty() {

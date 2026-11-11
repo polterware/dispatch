@@ -731,3 +731,151 @@ async fn test_rate_limit_builds_handoff_and_continues_from_it() {
         "bare task prompt"
     );
 }
+
+#[tokio::test]
+async fn test_near_limit_resumes_session_for_model_handoff_and_switches() {
+    use dispatch_core::runner::{HANDOFF_FILE, HANDOFF_INSTRUCTION, HANDOFF_MODEL_PROMPT};
+
+    let (_dir, root) = repo(&[("README", "hi\n")]);
+    let r = ran();
+    let model_handoff_reply =
+        "Done: wrote extra.txt. Left: run tests. Decisions: kept layout flat. Next: cargo test.";
+    let first = Fake::new("a", &r)
+        .edit(|dir| {
+            std::fs::write(std::path::Path::new(dir).join("extra.txt"), "hello\n").unwrap();
+        })
+        .delay(Duration::from_secs(5))
+        .run_quota(Quota {
+            used_percent: 95.0,
+            ..Quota::default()
+        })
+        .resume_out(model_handoff_reply);
+    let first_reqs = first.requests.clone();
+    let second = Fake::new("b", &r).out("completed from model handoff\n");
+    let second_reqs = second.requests.clone();
+
+    let mut t = test_deps(vec![first.arc(), second.arc()]);
+    t.deps.worktree_dir.clear();
+
+    let rec = run(
+        &t,
+        Options {
+            dir: root,
+            ..easy("implement extra.txt and verify")
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(rec.status, STATUS_COMPLETED, "{rec:?}");
+    assert_eq!(rec.agent, "b");
+    assert_eq!(ran_list(&r), vec!["a/m1", "a/m1@sess-a", "b/m2"]);
+    assert_eq!(rec.attempts.len(), 1);
+    assert_eq!(rec.attempts[0].exit_class, "near_limit");
+    assert_eq!(rec.attempts[0].error, "95% of usage limit");
+    assert_eq!(rec.attempts[0].handoff, model_handoff_reply);
+
+    let first_requests = first_reqs.lock().unwrap();
+    assert_eq!(first_requests.len(), 2);
+    assert_eq!(first_requests[1].resume_session, "sess-a");
+    assert_eq!(first_requests[1].prompt, HANDOFF_MODEL_PROMPT);
+
+    let second_requests = second_reqs.lock().unwrap();
+    assert_eq!(second_requests.len(), 1);
+    assert!(second_requests[0].prompt.starts_with(HANDOFF_INSTRUCTION));
+    assert!(second_requests[0].prompt.contains(model_handoff_reply));
+
+    let handoff_file = std::path::Path::new(&rec.worktree).join(HANDOFF_FILE);
+    assert_eq!(
+        std::fs::read_to_string(handoff_file).unwrap(),
+        model_handoff_reply
+    );
+
+    // Near-limit hand-off must not put the account in cooldown.
+    let cool = store_cooldowns(Some(t.store.as_ref()), Utc::now());
+    assert!(
+        !cool.contains_key("a") && !cool.contains_key("a:m1"),
+        "near_limit must not cool down the account: {cool:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_near_limit_resume_failure_falls_back_to_layer_one_handoff() {
+    use dispatch_core::runner::HANDOFF_INSTRUCTION;
+    use serde_json::json;
+
+    let (_dir, root) = repo(&[("README", "hi\n")]);
+    let stream_log = [
+        json!({"type": "assistant", "message": {"content": [{"type": "text", "text": "Edited extra.txt before reaching 96%."}]}}).to_string(),
+        String::new(),
+    ]
+    .join("\n");
+
+    let r = ran();
+    let first = Fake::new("a", &r)
+        .edit(|dir| {
+            std::fs::write(std::path::Path::new(dir).join("extra.txt"), "hello\n").unwrap();
+        })
+        .log(&stream_log)
+        .delay(Duration::from_secs(5))
+        .run_quota(Quota {
+            used_percent: 96.0,
+            ..Quota::default()
+        })
+        .resume_fail("resume failed");
+    let second = Fake::new("b", &r).out("completed from layer-1 fallback\n");
+    let second_reqs = second.requests.clone();
+
+    let t = test_deps(vec![first.arc(), second.arc()]);
+    let rec = run(
+        &t,
+        Options {
+            dir: root,
+            ..easy("implement extra.txt and verify")
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(rec.status, STATUS_COMPLETED, "{rec:?}");
+    assert_eq!(rec.agent, "b");
+    assert_eq!(ran_list(&r), vec!["a/m1", "a/m1@sess-a", "b/m2"]);
+    assert_eq!(rec.attempts.len(), 1);
+    assert_eq!(rec.attempts[0].exit_class, "near_limit");
+
+    let handoff = &rec.attempts[0].handoff;
+    assert!(handoff.contains("## Original task"), "{handoff}");
+    assert!(handoff.contains("a/m1 (near_limit)"), "{handoff}");
+    assert!(handoff.contains("96% of usage limit"), "{handoff}");
+    assert!(handoff.contains("extra.txt (+1 -0)"), "{handoff}");
+    assert!(
+        handoff.contains("Edited extra.txt before reaching 96%."),
+        "{handoff}"
+    );
+
+    let second_requests = second_reqs.lock().unwrap();
+    assert_eq!(second_requests.len(), 1);
+    assert!(second_requests[0].prompt.starts_with(HANDOFF_INSTRUCTION));
+    assert!(second_requests[0].prompt.contains(handoff));
+}
+
+#[tokio::test]
+async fn test_near_limit_with_no_other_candidate_runs_to_completion() {
+    let r = ran();
+    let only = Fake::new("a", &r)
+        .out("finished untouched\n")
+        .delay(Duration::from_millis(60))
+        .run_quota(Quota {
+            used_percent: 98.0,
+            ..Quota::default()
+        });
+    let mut t = test_deps(vec![only.arc()]);
+    t.deps.table = table(&[("easy", vec![entry("a", "m1")])]);
+
+    let rec = run(&t, read_only("solo task")).await.unwrap();
+    assert_eq!(rec.status, STATUS_COMPLETED, "{rec:?}");
+    assert_eq!(rec.agent, "a");
+    assert_eq!(rec.output, "finished untouched");
+    assert!(rec.attempts.is_empty(), "{:?}", rec.attempts);
+    assert_eq!(ran_list(&r), vec!["a/m1"]);
+}

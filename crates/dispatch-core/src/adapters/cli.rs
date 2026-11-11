@@ -64,7 +64,9 @@ pub fn parse_pi_models(out: &str) -> Vec<String> {
         .collect()
 }
 
-use super::{Request, RunResult, binaries, livelog::LiveLog, proc::run_command, stream, usage};
+use super::{
+    Request, RunResult, binaries, livelog::LiveLog, proc::run_command_outcome, stream, usage,
+};
 use crate::{Error, sandbox};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
@@ -190,12 +192,19 @@ pub fn arguments(
     Ok(a)
 }
 
-pub async fn run(
+pub async fn run_outcome(
     name: &str,
     req: &Request,
     model: &str,
     cancel: CancellationToken,
-) -> Result<RunResult, Error> {
+    resume: bool,
+) -> (RunResult, Result<(), Error>) {
+    if resume && req.resume_session.is_empty() {
+        return (
+            RunResult::default(),
+            Err(Error::Message(format!("{name}: resume requires a session"))),
+        );
+    }
     let session = if !req.resume_session.is_empty() {
         req.resume_session.clone()
     } else if matches!(name, "pi" | "grok") {
@@ -208,18 +217,27 @@ pub async fn run(
                 cmd.env(k, v);
             }
         }
-        let out = cmd.output().await?;
+        let out = match cmd.output().await {
+            Ok(out) => out,
+            Err(e) => return (RunResult::default(), Err(e.into())),
+        };
         if !out.status.success() {
-            return Err(Error::Message(format!(
-                "{name}: new session: {}",
-                out.status
-            )));
+            return (
+                RunResult::default(),
+                Err(Error::Message(format!(
+                    "{name}: new session: {}",
+                    out.status
+                ))),
+            );
         }
         String::from_utf8_lossy(&out.stdout).trim().to_owned()
     } else {
         String::new()
     };
-    let args = arguments(name, req, model, &session)?;
+    let args = match arguments(name, req, model, &session) {
+        Ok(args) => args,
+        Err(e) => return (RunResult::default(), Err(e)),
+    };
     let mut cmd = Command::new(binaries::bin(name));
     cmd.args(args).env_clear();
     let env = if req.env.is_empty() {
@@ -246,7 +264,7 @@ pub async fn run(
     } else {
         None
     };
-    let output = run_command(
+    let output = run_command_outcome(
         cmd,
         (name == "claude").then(|| req.prompt.clone()),
         token,
@@ -258,20 +276,28 @@ pub async fn run(
     if let Some(timer) = timer {
         timer.abort();
     }
-    let output = output.map_err(|err| match err {
-        Error::Message(m)
-            if m == "context canceled" && !cancel.is_cancelled() && !req.timeout.is_zero() =>
-        {
-            Error::Message("context deadline exceeded".into())
+    let (output, canceled) = match output {
+        Ok(v) => v,
+        Err(err) => {
+            let err = match err {
+                Error::Message(m)
+                    if m == "context canceled"
+                        && !cancel.is_cancelled()
+                        && !req.timeout.is_zero() =>
+                {
+                    Error::Message("context deadline exceeded".into())
+                }
+                other => other,
+            };
+            return (
+                RunResult {
+                    session_id: session,
+                    ..RunResult::default()
+                },
+                Err(err),
+            );
         }
-        other => other,
-    })?;
-    if !output.fatal.is_empty() {
-        return Err(Error::Message(format!(
-            "{name}: stopped early: {}",
-            output.fatal
-        )));
-    }
+    };
     let (text, parsed) = match name {
         "claude" => stream::parse_claude_stream(&output.stdout),
         "pi" => stream::parse_pi_stream(&output.stdout),
@@ -279,21 +305,8 @@ pub async fn run(
         "grok" => stream::parse_grok_stream(&output.stdout),
         _ => (output.stdout.trim().into(), String::new()),
     };
-    if output.exit_code != 0 {
-        return Err(Error::Message(format!(
-            "{name}: exit status {}: {}",
-            output.exit_code,
-            output.stderr.trim()
-        )));
-    }
-    if text.is_empty() && output.stderr.contains("auto-denied") {
-        return Err(Error::Message(format!(
-            "{name}: permission denied in headless mode: {}",
-            output.stderr.trim()
-        )));
-    }
-    Ok(RunResult {
-        output: text,
+    let res = RunResult {
+        output: text.clone(),
         exit_code: output.exit_code,
         session_id: if parsed.is_empty() { session } else { parsed },
         usage: match name {
@@ -303,7 +316,43 @@ pub async fn run(
             "grok" => usage::usage_grok(&output.stdout),
             _ => None,
         },
-    })
+    };
+    let status = if canceled {
+        if !cancel.is_cancelled() && !req.timeout.is_zero() {
+            Err(Error::Message("context deadline exceeded".into()))
+        } else {
+            Err(Error::Message("context canceled".into()))
+        }
+    } else if !output.fatal.is_empty() {
+        Err(Error::Message(format!(
+            "{name}: stopped early: {}",
+            output.fatal
+        )))
+    } else if output.exit_code != 0 {
+        Err(Error::Message(format!(
+            "{name}: exit status {}: {}",
+            output.exit_code,
+            output.stderr.trim()
+        )))
+    } else if text.is_empty() && output.stderr.contains("auto-denied") {
+        Err(Error::Message(format!(
+            "{name}: permission denied in headless mode: {}",
+            output.stderr.trim()
+        )))
+    } else {
+        Ok(())
+    };
+    (res, status)
+}
+
+pub async fn run(
+    name: &str,
+    req: &Request,
+    model: &str,
+    cancel: CancellationToken,
+) -> Result<RunResult, Error> {
+    let (res, status) = run_outcome(name, req, model, cancel, false).await;
+    status.map(|()| res)
 }
 
 pub async fn resume(
@@ -312,8 +361,6 @@ pub async fn resume(
     model: &str,
     cancel: CancellationToken,
 ) -> Result<RunResult, Error> {
-    if req.resume_session.is_empty() {
-        return Err(Error::Message(format!("{name}: resume requires a session")));
-    }
-    run(name, req, model, cancel).await
+    let (res, status) = run_outcome(name, req, model, cancel, true).await;
+    status.map(|()| res)
 }
