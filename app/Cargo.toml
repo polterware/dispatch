@@ -20,10 +20,14 @@ pulldown-cmark = { version = "0.12", default-features = false }
 syntect = { version = "5", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy", "parsing"] }
 polterware-ui.workspace = true
 raw-window-handle = "0.6.2"
+# The voice engine's protocol, discovery file, and paths (`app/src/voice.rs`).
+voice-core.workspace = true
+tungstenite = "0.24"
 
 [dev-dependencies]
 tempfile = "3.27.0"
 gpui = { workspace = true, features = ["test-support"] }
+tungstenite = "0.24"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2.7"

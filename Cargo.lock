@@ -1947,7 +1947,9 @@ dependencies = [
  "smallvec",
  "syntect",
  "tempfile",
+ "tungstenite",
  "ureq 2.12.1",
+ "voice-core",
 ]
 
 [[package]]

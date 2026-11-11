@@ -7,3 +7,4 @@ pub mod sidebar;
 pub mod spend;
 pub mod stats;
 pub mod transcript;
+pub mod voice;
