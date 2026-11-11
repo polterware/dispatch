@@ -72,6 +72,11 @@ impl AppView {
         self.state.clone()
     }
 
+    /// The run page, which also draws the new conversation (the tests read it).
+    pub fn run_page(&self) -> gpui::Entity<RunPageView> {
+        self.run_page.clone()
+    }
+
     /// Starts the countdown of every toast that has none yet, and forgets the ones gone.
     fn time_toasts(&mut self, state: &gpui::Entity<AppState>, cx: &mut Context<Self>) {
         let shown: Vec<(u64, crate::ui::ToastTone)> = state

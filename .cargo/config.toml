@@ -2,3 +2,11 @@
 # ONNX Runtime's prebuilt binaries require macOS 13.4; the voice crates link
 # against them. The app builds with the same (older) deployment target.
 MACOSX_DEPLOYMENT_TARGET = "13.4"
+
+# (local verification only) The sibling ui worktree of this run.
+[patch."https://github.com/polterware/ui"]
+polterware-assets = { path = "/Users/erickpatrickbarcelos/codes/polterware-workspace/ui/.dispatch/worktrees/cdfedcca39c1016a6a2e914d4f0f0a93/crates/polterware-assets" }
+polterware-motion = { path = "/Users/erickpatrickbarcelos/codes/polterware-workspace/ui/.dispatch/worktrees/cdfedcca39c1016a6a2e914d4f0f0a93/crates/polterware-motion" }
+polterware-theme = { path = "/Users/erickpatrickbarcelos/codes/polterware-workspace/ui/.dispatch/worktrees/cdfedcca39c1016a6a2e914d4f0f0a93/crates/polterware-theme" }
+polterware-ui = { path = "/Users/erickpatrickbarcelos/codes/polterware-workspace/ui/.dispatch/worktrees/cdfedcca39c1016a6a2e914d4f0f0a93/crates/polterware-ui" }
+polterware-window = { path = "/Users/erickpatrickbarcelos/codes/polterware-workspace/ui/.dispatch/worktrees/cdfedcca39c1016a6a2e914d4f0f0a93/crates/polterware-window" }

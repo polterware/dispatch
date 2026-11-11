@@ -1198,6 +1198,9 @@ impl Render for TranscriptView {
                 cache: cache.clone(),
                 on_expand: on_expand.clone(),
                 on_prompt_toggle: on_prompt_toggle.clone(),
+                on_read: Rc::new(|text: String, _, cx: &mut App| {
+                    crate::voice::read_aloud(&text, cx);
+                }),
             };
             let row = render_row(&frame, &row, window, cx);
             if compact {

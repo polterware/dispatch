@@ -46,8 +46,9 @@ use crate::state::{AppState, ConnectionState, Route, observe};
 use crate::theme::{Theme, status_tone, tw};
 use crate::ui::ellipsis;
 use crate::ui::parts::run_page::{context_meter, file_change_line};
+use crate::ui::parts::voice::voice_blob;
 use crate::ui::patterns::{
-    AnchorSlot, message_composer, message_input, trailing_toolbar, window_anchor,
+    AnchorSlot, ComposerAction, message_composer, message_input, trailing_toolbar, window_anchor,
 };
 use crate::ui::{
     Button, ButtonKind, ButtonSize, Icon, MascotMood, Menu, MenuEntry, PageWidth, RailGroup,
@@ -58,6 +59,7 @@ use crate::ui::{
 };
 use crate::ui::{PropertyOption, PropertyPicker, PropertyPickerEvent, text_swap};
 use crate::ui::{SkeletonLayout, TextInput, WIDE_MEASURE, page_skeleton};
+use crate::voice::{self, EngineMessage, VoiceEngine, VoicedTurns};
 
 /// The route picker's Loading row, which cannot be picked.
 const ROUTES_LOADING: &str = "routes-loading";
@@ -135,6 +137,19 @@ pub struct RunPageView {
     message_scroll: ScrollHandle,
     /// A follow-up is on its way to the core.
     sending: bool,
+    /// The voice engine: one connection, shared with every view.
+    voice: VoiceEngine,
+    /// The utterance being dictated, from the tap until its final transcript.
+    listening: Option<String>,
+    /// The words a dictation put in the composer, kept until the message starts a run: that run's
+    /// turn was voiced.
+    voiced_text: Option<String>,
+    /// The runs started from a dictation, and which of them were read aloud.
+    voiced: VoicedTurns,
+    /// Voiced runs whose reply was asked of the core, so it is asked once.
+    fetching_reply: HashSet<String>,
+    /// What the last tick saw, so the page redraws only when the blob comes or goes.
+    voice_active: bool,
     /// The new conversation (⌘N) before its first message.
     draft: Draft,
 }
@@ -294,6 +309,12 @@ impl RunPageView {
             message,
             message_scroll: ScrollHandle::new(),
             sending: false,
+            voice: crate::voice::engine(cx),
+            listening: None,
+            voiced_text: None,
+            voiced: VoicedTurns::default(),
+            fetching_reply: HashSet::new(),
+            voice_active: false,
             draft: Draft {
                 open: false,
                 generation: 0,
@@ -315,7 +336,198 @@ impl RunPageView {
             },
         };
         view.install_bodies(cx);
+        Self::spawn_voice_tick(cx);
         view
+    }
+
+    /// Drains the voice engine's events and reads completed voiced turns aloud, ten times a
+    /// second: a transcript lands in the composer as soon as the engine transcribes it.
+    fn spawn_voice_tick(cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                if this.update(cx, |view, cx| view.voice_tick(cx)).is_err() {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(100))
+                    .await;
+            }
+        })
+        .detach();
+    }
+
+    /// One voice tick: what the engine said, and the voiced runs that have completed.
+    fn voice_tick(&mut self, cx: &mut Context<Self>) {
+        let mut changed = false;
+        let messages = self.voice.drain();
+        for message in messages {
+            match message {
+                EngineMessage::TranscriptFinal { id, text, .. } => {
+                    if self.listening.as_deref() != Some(id.as_str()) {
+                        continue;
+                    }
+                    self.listening = None;
+                    changed = true;
+                    self.finish_dictation(text, cx);
+                }
+                EngineMessage::Error { code, message, id } => {
+                    if id
+                        .as_deref()
+                        .is_some_and(|id| self.listening.as_deref() == Some(id))
+                    {
+                        self.listening = None;
+                    }
+                    self.toast(voice::error_message(code, &message), ToastTone::Danger, cx);
+                    changed = true;
+                }
+                EngineMessage::SpeakEnded { .. } => changed = true,
+                _ => {}
+            }
+        }
+        let due: Vec<(String, Option<String>)> = {
+            let state = self.state.read(cx);
+            state
+                .runs()
+                .iter()
+                .filter(|run| self.voiced.due(run))
+                .map(|run| (run.id.clone(), state.run_reply(&run.id).map(str::to_string)))
+                .collect()
+        };
+        if !due.is_empty() {
+            changed = true;
+            for (id, reply) in due {
+                self.read_run_reply(id, reply, cx);
+            }
+        }
+        let active = self.voice.is_listening() || self.voice.is_speaking();
+        if active != self.voice_active {
+            self.voice_active = active;
+            changed = true;
+        }
+        if changed {
+            self.transcript.update(cx, |_, cx| cx.notify());
+            cx.notify();
+        }
+    }
+
+    /// The words a dictation was heard as: they go into the composer, and the message is sent
+    /// when the person asked for that.
+    fn finish_dictation(&mut self, said: String, cx: &mut Context<Self>) {
+        let said = said.trim().to_string();
+        if said.is_empty() {
+            self.toast("Nothing was heard.", ToastTone::Info, cx);
+            return;
+        }
+        let current = self.message.read(cx).text().to_string();
+        let next = voice::with_transcript(&current, &said);
+        self.message
+            .update(cx, |input, cx| input.set_text(next.clone(), cx));
+        self.voiced_text = Some(said);
+        if self.voice.prefs().send_when_i_stop {
+            self.send_dictation(next, cx);
+        }
+    }
+
+    /// Sends a dictated message on the page that holds the composer: a new conversation starts
+    /// on the New page, and a message goes to the open run.
+    fn send_dictation(&mut self, text: String, cx: &mut Context<Self>) {
+        match self.state.read(cx).route().clone() {
+            Route::NewRun => self.start_conversation(text, cx),
+            Route::Run(id) if id == self.transcript_run => self.send_message(text, cx),
+            _ => {}
+        }
+    }
+
+    /// The dictation a message carries, if any: the voiced text it was written with.
+    fn take_voiced(&mut self, prompt: &str) -> bool {
+        let Some(said) = self.voiced_text.take() else {
+            return false;
+        };
+        let said = said.trim();
+        !said.is_empty() && (prompt.trim() == said || prompt.contains(said))
+    }
+
+    /// Reads a voiced run's completed reply aloud, asking the core for it when the page does
+    /// not hold it.
+    fn read_run_reply(&mut self, id: String, reply: Option<String>, cx: &mut Context<Self>) {
+        if let Some(reply) = reply {
+            self.speak_run_reply(&id, &reply);
+            return;
+        }
+        if !self.fetching_reply.insert(id.clone()) {
+            return;
+        }
+        let Some(client) = self.state.read(cx).client() else {
+            self.fetching_reply.remove(&id);
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let asked = id.clone();
+            let answer = cx
+                .background_spawn(async move { client.run_reply(&asked) })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                view.fetching_reply.remove(&id);
+                let reply = answer.unwrap_or_default();
+                view.speak_run_reply(&id, &reply);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Speaks a voiced run's reply once, when reading replies is on.
+    fn speak_run_reply(&mut self, id: &str, reply: &str) {
+        self.voiced.mark_spoken(id);
+        if reply.trim().is_empty() || !self.voice.prefs().read_replies {
+            return;
+        }
+        self.voice.speak_reply(id, reply);
+    }
+
+    /// The composer's microphone: the first tap opens it, the second ends the utterance.
+    fn toggle_dictation(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.listening.take() {
+            self.voice.listen_stop(&id);
+        } else {
+            let id = self.voice.listen_start();
+            self.listening = Some(id);
+        }
+        cx.notify();
+    }
+
+    /// The composer's text, which the tests read after a dictation.
+    pub fn composer_text(&self, cx: &App) -> String {
+        self.message.read(cx).text().to_string()
+    }
+
+    /// The microphone action before Send, pressed while the microphone is open.
+    fn dictation_action(&self, cx: &mut Context<Self>) -> ComposerAction {
+        let listening = self.listening.is_some() || self.voice.is_listening();
+        let weak = cx.weak_entity();
+        ComposerAction::new(
+            "voice-mic",
+            Icon::Microphone,
+            if listening {
+                "Stop dictation"
+            } else {
+                "Dictate"
+            },
+        )
+        .active(listening)
+        .on_click(move |_, cx| {
+            let _ = weak.update(cx, |view, cx| view.toggle_dictation(cx));
+        })
+    }
+
+    /// The blob beside the composer, while a dictation or a reply is playing.
+    fn voice_mark(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let listening = self.listening.is_some() || self.voice.is_listening();
+        let speaking = self.voice.is_speaking();
+        if !listening && !speaking {
+            return None;
+        }
+        Some(voice_blob(&self.voice, speaking, Theme::global(cx)))
     }
 
     fn install_bodies(&mut self, cx: &mut Context<Self>) {
@@ -755,6 +967,7 @@ impl RunPageView {
         if prompt.is_empty() || self.sending {
             return;
         }
+        let voiced = self.take_voiced(&prompt);
         let client = self.state.read(cx).client();
         let Some(client) = client else {
             self.toast("Dispatch core is not running", ToastTone::Danger, cx);
@@ -797,6 +1010,9 @@ impl RunPageView {
                     Ok(response) if !response.run.id.is_empty() => {
                         let id = response.run.id.clone();
                         view.message.update(cx, |input, cx| input.set_text("", cx));
+                        if voiced {
+                            view.voiced.mark_voiced(&id);
+                        }
                         view.draft.started = Some((id.clone(), generation, pick));
                         view.draft.open = false;
                         view.state.update(cx, |state, cx| {
@@ -906,6 +1122,7 @@ impl RunPageView {
         if !can_send {
             card = card.can_send(false);
         }
+        card = card.trailing_action(self.dictation_action(cx));
         // Worktree: a ghost button that takes the primary colors while on, when the run gets
         // a git worktree and branch of its own; off, it edits the folder itself.
         if let Some(place) = self.place(cx) {
@@ -969,7 +1186,15 @@ impl RunPageView {
                     .size(ButtonSize::Sm),
                 )
         });
-        let card = div().w_full().children(busy).child(card);
+        let card = div().w_full().children(busy).child(
+            div()
+                .w_full()
+                .flex()
+                .items_end()
+                .gap(px(8.0))
+                .children(self.voice_mark(cx))
+                .child(div().flex_1().min_w(px(0.0)).child(card)),
+        );
         let column = div()
             .flex_1()
             .min_h(px(0.0))
@@ -1042,6 +1267,7 @@ impl RunPageView {
         if prompt.is_empty() || self.sending {
             return;
         }
+        let voiced = self.take_voiced(&prompt);
         let Some(run) = self.snapshot_run.clone() else {
             return;
         };
@@ -1073,6 +1299,9 @@ impl RunPageView {
                             cx.notify();
                         } else {
                             let id = response.run.id.clone();
+                            if voiced {
+                                view.voiced.mark_voiced(&id);
+                            }
                             view.state
                                 .update(cx, |state, _| state.note_run(response.run));
                             view.open_run(id, cx);
@@ -1117,6 +1346,7 @@ impl RunPageView {
         if blocked {
             card = card.can_send(false);
         }
+        card = card.trailing_action(self.dictation_action(cx));
         Some(
             div()
                 .w_full()
@@ -1127,7 +1357,16 @@ impl RunPageView {
                 // The column runs to the page's edge: the composer keeps the text's room.
                 .pr(px(16.0 + end_pad))
                 .pb(px(16.0))
-                .child(div().w_full().max_w(px(WIDE_MEASURE)).child(card))
+                .child(
+                    div()
+                        .w_full()
+                        .max_w(px(WIDE_MEASURE))
+                        .flex()
+                        .items_end()
+                        .gap(px(8.0))
+                        .children(self.voice_mark(cx))
+                        .child(div().flex_1().min_w(px(0.0)).child(card)),
+                )
                 .into_any_element(),
         )
     }

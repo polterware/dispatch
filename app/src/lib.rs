@@ -15,6 +15,7 @@ pub mod ui;
 pub mod updater;
 pub use polterware_ui::window::vibrancy;
 pub mod views;
+pub mod voice;
 pub use polterware_ui::window::window_drag;
 
 use app::{CheckForUpdates, NewConversation, OpenSettings, Quit, register_key_bindings};
@@ -33,6 +34,7 @@ pub fn run() {
             theme::set_status_tones(theme::dispatch_status_tone);
             cx.set_global(Theme::dark());
             polterware_ui::init(cx);
+            voice::init(cx);
             register_key_bindings(cx);
             let updates = updater::start().is_ok();
             let mut items = vec![

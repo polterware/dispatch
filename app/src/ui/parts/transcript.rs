@@ -13,8 +13,9 @@ use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
 use gpui::{
-    AnyElement, App, ClipboardItem, Font, FontFallbacks, FontFeatures, FontStyle, FontWeight,
-    HighlightStyle, Hsla, IntoElement, SharedString, StyledText, Window, div, font, prelude::*, px,
+    AnyElement, App, ClipboardItem, ElementId, Font, FontFallbacks, FontFeatures, FontStyle,
+    FontWeight, HighlightStyle, Hsla, IntoElement, SharedString, StyledText, Window, div, font,
+    prelude::*, px,
 };
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use syntect::easy::ScopeRegionIterator;
@@ -23,7 +24,9 @@ use syntect::parsing::{ParseState, ScopeStack, SyntaxSet};
 use crate::avatar::{BotAvatarState, agent_avatar_playing};
 use crate::models::transcript::{PromptBubble, TranscriptEntry, looks_like_diff, looks_like_json};
 use crate::theme::{StatusTone, Theme, status_tone, tw};
-use crate::ui::{ChatBubble, Icon, icon_colored, mono, sans, wrap_text};
+use crate::ui::{
+    Button, ButtonKind, ButtonSize, ChatBubble, Icon, icon_colored, mono, sans, wrap_text,
+};
 
 pub const OUTPUT_LINES: usize = 6;
 /// How many lines of the prompt its bubble shows before it folds.
@@ -140,6 +143,10 @@ pub enum RowBody {
         handoff: Option<String>,
         expanded: bool,
     },
+    /// The Read action under an agent's reply: it reads the reply aloud on demand.
+    Reply {
+        text: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -200,6 +207,8 @@ pub struct RowFrame {
     pub on_expand: Rc<dyn Fn(usize, &mut Window, &mut App)>,
     /// The prompt bubble's fold: called with whether it is now open.
     pub on_prompt_toggle: PromptToggle,
+    /// Reads a reply aloud on demand.
+    pub on_read: Rc<dyn Fn(String, &mut Window, &mut App)>,
 }
 
 /// JetBrains Mono when the machine or the asset source has it, else Menlo.
@@ -297,7 +306,12 @@ pub fn flatten_transcript(
             TranscriptEntry::Thinking { text } => {
                 push_row(&mut rows, RowBody::Thinking(strip_bold(text)));
             }
-            TranscriptEntry::Message { text } => push_markdown(&mut rows, text),
+            TranscriptEntry::Message { text } => {
+                push_markdown(&mut rows, text);
+                if !text.trim().is_empty() {
+                    push_row(&mut rows, RowBody::Reply { text: text.clone() });
+                }
+            }
             TranscriptEntry::Output { text } => {
                 push_output_lines(&mut rows, index, text, false, false, None);
             }
@@ -396,7 +410,7 @@ pub fn prompt_transcript_row(bubble: &PromptBubble, expanded: bool) -> Transcrip
 pub fn render_row(
     frame: &RowFrame,
     row: &TranscriptRow,
-    _window: &mut Window,
+    window: &mut Window,
     cx: &mut App,
 ) -> gpui::AnyElement {
     let theme = frame.theme;
@@ -514,13 +528,42 @@ pub fn render_row(
                 toggle,
             )
         }
+        RowBody::Reply { text } => reply_row(frame, row.signature, text, window, cx),
     };
-    let _ = cx;
     let mut wrap = div().w_full();
     if opacity < 0.999 {
         wrap = wrap.opacity(opacity);
     }
     wrap.child(child).into_any_element()
+}
+
+/// The Read action under an agent's reply: a quiet ghost button that reads it aloud on demand.
+fn reply_row(
+    frame: &RowFrame,
+    signature: u64,
+    text: &str,
+    _window: &mut Window,
+    _cx: &mut App,
+) -> AnyElement {
+    let on_read = frame.on_read.clone();
+    let said = text.to_string();
+    div()
+        .w_full()
+        .min_h(px(TERM_LINE_PX))
+        .child(
+            Button::new(
+                ElementId::Name(format!("read-{signature:x}").into()),
+                ButtonKind::Ghost,
+            )
+            .size(ButtonSize::Sm)
+            .height(22.0)
+            .icon(Icon::Play)
+            .icon_size(12.0)
+            .label("Read aloud")
+            .tooltip("Read this reply aloud")
+            .on_click(move |window, cx| on_read(said.clone(), window, cx)),
+        )
+        .into_any_element()
 }
 
 pub fn highlight_line(line: &str, language: &str) -> Vec<HlSpan> {
@@ -1444,6 +1487,10 @@ fn body_signature(body: &RowBody) -> u64 {
             label.hash(&mut hasher);
             handoff.hash(&mut hasher);
             expanded.hash(&mut hasher);
+        }
+        RowBody::Reply { text } => {
+            18u8.hash(&mut hasher);
+            text.hash(&mut hasher);
         }
     }
     hasher.finish()
