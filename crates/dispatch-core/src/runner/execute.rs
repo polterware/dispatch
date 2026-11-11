@@ -307,6 +307,7 @@ impl Deps {
             prompt: o.prompt.clone(),
             dir: o.dir.clone(),
             read_only: o.read_only,
+            images: o.images,
             created_at: fmt_time(self.now()),
             timeout_sec: i64::try_from(o.timeout.as_secs()).unwrap_or(i64::MAX),
             no_worktree: o.no_worktree,
@@ -351,6 +352,8 @@ impl Deps {
             rec.base_sha.clone_from(&prev.base_sha);
             rec.provider.clone_from(&prev.provider);
             rec.effort.clone_from(&prev.effort);
+            // A follow-up carries on in the mode its run had.
+            rec.images = o.images || prev.images;
             rec.resolved.clone_from(&prev.resolved);
             rec.linked.clone_from(&prev.linked);
             let f = &o.filters;
@@ -575,6 +578,7 @@ impl Deps {
         let mut o = Options {
             tier: rec.tier.clone(),
             read_only: rec.read_only,
+            images: rec.images,
             prefer: rec.prefer.clone(),
             avoid: rec.avoid.clone(),
             profile: rec.profile.clone(),
@@ -776,8 +780,8 @@ impl Deps {
             Some(h) if !h.is_empty() => super::handoff::prompt_with_handoff(h),
             _ => rec.prompt.clone(),
         };
-        // The image mode of a later phase asks for images; until then only the folder is passed.
-        let wants_images = false;
+        // The run's folder is always passed; the brief names it when the run asks for images.
+        let wants_images = rec.images;
         let artifacts_note = artifacts
             .as_deref()
             .map(|dir| crate::artifacts::brief_note(wants_images, dir))

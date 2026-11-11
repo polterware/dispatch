@@ -147,6 +147,11 @@ pub struct Usage {
     pub context_tokens: i64,
     #[serde(skip_serializing_if = "is_zero")]
     pub context_window: i64,
+    /// Images the CLI said it made, and the price it gave them, if any.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub image_generations: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_cost_usd: Option<f64>,
 }
 
 fn is_zero(v: &i64) -> bool {
@@ -193,6 +198,9 @@ pub struct Run {
     pub base_sha: String,
     pub read_only: bool,
     pub no_worktree: bool,
+    /// The run asked for images: it routed only to agents that make them, and its brief names
+    /// the run's artifacts folder.
+    pub images: bool,
     pub agent_run_id: String,
     pub card_slug: String,
     /// Routing input resolved by the caller; not stored (the decision log keeps it).

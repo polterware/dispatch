@@ -11,13 +11,37 @@ pub struct Usage {
     pub cost_usd: Option<f64>,
     pub context_tokens: i64,
     pub context_window: i64,
+    /// Images the CLI said it made, and the price it named for them.
+    pub image_generations: i64,
+    pub image_cost_usd: Option<f64>,
 }
 
 pub fn usage_line(u: &Usage) -> String {
     format!(
         "{}\n",
-        json!({"dispatch":"usage", "context":u.context_tokens, "window":u.context_window, "input":u.input_tokens, "cacheRead":u.cache_read_tokens, "cacheWrite":u.cache_write_tokens, "output":u.output_tokens, "reasoning":u.reasoning_tokens, "costUsd":u.cost_usd})
+        json!({"dispatch":"usage", "context":u.context_tokens, "window":u.context_window, "input":u.input_tokens, "cacheRead":u.cache_read_tokens, "cacheWrite":u.cache_write_tokens, "output":u.output_tokens, "reasoning":u.reasoning_tokens, "costUsd":u.cost_usd, "images":u.image_generations, "imageCostUsd":u.image_cost_usd})
     )
+}
+
+/// Images a CLI's usage object names, when it names any: how many it made and what it
+/// charged for them. An agent that bills images in its own total needs nothing here.
+fn add_images(u: &mut Usage, x: &Value) {
+    let count = x
+        .get("imageGenerations")
+        .or_else(|| x.get("image_generations"))
+        .or_else(|| x.get("images"))
+        .and_then(Value::as_i64);
+    if let Some(n) = count.filter(|n| *n > 0) {
+        u.image_generations += n;
+    }
+    let cost = x
+        .get("imageCostUsd")
+        .or_else(|| x.get("image_cost_usd"))
+        .and_then(Value::as_f64)
+        .filter(|c| c.is_finite() && *c > 0.0);
+    if let Some(c) = cost {
+        u.image_cost_usd = Some(u.image_cost_usd.unwrap_or(0.0) + c);
+    }
 }
 fn num(v: &Value, key: &str) -> i64 {
     v.get(key).and_then(Value::as_i64).unwrap_or(0)
@@ -28,19 +52,22 @@ fn grok_add(u: &mut Usage, x: &Value) {
     u.cache_write_tokens += num(x, "cache_creation_input_tokens");
     u.output_tokens += num(x, "output_tokens");
     u.reasoning_tokens += num(x, "reasoning_tokens");
+    add_images(u, x);
 }
 pub fn usage_cursor(stdout: &str) -> Option<Usage> {
     let mut out = None;
     for ev in events(stdout) {
         if text(&ev, "type") == "result" && ev["usage"].is_object() {
             let x = &ev["usage"];
-            out = Some(Usage {
+            let mut u = Usage {
                 input_tokens: num(x, "inputTokens"),
                 output_tokens: num(x, "outputTokens"),
                 cache_read_tokens: num(x, "cacheReadTokens"),
                 cache_write_tokens: num(x, "cacheWriteTokens"),
                 ..Usage::default()
-            });
+            };
+            add_images(&mut u, x);
+            out = Some(u);
         }
     }
     out
@@ -85,6 +112,7 @@ pub fn usage_pi(stdout: &str) -> Option<Usage> {
             continue;
         }
         let u = out.get_or_insert_with(Usage::default);
+        add_images(u, x);
         let (input, read, write, output) = (
             num(x, "input"),
             num(x, "cacheRead"),
@@ -149,6 +177,7 @@ pub fn usage_claude(stdout: &str) -> Option<Usage> {
             cost_usd: ev["total_cost_usd"].as_f64(),
             ..Usage::default()
         };
+        add_images(&mut u, &ev);
         let models = ev["modelUsage"].as_object();
         if models.is_none_or(|m| m.is_empty()) {
             claude_add(&mut u, x);
@@ -199,6 +228,9 @@ pub struct AcpUsage {
     pub cached_write_tokens: i64,
     pub thought_tokens: i64,
     pub total_tokens: i64,
+    /// Images the agent said it made, and the price it gave them, when it names them.
+    pub image_generations: i64,
+    pub image_cost_usd: Option<f64>,
 }
 impl AcpUsage {
     pub fn normalize(&self) -> Usage {
@@ -222,6 +254,8 @@ impl AcpUsage {
             cache_write_tokens: self.cached_write_tokens,
             output_tokens: output,
             reasoning_tokens: self.thought_tokens,
+            image_generations: self.image_generations,
+            image_cost_usd: self.image_cost_usd,
             ..Usage::default()
         }
     }

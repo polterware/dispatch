@@ -80,6 +80,14 @@ pub fn capabilities(name: &str) -> Capabilities {
         read_only: true,
         file_editing: true,
         usage: matches!(name, "codex" | "claude" | "antigravity"),
+        // Grok's image_gen, Codex's image_gen, and Cursor's generate_image write the
+        // image where they are told. Antigravity's generate_image and OpenCode's
+        // experimental tool wait for an image model, and Pi's codemode needs a key and
+        // tool of its own; Gemini, Claude Code, Copilot, and Kimi cannot make images.
+        // An ACP agent the user added may carry its own image tool, so it is not
+        // refused for one Dispatch cannot see.
+        images: matches!(name, "grok" | "codex" | "cursor")
+            || super::acp::custom_agents().contains_key(name),
         ..Default::default()
     };
     if matches!(name, "codex" | "claude" | "pi") {
@@ -352,5 +360,28 @@ pub fn usage_source(name: &str) -> Option<&'static str> {
         "antigravity" => Some(super::quota::SOURCE_AGY_USAGE),
         "claude" => Some(super::quota::SOURCE_CLAUDE_STREAM),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::capabilities;
+
+    #[test]
+    fn only_the_agents_that_make_images_say_so() {
+        for name in ["grok", "codex", "cursor"] {
+            assert!(capabilities(name).images, "{name} makes images");
+        }
+        for name in [
+            "antigravity",
+            "opencode",
+            "pi",
+            "gemini",
+            "claude",
+            "copilot",
+            "kimi",
+        ] {
+            assert!(!capabilities(name).images, "{name} makes no images");
+        }
     }
 }

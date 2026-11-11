@@ -143,7 +143,9 @@ fn claude_usage_counts_every_model() {
             reasoning_tokens: 5,
             cost_usd: Some(0.5),
             context_tokens: 160,
-            context_window: 1000000
+            context_window: 1000000,
+            image_generations: 0,
+            image_cost_usd: None,
         })
     );
 }

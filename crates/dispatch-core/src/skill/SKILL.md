@@ -78,6 +78,10 @@ dispatch run --role none …        # no role, no pick
 
 Explicit flags win over the role. `prefer` and `avoid` are weights in the ranking, not filters.
 
+## Images
+
+A run asked for images (`dispatch run --images`) routes only to the agents that can make them (Codex, Cursor, and Grok today, plus ACP agents you added), or fails with "no image-capable agent installed", and its brief says to write each image into `$DISPATCH_ARTIFACTS_DIR` with a name that says what it is; `dispatch route --images` shows the narrowed candidates. Images a normal run happens to write in its folder or in its worktree are collected all the same. No price covers an image unless the agent's own usage names one, so an unpriced one leaves the run's cost as it was, marked partial.
+
 ## Filters and routing (optional; Auto is the default with a classifier, else normal)
 
 `run --with <dir>,<dir>` spans other repositories: each gets a worktree on the run's branch, and `merge`/`clean` take them all as one (a repository's own `.dispatch/hooks/link` can point its build at the others; `DISPATCH_LINKED_WORKTREES` names them).

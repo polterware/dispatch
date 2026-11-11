@@ -792,3 +792,65 @@ async fn test_an_agent_the_table_never_names_routes_on_its_own_models() {
         );
     }
 }
+
+fn image_opts() -> Options {
+    Options {
+        images: true,
+        ..opts("easy", Filters::default())
+    }
+}
+
+#[tokio::test]
+async fn image_mode_keeps_only_agents_that_make_images() {
+    let r = routing_deps();
+    // b makes images; a does not.
+    r.fakes[1].caps.lock().unwrap().images = true;
+    let (cs, why) = r.select(image_opts()).await;
+    assert!(
+        !cs.is_empty() && cs.iter().all(|c| c.route.agent == "b"),
+        "{cs:?} {why:?}"
+    );
+    assert!(
+        why.iter().any(|w| w.contains("cannot make images")),
+        "{why:?}"
+    );
+}
+
+#[tokio::test]
+async fn image_mode_with_no_capable_agent_says_so() {
+    let r = routing_deps();
+    let (cs, why) = r.select(image_opts()).await;
+    assert!(cs.is_empty(), "{cs:?}");
+    assert_eq!(why, ["no image-capable agent installed"]);
+}
+
+#[tokio::test]
+async fn an_image_run_is_told_where_to_put_its_images() {
+    let mut r = routing_deps();
+    r.fakes[1].caps.lock().unwrap().images = true;
+    r.t.deps.artifacts_dir = format!("{}/artifacts", r.t.state_dir);
+    let reqs = r.fakes[1].requests.clone();
+    let rec = r.run(image_opts()).await;
+    assert!(rec.images, "{rec:?}");
+    let request = reqs.lock().unwrap()[0].clone();
+    assert!(
+        request.prompt.contains("Write any images you make in"),
+        "{}",
+        request.prompt
+    );
+    assert!(
+        request
+            .prompt
+            .contains(&format!("{}/artifacts/{}", r.t.state_dir, rec.id)),
+        "{}",
+        request.prompt
+    );
+    assert!(
+        request
+            .env
+            .iter()
+            .any(|e| e.starts_with("DISPATCH_ARTIFACTS_DIR=")),
+        "{:?}",
+        request.env
+    );
+}

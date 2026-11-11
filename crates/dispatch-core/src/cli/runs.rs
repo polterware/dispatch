@@ -18,7 +18,7 @@ use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 
-const RUN_USAGE: &str = "usage: dispatch run [--tier <auto|easy|normal|hard>] [--role <name|none>] [--card <slug>] [--agent <name>] [--provider <p>] [--model <m>] [--effort <e>] [--priority <p>] [--relax] [--readonly] [--timeout <dur>] [--dir <repo>] [--worktree-mode worktree|in-place] [--worktree <dir>] [--json] [--compact] <prompt|->
+const RUN_USAGE: &str = "usage: dispatch run [--tier <auto|easy|normal|hard>] [--role <name|none>] [--card <slug>] [--agent <name>] [--provider <p>] [--model <m>] [--effort <e>] [--priority <p>] [--relax] [--readonly] [--images] [--timeout <dur>] [--dir <repo>] [--worktree-mode worktree|in-place] [--worktree <dir>] [--json] [--compact] <prompt|->
        dispatch send <id> [--json] [--compact] <message|->
        dispatch runs [--conversation <id>] [--project <id>] [--json] [--compact]
        dispatch status <id> [--json] [--compact]
@@ -206,6 +206,8 @@ pub(super) fn run_from_proto(p: &pb::DispatchRun) -> Run {
             context_tokens: u.context_tokens,
             context_window: u.context_window,
             cost_partial: u.cost_partial,
+            image_generations: u.image_generations,
+            image_cost_usd: u.image_cost_usd,
         }),
         merged_at: (!p.merged_at.trim().is_empty()
             && chrono::DateTime::parse_from_rfc3339(p.merged_at.trim()).is_ok())
@@ -569,6 +571,11 @@ pub(super) async fn run(db_path: &Path, args: &[String]) -> CliResult {
         "fall back to tier routing when filters match nothing",
     )
     .bool("readonly", false, "run read-only")
+    .bool(
+        "images",
+        false,
+        "ask for images: routes only to agents that make them, and names the run's artifacts folder",
+    )
     .duration(
         "timeout",
         Duration::ZERO,
@@ -624,6 +631,7 @@ pub(super) async fn run(db_path: &Path, args: &[String]) -> CliResult {
             worktree: f.str("worktree").trim().into(),
             dir: wd,
             read_only: f.flag("readonly"),
+            images: f.flag("images"),
             provider: f.str("provider").trim().into(),
             model: f.str("model").trim().into(),
             effort: f.str("effort").trim().into(),
@@ -1526,7 +1534,7 @@ pub(super) async fn agents(db_path: &Path, args: &[String]) -> CliResult {
                 json!({
                     "Name": a.name, "Bin": a.bin, "Provider": a.provider,
                     "UsedPercent": a.used_percent, "CooldownUntil": cooldown,
-                    "Enabled": a.enabled,
+                    "Enabled": a.enabled, "Images": a.images,
                 })
             })
             .collect();
@@ -1542,8 +1550,9 @@ pub(super) async fn agents(db_path: &Path, args: &[String]) -> CliResult {
             .used_percent
             .map_or_else(|| "unknown".to_owned(), |p| format!("{p:.0}%"));
         let state = if a.enabled { "" } else { "  disabled" };
+        let images = if a.images { "  images" } else { "" };
         println!(
-            "{:<12}  {:<10}  used={used}{state}",
+            "{:<12}  {:<10}  used={used}{state}{images}",
             a.name,
             or_unknown(&a.provider)
         );

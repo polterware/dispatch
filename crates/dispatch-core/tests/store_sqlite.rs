@@ -197,7 +197,7 @@ fn conversation_migration_from_0005() {
     assert_eq!(old.session_id, "worker-session");
     assert_eq!(old.conversation_id, "");
     assert_eq!(old.caller_agent, "");
-    assert_eq!(count(&s, "PRAGMA user_version"), 14);
+    assert_eq!(count(&s, "PRAGMA user_version"), 15);
     assert_eq!(
         count(
             &s,
@@ -237,7 +237,7 @@ fn tier_speed_strength_migration_keeps_rows() {
         .unwrap();
     }
     let s = Store::new(path.to_str().unwrap()).unwrap();
-    assert_eq!(count(&s, "PRAGMA user_version"), 14);
+    assert_eq!(count(&s, "PRAGMA user_version"), 15);
     assert_eq!(
         count(
             &s,
@@ -295,10 +295,13 @@ fn runs_conversation_round_trip_and_filter() {
     assert_eq!(got.caller_agent, "codex");
     assert_eq!(got.session_id, "worker-first");
     got.note = "updated".into();
+    got.images = true;
     s.save_run(&got).unwrap();
     let got = s.get_run("first").unwrap();
     assert_eq!(got.conversation_id, "codex:chat");
     assert_eq!(got.note, "updated");
+    assert!(got.images);
+    assert!(!s.get_run("second").unwrap().images);
     assert_eq!(s.list_runs("", 0, 0, "codex:chat").unwrap().len(), 3);
     let page = s.list_runs("one", 1, 1, "codex:chat").unwrap();
     assert_eq!(page.len(), 1);

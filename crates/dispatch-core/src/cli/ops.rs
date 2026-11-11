@@ -27,7 +27,7 @@ use std::path::Path;
 use std::time::Duration;
 
 pub(crate) const OPS_USAGE: &str = "       dispatch wait <id> [--timeout <dur>] [--json=false]
-       dispatch route [--tier <auto|easy|normal|hard>] [--provider <p>] [--model <m>] [--effort <e>] [--agent <a>] [--priority speed|balanced|quality] [--relax] [--readonly] [--role <name|none>] [--card <slug>] [--dir <repo>] [--json] [<prompt>]
+       dispatch route [--tier <auto|easy|normal|hard>] [--provider <p>] [--model <m>] [--effort <e>] [--agent <a>] [--priority speed|balanced|quality] [--relax] [--readonly] [--images] [--role <name|none>] [--card <slug>] [--dir <repo>] [--json] [<prompt>]
        dispatch models [--json] | enable|disable <model> --agent <name> | enable|disable <provider>[/<model>] | refresh | bench [--json]
        dispatch classify [--card <slug>] [--dir <repo>] [--json] <prompt>
        dispatch config get [priority|discover|roles|classifier|classifier_model|classifier_agent|classifier_keys|classifier_cli]
@@ -173,6 +173,7 @@ pub(super) async fn route(db_path: &Path, args: &[String]) -> CliResult {
         "fall back to tier routing when filters match nothing",
     )
     .bool("readonly", false, "require read-only capability")
+    .bool("images", false, "keep only agents that can make images")
     .string(
         "role",
         "",
@@ -200,6 +201,7 @@ pub(super) async fn route(db_path: &Path, args: &[String]) -> CliResult {
             priority: f.str("priority"),
             relax: f.flag("relax"),
             read_only: f.flag("readonly"),
+            images: f.flag("images"),
             dir,
             profile: f.str("role"),
             prompt: positional.join(" ").trim().to_owned(),

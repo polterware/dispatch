@@ -62,6 +62,7 @@ pub fn run(r: &Run) -> pb::DispatchRun {
         branch: r.branch.clone(),
         base_sha: r.base_sha.clone(),
         read_only: r.read_only,
+        images: r.images,
         exit_code: i32_of(r.exit_code),
         exit_class: r.exit_class.clone(),
         error: r.error.clone(),
@@ -91,6 +92,8 @@ pub fn run(r: &Run) -> pb::DispatchRun {
             context_tokens: u.context_tokens,
             context_window: u.context_window,
             cost_partial: u.cost_partial,
+            image_generations: u.image_generations,
+            image_cost_usd: u.image_cost_usd,
         }),
         worktree_status: r.worktree_status.clone(),
         // A pending run has not cut its worktree yet.
@@ -205,6 +208,7 @@ pub fn agent(a: &Agent) -> pb::DispatchAgent {
             .unwrap_or_default(),
         installed: false,
         enabled: true,
+        images: crate::adapters::probe::capabilities(&a.name).images,
     }
 }
 
@@ -351,6 +355,7 @@ pub fn run_meta(r: &Run) -> Value {
         ("BaseSHA", json!(r.base_sha)),
         ("ReadOnly", json!(r.read_only)),
         ("NoWorktree", json!(r.no_worktree)),
+        ("Images", json!(r.images)),
         ("AgentRunID", json!(r.agent_run_id)),
         ("CardSlug", json!(r.card_slug)),
         ("Area", json!(r.area)),

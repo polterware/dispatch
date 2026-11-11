@@ -420,6 +420,7 @@ impl Core {
             dir: dir.clone(),
             with: m.with.iter().map(|d| absolute(d.trim())).collect(),
             read_only: m.read_only,
+            images: m.images,
             no_worktree,
             timeout: Duration::from_secs(u64::try_from(m.timeout_sec).unwrap_or(0)),
             filters: Filters {
@@ -625,6 +626,7 @@ impl Core {
             prompt: prompt.clone(),
             dir: dir.clone(),
             read_only: prev.read_only,
+            images: prev.images,
             no_worktree: prev.no_worktree,
             timeout: Duration::from_secs(u64::try_from(prev.timeout_sec).unwrap_or(0)),
             resume: prev.id.clone(),
