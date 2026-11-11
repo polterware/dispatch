@@ -305,6 +305,47 @@ fn the_run_page_merges_then_deletes_the_worktree(cx: &mut TestAppContext) {
     );
 }
 
+/// A run that made an image shows it under its reply, and a click opens it whole.
+#[gpui::test]
+fn a_runs_image_shows_under_its_reply_and_opens_whole(cx: &mut TestAppContext) {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let core = Core::new();
+    let id = core.start("IMAGE draw a chart", false);
+    core.wait_for(&id, "COMPLETED");
+    let artifact = core
+        .client
+        .list_artifacts(&dispatch_app::client::ListArtifactsRequest::default())
+        .expect("artifacts")
+        .artifacts
+        .into_iter()
+        .find(|artifact| artifact.run_id == id)
+        .expect("the run's image");
+    assert!(artifact.path.ends_with(".png"), "{}", artifact.path);
+    let mut w = open(&core, cx);
+    w.go(Route::Run(id.clone()));
+
+    let thumb = format!("transcript-image-{}", artifact.id);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !w.shows(&thumb) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the run's image never showed under its reply"
+        );
+        w.settle();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(!w.shows("image-reveal"), "the viewer opened before a click");
+    w.click(&thumb);
+    w.pump();
+    assert!(
+        w.shows("image-reveal") && w.shows("image-copy"),
+        "the thumbnail opened no viewer with Reveal and Copy"
+    );
+    w.click("transcript-image-viewer-close");
+    w.pump();
+    assert!(w.toasts().is_empty(), "{:?}", w.toasts());
+}
+
 #[gpui::test]
 fn the_run_page_sends_a_message_to_an_ended_run(cx: &mut TestAppContext) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());

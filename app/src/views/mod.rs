@@ -2,6 +2,7 @@
 
 mod commander;
 mod conversation_usage;
+mod image_viewer;
 mod intelligence;
 pub mod repository_actions;
 mod roles;
@@ -15,6 +16,7 @@ mod transcript;
 
 pub use commander::CommanderView;
 pub use conversation_usage::ConversationUsageView;
+pub use image_viewer::ImageViewerView;
 
 /// What the core said when a call failed, in words for a toast.
 pub(crate) fn core_message(error: crate::client::CoreError) -> String {

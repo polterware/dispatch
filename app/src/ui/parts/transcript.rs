@@ -22,10 +22,13 @@ use syntect::easy::ScopeRegionIterator;
 use syntect::parsing::{ParseState, ScopeStack, SyntaxSet};
 
 use crate::avatar::{BotAvatarState, agent_avatar_playing};
-use crate::models::transcript::{PromptBubble, TranscriptEntry, looks_like_diff, looks_like_json};
+use crate::models::transcript::{
+    PromptBubble, TranscriptEntry, TranscriptImage, looks_like_diff, looks_like_json,
+};
 use crate::theme::{StatusTone, Theme, status_tone, tw};
 use crate::ui::{
-    Button, ButtonKind, ButtonSize, ChatBubble, Icon, icon_colored, mono, sans, wrap_text,
+    Button, ButtonKind, ButtonSize, ChatBubble, Icon, ImageData, ImageThumb, icon_colored, mono,
+    sans, wrap_text,
 };
 
 pub const OUTPUT_LINES: usize = 6;
@@ -147,6 +150,10 @@ pub enum RowBody {
     Reply {
         text: String,
     },
+    /// The images the run made, under its reply: thumbnails a click opens whole.
+    Images {
+        images: Vec<TranscriptImage>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -197,6 +204,9 @@ impl Default for HighlightCache {
 /// Opens (`true`) or folds the prompt's bubble.
 pub type PromptToggle = Rc<dyn Fn(bool, &mut Window, &mut App)>;
 
+/// Opens one of the run's images whole, by its artifact id.
+pub type ImageOpen = Rc<dyn Fn(String, &mut Window, &mut App)>;
+
 pub struct RowFrame {
     pub theme: Theme,
     pub index: usize,
@@ -209,6 +219,8 @@ pub struct RowFrame {
     pub on_prompt_toggle: PromptToggle,
     /// Reads a reply aloud on demand.
     pub on_read: Rc<dyn Fn(String, &mut Window, &mut App)>,
+    /// Opens one of the run's images whole, by its artifact id.
+    pub on_image: ImageOpen,
 }
 
 /// JetBrains Mono when the machine or the asset source has it, else Menlo.
@@ -407,6 +419,17 @@ pub fn prompt_transcript_row(bubble: &PromptBubble, expanded: bool) -> Transcrip
     }
 }
 
+/// The row that closes a run's transcript with the images it made, under its reply.
+pub fn images_transcript_row(images: &[TranscriptImage]) -> TranscriptRow {
+    let body = RowBody::Images {
+        images: images.to_vec(),
+    };
+    TranscriptRow {
+        signature: body_signature(&body),
+        body,
+    }
+}
+
 pub fn render_row(
     frame: &RowFrame,
     row: &TranscriptRow,
@@ -529,6 +552,7 @@ pub fn render_row(
             )
         }
         RowBody::Reply { text } => reply_row(frame, row.signature, text, window, cx),
+        RowBody::Images { images } => images_row(frame, images, &theme),
     };
     let mut wrap = div().w_full();
     if opacity < 0.999 {
@@ -564,6 +588,30 @@ fn reply_row(
             .on_click(move |window, cx| on_read(said.clone(), window, cx)),
         )
         .into_any_element()
+}
+
+/// The images under a run's reply: a wrapped row of thumbnails, each opening whole.
+fn images_row(frame: &RowFrame, images: &[TranscriptImage], theme: &Theme) -> AnyElement {
+    let mut row = div().w_full().pt(px(8.0)).flex().flex_wrap().gap(px(10.0));
+    for image in images {
+        let on_image = frame.on_image.clone();
+        let id = image.id.clone();
+        let name = image.id.clone();
+        row = row.child(
+            div()
+                .debug_selector(move || format!("transcript-image-{name}"))
+                .child(
+                    ImageThumb::new(
+                        ElementId::Name(SharedString::from(format!("image-{}", image.id))),
+                        ImageData::from_path(image.path.clone()),
+                    )
+                    .size(120.0)
+                    .caption(image.title.clone())
+                    .on_click(move |window, cx| on_image(id.clone(), window, cx)),
+                ),
+        );
+    }
+    row.text_color(theme.color_text_muted).into_any_element()
 }
 
 pub fn highlight_line(line: &str, language: &str) -> Vec<HlSpan> {
@@ -1491,6 +1539,12 @@ fn body_signature(body: &RowBody) -> u64 {
         RowBody::Reply { text } => {
             18u8.hash(&mut hasher);
             text.hash(&mut hasher);
+        }
+        RowBody::Images { images } => {
+            19u8.hash(&mut hasher);
+            for image in images {
+                image.id.hash(&mut hasher);
+            }
         }
     }
     hasher.finish()
