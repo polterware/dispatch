@@ -1,24 +1,55 @@
-//! Pure logic for the Runs page (the sidebar's View all): every workspace's runs as
-//! `DispatchRunRow` draws them, each with the repository it came from (named as the sidebar
-//! names its repository groups), their filter fields, search, and sort. Nothing here performs
-//! IO beyond the sidebar's cached look-up of a worktree's main checkout.
+//! Pure logic for the Runs page (the sidebar's View all): every workspace's runs as stacked
+//! rows grouped by the page's [`SidebarDisplay`] (Status by default), each with the repository
+//! it came from (named as the sidebar names its repository groups), its filter fields, search,
+//! and usage figures. Nothing here performs IO beyond the sidebar's cached look-up of a
+//! worktree's main checkout.
 
 use std::collections::HashMap;
 
 use crate::client::{DispatchRun, Workspace};
 
 use super::filter::{FilterOption, FilterSpec, Filters};
-use super::sidebar::main_checkout;
+use super::run_page::{format_tokens, run_cost, stored_usage, token_breakdown, total_tokens};
+use super::sidebar::{
+    Direction, GroupBy, GroupKind, Show, SidebarDisplay, SidebarRun, SortBy, group_sidebar_runs,
+    main_checkout, parse_display_with,
+};
 use super::sort::{SortDirection, SortValue, sort_rows};
 
 pub const EM_DASH: &str = "\u{2014}";
+pub const DISPLAY_PREFERENCE: &str = "pwdispatch.runs.display";
+pub const COLLAPSED_PREFERENCE: &str = "pwdispatch.runs.collapsed";
 
 /// The Runs table's columns: Run, Repository, Status, Agent, Changes, and Started.
 pub const COLUMNS: [&str; 6] = ["Run", "Repository", "Status", "Agent", "Changes", "Started"];
 /// Changes is the one column that does not sort.
 pub const SORTABLE: [bool; 6] = [true, true, true, true, false, true];
 
-/// One run in the Runs table.
+/// The Runs page's default Display: grouped by Status, newest updated first, showing all runs.
+pub fn runs_default_display() -> SidebarDisplay {
+    SidebarDisplay {
+        group_by: GroupBy::Status,
+        sort_by: SortBy::Updated,
+        direction: Direction::Desc,
+        show: Show::All,
+    }
+}
+
+/// Validates the Runs page's persisted Display preferences, defaulting `groupBy` to `Status`.
+pub fn parse_runs_display(raw: &str) -> SidebarDisplay {
+    parse_display_with(raw, runs_default_display())
+}
+
+/// One group of runs on the Runs page.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RunGroup {
+    pub id: String,
+    pub kind: GroupKind,
+    pub title: String,
+    pub runs: Vec<RunRow>,
+}
+
+/// One run on the Runs page.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunRow {
     pub id: String,
@@ -46,9 +77,17 @@ pub struct RunRow {
     pub files_changed: Option<i32>,
     pub insertions: Option<i32>,
     pub deletions: Option<i32>,
+    /// Total tokens when reported, and its breakdown tooltip.
+    pub tokens_label: Option<String>,
+    pub tokens_title: String,
+    /// API-equivalent cost when known, and its source tooltip.
+    pub cost_label: Option<String>,
+    pub cost_title: String,
     /// `createdAt || startedAt`, which Started shows and sorts by.
     pub started: String,
     pub active: bool,
+    /// The sidebar representation used when grouping with [`group_sidebar_runs`].
+    pub sidebar: SidebarRun,
 }
 
 impl RunRow {
@@ -61,12 +100,8 @@ impl RunRow {
     /// the first of the run's repo, its folder, and the workspace's path, at its main checkout,
     /// as `SidebarRun::from_dispatch` finds it.
     pub fn of(run: &DispatchRun, workspace_name: &str, workspace_path: &str) -> Self {
-        let repo = [run.repo.as_str(), run.dir.as_str(), workspace_path]
-            .into_iter()
-            .map(|path| path.trim().trim_end_matches('/'))
-            .find(|path| !path.is_empty())
-            .map(main_checkout)
-            .unwrap_or_default();
+        let sidebar = SidebarRun::from_dispatch(run, workspace_name, workspace_path);
+        let repo = sidebar.repo.clone();
         let folder = repo.rsplit('/').next().unwrap_or_default();
         let workspace_name = workspace_name.trim();
         let source = [folder, workspace_name, run.project_id.as_str()]
@@ -85,6 +120,22 @@ impl RunRow {
             repo
         };
         let title = run.prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+        let usage = stored_usage(&run.usage);
+        let (tokens_label, tokens_title) = match usage.as_ref() {
+            Some(usage) if total_tokens(usage) > 0 => (
+                Some(format!("{} tokens", format_tokens(total_tokens(usage)))),
+                token_breakdown(usage),
+            ),
+            _ => (None, String::new()),
+        };
+        let (cost_label, cost_title) =
+            match usage.as_ref().filter(|usage| usage.cost_usd.is_some()) {
+                Some(usage) => {
+                    let cost = run_cost(usage);
+                    (Some(cost.label), cost.title)
+                }
+                None => (None, String::new()),
+            };
         Self {
             id: run.id.clone(),
             title: if title.is_empty() {
@@ -108,12 +159,17 @@ impl RunRow {
             files_changed: run.files_changed,
             insertions: run.insertions,
             deletions: run.deletions,
+            tokens_label,
+            tokens_title,
+            cost_label,
+            cost_title,
             started: if run.created_at.is_empty() {
                 run.started_at.clone()
             } else {
                 run.created_at.clone()
             },
             active: is_run_active(&run.status),
+            sidebar,
         }
     }
 
@@ -236,6 +292,26 @@ pub fn visible_rows(
         }
         _ => kept,
     }
+}
+
+/// Groups `rows` with [`group_sidebar_runs`] under `display`, so the Runs page shares the
+/// sidebar's grouping, Display filters, and running-first order.
+pub fn group_run_rows(rows: &[RunRow], display: &SidebarDisplay, now_ms: i64) -> Vec<RunGroup> {
+    let by_id: HashMap<&str, &RunRow> = rows.iter().map(|row| (row.id.as_str(), row)).collect();
+    let sidebar_runs: Vec<SidebarRun> = rows.iter().map(|row| row.sidebar.clone()).collect();
+    group_sidebar_runs(&sidebar_runs, &[], display, now_ms)
+        .into_iter()
+        .map(|group| RunGroup {
+            id: group.id,
+            kind: group.kind,
+            title: group.title,
+            runs: group
+                .runs
+                .iter()
+                .filter_map(|run| by_id.get(run.id.as_str()).copied().cloned())
+                .collect(),
+        })
+        .collect()
 }
 
 fn sort_value(row: &RunRow, column: usize) -> SortValue {
@@ -636,5 +712,54 @@ mod tests {
             )),
             ["a", "b", "c"]
         );
+    }
+
+    #[test]
+    fn defaults_the_runs_page_display_to_status_and_validates_saved_preferences() {
+        let default = runs_default_display();
+        assert_eq!(default.group_by, GroupBy::Status);
+        assert_eq!(default.sort_by, SortBy::Updated);
+        assert_eq!(default.direction, Direction::Desc);
+        assert_eq!(default.show, Show::All);
+        assert_ne!(default, SidebarDisplay::default());
+
+        for raw in ["", "broken", "{}", r#"{"groupBy":"unknown"}"#] {
+            assert_eq!(parse_runs_display(raw), default);
+        }
+        assert_eq!(
+            parse_runs_display(r#"{"groupBy":"repository","direction":"asc"}"#),
+            SidebarDisplay {
+                group_by: GroupBy::Repository,
+                sort_by: SortBy::Updated,
+                direction: Direction::Asc,
+                show: Show::All,
+            }
+        );
+    }
+
+    #[test]
+    fn groups_run_rows_by_status_with_running_first_and_formats_tokens_and_cost() {
+        let mut done = run("done", "Finish docs", "completed", "codex", "2026-01-03T00:00:00Z");
+        done.usage.input_tokens = crate::client::ProtoI64(1200);
+        done.usage.output_tokens = crate::client::ProtoI64(300);
+        done.usage.cost_usd = Some(0.04);
+        let running = run(
+            "live",
+            "Build feature",
+            "running",
+            "claude",
+            "2026-01-01T00:00:00Z",
+        );
+        let rows = all_rows(&[workspace("ws", "App", "/nowhere/app")], &[done, running]);
+        assert_eq!(rows[0].tokens_label.as_deref(), Some("1.5k tokens"));
+        assert_eq!(rows[0].cost_label.as_deref(), Some("$0.04"));
+        assert_eq!(rows[1].tokens_label, None);
+        assert_eq!(rows[1].cost_label, None);
+
+        let groups = group_run_rows(&rows, &runs_default_display(), 0);
+        let titles: Vec<&str> = groups.iter().map(|g| g.title.as_str()).collect();
+        assert_eq!(titles, ["Running", "Done"]);
+        assert_eq!(groups[0].runs[0].id, "live");
+        assert_eq!(groups[1].runs[0].id, "done");
     }
 }

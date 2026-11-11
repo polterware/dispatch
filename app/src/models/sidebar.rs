@@ -365,7 +365,12 @@ pub fn page_sidebar_rows<'a>(
 
 /// Validate persisted preferences field by field, including older or malformed values.
 pub fn parse_sidebar_display(raw: &str) -> SidebarDisplay {
-    let mut display = SidebarDisplay::default();
+    parse_display_with(raw, SidebarDisplay::default())
+}
+
+/// Validates persisted display preferences field by field, falling back to `default` for
+/// missing or malformed fields.
+pub fn parse_display_with(raw: &str, mut display: SidebarDisplay) -> SidebarDisplay {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
         return display;
     };
@@ -493,9 +498,31 @@ pub fn group_sidebar_runs(
     }
 
     for group in custom.iter_mut().chain(automatic.iter_mut()) {
-        group.runs.sort_by(|a, b| compare(a, b));
+        group.runs.sort_by(|a, b| {
+            let a_active = crate::models::runs::is_run_active(&a.status);
+            let b_active = crate::models::runs::is_run_active(&b.status);
+            b_active.cmp(&a_active).then_with(|| compare(a, b))
+        });
     }
     automatic.sort_by(|a, b| {
+        if display.group_by == GroupBy::Status {
+            match (a.title == "Running", b.title == "Running") {
+                (true, false) => return std::cmp::Ordering::Less,
+                (false, true) => return std::cmp::Ordering::Greater,
+                _ => {}
+            }
+        }
+        let a_active = a
+            .runs
+            .iter()
+            .any(|run| crate::models::runs::is_run_active(&run.status));
+        let b_active = b
+            .runs
+            .iter()
+            .any(|run| crate::models::runs::is_run_active(&run.status));
+        if a_active != b_active {
+            return b_active.cmp(&a_active);
+        }
         if display.group_by == GroupBy::Conversation {
             if a.id == "conversation:" {
                 return std::cmp::Ordering::Greater;
@@ -705,7 +732,7 @@ fn merged(run: &SidebarRun) -> bool {
 
 fn status_group(run: &SidebarRun) -> &'static str {
     let status = run.status.to_ascii_lowercase();
-    if status == "pending" || status == "running" {
+    if crate::models::runs::is_run_active(&status) {
         "Running"
     } else if matches!(
         status.as_str(),
@@ -1587,5 +1614,138 @@ mod tests {
         let page = page_sidebar_rows(&rows, 5, |run| run.id == "r2");
         assert_eq!(page.rows.len(), 5);
         assert_eq!(page.hidden, 7);
+    }
+
+    #[test]
+    fn puts_running_rows_first_inside_each_group_before_the_display_sort() {
+        let runs = vec![
+            run("done-new", |r| {
+                r.prompt = "Bravo".into();
+                r.created_at = "2026-11-02T12:00:00Z".into();
+            }),
+            run("running-old", |r| {
+                r.prompt = "Zebra".into();
+                r.status = "running".into();
+                r.created_at = "2026-11-02T08:00:00Z".into();
+            }),
+            run("done-old", |r| {
+                r.prompt = "Alpha".into();
+                r.created_at = "2026-11-02T09:00:00Z".into();
+            }),
+            run("pending-new", |r| {
+                r.prompt = "Charlie".into();
+                r.status = "pending".into();
+                r.created_at = "2026-11-02T10:00:00Z".into();
+            }),
+        ];
+        let none_desc = display(|d| d.group_by = GroupBy::None);
+        assert_eq!(
+            ids(&group_sidebar_runs(&runs, &[], &none_desc, 0)[0].runs),
+            ["pending-new", "running-old", "done-new", "done-old"]
+        );
+        let name_asc = display(|d| {
+            d.group_by = GroupBy::None;
+            d.sort_by = SortBy::Name;
+            d.direction = Direction::Asc;
+        });
+        assert_eq!(
+            ids(&group_sidebar_runs(&runs, &[], &name_asc, 0)[0].runs),
+            ["pending-new", "running-old", "done-old", "done-new"]
+        );
+    }
+
+    #[test]
+    fn orders_automatic_groups_with_running_work_before_idle_ones() {
+        let runs = vec![
+            run("idle-newest", |r| {
+                r.repo = "/code/alpha".into();
+                r.created_at = "2026-11-02T14:00:00Z".into();
+            }),
+            run("idle-older", |r| {
+                r.repo = "/code/beta".into();
+                r.created_at = "2026-11-02T11:00:00Z".into();
+            }),
+            run("active-older-done", |r| {
+                r.repo = "/code/gamma".into();
+                r.created_at = "2026-11-02T13:00:00Z".into();
+            }),
+            run("active-older-run", |r| {
+                r.repo = "/code/gamma".into();
+                r.status = "running".into();
+                r.created_at = "2026-11-02T07:00:00Z".into();
+            }),
+            run("active-newer-run", |r| {
+                r.repo = "/code/delta".into();
+                r.status = "pending".into();
+                r.created_at = "2026-11-02T09:00:00Z".into();
+            }),
+        ];
+        let by_repo = display(|d| d.group_by = GroupBy::Repository);
+        let groups = group_sidebar_runs(&runs, &[], &by_repo, 0);
+        let titles: Vec<&str> = groups.iter().map(|g| g.title.as_str()).collect();
+        assert_eq!(titles, ["delta", "gamma", "alpha", "beta"]);
+        assert_eq!(
+            ids(&groups[1].runs),
+            ["active-older-run", "active-older-done"]
+        );
+    }
+
+    #[test]
+    fn keeps_the_running_group_first_under_status_grouping() {
+        let runs = vec![
+            run("done-newest", |r| {
+                r.prompt = "Alpha".into();
+                r.created_at = "2026-11-02T15:00:00Z".into();
+            }),
+            run("failed-mid", |r| {
+                r.prompt = "Bravo".into();
+                r.status = "failed".into();
+                r.created_at = "2026-11-02T12:00:00Z".into();
+            }),
+            run("running-oldest", |r| {
+                r.prompt = "Zebra".into();
+                r.status = "running".into();
+                r.created_at = "2026-11-02T08:00:00Z".into();
+            }),
+        ];
+        for (sort_by, direction) in [
+            (SortBy::Updated, Direction::Desc),
+            (SortBy::Updated, Direction::Asc),
+            (SortBy::Name, Direction::Asc),
+        ] {
+            let status_display = display(|d| {
+                d.group_by = GroupBy::Status;
+                d.sort_by = sort_by;
+                d.direction = direction;
+            });
+            let groups = group_sidebar_runs(&runs, &[], &status_display, 0);
+            assert_eq!(groups[0].title, "Running");
+            assert_eq!(ids(&groups[0].runs), ["running-oldest"]);
+        }
+    }
+
+    #[test]
+    fn keeps_custom_sections_in_user_order_with_running_rows_first_inside() {
+        let runs = vec![
+            run("s1-done", |r| {
+                r.created_at = "2026-11-02T10:00:00Z".into();
+            }),
+            run("s2-done-new", |r| {
+                r.created_at = "2026-11-02T14:00:00Z".into();
+            }),
+            run("s2-running-old", |r| {
+                r.status = "running".into();
+                r.created_at = "2026-11-02T08:00:00Z".into();
+            }),
+        ];
+        let sections = vec![
+            section("second", 1, vec![item("run", "s2-done-new"), item("run", "s2-running-old")]),
+            section("first", 0, vec![item("run", "s1-done")]),
+        ];
+        let groups = group_sidebar_runs(&runs, &sections, &SidebarDisplay::default(), 0);
+        let group_ids: Vec<&str> = groups.iter().map(|g| g.id.as_str()).collect();
+        assert_eq!(group_ids, ["section:first", "section:second"]);
+        assert_eq!(ids(&groups[0].runs), ["s1-done"]);
+        assert_eq!(ids(&groups[1].runs), ["s2-running-old", "s2-done-new"]);
     }
 }
