@@ -5,13 +5,10 @@ pub(crate) struct Span {
     pub end: usize,
 }
 
-/// What editing the plugins list needs of a JSON or JSONC object: where it
-/// opens, how many members it has, and the plugins list's range and elements.
+/// What cutting an entry out of the plugins list needs of a JSON or JSONC
+/// object: the plugins list's range and its elements' ranges.
 #[derive(Debug, Default)]
 pub(crate) struct JsoncDoc {
-    pub open: usize,
-    pub members: usize,
-    pub plugins_key: bool,
     pub plugins_array: Option<Span>,
     pub plugins: Vec<Span>,
 }
@@ -30,7 +27,6 @@ pub(crate) fn parse_jsonc(src: &[u8]) -> Result<JsoncDoc, String> {
     if s.peek() != b'{' {
         return Err("the config is not a JSON object".into());
     }
-    doc.open = s.pos;
     s.pos += 1;
     loop {
         s.space();
@@ -44,16 +40,10 @@ pub(crate) fn parse_jsonc(src: &[u8]) -> Result<JsoncDoc, String> {
         }
         s.pos += 1;
         s.space();
-        doc.members += 1;
-        if key == b"\"plugins\"" {
-            doc.plugins_key = true;
-            if s.peek() == b'[' {
-                let (arr, els) = s.array()?;
-                doc.plugins_array = Some(arr);
-                doc.plugins = els;
-            } else {
-                s.value()?;
-            }
+        if key == b"\"plugins\"" && s.peek() == b'[' {
+            let (arr, els) = s.array()?;
+            doc.plugins_array = Some(arr);
+            doc.plugins = els;
         } else {
             s.value()?;
         }

@@ -24,9 +24,9 @@ use crate::models::settings::{
     agent_label, agent_model_groups, bool_wire, classifier_trailing, classify_meta,
     cli_description, draft_ready, env_key_sentence, fixed2, folder_agents_label, hook_note,
     hook_points_elsewhere, key_chip, key_placeholder, key_test_enabled, key_uses_replace,
-    keyed_classifier, opencode_description, parse_agent_setup, parse_classify, parse_cli_model,
-    parse_key_map, parse_key_status_value, parse_policy, priority_label, priority_value, prob_line,
-    radio_value, role_answer_line, skill_readers, skills_need_install, trimmed_draft,
+    keyed_classifier, parse_agent_setup, parse_classify, parse_cli_model, parse_key_map,
+    parse_key_status_value, parse_policy, priority_label, priority_value, prob_line, radio_value,
+    role_answer_line, skill_readers, skills_need_install, trimmed_draft,
 };
 use crate::motion::{Animator, Spring, SpringTier, SpringValue};
 use crate::state::{AppState, Route, SettingsPage, ToastTone};
@@ -93,7 +93,6 @@ pub struct SettingsView {
     openai_placeholder: &'static str,
     /// Each agent's session hook switch, made when the setup first lists the agent.
     hooks: BTreeMap<String, Entity<Switch>>,
-    opencode: Entity<Switch>,
     roles: Entity<Switch>,
     discover: Entity<Switch>,
     priority_menu: Entity<Menu>,
@@ -123,9 +122,6 @@ impl SettingsView {
             cx.new(|cx| TextInput::new(cx).placeholder("Search providers and models"));
         let jev_key = key_input("jev", "Paste a key", view.clone(), cx);
         let openai_key = key_input("openai", "Paste a key", view.clone(), cx);
-        let opencode = switch(true, view.clone(), cx, |this, on, cx| {
-            this.on_opencode(on, cx)
-        });
         let roles = switch(true, view.clone(), cx, |this, on, cx| this.on_roles(on, cx));
         let discover = switch(true, view.clone(), cx, |this, on, cx| {
             this.on_discover(on, cx)
@@ -180,7 +176,6 @@ impl SettingsView {
             jev_placeholder: "Paste a key",
             openai_placeholder: "Paste a key",
             hooks: BTreeMap::new(),
-            opencode,
             roles,
             discover,
             priority_menu,
@@ -415,8 +410,6 @@ impl SettingsView {
                     .clone();
                 toggle.update(cx, |switch, _| switch.set_on(hook.on));
             }
-            self.opencode
-                .update(cx, |switch, _| switch.set_on(setup.opencode.on));
         }
     }
 
@@ -1187,20 +1180,6 @@ impl SettingsView {
         self.apply_setup(&format!("hook:{agent}"), action, agent, &done, cx);
     }
 
-    fn on_opencode(&mut self, on: bool, cx: &mut Context<Self>) {
-        if self.busy() {
-            self.opencode.update(cx, |switch, _| switch.set_on(!on));
-            cx.notify();
-            return;
-        }
-        let (action, done) = if on {
-            ("opencode_on", "OpenCode delegates through dispatch.")
-        } else {
-            ("opencode_off", "OpenCode uses its own subagents.")
-        };
-        self.apply_setup("opencode", action, "", done, cx);
-    }
-
     fn on_roles(&mut self, on: bool, cx: &mut Context<Self>) {
         if self.client(cx).is_none() {
             self.roles.update(cx, |switch, _| switch.set_on(!on));
@@ -1739,82 +1718,6 @@ impl SettingsView {
             "At the start of each session the agent reads one line saying dispatch is here and where its skill is. Each agent keeps its hooks in its own file, so each has its own switch.",
             None,
             hook_body,
-            cx,
-        ));
-
-        let mut plugin = div()
-            .flex()
-            .items_center()
-            .gap(px(theme.space_2))
-            .child(chip(
-                setup.opencode.state.label(),
-                install_tone(setup.opencode.state),
-                cx,
-            ));
-        if let Some(action) = setup.opencode.state.action_label() {
-            plugin = plugin.child(dim_button(
-                "settings-opencode-install",
-                action,
-                ButtonKind::Secondary,
-                enabled,
-                gated(enabled, view.clone(), |this, cx| {
-                    this.apply_setup(
-                        "opencode",
-                        "install_opencode",
-                        "",
-                        "OpenCode plugin installed.",
-                        cx,
-                    );
-                }),
-                cx,
-            ));
-        }
-        if setup.opencode.state != InstallState::Missing {
-            plugin = plugin.child(dim_button(
-                "settings-opencode-remove",
-                "Remove",
-                ButtonKind::Ghost,
-                enabled,
-                gated(enabled, view, |this, cx| {
-                    this.apply_setup(
-                        "opencode",
-                        "remove_opencode",
-                        "",
-                        "OpenCode plugin removed.",
-                        cx,
-                    );
-                }),
-                cx,
-            ));
-        }
-        let mut plugin_body = div().flex().flex_col().child(settings_row(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(theme.space_2))
-                .child(agent_avatar("opencode", "", 20.0))
-                .child(agent_label("opencode")),
-            text_or_none(opencode_description(&setup.opencode)),
-            plugin,
-            cx,
-        ));
-        if setup.opencode.state != InstallState::Missing {
-            plugin_body = plugin_body.child(settings_row(
-                "Delegate OpenCode's subagent work through dispatch",
-                None,
-                div()
-                    .when(!enabled, |row| row.opacity(0.45))
-                    .child(self.opencode.clone()),
-                cx,
-            ));
-        }
-        column = column.child(settings_section(
-            Icon::Plug,
-            TileTone::Integration,
-            "OpenCode plugin",
-            "Replaces OpenCode's subagents with dispatch runs and shows each conversation's runs in OpenCode Desktop. It loads from OpenCode's global config.",
-            None,
-            plugin_body,
             cx,
         ));
         column.into_any_element()

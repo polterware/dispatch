@@ -46,7 +46,7 @@ pub(crate) const OPS_USAGE: &str = "       dispatch wait <id> [--timeout <dur>] 
        dispatch roles add <name> --from-template <template> [--dir <repo>]
        dispatch roles save <name> [--when <text>] [--tier easy|normal|hard] [--columns easy,normal,hard] [--easy|--normal|--hard agent/model,...] [--readonly] [--instructions <text>] [--manual] [--prefer a,b] [--avoid a,b] [--timeout <dur>] | remove <name>
        dispatch on|off|hook [--agent <name>]
-       dispatch setup [--json] | link | skill [--remove] [<agent> | <folder>] | hook [<agent>] on|off | opencode [--remove | on | off]
+       dispatch setup [--json] | link | skill [--remove] [<agent> | <folder>] | hook [<agent>] on|off
        dispatch skill install|remove [--agent <name> | --dir <folder>] [--force] | show | refresh
        dispatch update [--check]";
 
@@ -1543,16 +1543,23 @@ pub(super) fn skill(args: &[String]) -> CliResult {
 
 /// Reports how the agent CLIs reach dispatch, or changes one part of it: link
 /// points ~/.local/bin/dispatch at this binary, skill installs the current
-/// skill (into one folder, or the three Dispatch uses) or removes it, hook
-/// switches an agent's SessionStart hook (Claude Code's when none is named),
-/// and opencode installs or removes the Dispatch plugin in OpenCode or
-/// switches its delegation. The app's Settings › Agents does the same.
+/// skill (into one folder, or the three Dispatch uses) or removes it, and hook
+/// switches an agent's SessionStart hook (Claude Code's when none is named).
+/// The app's Settings › Agents does the same. It also drops the OpenCode
+/// plugin an earlier version installed.
 pub(super) fn setup(db_path: &Path, args: &[String]) -> CliResult {
     let home = home()?;
     let binary = crate::runstate::command_binary()?
         .to_string_lossy()
         .into_owned();
     let state = state_dir(db_path);
+    match setup::remove_legacy_opencode_plugin(&home, &state) {
+        Ok(true) => eprintln!(
+            "removed the Dispatch plugin an earlier version installed in OpenCode: OpenCode reaches dispatch through the CLI and the skill"
+        ),
+        Ok(false) => {}
+        Err(e) => eprintln!("OpenCode plugin cleanup: {e}"),
+    }
     let action = args.first().map_or("", String::as_str);
     match action {
         "" | "--json" => {}
@@ -1592,39 +1599,9 @@ pub(super) fn setup(db_path: &Path, args: &[String]) -> CliResult {
             setup::set_hook(&home, &binary, &state, agent, on)?;
             println!("{agent} hook {switch}");
         }
-        "opencode" => match args.get(1).map_or("", String::as_str) {
-            "" => {
-                let path = setup::install_opencode_plugin(
-                    &home,
-                    &setup::opencode_binary(&home, &binary),
-                    &state,
-                )?;
-                println!(
-                    "installed {} and loaded it from {}",
-                    path.display(),
-                    setup::opencode_config_path(&home).display()
-                );
-            }
-            "--remove" => {
-                setup::remove_opencode_plugin(&home, &state)?;
-                println!(
-                    "removed the Dispatch plugin from {}",
-                    setup::opencode_config_path(&home).display()
-                );
-            }
-            sub @ ("on" | "off") => {
-                setup::set_opencode_delegation(&state, sub == "on")?;
-                println!("OpenCode delegation through dispatch {sub}");
-            }
-            _ => {
-                return Err(usage_err(
-                    "usage: dispatch setup opencode [--remove | on | off]",
-                ));
-            }
-        },
         _ => {
             return Err(usage_err(
-                "usage: dispatch setup [--json] | link | skill [--remove] [<agent> | <folder>] | hook [<agent>] on|off | opencode [--remove | on | off]",
+                "usage: dispatch setup [--json] | link | skill [--remove] [<agent> | <folder>] | hook [<agent>] on|off",
             ));
         }
     }
@@ -1665,21 +1642,6 @@ fn print_setup(r: &setup::Report) {
         }
         println!("hook     {:<9} {state}  {}", h.agent, h.settings);
     }
-    let mut plugin = match r.opencode.state.as_str() {
-        setup::CURRENT => "current",
-        setup::OUTDATED => "outdated",
-        setup::MISSING => "not installed",
-        _ => "",
-    }
-    .to_owned();
-    if r.opencode.state != setup::MISSING {
-        plugin += if r.opencode.on {
-            ", delegation on"
-        } else {
-            ", delegation off"
-        };
-    }
-    println!("plugin   OpenCode {plugin}  {}", r.opencode.path);
 }
 
 /// Explains where updates come from: dispatch ships inside the Polterware

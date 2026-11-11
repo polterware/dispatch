@@ -108,21 +108,12 @@ pub struct HookSetup {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OpenCodeSetup {
-    pub path: String,
-    pub config: String,
-    pub state: InstallState,
-    pub on: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentSetup {
     pub cli: CliInstall,
     pub skills: Vec<SkillRow>,
     pub hooks: Vec<HookSetup>,
     /// The agents whose config folder is on this machine.
     pub agents: Vec<String>,
-    pub opencode: OpenCodeSetup,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -374,7 +365,6 @@ pub fn opencode_description(item: &OpenCodeSetup) -> &str {
 pub fn parse_agent_setup(json: &str) -> AgentSetup {
     let root = json_object(json);
     let cli = record(root.get("cli"));
-    let opencode = record(root.get("opencode"));
     let items = |key: &str| -> Vec<Map<String, Value>> {
         root.get(key)
             .and_then(Value::as_array)
@@ -454,12 +444,6 @@ pub fn parse_agent_setup(json: &str) -> AgentSetup {
         skills,
         hooks,
         agents: strings(&root, "agents"),
-        opencode: OpenCodeSetup {
-            path: text(&opencode, "path"),
-            config: text(&opencode, "config"),
-            state: InstallState::from_wire(&text(&opencode, "state")),
-            on: flag_not_false(&opencode, "on"),
-        },
     }
 }
 
@@ -815,11 +799,10 @@ fn number_or(value: Option<&Value>, default: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentSetup, CliModel, CliState, HookSetup, InstallState, ListedModel, OpenCodeSetup,
-        agent_model_groups, classifier_trailing, fixed2, folder_agents_label, hook_note,
-        hook_points_elsewhere, key_chip, model_agent, parse_agent_setup, parse_classify,
-        parse_key_status_value, parse_policy, parse_role_answer, role_answer_line, skill_readers,
-        skills_need_install,
+        AgentSetup, CliModel, CliState, HookSetup, InstallState, ListedModel, agent_model_groups,
+        classifier_trailing, fixed2, folder_agents_label, hook_note, hook_points_elsewhere,
+        key_chip, model_agent, parse_agent_setup, parse_classify, parse_key_status_value,
+        parse_policy, parse_role_answer, role_answer_line, skill_readers, skills_need_install,
     };
     use crate::client::{DispatchAgent, DispatchAgentModels, DispatchModelSetting};
     use serde_json::json;
@@ -920,32 +903,12 @@ mod tests {
     }
 
     #[test]
-    fn opencode_plugin_stays_on_unless_it_says_off() {
-        let view = parse_agent_setup(
-            r#"{"opencode":{"path":"/s/opencode-plugin","config":"/h/.config/opencode/opencode.json","state":"outdated","on":false}}"#,
-        );
-        assert_eq!(
-            view.opencode,
-            OpenCodeSetup {
-                path: "/s/opencode-plugin".into(),
-                config: "/h/.config/opencode/opencode.json".into(),
-                state: InstallState::Outdated,
-                on: false,
-            }
-        );
-        assert_eq!(
-            parse_agent_setup("{}").opencode,
-            OpenCodeSetup {
-                path: String::new(),
-                config: String::new(),
-                state: InstallState::Missing,
-                on: true,
-            }
-        );
+    fn agent_setup_reads_an_empty_report() {
         let empty = parse_agent_setup("{}");
         assert_eq!(empty.cli.state, CliState::Missing);
         assert!(empty.skills.is_empty());
         assert!(empty.hooks.is_empty());
+        assert!(empty.agents.is_empty());
         let _typed: AgentSetup = empty;
     }
 

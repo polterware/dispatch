@@ -301,128 +301,78 @@ fn under_grok_one_hook_speaks() {
 }
 
 #[test]
-fn opencode_plugin_install_update_and_remove() {
+fn legacy_opencode_plugin_is_removed() {
     let f = fixture();
-    let (home, binary, state) = (&f.home, f.binary.as_str(), &f.state);
+    let (home, state) = (&f.home, &f.state);
     let config = home.join(".config").join("opencode").join("opencode.json");
-    let got = read(home, binary, state).opencode;
-    assert!(
-        got.state == MISSING && got.on && got.config == config.to_string_lossy(),
-        "before install = {got:?}"
-    );
-    let dir = install_opencode_plugin(home, binary, state).unwrap();
-    assert_eq!(dir, state.join("opencode-plugin"));
-    for name in [
-        "package.json",
-        "server.js",
-        "rpc.js",
-        "gui-experimental.cjs",
-    ] {
-        assert!(dir.join(name).exists(), "{name}");
-    }
-    let body = fs::read_to_string(&config).unwrap();
-    let parsed: Value = serde_json::from_str(&body).expect("config is JSON");
-    let plugins = parsed["plugins"].as_array().unwrap();
-    let state_file = state.join(OPENCODE_SWITCH);
-    assert!(
-        plugins.len() == 1
-            && plugins[0]["package"] == dir.to_string_lossy().as_ref()
-            && plugins[0]["options"]["binary"] == binary
-            && plugins[0]["options"]["state"] == state_file.to_string_lossy().as_ref()
-            && parsed["$schema"].as_str().is_some_and(|s| !s.is_empty()),
-        "config = {body}"
-    );
-    assert_eq!(read(home, binary, state).opencode.state, CURRENT);
-
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    let dir = opencode_plugin_dir(state);
+    fs::create_dir_all(&dir).unwrap();
     fs::write(dir.join("server.js"), "export default {}\n").unwrap();
-    assert_eq!(read(home, binary, state).opencode.state, OUTDATED);
-    let other_dir = tempfile::tempdir().unwrap();
-    let other = other_dir.path().join("dispatch");
-    assert_eq!(
-        read(home, &other.to_string_lossy(), state).opencode.state,
-        OUTDATED
+    let switch = state.join("opencode-plugin.json");
+    fs::write(&switch, "{\n  \"enabled\": true\n}\n").unwrap();
+    let ours = serde_json::to_string(&dir.to_string_lossy().as_ref()).unwrap();
+    let src = format!(
+        "{{\n  // plugins\n  \"plugins\": [\n    \"acme\", /* theirs */\n    {ours}\n  ],\n  \"model\": \"a/b\"\n}}\n"
     );
-    install_opencode_plugin(home, binary, state).unwrap();
-    assert_eq!(read(home, binary, state).opencode.state, CURRENT);
-    let after = fs::read_to_string(&config).unwrap();
-    assert_eq!(
-        after.matches("\"package\":").count(),
-        1,
-        "an update must replace the entry, not add one:\n{after}"
-    );
+    fs::write(&config, &src).unwrap();
 
-    set_opencode_delegation(state, false).unwrap();
-    let got = read(home, binary, state).opencode;
-    assert!(!got.on && got.state == CURRENT, "delegation off = {got:?}");
-
-    remove_opencode_plugin(home, state).unwrap();
-    let got = read(home, binary, state).opencode;
-    assert!(got.state == MISSING && got.on, "after remove = {got:?}");
+    assert!(remove_legacy_opencode_plugin(home, state).unwrap());
     assert!(!dir.exists(), "plugin folder should be gone");
+    assert!(!switch.exists(), "switch should be gone");
     let left = fs::read_to_string(&config).unwrap();
+    assert!(left.contains("// plugins"), "comment kept:\n{left}");
+    assert!(left.contains("/* theirs */"), "comment kept:\n{left}");
+    let parsed: Value = serde_json::from_str(&left).expect("config is JSON");
+    assert_eq!(parsed["plugins"], serde_json::json!(["acme"]), "{left}");
+    assert_eq!(parsed["model"], "a/b");
     assert!(
-        !left.contains(dir.to_string_lossy().as_ref()),
-        "entry left behind:\n{left}"
+        !remove_legacy_opencode_plugin(home, state).unwrap(),
+        "nothing left to remove"
     );
-    serde_json::from_str::<Value>(&left).expect("config after remove is JSON");
-    remove_opencode_plugin(home, state).expect("removing twice");
+    assert_eq!(fs::read_to_string(&config).unwrap(), left);
 }
 
 #[test]
-fn edit_opencode_config_keeps_the_rest_of_the_file() {
-    let dir = "/state/opencode-plugin";
-    let entry = r#"{"package":"/state/opencode-plugin","options":{"binary":"/bin/dispatch"}}"#;
-    let cases = [
-        (
-            "no plugins",
-            "{\n  // models\n  \"model\": \"a/b\"\n}\n".to_string(),
-            format!(
-                "{{\n  \"plugins\": [\n    {entry}\n  ],\n  // models\n  \"model\": \"a/b\"\n}}\n"
-            ),
-        ),
-        (
-            "empty object",
-            "{}".to_string(),
-            format!("{{\n  \"plugins\": [\n    {entry}\n  ]\n}}"),
-        ),
-        (
-            "empty list",
-            "{\"plugins\": []}".to_string(),
-            format!("{{\"plugins\": [\n    {entry}\n  ]}}"),
-        ),
-        (
-            "other plugins",
-            "{\n  \"plugins\": [\n    \"acme\", /* keep */\n    \"./local\"\n  ]\n}".to_string(),
-            format!(
-                "{{\n  \"plugins\": [\n    \"acme\", /* keep */\n    \"./local\",\n    {entry}\n  ]\n}}"
-            ),
-        ),
-        (
-            "older entry as a path",
-            "{\"plugins\": [\"acme\", \"/state/opencode-plugin\", \"b\"]}".to_string(),
-            format!("{{\"plugins\": [\"acme\", {entry}, \"b\"]}}"),
-        ),
-    ];
-    for (name, src, want) in cases {
-        let tmp = tempfile::tempdir().unwrap();
-        let config = tmp.path().join("opencode.jsonc");
+fn legacy_opencode_plugin_goes_as_an_object_entry_too() {
+    let f = fixture();
+    let (home, state) = (&f.home, &f.state);
+    let config = home.join(".config").join("opencode").join("opencode.jsonc");
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    let dir = opencode_plugin_dir(state);
+    let package = dir.to_string_lossy();
+    for ours in [
+        format!("{{\"package\": \"{package}\", \"options\": {{\"binary\": \"/bin/dispatch\"}}}}"),
+        format!("\"{package}\""),
+    ] {
+        let src = format!("{{\"plugins\": [\"a\", {ours}, \"b\"]}}");
         fs::write(&config, &src).unwrap();
-        edit_opencode_config(&config, dir, Some(entry.as_bytes())).unwrap();
-        let got = fs::read_to_string(&config).unwrap();
-        assert_eq!(got, want, "{name}");
+        assert!(
+            remove_legacy_opencode_plugin(home, state).unwrap(),
+            "{ours}"
+        );
+        assert_eq!(
+            fs::read_to_string(&config).unwrap(),
+            "{\"plugins\": [\"a\", \"b\"]}",
+            "{ours}"
+        );
     }
 }
 
 #[test]
-fn edit_opencode_config_keeps_the_file_mode() {
-    let tmp = tempfile::tempdir().unwrap();
-    let config = tmp.path().join("opencode.json");
-    fs::write(&config, "{}").unwrap();
+fn legacy_opencode_cleanup_keeps_the_config_mode() {
+    let f = fixture();
+    let (home, state) = (&f.home, &f.state);
+    let config = home.join(".config").join("opencode").join("opencode.json");
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    let dir = opencode_plugin_dir(state);
+    let ours = serde_json::to_string(&dir.to_string_lossy().as_ref()).unwrap();
+    fs::write(&config, format!("{{\"plugins\": [{ours}]}}")).unwrap();
     fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
-    edit_opencode_config(&config, "/d", Some(br#""/d""#)).unwrap();
+    assert!(remove_legacy_opencode_plugin(home, state).unwrap());
     let mode = fs::metadata(&config).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
-    let left: Vec<_> = fs::read_dir(tmp.path())
+    let left: Vec<_> = fs::read_dir(config.parent().unwrap())
         .unwrap()
         .filter_map(Result::ok)
         .map(|e| e.file_name().to_string_lossy().into_owned())
@@ -432,48 +382,17 @@ fn edit_opencode_config_keeps_the_file_mode() {
 }
 
 #[test]
-fn edit_opencode_config_removes_only_its_entry() {
-    let dir = "/state/opencode-plugin";
-    let ours = r#"{"package": "/state/opencode-plugin", "options": {}}"#;
-    let cases = [
-        (
-            format!("{{\"plugins\": [\"a\", {ours}, \"b\"]}}"),
-            "{\"plugins\": [\"a\", \"b\"]}",
-        ),
-        (
-            format!("{{\"plugins\": [\"a\", {ours}]}}"),
-            "{\"plugins\": [\"a\"]}",
-        ),
-        (
-            format!("{{\"plugins\": [{ours}], \"model\": \"x\"}}"),
-            "{\"plugins\": [], \"model\": \"x\"}",
-        ),
-        (
-            "{\"plugins\": [\"a\"]}".to_string(),
-            "{\"plugins\": [\"a\"]}",
-        ),
-    ];
-    for (src, want) in cases {
-        let tmp = tempfile::tempdir().unwrap();
-        let config = tmp.path().join("opencode.json");
-        fs::write(&config, &src).unwrap();
-        edit_opencode_config(&config, dir, None).unwrap();
-        assert_eq!(fs::read_to_string(&config).unwrap(), want);
-    }
-}
-
-#[test]
-fn edit_opencode_config_refuses_what_it_cannot_read() {
-    for src in ["[]", "{\"plugins\": \"acme\"}", "{\"a\": "] {
-        let tmp = tempfile::tempdir().unwrap();
-        let config = tmp.path().join("opencode.json");
-        fs::write(&config, src).unwrap();
-        assert!(
-            edit_opencode_config(&config, "/d", Some(br#""x""#)).is_err(),
-            "{src}: want an error"
-        );
-        assert_eq!(fs::read_to_string(&config).unwrap(), src);
-    }
+fn legacy_opencode_cleanup_leaves_an_unreadable_config_alone() {
+    let f = fixture();
+    let (home, state) = (&f.home, &f.state);
+    let config = home.join(".config").join("opencode").join("opencode.json");
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(&config, "{\"a\": ").unwrap();
+    let dir = opencode_plugin_dir(state);
+    fs::create_dir_all(&dir).unwrap();
+    assert!(remove_legacy_opencode_plugin(home, state).is_err());
+    assert_eq!(fs::read_to_string(&config).unwrap(), "{\"a\": ");
+    assert!(dir.exists(), "the folder waits for the next try");
 }
 
 #[test]

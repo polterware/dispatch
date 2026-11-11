@@ -1428,7 +1428,7 @@ fn setup_installs_and_removes_skills_and_hooks() {
     std::fs::create_dir_all(env.home.join(".claude")).unwrap();
     std::fs::create_dir_all(env.home.join(".codex")).unwrap();
     let report = env.json(&["setup", "--json"]);
-    for key in ["cli", "skills", "hooks", "agents", "opencode"] {
+    for key in ["cli", "skills", "hooks", "agents"] {
         assert!(
             report.get(key).is_some(),
             "setup --json has no {key}: {report}"
