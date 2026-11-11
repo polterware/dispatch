@@ -1294,11 +1294,15 @@ pub struct StreamedLog {
 /// The core's event that repeats the run's prompt, which the transcript shows once, as a chat
 /// bubble, instead of as a row.
 const EVENT_STARTED: &str = "started";
+const EVENT_PHASE: &str = "phase";
 
 fn write_event(text: &mut String, has_output: &mut bool, event: &LogEvent) {
     if event.kind == EVENT_STARTED {
         // Left out whole: a prompt of several lines would otherwise leave its later lines
         // behind as plain output.
+        return;
+    }
+    if event.kind == EVENT_PHASE {
         return;
     }
     if event.kind == "output" || event.kind == "agent" {
@@ -1316,6 +1320,20 @@ fn write_event(text: &mut String, has_output: &mut bool, event: &LogEvent) {
     }
 }
 
+/// The most recent preparation phase, hidden after the agent starts producing output.
+pub fn live_phase(events: &[LogEvent]) -> Option<String> {
+    let mut phase = None;
+    let mut has_output = false;
+    for event in events {
+        if event.kind == EVENT_PHASE {
+            phase = Some(event.text.clone());
+        } else if event.kind == "output" || event.kind == "agent" {
+            has_output = true;
+        }
+    }
+    (!has_output).then_some(phase).flatten()
+}
+
 impl StreamedLog {
     /// Writes `events` after the ones already in: output as it is, any other kind as one
     /// `[kind] text` line, and the `started` event not at all.
@@ -1323,6 +1341,10 @@ impl StreamedLog {
         for event in events {
             write_event(&mut self.text, &mut self.has_output, event);
         }
+    }
+
+    pub fn has_output(&self) -> bool {
+        self.has_output
     }
 
     /// [`Self::extend`] with events that know their place, the first of which marks where the
