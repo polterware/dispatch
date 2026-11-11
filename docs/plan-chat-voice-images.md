@@ -22,6 +22,14 @@ land one at a time).
   shared menu or picker, fix it in polterware-ui (AGENTS.md), not in Dispatch. Add a
   `ui_flows` test that opens a row's menu and checks its bounds against the row and window.
 
+- **Sidebar groups show five rows, strictly** (after the runs in flight are merged, since
+  it touches `app/src/models/sidebar.rs` and `views/sidebar.rs`). Today
+  `page_sidebar_rows` keeps the first five plus every pinned row (running, unseen update,
+  the open run), so a group with many unseen or running runs lists them all (seen with 12
+  rows in one group). New rule: the first five in Display order, then Show 5 more; only the
+  open run is kept if it falls past the page. Unseen and running rows keep their dot and
+  bot state but no longer bypass the page. Update AGENTS.md's sidebar paragraph and the
+  model tests.
 - **Conversation origin** (the gallery's App / Delegated filter needs it). A conversation started from the app's New page gets the
   caller agent `dispatch` and a conversation id of its own (`dispatch:<uuid>`), sent in
   `StartRunRequest.caller`; follow-ups keep it (they already inherit the conversation).
