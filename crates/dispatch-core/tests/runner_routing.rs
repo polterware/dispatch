@@ -854,3 +854,145 @@ async fn an_image_run_is_told_where_to_put_its_images() {
         request.env
     );
 }
+
+#[tokio::test]
+async fn live_quota_deadline_saves_late_result_and_reuses_it() {
+    let mut r = routing_deps();
+    let mut fake = r.fakes[0].clone();
+    fake.quota_delay = std::time::Duration::from_millis(1900);
+    let calls = fake.quota_calls.clone();
+    r.set(vec![fake]);
+    r.t.store
+        .save_quota(&QuotaSnapshot {
+            agent: "a".into(),
+            used_percent: Some(12.0),
+            window_minutes: 10080,
+            resets_at: rfc(now() + TimeDelta::hours(84)),
+            sampled_at: rfc(now()),
+            ..QuotaSnapshot::default()
+        })
+        .unwrap();
+    r.t.store
+        .save_quota(&QuotaSnapshot {
+            agent: "a".into(),
+            used_percent: Some(80.0),
+            window_minutes: 10080,
+            resets_at: rfc(now() + TimeDelta::hours(84)),
+            sampled_at: rfc(now() - TimeDelta::hours(1)),
+            ..QuotaSnapshot::default()
+        })
+        .unwrap();
+    let (cs, _) = r
+        .select(opts("easy", filters(|f| f.agent = "a".into())))
+        .await;
+    let before = tokio::time::Instant::now();
+    let result = r.t.deps.observe(cs.clone(), true).await;
+    assert!(before.elapsed() < std::time::Duration::from_millis(1850));
+    assert_eq!(result[0].quota.as_ref().unwrap().used_percent, 12.0);
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        r.t.store
+            .quota()
+            .iter()
+            .any(|q| q.used_percent == Some(40.0))
+    );
+    let result = r.t.deps.observe(cs, true).await;
+    assert_eq!(result[0].quota.as_ref().unwrap().used_percent, 40.0);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn concurrent_plans_share_live_quota() {
+    let mut r = routing_deps();
+    let mut fake = r.fakes[0].clone();
+    fake.quota_delay = std::time::Duration::from_millis(100);
+    let calls = fake.quota_calls.clone();
+    r.set(vec![fake]);
+    let options = opts("easy", filters(|f| f.agent = "a".into()));
+    let (a, b) = tokio::join!(r.run(options.clone()), r.run(options));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(a.status, STATUS_COMPLETED);
+    assert_eq!(b.status, STATUS_COMPLETED);
+}
+
+#[tokio::test]
+async fn quota_phases_precede_agent_start_and_cache_is_reported() {
+    let mut r = routing_deps();
+    r.set(vec![r.fakes[0].clone()]);
+    let first = r.run(opts("easy", filters(|f| f.agent = "a".into()))).await;
+    let phases: Vec<_> =
+        r.t.store
+            .events()
+            .into_iter()
+            .filter(|e| e.run_id == first.id && e.kind == "phase")
+            .map(|e| e.text)
+            .collect();
+    assert_eq!(phases, vec!["Checking quota: a", "Starting a (gpt-small)"]);
+    let second = r.run(opts("easy", filters(|f| f.agent = "a".into()))).await;
+    let phases: Vec<_> =
+        r.t.store
+            .events()
+            .into_iter()
+            .filter(|e| e.run_id == second.id && e.kind == "phase")
+            .map(|e| e.text)
+            .collect();
+    assert_eq!(
+        phases,
+        vec!["Using cached quota: a", "Starting a (gpt-small)"]
+    );
+}
+
+#[tokio::test]
+async fn failed_plan_removes_the_new_worktree_and_branch() {
+    let r = routing_deps();
+    let (_dir, root) = repo(&[("file", "base")]);
+    let run = r
+        .run(Options {
+            tier: "easy".into(),
+            prompt: "p".into(),
+            dir: root.clone(),
+            filters: filters(|f| f.agent = "missing".into()),
+            ..Options::default()
+        })
+        .await;
+    assert_eq!(run.status, STATUS_FAILED);
+    assert!(!run.worktree.is_empty());
+    assert!(!std::path::Path::new(&run.worktree).exists());
+    assert!(
+        git(&root, &["branch", "--list", &run.branch])
+            .trim()
+            .is_empty()
+    );
+    let phases: Vec<_> =
+        r.t.store
+            .events()
+            .into_iter()
+            .filter(|e| e.run_id == run.id && e.kind == "phase")
+            .map(|e| e.text)
+            .collect();
+    assert_eq!(phases, vec!["Preparing worktree"]);
+}
+
+#[tokio::test]
+async fn quota_deadline_phase_precedes_start() {
+    let mut r = routing_deps();
+    let mut fake = r.fakes[0].clone();
+    fake.quota_delay = std::time::Duration::from_secs(2);
+    r.set(vec![fake]);
+    let run = r.run(opts("easy", filters(|f| f.agent = "a".into()))).await;
+    let phases: Vec<_> =
+        r.t.store
+            .events()
+            .into_iter()
+            .filter(|e| e.run_id == run.id && e.kind == "phase")
+            .map(|e| e.text)
+            .collect();
+    assert_eq!(
+        phases,
+        vec![
+            "Checking quota: a",
+            "Using cached quota: a",
+            "Starting a (gpt-small)"
+        ]
+    );
+}
