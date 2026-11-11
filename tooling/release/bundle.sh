@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Builds Dispatch.app for macOS arm64 with its ZIP, DMG, checksums, and signed appcast:
 #   bash tooling/release/bundle.sh <version>
-# The bundle holds one binary, the GPUI app that is also the `dispatch` core and CLI
-# (Contents/Resources/dispatch links to it), the app icon, and Sparkle. Signing is ad-hoc,
-# as the Electron app's was: no certificate, entitlements, hardened runtime, or notarization.
+# The bundle holds the GPUI app, which is also the `dispatch` core and CLI
+# (Contents/Resources/dispatch links to it), the voice engine
+# (Contents/Resources/dispatch-voice, with the ONNX Runtime dylibs it needs), the app
+# icon, and Sparkle. Signing is ad-hoc, as the Electron app's was: no certificate,
+# entitlements, hardened runtime, or notarization.
 # SOURCE_DATE_EPOCH (the last commit's time by default) is the Sparkle build number.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -29,6 +31,33 @@ cp "$ROOT/target/release/dispatch-app" "$APP/Contents/MacOS/$PRODUCT"
 # which runs as the CLI and the core when it is given a command or called dispatch.
 ln -s "../MacOS/$PRODUCT" "$APP/Contents/Resources/dispatch"
 
+# The voice engine, a binary of its own because its models take hundreds of MB and the
+# core and the app stay lean. ort's `copy-dylibs` leaves the ONNX Runtime dylibs it
+# needs beside it in the target folder when it links them dynamically (the macOS arm64
+# build links ONNX Runtime statically and copies none); each goes next to the engine,
+# found through @loader_path, and the engine's references follow.
+(cd "$ROOT" && cargo build --release --locked -p voice-server --bin dispatch-voice)
+VOICE="$APP/Contents/Resources/dispatch-voice"
+cp "$ROOT/target/release/dispatch-voice" "$VOICE"
+relink() { # points <binary>'s references to <dylib> at the copy beside it
+  while read -r ref _; do
+    [[ "$ref" == *"/$2" ]] || continue
+    [[ "$ref" == @loader_path/* ]] && continue
+    install_name_tool -change "$ref" "@loader_path/$2" "$1"
+  done < <(otool -L "$1" | tail -n +2)
+}
+shopt -s nullglob
+for dylib in "$ROOT"/target/release/libonnxruntime*.dylib; do
+  name="$(basename "$dylib")"
+  cp "$dylib" "$APP/Contents/Resources/$name"
+  install_name_tool -id "@loader_path/$name" "$APP/Contents/Resources/$name"
+  relink "$VOICE" "$name"
+  for other in "$APP"/Contents/Resources/libonnxruntime*.dylib; do
+    [[ "$other" == "$APP/Contents/Resources/$name" ]] || relink "$other" "$name"
+  done
+done
+shopt -u nullglob
+
 PLIST="$APP/Contents/Info.plist"
 cat > "$PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -47,6 +76,7 @@ cat > "$PLIST" <<PLIST
   <key>LSMinimumSystemVersion</key><string>15.0</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>NSMicrophoneUsageDescription</key><string>Dispatch listens when you talk to a run; audio stays on this Mac.</string>
   <key>CFBundleURLTypes</key>
   <array>
     <dict>
@@ -73,7 +103,13 @@ xcrun actool "$ROOT/app/resources/dispatch.icon" --compile "$APP/Contents/Resour
 ditto "$ROOT/tooling/updater/vendor/Sparkle.framework" "$APP/Contents/Frameworks/Sparkle.framework"
 cp "$ROOT/tooling/updater/vendor/LICENSE" "$APP/Contents/Resources/Sparkle-LICENSE"
 
-# Ad-hoc signing, inside out: Sparkle's helpers, the framework, then the app.
+# Ad-hoc signing, inside out: the voice engine and its dylibs, Sparkle's helpers, the
+# framework, then the app.
+for path in "$VOICE" "$APP"/Contents/Resources/libonnxruntime*.dylib; do
+  if [[ -e "$path" ]]; then
+    codesign --force --sign - --timestamp=none "$path"
+  fi
+done
 FRAMEWORK="$APP/Contents/Frameworks/Sparkle.framework"
 for path in Versions/B/XPCServices/Downloader.xpc Versions/B/XPCServices/Installer.xpc Versions/B/Autoupdate Versions/B/Updater.app ""; do
   codesign --force --deep --sign - --timestamp=none "$FRAMEWORK/$path"
