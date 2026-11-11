@@ -31,6 +31,7 @@ pub fn empirical_quota(
                 .iter()
                 .filter(|at| {
                     at.agent == agent
+                        && at.exit_class != "near_limit"
                         && (at.exit_class == "rate_limit" || RATE_LIMITED.is_match(&at.error))
                 })
                 .count();

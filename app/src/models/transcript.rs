@@ -164,7 +164,8 @@ impl TranscriptBuilder {
                 self.flush_text();
                 let switch_ix = self.switches;
                 self.switches += 1;
-                let has_handoff = matches!(exit_class.as_str(), "rate_limit" | "credits");
+                let has_handoff =
+                    matches!(exit_class.as_str(), "rate_limit" | "credits" | "near_limit");
                 let label = switch_divider_label(
                     &from_agent,
                     &from_model,

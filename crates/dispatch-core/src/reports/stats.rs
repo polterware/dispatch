@@ -515,9 +515,10 @@ fn hit_rate_limit(r: &Run) -> bool {
     if r.exit_class == "rate_limit" || is_rate_limit_message(&r.error) {
         return true;
     }
-    r.attempts
-        .iter()
-        .any(|a| a.exit_class == "rate_limit" || is_rate_limit_message(&a.error))
+    r.attempts.iter().any(|a| {
+        a.exit_class != "near_limit"
+            && (a.exit_class == "rate_limit" || is_rate_limit_message(&a.error))
+    })
 }
 
 fn rank_all_stats(recs: &[&Run]) -> Rankings {

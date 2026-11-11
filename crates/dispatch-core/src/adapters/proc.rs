@@ -61,13 +61,29 @@ async fn read_stream<R: AsyncRead + Unpin>(
 }
 
 pub async fn run_command(
-    mut command: Command,
+    command: Command,
     input: Option<String>,
     cancel: CancellationToken,
     log: LiveLog,
     filter_name: Option<&str>,
     started: Option<&StartedHook>,
 ) -> Result<CommandOutput, Error> {
+    let (out, canceled) =
+        run_command_outcome(command, input, cancel, log, filter_name, started).await?;
+    if canceled {
+        return Err(Error::Message("context canceled".into()));
+    }
+    Ok(out)
+}
+
+pub async fn run_command_outcome(
+    mut command: Command,
+    input: Option<String>,
+    cancel: CancellationToken,
+    log: LiveLog,
+    filter_name: Option<&str>,
+    started: Option<&StartedHook>,
+) -> Result<(CommandOutput, bool), Error> {
     command
         .process_group(0)
         .kill_on_drop(true)
@@ -137,15 +153,16 @@ pub async fn run_command(
         }
     };
     log.close();
-    if interrupted && cancel.is_cancelled() && watch.fatal().is_empty() {
-        return Err(Error::Message("context canceled".into()));
-    }
-    Ok(CommandOutput {
-        stdout: String::from_utf8_lossy(&stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&stderr).into_owned(),
-        exit_code: status.code().unwrap_or(-1),
-        fatal: watch.fatal(),
-    })
+    let canceled = interrupted && cancel.is_cancelled() && watch.fatal().is_empty();
+    Ok((
+        CommandOutput {
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
+            exit_code: status.code().unwrap_or(-1),
+            fatal: watch.fatal(),
+        },
+        canceled,
+    ))
 }
 
 async fn stop_child(

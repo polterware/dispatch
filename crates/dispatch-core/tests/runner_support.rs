@@ -371,6 +371,8 @@ pub struct Fake {
     pub ran: Ran,
     pub caps: Arc<Mutex<Capabilities>>,
     pub quota: Option<Quota>,
+    pub run_quota: Option<Quota>,
+    pub live_quota: Arc<Mutex<Option<Quota>>>,
     pub model_quotas: Option<HashMap<String, Quota>>,
     pub quota_calls: Arc<AtomicUsize>,
     pub models: Vec<String>,
@@ -381,6 +383,8 @@ pub struct Fake {
     pub delay: Duration,
     pub usage: Option<Usage>,
     pub pid: Option<i64>,
+    pub resume_out: Option<String>,
+    pub resume_err: Option<AttemptError>,
 }
 
 impl Fake {
@@ -398,6 +402,8 @@ impl Fake {
                 ..Capabilities::default()
             })),
             quota: None,
+            run_quota: None,
+            live_quota: Arc::new(Mutex::new(None)),
             model_quotas: None,
             quota_calls: Arc::new(AtomicUsize::new(0)),
             models: Vec::new(),
@@ -408,6 +414,8 @@ impl Fake {
             delay: Duration::ZERO,
             usage: None,
             pid: None,
+            resume_out: None,
+            resume_err: None,
         }
     }
 
@@ -437,7 +445,23 @@ impl Fake {
     }
 
     pub fn quota(mut self, q: Quota) -> Self {
+        *self.live_quota.lock().unwrap() = Some(q.clone());
         self.quota = Some(q);
+        self
+    }
+
+    pub fn run_quota(mut self, q: Quota) -> Self {
+        self.run_quota = Some(q);
+        self
+    }
+
+    pub fn resume_out(mut self, out: &str) -> Self {
+        self.resume_out = Some(out.into());
+        self
+    }
+
+    pub fn resume_fail(mut self, err: &str) -> Self {
+        self.resume_err = Some(AttemptError::Failed(err.into()));
         self
     }
 
@@ -493,7 +517,12 @@ impl AgentAdapter for Fake {
 
     fn quota(&self) -> BoxFuture<'_, Result<Quota, Error>> {
         self.quota_calls.fetch_add(1, Ordering::SeqCst);
-        let q = self.quota.clone();
+        let q = self
+            .live_quota
+            .lock()
+            .unwrap()
+            .clone()
+            .or_else(|| self.quota.clone());
         Box::pin(async move { q.ok_or_else(|| Error::Message(ERR_NO_QUOTA.into())) })
     }
 
@@ -523,6 +552,21 @@ impl AgentAdapter for Fake {
             if let Some(pid) = self.pid {
                 let _ = (call.started)(pid);
             }
+            let is_resume = !call.request.resume_session.is_empty();
+            if !is_resume && let Some(rq) = &self.run_quota {
+                *self.live_quota.lock().unwrap() = Some(rq.clone());
+            }
+            if is_resume && (self.resume_out.is_some() || self.resume_err.is_some()) {
+                return AttemptResult {
+                    result: RunResult {
+                        output: self.resume_out.clone().unwrap_or_default(),
+                        exit_code: 0,
+                        session_id: call.request.resume_session.clone(),
+                        usage: self.usage.clone(),
+                    },
+                    error: self.resume_err.clone(),
+                };
+            }
             if let Some(edit) = &self.edit {
                 edit(&call.request.dir);
             }
@@ -541,7 +585,20 @@ impl AgentAdapter for Fake {
                 }
             }
             if !self.delay.is_zero() {
-                tokio::time::sleep(self.delay).await;
+                tokio::select! {
+                    () = tokio::time::sleep(self.delay) => {}
+                    () = call.cancel.cancelled() => {
+                        return AttemptResult {
+                            result: RunResult {
+                                output: self.out.clone(),
+                                exit_code: -1,
+                                session_id: format!("sess-{}", self.name),
+                                usage: self.usage.clone(),
+                            },
+                            error: Some(AttemptError::Failed("context canceled".into())),
+                        };
+                    }
+                }
             }
             AttemptResult {
                 result: RunResult {
@@ -672,6 +729,7 @@ pub fn test_deps(adapters: Vec<Arc<dyn AgentAdapter>>) -> TestDeps {
             getenv.lock().unwrap().get(k).cloned().unwrap_or_default()
         })),
         work_dir: work_dir.clone(),
+        quota_poll: Duration::from_millis(10),
         ..Deps::default()
     };
     TestDeps {

@@ -935,6 +935,7 @@ pub fn attempt_model_id(agent: &str, model: &str) -> String {
 
 pub fn switch_reason_label(exit_class: &str) -> String {
     match exit_class.trim() {
+        "near_limit" => "95% of usage limit".to_string(),
         "rate_limit" | "credits" => "usage limit".to_string(),
         "" => "failed".to_string(),
         other => other.replace('_', " "),
@@ -955,7 +956,12 @@ pub fn switch_divider_label(
     let to = attempt_model_id(to_agent, to_model);
     let reason = switch_reason_label(exit_class);
     if has_handoff {
-        format!("Switched {from} \u{2192} {to} \u{00b7} {reason} \u{00b7} hand-off")
+        let suffix = if exit_class.trim() == "near_limit" {
+            "hand-off by the model"
+        } else {
+            "hand-off"
+        };
+        format!("Switched {from} \u{2192} {to} \u{00b7} {reason} \u{00b7} {suffix}")
     } else {
         format!("Switched {from} \u{2192} {to} \u{00b7} {reason}")
     }
@@ -1968,5 +1974,16 @@ mod tests {
             "Switched claude/claude-opus-5-5-high \u{2192} codex/gpt-6-luna-medium \u{00b7} usage limit \u{00b7} hand-off"
         );
         assert_eq!(switches[0].handoff, "## Original task\nFix it");
+        assert_eq!(
+            switch_divider_label(
+                "claude",
+                "claude-opus-5-5-high",
+                "codex",
+                "gpt-6.1-sol",
+                "near_limit",
+                true,
+            ),
+            "Switched claude/claude-opus-5-5-high \u{2192} codex/gpt-6.1-sol \u{00b7} 95% of usage limit \u{00b7} hand-off by the model"
+        );
     }
 }
