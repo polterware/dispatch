@@ -235,6 +235,66 @@ async fn openai_reads_the_level_probabilities() {
     assert_eq!(body["questions"][0]["levels"].as_array().unwrap().len(), 3);
 }
 
+/// One choice question with two candidates, for the classifier judges.
+fn tier_question() -> BTreeMap<String, JevChoice> {
+    let criteria = [
+        ("a/one".to_string(), "First".to_string()),
+        ("b/two".to_string(), "Second".to_string()),
+    ]
+    .into_iter()
+    .collect();
+    [(
+        "hard".to_string(),
+        JevChoice {
+            instructions: "Which model fits the hard tier?".into(),
+            criteria,
+        },
+    )]
+    .into_iter()
+    .collect()
+}
+
+#[tokio::test]
+async fn openai_choices_asks_each_tier_as_a_score_over_its_candidates() {
+    let (url, seen) = fake_api(json!({"type": "answer", "answers": [{
+        "name": "hard",
+        "probabilities": [
+            {"index": 0, "label": "a/one", "probability": 0.3},
+            {"index": 1, "label": "b/two", "probability": 0.7},
+        ],
+    }]}))
+    .await;
+    let openai = OpenAi {
+        url,
+        ..OpenAi::default()
+    };
+    let answers = openai
+        .choices(json!({"role": "reviewer"}), tier_question())
+        .await
+        .unwrap();
+    assert_eq!(answers["hard"]["b/two"], 0.7);
+    assert_eq!(answers["hard"]["a/one"], 0.3);
+    let seen = seen.lock().unwrap();
+    let question = &seen[0].1["questions"][0];
+    assert_eq!(question["name"], "hard");
+    assert_eq!(question["type"], "score");
+    assert_eq!(question["levels"][1]["label"], "b/two");
+}
+
+#[test]
+fn a_cli_classifier_ranks_candidates_as_json_and_unknown_names_drop() {
+    let questions = tier_question();
+    let prompt =
+        dispatch_core::classifier::choices_prompt(&json!({"role": "reviewer"}), &questions);
+    assert!(prompt.contains("- a/one: First") && prompt.contains("## hard"));
+    let reply = "Here you go:\n{\"hard\": [\"b/two\", \"x/nope\", \"a/one\"]}";
+    let answers = dispatch_core::classifier::parse_choices(reply, &questions).unwrap();
+    assert_eq!(answers["hard"]["b/two"], 1.0);
+    assert_eq!(answers["hard"]["a/one"], 0.5);
+    assert!(!answers["hard"].contains_key("x/nope"));
+    assert!(dispatch_core::classifier::parse_choices("no json", &questions).is_err());
+}
+
 #[tokio::test]
 async fn openai_refusal_is_an_error() {
     let (url, _) = fake_api(json!({"type": "refusal", "refusal": "not a task"})).await;

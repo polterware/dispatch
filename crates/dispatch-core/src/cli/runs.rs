@@ -1085,7 +1085,7 @@ pub(super) async fn tiers(db_path: &Path, args: &[String]) -> CliResult {
     .string(
         "judge",
         "",
-        "with build: jev asks TypeSafe's Jev once which candidates fit the role's work",
+        "with build: jev asks TypeSafe's Jev once which candidates fit the role's work; classifier asks the classifier Settings › Classifier picked",
     );
     common(&mut f);
     let positional = f.parse_interspersed(args)?;

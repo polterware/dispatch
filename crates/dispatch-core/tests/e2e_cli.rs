@@ -1756,3 +1756,15 @@ fn an_agents_disabled_model_leaves_that_agents_card_alone() {
             .any(|m| m.agent == "fake" && m.model == "fake-fast")
     );
 }
+
+/// Classifier recommendation asks the classifier Settings › Classifier picked, so with none it
+/// says where to pick one; the old cheapest judge is gone.
+#[test]
+fn a_tier_build_judged_by_the_classifier_needs_one() {
+    let env = Env::new();
+    env.ok(&["config", "set", "classifier", "off"]);
+    let none = env.fails(&["tiers", "build", "--judge", "classifier"]);
+    assert!(none.contains("Settings › Classifier"), "{none}");
+    let gone = env.fails(&["tiers", "build", "--judge", "cheapest"]);
+    assert!(gone.contains("unknown judge"), "{gone}");
+}

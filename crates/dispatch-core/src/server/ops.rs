@@ -1011,15 +1011,10 @@ impl Core {
             .unwrap_or_else(|| PRIORITY_BALANCED.into());
         let role = m.role.trim().to_owned();
         let judge = m.judge.trim().to_owned();
-        if !judge.is_empty() && judge != JUDGE_JEV && judge != JUDGE_CHEAPEST {
+        if !judge.is_empty() && judge != JUDGE_JEV && judge != JUDGE_CLASSIFIER {
             return Err(RpcError::invalid(format!(
-                "unknown judge {judge} (want {JUDGE_JEV} or {JUDGE_CHEAPEST})"
+                "unknown judge {judge} (want {JUDGE_JEV} or {JUDGE_CLASSIFIER})"
             )));
-        }
-        // The cheapest pick weighs only what this machine's agent CLIs report, never the
-        // stored table's models.
-        if judge == JUDGE_CHEAPEST && agent.is_empty() {
-            entries = models.clone();
         }
         if !role.is_empty() && m.apply {
             return Err(RpcError::invalid(
@@ -1037,7 +1032,7 @@ impl Core {
                     .ok_or_else(|| RpcError::invalid(format!("unknown role {role}")))?,
             )
         };
-        let per_tier = if judge == JUDGE_JEV {
+        let per_tier = if judge == JUDGE_JEV || judge == JUDGE_CLASSIFIER {
             JEV_POOL
         } else {
             tiers_build::BUILD_PER_TIER
@@ -1053,8 +1048,22 @@ impl Core {
         for tier in tiers_under(&floor) {
             tiers_build::clear_tier(&mut built, tier);
         }
-        if judge == JUDGE_JEV {
-            judge_with_jev(&mut built, &role, profile.as_ref()).await?;
+        if judge == JUDGE_JEV || judge == JUDGE_CLASSIFIER {
+            let (state, questions) = judge_questions(&built, &role, profile.as_ref());
+            let answers = if questions.is_empty() {
+                BTreeMap::new()
+            } else if judge == JUDGE_JEV {
+                classifier::Jev::default()
+                    .choices(state, questions)
+                    .await
+                    .map_err(|e| RpcError::invalid(format!("jev: {e}")))?
+            } else {
+                let deps = self.deps_in("").map_err(RpcError::internal)?;
+                classifier::choices(&deps, state, questions)
+                    .await
+                    .map_err(|e| RpcError::invalid(format!("classifier: {e}")))?
+            };
+            keep_judged(&mut built, &answers);
         }
         let mut out = json!({
             "priority": priority, "agent": agent, "tiers": built.tiers,
@@ -1080,9 +1089,10 @@ impl Core {
 
 /// The judge that asks TypeSafe's Jev which candidates fit a role.
 const JUDGE_JEV: &str = "jev";
-/// The judge that ranks only the installed agent CLIs' models, the cheapest that qualify first.
-const JUDGE_CHEAPEST: &str = "cheapest";
-/// How many candidates per tier Jev chooses among; it keeps the build's usual three.
+/// The judge that asks the classifier Settings › Classifier picked (Jev, an OpenAI model,
+/// or an agent CLI's model) which candidates fit a role.
+const JUDGE_CLASSIFIER: &str = "classifier";
+/// How many candidates per tier a judge chooses among; it keeps the build's usual three.
 const JEV_POOL: usize = 8;
 
 /// The tiers under `floor`, which a role with that lowest tier never runs at.
@@ -1094,20 +1104,23 @@ fn tiers_under(floor: &str) -> &'static [&'static str] {
     }
 }
 
-/// Asks Jev once, with one choice question per tier, which of each tier's candidates fit
-/// `role`'s work, and keeps each tier's three it rates highest.
-async fn judge_with_jev(
-    built: &mut tiers_build::TierBuild,
+/// A candidate's name in a judge's question: `agent/model`, with `@effort` when it has one.
+fn judged_key(b: &tiers_build::BuiltEntry) -> String {
+    if b.entry.effort.is_empty() {
+        format!("{}/{}", b.entry.agent, b.entry.model)
+    } else {
+        format!("{}/{}@{}", b.entry.agent, b.entry.model, b.entry.effort)
+    }
+}
+
+/// One choice question per tier about which of its candidates fit `role`'s work, and the
+/// role's description they are asked about, for a judge (Jev or the classifier).
+fn judge_questions(
+    built: &tiers_build::TierBuild,
     role: &str,
     profile: Option<&Profile>,
-) -> RpcResult<()> {
-    let key = |b: &tiers_build::BuiltEntry| {
-        if b.entry.effort.is_empty() {
-            format!("{}/{}", b.entry.agent, b.entry.model)
-        } else {
-            format!("{}/{}@{}", b.entry.agent, b.entry.model, b.entry.effort)
-        }
-    };
+) -> (Value, BTreeMap<String, classifier::JevChoice>) {
+    let key = judged_key;
     let mut questions = BTreeMap::new();
     for (tier, work) in [
         ("easy", "small, clear tasks"),
@@ -1152,9 +1165,6 @@ async fn judge_with_jev(
             },
         );
     }
-    if questions.is_empty() {
-        return Ok(());
-    }
     let state = match profile {
         Some(p) => json!({
             "role": role,
@@ -1164,11 +1174,17 @@ async fn judge_with_jev(
         }),
         None => json!({"role": "general", "when to use": "any task no other role takes"}),
     };
-    let answers = classifier::Jev::default()
-        .choices(state, questions)
-        .await
-        .map_err(|e| RpcError::invalid(format!("jev: {e}")))?;
-    for (tier, probs) in &answers {
+    (state, questions)
+}
+
+/// Keeps each tier's three candidates the judge rated highest; a tier it was not asked
+/// about keeps the catalog's first three.
+fn keep_judged(
+    built: &mut tiers_build::TierBuild,
+    answers: &BTreeMap<String, BTreeMap<String, f64>>,
+) {
+    let key = judged_key;
+    for (tier, probs) in answers {
         tiers_build::rank_tier(
             built,
             tier,
@@ -1176,13 +1192,11 @@ async fn judge_with_jev(
             tiers_build::BUILD_PER_TIER,
         );
     }
-    // A tier Jev was not asked about keeps the catalog's first three.
     for tier in ["easy", "normal", "hard"] {
         if !answers.contains_key(tier) {
             tiers_build::rank_tier(built, tier, |_| 0.0, tiers_build::BUILD_PER_TIER);
         }
     }
-    Ok(())
 }
 
 /// Applies a set action to `f` and names the key it writes.

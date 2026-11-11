@@ -108,6 +108,90 @@ impl Cli {
     }
 }
 
+impl Cli {
+    /// Asks the agent, in one read-only call, to rank each question's candidates for `state`,
+    /// and scores them by rank: the first 1, the second 1/2, and so on.
+    pub async fn choices(
+        &self,
+        state: serde_json::Value,
+        questions: BTreeMap<String, super::JevChoice>,
+    ) -> Result<BTreeMap<String, BTreeMap<String, f64>>, Error> {
+        let run = self
+            .run
+            .as_ref()
+            .ok_or_else(|| Error::Message("cli classifier: no agent to ask".into()))?;
+        let out = run(choices_prompt(&state, &questions)).await?;
+        parse_choices(&out, &questions)
+    }
+}
+
+/// The prompt that has an agent rank each question's candidates.
+pub fn choices_prompt(
+    state: &serde_json::Value,
+    questions: &BTreeMap<String, super::JevChoice>,
+) -> String {
+    let mut b = String::from(
+        "Rank coding agents and models for a role. Judge from the text alone: do not read files, run commands, or start any work.\n\nThe role:\n",
+    );
+    b.push_str(&serde_json::to_string_pretty(state).unwrap_or_default());
+    b.push_str(
+        "\n\nFor each question, rank its candidates from best to worst for the work it names.\n",
+    );
+    for (id, q) in questions {
+        b.push_str(&format!("\n## {id}\n{}\nCandidates:\n", q.instructions));
+        for (key, about) in &q.criteria {
+            b.push_str(&format!("- {key}: {about}\n"));
+        }
+    }
+    let example: Vec<String> = questions
+        .keys()
+        .map(|id| format!("\"{id}\": [\"<best candidate>\", \"<next>\"]"))
+        .collect();
+    b.push_str(&format!(
+        "\nReply with only JSON like {{{}}}, naming each question and its candidates exactly as written above.",
+        example.join(", ")
+    ));
+    b
+}
+
+/// The ranks in an agent's reply, as scores by candidate: the first JSON object in it, each
+/// question's list of candidate names, best first. Unknown names are left out.
+pub fn parse_choices(
+    out: &str,
+    questions: &BTreeMap<String, super::JevChoice>,
+) -> Result<BTreeMap<String, BTreeMap<String, f64>>, Error> {
+    let (Some(start), Some(end)) = (out.find('{'), out.rfind('}')) else {
+        return Err(Error::Message(
+            "cli classifier: no JSON in the reply".into(),
+        ));
+    };
+    let value: serde_json::Value = serde_json::from_str(&out[start..=end])
+        .map_err(|e| Error::Message(format!("cli classifier: unreadable JSON: {e}")))?;
+    let mut answers = BTreeMap::new();
+    for (id, q) in questions {
+        let Some(list) = value.get(id).and_then(|v| v.as_array()) else {
+            continue;
+        };
+        let mut scores = BTreeMap::new();
+        for name in list.iter().filter_map(|v| v.as_str()) {
+            let name = name.trim();
+            if q.criteria.contains_key(name) && !scores.contains_key(name) {
+                let rank = scores.len() as f64 + 1.0;
+                scores.insert(name.to_owned(), 1.0 / rank);
+            }
+        }
+        if !scores.is_empty() {
+            answers.insert(id.clone(), scores);
+        }
+    }
+    if answers.is_empty() {
+        return Err(Error::Message(
+            "cli classifier: the reply ranked no candidate".into(),
+        ));
+    }
+    Ok(answers)
+}
+
 impl Classifier for Cli {
     fn name(&self) -> String {
         CLASSIFIER_CLI.into()

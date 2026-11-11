@@ -7,7 +7,7 @@ mod keychain;
 mod keys;
 mod openai;
 
-pub use cli::{Cli, cli_prompt, parse_role, parse_tier};
+pub use cli::{Cli, choices_prompt, cli_prompt, parse_choices, parse_role, parse_tier};
 pub use jev::{Jev, JevChoice};
 pub use keychain::{KEYCHAIN_SERVICE, KEYS_FILE, SecretStore, set_keys_dir, set_secret_store};
 pub use keys::{JEV_KEY, Key, OPENAI_KEY};
@@ -32,6 +32,26 @@ pub fn for_policy(deps: &Deps) -> Option<Arc<dyn Classifier>> {
         CLASSIFIER_OPENAI => Some(Arc::new(OpenAi::new(model))),
         CLASSIFIER_CLI => Some(Arc::new(cli_for(deps))),
         _ => None,
+    }
+}
+
+/// Asks the policy's classifier the choice `questions` about `state`: how well each candidate
+/// fits each question, by candidate. Jev and OpenAI answer through their decision APIs, an
+/// agent CLI with ranks from one read-only call.
+pub async fn choices(
+    deps: &Deps,
+    state: serde_json::Value,
+    questions: std::collections::BTreeMap<String, JevChoice>,
+) -> Result<std::collections::BTreeMap<String, std::collections::BTreeMap<String, f64>>, crate::Error>
+{
+    let model = deps.policy.classifier_model.clone();
+    match deps.policy.classifier.as_str() {
+        CLASSIFIER_JEV => Jev::new(model).choices(state, questions).await,
+        CLASSIFIER_OPENAI => OpenAi::new(model).choices(state, questions).await,
+        CLASSIFIER_CLI => cli_for(deps).choices(state, questions).await,
+        _ => Err(crate::Error::Message(
+            "no classifier is set: choose one in Settings › Classifier".into(),
+        )),
     }
 }
 

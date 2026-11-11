@@ -1037,7 +1037,8 @@ impl RolesView {
     }
 
     /// Proposes `role`'s board (General's name for the tier table), ranked by the catalog or,
-    /// with `judge` "jev", by Jev.
+    /// with `judge` "jev", by Jev, or with "classifier", by the classifier Settings ›
+    /// Classifier picked.
     fn open_build(&mut self, role: &str, judge: &str, cx: &mut Context<Self>) {
         let Some(client) = self.state.read(cx).client() else {
             self.toast("The local core is not running.", ToastTone::Danger, cx);
@@ -1746,7 +1747,7 @@ impl RolesView {
                     }),
                 )
             };
-        let (catalog, cheapest, jev, prompt) = (name.clone(), name.clone(), name.clone(), name);
+        let (catalog, judged, jev, prompt) = (name.clone(), name.clone(), name.clone(), name);
         let items = vec![
             item(
                 "From the catalog",
@@ -1754,9 +1755,9 @@ impl RolesView {
                 Rc::new(move |this, cx| this.open_build(&catalog, "", cx)),
             ),
             item(
-                "Cheapest on this machine",
-                Icon::CreditCard,
-                Rc::new(move |this, cx| this.open_build(&cheapest, "cheapest", cx)),
+                "Classifier recommendation",
+                Icon::AiBrain01Icon,
+                Rc::new(move |this, cx| this.open_build(&judged, "classifier", cx)),
             ),
             item(
                 "Decision API recommendation",
@@ -1807,8 +1808,11 @@ impl RolesView {
         let general = self.build_role == GENERAL_ROLE;
         match (general, self.build_judge.as_str()) {
             (true, "jev") => "Tiers the Decision API recommends".to_string(),
-            (true, "cheapest") => "The cheapest tiers on this machine".to_string(),
-            (false, "cheapest") => format!("{}'s board, cheapest on this machine", self.build_role),
+            (true, "classifier") => "Tiers your classifier recommends".to_string(),
+            (false, "classifier") => format!(
+                "{}'s board, as your classifier recommends it",
+                self.build_role
+            ),
             (true, _) => "Build tiers from the model".to_string(),
             (false, "jev") => format!(
                 "{}'s board, as the Decision API recommends it",
