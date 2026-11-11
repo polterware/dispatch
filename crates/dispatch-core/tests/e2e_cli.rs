@@ -1149,6 +1149,112 @@ fn delete_takes_the_worktrees_dispatch_cut_and_keeps_the_users() {
 }
 
 #[test]
+fn a_run_started_from_the_app_reads_as_the_apps() {
+    let env = Env::new();
+    // The app records its conversations' runs with the caller `dispatch`; a delegated run
+    // records the agent that ran it, which is what the gallery's App filter reads.
+    let out = env
+        .command(&["run", "--agent", "fake", "--json", "say hi"])
+        .env("DISPATCH_CALLER_AGENT", "dispatch")
+        .output()
+        .expect("spawn dispatch");
+    assert!(
+        out.status.success(),
+        "dispatch run: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let started: Value = serde_json::from_slice(&out.stdout).expect("run json");
+    let id = started["id"].as_str().expect("run id").to_owned();
+    let s = env.wait_for(&id, "COMPLETED");
+    assert_eq!(s["origin"], "app", "{s}");
+    assert_eq!(s["caller_agent"], "dispatch", "{s}");
+    assert!(
+        s["conversation_id"]
+            .as_str()
+            .is_some_and(|c| c.starts_with("dispatch:")),
+        "{s}"
+    );
+
+    let delegated = env.run("say hi", &["--readonly"]);
+    let s = env.wait_for(&delegated, "COMPLETED");
+    assert_eq!(s["origin"], "delegated", "{s}");
+}
+
+#[test]
+fn run_images_land_in_artifacts_and_go_with_the_run() {
+    let env = Env::new();
+    let id = env.run("IMAGE draw a chart", &[]);
+    env.wait_for(&id, "COMPLETED");
+    wait_until("the run's image is indexed", || {
+        env.json(&["artifacts", "--json"])["total"] == 1
+    });
+    let listed = env.json(&["artifacts", "--json"]);
+    let item = &items(&listed["artifacts"])[0];
+    assert_eq!(item["runId"], id.as_str(), "{listed}");
+    assert_eq!(item["origin"], "delegated");
+    assert_eq!(item["kind"], "png");
+    assert_eq!(item["width"], 1);
+    assert_eq!(item["height"], 1);
+    assert_eq!(item["relPath"], "chart.png");
+    assert_eq!(item["prompt"], "IMAGE draw a chart");
+    let chart = PathBuf::from(item["path"].as_str().expect("path"));
+    assert!(
+        chart.starts_with(env.data.join("artifacts")),
+        "{} is not in the data folder",
+        chart.display()
+    );
+    assert!(chart.is_file());
+    // This run is an agent's delegation, not a conversation started in the app.
+    let run = env.status(&id);
+    assert_eq!(run["origin"], "delegated", "{run}");
+
+    // The filters pick it by its run's prompt and agent, and leave the app's out.
+    assert!(items(&env.json(&["artifacts", "--origin", "app", "--json"])["artifacts"]).is_empty());
+    let mine = env.json(&["artifacts", "--agent", "fake", "--query", "chart", "--json"]);
+    assert_eq!(items(&mine["artifacts"]).len(), 1, "{mine}");
+    assert!(items(&env.json(&["artifacts", "--query", "a fox", "--json"])["artifacts"]).is_empty());
+
+    // An image the agent wrote into its worktree is copied before the worktree can go.
+    let committed = env.run("COMMITIMAGE draw a shot", &[]);
+    let s = env.wait_for(&committed, "COMPLETED");
+    let worktree = PathBuf::from(s["worktree"].as_str().expect("worktree"));
+    assert!(worktree.join("shot.png").exists());
+    wait_until("both images are indexed", || {
+        env.json(&["artifacts", "--json"])["total"] == 2
+    });
+    let listed = env.json(&["artifacts", "--json"]);
+    let shot = items(&listed["artifacts"])
+        .iter()
+        .find(|a| a["runId"] == committed.as_str())
+        .unwrap_or_else(|| panic!("the committed image is not indexed: {listed}"))
+        .clone();
+    assert_eq!(shot["relPath"], "worktree/shot.png");
+    let copy = PathBuf::from(shot["path"].as_str().expect("path"));
+    assert!(copy.is_file());
+    let text = env.ok(&["artifacts"]);
+    assert!(text.contains("chart.png"), "{text}");
+    assert!(text.contains("delegated"), "{text}");
+    assert!(text.contains("IMAGE draw a chart"), "{text}");
+
+    // Deleting the run takes its images with it, rows and copies.
+    env.ok(&["delete", &committed]);
+    wait_until("the deleted run's image is gone", || !copy.exists());
+    let listed = env.json(&["artifacts", "--json"]);
+    assert_eq!(listed["total"], 1, "{listed}");
+    assert!(
+        items(&listed["artifacts"])
+            .iter()
+            .all(|a| a["runId"] != committed.as_str())
+    );
+
+    let refused = env.fails(&["artifacts", "--origin", "nonsense"]);
+    assert!(
+        refused.contains("origin must be app or delegated"),
+        "{refused}"
+    );
+}
+
+#[test]
 fn a_conversation_is_renamed_and_named_by_its_prompt_again() {
     let env = Env::new();
     let named = env.ok(&["rename", "conv-1", "Release", "notes"]);

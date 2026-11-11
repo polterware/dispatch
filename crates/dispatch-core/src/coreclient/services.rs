@@ -243,6 +243,18 @@ impl DispatchClient {
         proto::ListWorktreesResponse
     );
     unary_rpc!(
+        list_artifacts,
+        "ListArtifacts",
+        proto::ListArtifactsRequest,
+        proto::ListArtifactsResponse
+    );
+    unary_rpc!(
+        delete_artifact,
+        "DeleteArtifact",
+        proto::DeleteArtifactRequest,
+        proto::DeleteArtifactResponse
+    );
+    unary_rpc!(
         list_quota,
         "ListQuota",
         proto::ListQuotaRequest,

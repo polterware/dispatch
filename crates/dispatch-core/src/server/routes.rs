@@ -103,6 +103,27 @@ async fn shutdown(State(core): State<Arc<Core>>, headers: HeaderMap, body: Bytes
     }
 }
 
+/// The client a call names in `Polterware-Client`, as the desktop app does.
+fn client_name(headers: &HeaderMap) -> String {
+    headers
+        .get("polterware-client")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_owned()
+}
+
+/// StartRun reads the client header: the app's own requests record their caller as the app's.
+async fn start_run(State(core): State<Arc<Core>>, headers: HeaderMap, body: Bytes) -> Response {
+    if let Err(e) = authorize(&core, &headers) {
+        return e.into_response();
+    }
+    let client = client_name(&headers);
+    match unary_request::<pb::StartRunRequest>(&headers, &body) {
+        Ok((codec, req)) => unary_response(codec, core.start_run(req, &client).await),
+        Err(e) => e.into_response(),
+    }
+}
+
 async fn watch_run(State(core): State<Arc<Core>>, headers: HeaderMap, body: Bytes) -> Response {
     if let Err(e) = authorize(&core, &headers) {
         return e.into_response();
@@ -124,7 +145,8 @@ pub(super) fn router(core: Arc<Core>) -> Router {
     let r = Router::new()
         .route("/dispatch.v1.HealthService/Check", post(check))
         .route("/dispatch.v1.HealthService/Shutdown", post(shutdown))
-        .route("/dispatch.v1.DispatchService/WatchRun", post(watch_run));
+        .route("/dispatch.v1.DispatchService/WatchRun", post(watch_run))
+        .route("/dispatch.v1.DispatchService/StartRun", post(start_run));
     let r = unary!(
         r,
         "/dispatch.v1.DispatchService/ListSections",
@@ -153,13 +175,22 @@ pub(super) fn router(core: Arc<Core>) -> Router {
         "/dispatch.v1.DispatchService/ReadRunEvents",
         read_run_events
     );
-    let r = unary!(r, "/dispatch.v1.DispatchService/StartRun", start_run);
     let r = unary!(r, "/dispatch.v1.DispatchService/CancelRun", cancel_run);
     let r = unary!(r, "/dispatch.v1.DispatchService/Result", result);
     let r = unary!(
         r,
         "/dispatch.v1.DispatchService/ListWorktrees",
         list_worktrees
+    );
+    let r = unary!(
+        r,
+        "/dispatch.v1.DispatchService/ListArtifacts",
+        list_artifacts
+    );
+    let r = unary!(
+        r,
+        "/dispatch.v1.DispatchService/DeleteArtifact",
+        delete_artifact
     );
     let r = unary!(r, "/dispatch.v1.DispatchService/ListQuota", list_quota);
     let r = unary!(r, "/dispatch.v1.DispatchService/ListTiers", list_tiers);

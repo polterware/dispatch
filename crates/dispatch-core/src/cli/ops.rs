@@ -37,6 +37,7 @@ pub(crate) const OPS_USAGE: &str = "       dispatch wait <id> [--timeout <dur>] 
        dispatch merge <id>
        dispatch clean <id> [--force]
        dispatch worktrees [--prune] [--dir <repo>] [--json]
+       dispatch artifacts [--origin app|delegated] [--repo <folder>] [--agent <name>] [--conversation <id>] [--query <text>] [--limit <n>] [--offset <n>] [--json]
        dispatch delete <id>... | --conversation <id> [--json]   (ended runs, their transcripts, and the worktrees Dispatch cut for them)
        dispatch rename <conversation-id> <name>   (an empty name gives the conversation back its first prompt)
        dispatch recover <id>
@@ -988,6 +989,115 @@ fn plural_worktrees(n: usize) -> String {
     } else {
         format!("{n} worktrees")
     }
+}
+
+/// `dispatch artifacts`: the images runs made, newest first, each with where it came from:
+/// the app or the agent that delegated it, the run's agent and model, and its prompt.
+pub(super) async fn artifacts(db_path: &Path, args: &[String]) -> CliResult {
+    let mut f = Flags::new("dispatch artifacts");
+    f.string("origin", "", "app or delegated (default: both)")
+        .string("repo", "", "a repository's folder")
+        .string("agent", "", "one agent's images")
+        .string("conversation", "", "one conversation's images")
+        .string("query", "", "search the prompt of the run that made each")
+        .int("limit", 50, "how many to list (0 = every one)")
+        .int("offset", 0, "where to start")
+        .bool("json", false, "print one JSON object");
+    if !f.parse_interspersed(args)?.is_empty() {
+        return Err(usage_err(format!(
+            "dispatch artifacts takes no arguments\n{OPS_USAGE}"
+        )));
+    }
+    let c = super::dial(db_path).await?;
+    let res = c
+        .dispatch
+        .list_artifacts(&pb::ListArtifactsRequest {
+            origin: f.str("origin"),
+            repo: f.str("repo"),
+            agent: f.str("agent"),
+            conversation_id: f.str("conversation"),
+            query: f.str("query"),
+            limit: i32::try_from(f.int_value("limit")).unwrap_or(i32::MAX),
+            offset: i32::try_from(f.int_value("offset")).unwrap_or(0),
+        })
+        .await?;
+    if f.flag("json") {
+        let rows = res.artifacts.iter().map(artifact_json).collect::<Vec<_>>();
+        write_json(&serde_json::json!({
+            "artifacts": rows,
+            "total": res.total,
+        }))?;
+        return Ok(());
+    }
+    if res.artifacts.is_empty() {
+        println!("no artifacts");
+        return Ok(());
+    }
+    for item in &res.artifacts {
+        println!("{}", artifact_line(item));
+    }
+    let shown = i64::try_from(res.artifacts.len()).unwrap_or(i64::MAX);
+    let total = i64::from(res.total);
+    if total > shown {
+        println!("{} more", total - shown);
+    }
+    Ok(())
+}
+
+/// One image as `dispatch artifacts` prints it, with the run's prompt under it.
+fn artifact_line(item: &pb::DispatchArtifact) -> String {
+    let created = item.created_at.replace('T', " ");
+    let created = created.get(..16).unwrap_or(&created).to_owned();
+    let prompt = item.prompt.trim().lines().next().unwrap_or_default();
+    let prompt = if prompt.chars().count() > 80 {
+        format!("{}…", prompt.chars().take(80).collect::<String>())
+    } else {
+        prompt.to_owned()
+    };
+    format!(
+        "{created}  {:<9}  {}/{}  {} {}x{}  {}  {}\n    {prompt}",
+        item.origin,
+        item.agent,
+        item.model,
+        item.kind,
+        item.width,
+        item.height,
+        size_text(item.bytes),
+        item.path
+    )
+}
+
+fn size_text(bytes: i64) -> String {
+    let bytes = f64::from(i32::try_from(bytes.max(0)).unwrap_or(i32::MAX));
+    if bytes >= 1024.0 * 1024.0 {
+        format!("{:.1} MB", bytes / (1024.0 * 1024.0))
+    } else if bytes >= 1024.0 {
+        format!("{:.1} kB", bytes / 1024.0)
+    } else {
+        format!("{bytes:.0} B")
+    }
+}
+
+fn artifact_json(item: &pb::DispatchArtifact) -> Value {
+    serde_json::json!({
+        "id": item.id,
+        "runId": item.run_id,
+        "workspaceId": item.workspace_id,
+        "conversationId": item.conversation_id,
+        "callerAgent": item.caller_agent,
+        "agent": item.agent,
+        "model": item.model,
+        "repo": item.repo,
+        "path": item.path,
+        "relPath": item.rel_path,
+        "kind": item.kind,
+        "bytes": item.bytes,
+        "width": item.width,
+        "height": item.height,
+        "createdAt": item.created_at,
+        "prompt": item.prompt,
+        "origin": item.origin,
+    })
 }
 
 /// One folder as `dispatch worktrees` prints it: run, status, changes, branch, path.

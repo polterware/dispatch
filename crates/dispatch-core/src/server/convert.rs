@@ -109,6 +109,7 @@ pub fn run(r: &Run) -> pb::DispatchRun {
                 merge_sha: l.merge_sha.clone(),
             })
             .collect(),
+        origin: crate::types::origin(&r.caller_agent).into(),
     }
 }
 
@@ -331,6 +332,7 @@ pub fn run_meta(r: &Run) -> Value {
     let pairs: Vec<(&str, Value)> = vec![
         ("ConversationID", json!(r.conversation_id)),
         ("CallerAgent", json!(r.caller_agent)),
+        ("Origin", json!(crate::types::origin(&r.caller_agent))),
         ("ID", json!(r.id)),
         ("ProjectID", json!(r.project_id)),
         ("Status", json!(r.status)),

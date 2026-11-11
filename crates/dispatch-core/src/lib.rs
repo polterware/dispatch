@@ -31,6 +31,7 @@ pub mod tiers;
 pub mod tiers_build;
 
 pub mod adapters;
+pub mod artifacts;
 pub mod classifier;
 pub mod cli;
 pub mod coreclient;
