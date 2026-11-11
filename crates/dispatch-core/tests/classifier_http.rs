@@ -250,8 +250,7 @@ async fn openai_refusal_is_an_error() {
     assert!(error.to_string().contains("openai refused"), "{error}");
 }
 
-/// The live tests read the key from the environment only: the Keychain item trusts the
-/// dispatch binary alone, so a test binary would have to ask for it.
+/// The live tests read the key from the environment only, never the person's saved key.
 fn live_key(env: &str) {
     assert!(
         std::env::var(env).is_ok_and(|value| !value.trim().is_empty()),

@@ -1094,11 +1094,7 @@ impl SettingsView {
                         let field = if name == "openai" { "openai" } else { "jev" };
                         view.refresh_key_field(field, cx);
                         view.toast(
-                            if saving {
-                                "Key saved in the Keychain."
-                            } else {
-                                "Key removed from the Keychain."
-                            },
+                            if saving { "Key saved." } else { "Key removed." },
                             ToastTone::Success,
                             cx,
                         );
@@ -1956,7 +1952,7 @@ impl SettingsView {
             Icon::AiBrain01Icon,
             TileTone::Knowledge,
             "Difficulty classifier",
-            "What judges how hard a task is before it is routed. Auto exists only with one; without it, every run takes a tier. A key is kept in the macOS Keychain, where only Dispatch reads it, and never shown again.",
+            "What judges how hard a task is before it is routed. Auto exists only with one; without it, every run takes a tier. A key is saved in Dispatch's data folder, readable only by your user, and never shown again.",
             None,
             body,
             cx,

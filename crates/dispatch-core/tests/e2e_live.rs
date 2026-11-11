@@ -6,8 +6,7 @@
 //! cargo test -p dispatch-core --test e2e_live -- --ignored --test-threads=1
 //!
 //! `DISPATCH_LIVE_MODELS` picks the agents and models (`agent/model,...`), and
-//! `DISPATCH_E2E_BIN` another build, such as the installed app's, which can read the Jev key
-//! its own Keychain item holds without asking.
+//! `DISPATCH_E2E_BIN` another build, such as the installed app's.
 
 use serde_json::Value;
 use std::path::{Path, PathBuf};

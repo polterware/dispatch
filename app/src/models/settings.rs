@@ -509,7 +509,7 @@ pub fn env_key_sentence(env: &str) -> String {
 }
 
 pub fn key_placeholder(status: &str) -> &'static str {
-    if status == "keychain" {
+    if status == "saved" {
         "Paste a new key"
     } else {
         "Paste a key"
@@ -517,7 +517,7 @@ pub fn key_placeholder(status: &str) -> &'static str {
 }
 
 pub fn key_uses_replace(status: &str) -> bool {
-    status == "keychain"
+    status == "saved"
 }
 
 /// Test is disabled only while the core reports the key missing.
@@ -536,8 +536,8 @@ pub fn trimmed_draft(draft: &str) -> String {
 /// Chip copy for a key source. The returned label is never the stored secret.
 pub fn key_chip(status: &str) -> KeyChip {
     match status {
-        "keychain" => KeyChip {
-            label: "Keychain",
+        "saved" => KeyChip {
+            label: "Saved",
             ok: true,
         },
         "env" => KeyChip {
@@ -995,7 +995,7 @@ mod tests {
             Some("Needs a key")
         );
         assert_eq!(
-            classifier_trailing("openai", "off", "keychain", Some(&cli)),
+            classifier_trailing("openai", "off", "saved", Some(&cli)),
             None
         );
         assert_eq!(
@@ -1015,17 +1015,16 @@ mod tests {
 
     #[test]
     fn key_status_never_keeps_or_displays_the_secret() {
-        let status = parse_key_status_value(
-            r#"{"key":"jev","status":"keychain","value":"sk-secret-value"}"#,
-        );
-        assert_eq!(status, "keychain");
+        let status =
+            parse_key_status_value(r#"{"key":"jev","status":"saved","value":"sk-secret-value"}"#);
+        assert_eq!(status, "saved");
         assert!(!status.contains("sk-secret"));
         for secret in ["sk-live", "sk-typesafe", "super-secret-key", ""] {
             let chip = key_chip(secret);
-            assert!(matches!(chip.label, "Keychain" | "Environment" | "Not set"));
+            assert!(matches!(chip.label, "Saved" | "Environment" | "Not set"));
             assert_ne!(chip.label, secret);
         }
-        assert_eq!(key_chip("keychain").label, "Keychain");
+        assert_eq!(key_chip("saved").label, "Saved");
         assert_eq!(key_chip("env").label, "Environment");
         assert_eq!(key_chip("missing").label, "Not set");
         assert!(!key_chip("missing").ok);

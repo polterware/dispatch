@@ -32,7 +32,7 @@ pub(crate) const OPS_USAGE: &str = "       dispatch wait <id> [--timeout <dur>] 
        dispatch classify [--card <slug>] [--dir <repo>] [--json] <prompt>
        dispatch config get [priority|discover|roles|classifier|classifier_model|classifier_agent|classifier_keys|classifier_cli]
        dispatch config set priority <speed|balanced|quality> | discover <true|false> | roles <true|false> | classifier <off|jev|openai|cli> | classifier_model <model> | classifier_agent <agent[/model]|default>
-       dispatch config key set|clear jev|openai   (set reads the key from stdin into a Keychain item only dispatch reads; TYPESAFE_API_KEY or OPENAI_API_KEY wins over it)
+       dispatch config key set|clear jev|openai   (set reads the key from stdin into keys.json in the state folder, readable only by your user; TYPESAFE_API_KEY or OPENAI_API_KEY wins over it)
        dispatch doctor [--json]
        dispatch merge <id>
        dispatch clean <id> [--force]

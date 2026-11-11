@@ -53,4 +53,6 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-cli
 [profile.release]
 lto = "thin"
 codegen-units = 1
-panic = "abort"
+# A panic in one of the core's tasks (a TLS check inside reqwest once did) stays in that
+# task: aborting took the whole core down with every run in flight.
+panic = "unwind"

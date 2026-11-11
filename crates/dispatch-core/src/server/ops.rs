@@ -628,8 +628,8 @@ impl Core {
         };
         let path_text = |p: &Path| p.to_string_lossy().into_owned();
         match m.action.as_str() {
-            // key-set and key-clear keep a classifier's API key in the macOS
-            // Keychain; the reply says only where the key is now found.
+            // key-set and key-clear keep a classifier's API key in keys.json in
+            // the state folder; the reply says only where the key is now found.
             "key-set" | "key-clear" => {
                 let Some(k) = classifier::key_for(&key) else {
                     return Err(RpcError::invalid(format!(

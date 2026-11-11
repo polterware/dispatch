@@ -1,8 +1,10 @@
-//! The macOS Keychain items that hold the classifier keys: generic passwords
-//! in the login Keychain through Security.framework. An item the dispatch
-//! binary adds has an access list that trusts only that binary: any other
-//! program, security(1) included, has to ask the person before it reads the
-//! value.
+//! Where the classifier keys live: `keys.json` in Dispatch's state folder, readable by the
+//! person's user only (0600 in a 0700 folder), as other agent CLIs keep theirs.
+//!
+//! They used to be macOS Keychain items. An item the dispatch binary adds trusts only that
+//! binary, and every build is another binary: the next build, the release app, or the CLI
+//! could no longer read it (errSecAuthFailed, with no one to ask from the headless core). The
+//! Keychain code stays to move a key saved there into the file once, when it still reads.
 #![allow(unsafe_code)]
 
 use crate::Error;
@@ -13,7 +15,9 @@ use core_foundation::{
     dictionary::{CFDictionary, CFDictionaryRef},
     string::{CFString, CFStringRef},
 };
+use std::collections::BTreeMap;
 use std::ffi::c_void;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, LazyLock, RwLock};
 
@@ -42,11 +46,137 @@ pub trait SecretStore: Send + Sync {
     fn drop_legacy(&self, account: &str) -> Result<(), Error>;
 }
 
-static STORE: LazyLock<RwLock<Arc<dyn SecretStore>>> = LazyLock::new(|| {
-    RwLock::new(Arc::new(MacKeychain {
-        service: KEYCHAIN_SERVICE,
-    }))
-});
+static STORE: LazyLock<RwLock<Arc<dyn SecretStore>>> =
+    LazyLock::new(|| RwLock::new(Arc::new(FileSecrets::default())));
+
+/// The folder `keys.json` lives in, set when the core starts.
+static KEYS_DIR: LazyLock<RwLock<Option<PathBuf>>> = LazyLock::new(|| RwLock::new(None));
+
+/// Points the key file at `state_dir`.
+pub fn set_keys_dir(state_dir: &Path) {
+    match KEYS_DIR.write() {
+        Ok(mut g) => *g = Some(state_dir.to_path_buf()),
+        Err(e) => *e.into_inner() = Some(state_dir.to_path_buf()),
+    }
+}
+
+/// The file's name in the state folder.
+pub const KEYS_FILE: &str = "keys.json";
+
+/// The keys in `keys.json`; an account the file lacks may still be moved from the Keychain.
+#[derive(Default)]
+struct FileSecrets {
+    /// The Keychain items each account was already looked for, once per process: a read
+    /// the Keychain refuses is not asked again.
+    tried: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+impl FileSecrets {
+    fn path(&self) -> Result<PathBuf, Error> {
+        let dir = KEYS_DIR
+            .read()
+            .map_or_else(|e| e.into_inner().clone(), |g| g.clone());
+        dir.map(|d| d.join(KEYS_FILE))
+            .ok_or_else(|| Error::Message("the key file's folder is not set".into()))
+    }
+
+    fn load(&self) -> Result<BTreeMap<String, String>, Error> {
+        let path = self.path()?;
+        match std::fs::read_to_string(&path) {
+            Ok(text) if text.trim().is_empty() => Ok(BTreeMap::new()),
+            Ok(text) => serde_json::from_str(&text)
+                .map_err(|e| Error::Message(format!("{}: {e}", path.display()))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Writes the keys to a private temporary file and renames it over `keys.json`, so a
+    /// reader never sees half a file and the file is never readable by others.
+    fn save(&self, keys: &BTreeMap<String, String>) -> Result<(), Error> {
+        use std::io::Write as _;
+        use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
+        let path = self.path()?;
+        let dir = path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+        let tmp = dir.join(format!(".{KEYS_FILE}.{}", std::process::id()));
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        f.write_all(serde_json::to_string_pretty(keys)?.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+
+    fn keychain() -> MacKeychain {
+        MacKeychain {
+            service: KEYCHAIN_SERVICE,
+        }
+    }
+}
+
+impl SecretStore for FileSecrets {
+    fn has(&self, account: &str) -> Result<bool, Error> {
+        Ok(self
+            .load()?
+            .get(account)
+            .is_some_and(|v| !v.trim().is_empty()))
+    }
+
+    fn get(&self, account: &str) -> Result<String, Error> {
+        Ok(self.load()?.get(account).cloned().unwrap_or_default())
+    }
+
+    fn set(&self, account: &str, value: &str) -> Result<(), Error> {
+        let mut keys = self.load()?;
+        keys.insert(account.to_owned(), value.to_owned());
+        self.save(&keys)
+    }
+
+    fn delete(&self, account: &str) -> Result<(), Error> {
+        let mut keys = self.load()?;
+        if keys.remove(account).is_some() {
+            self.save(&keys)?;
+        }
+        Ok(())
+    }
+
+    /// A key a Keychain item still holds under `account`: the dispatch binary's own item,
+    /// when this binary may read it, else one saved through security(1). Each is looked
+    /// for once per process; a refused read is not an error.
+    fn legacy(&self, account: &str) -> Result<String, Error> {
+        let first = self
+            .tried
+            .lock()
+            .map_or(true, |mut t| t.insert(account.to_owned()));
+        if !first {
+            return Ok(String::new());
+        }
+        let k = Self::keychain();
+        if let Ok(v) = k.get(account)
+            && !v.trim().is_empty()
+        {
+            return Ok(v);
+        }
+        Ok(k.legacy(account).unwrap_or_default())
+    }
+
+    /// Removes the Keychain items under `account`, as far as the Keychain allows.
+    fn drop_legacy(&self, account: &str) -> Result<(), Error> {
+        let k = Self::keychain();
+        let _ = k.delete(account);
+        let _ = k.drop_legacy(account);
+        Ok(())
+    }
+}
 
 pub(super) fn store() -> Arc<dyn SecretStore> {
     STORE
@@ -296,5 +426,35 @@ impl SecretStore for MacKeychain {
             )));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FileSecrets, KEYS_FILE, SecretStore, set_keys_dir};
+    use std::os::unix::fs::PermissionsExt as _;
+
+    #[test]
+    fn the_key_file_keeps_keys_for_the_user_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("dispatch");
+        set_keys_dir(&state);
+        let s = FileSecrets::default();
+        assert!(!s.has("jev").unwrap());
+        s.set("jev", "sk-one").unwrap();
+        s.set("openai", "sk-two").unwrap();
+        assert_eq!(s.get("jev").unwrap(), "sk-one");
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&state.join(KEYS_FILE)), 0o600);
+        assert_eq!(mode(&state), 0o700);
+        s.delete("jev").unwrap();
+        assert!(!s.has("jev").unwrap());
+        assert_eq!(s.get("openai").unwrap(), "sk-two");
+        // Nothing else is left in the folder: the temporary file was renamed over the key file.
+        let names: Vec<_> = std::fs::read_dir(&state)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from(KEYS_FILE)]);
     }
 }

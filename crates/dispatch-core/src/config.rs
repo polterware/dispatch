@@ -85,6 +85,7 @@ pub fn validate_config(f: &Policy) -> Result<(), Error> {
 
 pub fn apply_agent_config(state_dir: &Path) -> Result<(), Error> {
     crate::adapters::claude_limits::set_state_dir(state_dir);
+    crate::classifier::set_keys_dir(state_dir);
     let f = load(&policy_config_path(state_dir))?;
     crate::adapters::acp::set_custom_agents(f.acp_agents.into_iter().collect());
     Ok(())
