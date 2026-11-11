@@ -335,8 +335,9 @@ pub fn group_title_tooltip(title: &str) -> String {
     cut
 }
 
-/// A group's rows as the sidebar lists them: the first `limit` in Display order, plus every
-/// row that needs attention, which is never cut. `hidden` counts the rows left out.
+/// A group's rows as the sidebar lists them: the first `limit` in Display order, plus the open
+/// run when it falls past them, which is never cut. Running rows and rows with an unseen update
+/// keep their dot and bot state but do not bypass the page. `hidden` counts the rows left out.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SidebarPage<'a> {
     pub rows: Vec<&'a SidebarRun>,
@@ -1556,7 +1557,7 @@ mod tests {
     }
 
     #[test]
-    fn pages_a_groups_rows_five_at_a_time_without_cutting_a_pinned_row() {
+    fn pages_a_groups_rows_five_at_a_time_without_cutting_the_open_run() {
         let rows: Vec<SidebarRun> = (0..12)
             .map(|index| run(&format!("r{index}"), |_| {}))
             .collect();
@@ -1578,8 +1579,9 @@ mod tests {
         assert_eq!(page.rows.len(), 12);
         assert_eq!(page.hidden, 0);
 
-        // A row that needs attention stays past the limit, in its Display place, and counts
-        // as shown; one already inside the page changes nothing.
+        // The open run stays past the limit, in its Display place, and counts as shown; one
+        // already inside the page changes nothing. A running row or one with an unseen update
+        // does not pin itself here: the caller only pins the open run.
         let page = page_sidebar_rows(&rows, 5, |run| run.id == "r9");
         assert_eq!(page.rows.len(), 6);
         assert_eq!(page.rows[5].id, "r9");
