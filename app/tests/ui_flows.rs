@@ -388,6 +388,68 @@ fn the_runs_page_cancels_a_running_run(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn the_runs_page_groups_by_status_with_running_first_and_switches_to_repository(
+    cx: &mut TestAppContext,
+) {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let core = Core::new();
+    let done = core.start("say hi", true);
+    core.wait_for(&done, "COMPLETED");
+    let running = core.start("SLOW answer", true);
+    core.wait_for(&running, "RUNNING");
+    let mut w = open(&core, cx);
+    w.go(Route::Runs);
+
+    let running_group =
+        w.cx.debug_bounds("runs-group-status:Running")
+            .expect("the Running group on the Runs page");
+    let done_group =
+        w.cx.debug_bounds("runs-group-status:Done")
+            .expect("the Done group on the Runs page");
+    assert!(
+        running_group.top() < done_group.top(),
+        "Running is not above Done: {running_group:?} vs {done_group:?}"
+    );
+    let running_row =
+        w.cx.debug_bounds(Box::leak(format!("runs-row-{running}").into_boxed_str()))
+            .expect("the running row");
+    let done_row =
+        w.cx.debug_bounds(Box::leak(format!("runs-row-{done}").into_boxed_str()))
+            .expect("the completed row");
+    assert!(
+        running_row.top() < done_row.top(),
+        "the running row is not above the completed row: {running_row:?} vs {done_row:?}"
+    );
+
+    w.click("runs-display");
+    w.pump();
+    w.click("menu-item-0");
+    w.pump();
+    w.pick("menu-sub-item-1");
+
+    let repo_group = format!("runs-group-repository:{}", core.repo.display());
+    assert!(
+        w.shows(&repo_group),
+        "switching Display to Repository did not show {repo_group}"
+    );
+    let running_in_repo =
+        w.cx.debug_bounds(Box::leak(format!("runs-row-{running}").into_boxed_str()))
+            .expect("the running row in the repository group");
+    let done_in_repo =
+        w.cx.debug_bounds(Box::leak(format!("runs-row-{done}").into_boxed_str()))
+            .expect("the completed row in the repository group");
+    assert!(
+        running_in_repo.top() < done_in_repo.top(),
+        "the running row is not first inside the repository group"
+    );
+
+    let cancel = format!("run-cancel-{running}");
+    w.click(&cancel);
+    w.wait_for_status(&core, &running, "CANCELLED");
+    assert!(w.toasts().is_empty(), "{:?}", w.toasts());
+}
+
+#[gpui::test]
 fn settings_switch_an_agents_hook(cx: &mut TestAppContext) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let core = Core::new();

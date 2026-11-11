@@ -1,17 +1,22 @@
-//! `DispatchRunRow`'s cells: the run's bot and prompt (with Cancel while it runs), the
-//! repository it came from, its `StatusChip`, `agent / model` in 12px mono, `FileChangeLine`, and when it started.
+//! Parts for the Runs page: collapsible group headers (`SidebarSectionLabel` + count) and
+//! full-width stacked run rows (`SidebarItem::run_row` with the live bot avatar, title, muted
+//! metadata line, Cancel while active, and `StatusChip` at the right).
 
 use std::rc::Rc;
 
-use gpui::{AnyElement, App, FontWeight, IntoElement, SharedString, Window, div, prelude::*, px};
+use gpui::{
+    AnyElement, App, FontWeight, IntoElement, MouseButton, SharedString, Window, div, prelude::*,
+    px,
+};
 
-use crate::avatar::agent_avatar;
+use crate::avatar::{agent_avatar, agent_avatar_live};
 use crate::models::avatar::avatar_status;
-use crate::models::runs::{EM_DASH, RunRow, format_ago};
+use crate::models::runs::{EM_DASH, RunGroup, RunRow, format_ago};
+use crate::models::sidebar::group_title_tooltip;
 use crate::theme::{Theme, status_tone, tw};
 use crate::ui::{
-    Button, ButtonKind, ButtonSize, Icon, chip, icon_colored, mono, primary_cell, sans, tabular,
-    text_width, tooltip,
+    Button, ButtonKind, ButtonSize, CountBadge, CountTone, Icon, SidebarItem, SidebarSectionLabel,
+    chip, ellipsis, icon_colored, mono, primary_cell, sans, tabular, text_width, tooltip,
 };
 
 /// `DispatchAgentAvatar size={32}`; a row is the bot and 5px above and below it.
@@ -149,6 +154,180 @@ pub fn started_cell(row: &RunRow, now_ms: i64, cx: &App) -> AnyElement {
         .text_size(px(12.0))
         .text_color(theme.color_text_muted)
         .child(format_ago(&row.started, now_ms))
+        .into_any_element()
+}
+
+/// A collapsible group header on the Runs page: the group's title and chevron (like the
+/// sidebar's group headers) and its run count badge at the right.
+pub fn group_header(
+    group: &RunGroup,
+    collapsed: bool,
+    on_toggle: RunAction,
+    cx: &App,
+) -> AnyElement {
+    let theme = Theme::global(cx);
+    let toggle_id = group.id.clone();
+    let selector_id = group.id.clone();
+    let label = SidebarSectionLabel::new(
+        SharedString::from(format!("runs-header-{}", group.id)),
+        group.title.clone(),
+        collapsed,
+    )
+    .title_tooltip(group_title_tooltip(&group.title))
+    .padding(theme.space_2, 44.0)
+    .on_toggle(move |window, cx| {
+        on_toggle(&toggle_id, window, cx);
+    });
+    div()
+        .relative()
+        .w_full()
+        .debug_selector(move || format!("runs-group-{selector_id}"))
+        .child(label)
+        .child(
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .right(px(theme.space_2))
+                .flex()
+                .items_center()
+                .child(
+                    CountBadge::new(group.runs.len() as u64)
+                        .tone(CountTone::Neutral)
+                        .sidebar(),
+                ),
+        )
+        .into_any_element()
+}
+
+/// One full-width stacked run row under a group header: the live 40px bot in a 36px box,
+/// the run title over the muted metadata line (`agent / model`, repository, tier, `+/-`
+/// changes, tokens/cost when known, and time ago), Cancel while running, and the status chip
+/// at the right.
+pub fn run_stack_row(
+    index: usize,
+    row: &RunRow,
+    cancelling: bool,
+    now_ms: i64,
+    on_open: RunAction,
+    on_cancel: RunAction,
+    cx: &App,
+) -> AnyElement {
+    let theme = Theme::global(cx);
+    let dot = || {
+        div()
+            .flex_none()
+            .text_color(theme.color_text_muted)
+            .child("\u{00b7}")
+    };
+    let mut meta = div()
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .min_w(px(0.0))
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .text_size(px(12.0))
+        .text_color(theme.color_text_muted)
+        .child(div().flex_none().child(agent_cell(index, row, cx)))
+        .child(dot())
+        .child(div().flex_none().child(source_cell(index, row, cx)));
+    if !row.tier.trim().is_empty() {
+        meta = meta.child(dot()).child(
+            div()
+                .flex_none()
+                .font(sans(theme, FontWeight::NORMAL))
+                .child(SharedString::from(row.tier.clone())),
+        );
+    }
+    if row.has_changes() {
+        meta = meta
+            .child(dot())
+            .child(div().flex_none().child(changes_cell(row, cx)));
+    }
+    if let Some(tokens) = &row.tokens_label {
+        let mut cell = div()
+            .id(("runs-tokens", index))
+            .flex_none()
+            .font(tabular(sans(theme, FontWeight::NORMAL)))
+            .child(SharedString::from(tokens.clone()));
+        if !row.tokens_title.is_empty() {
+            cell = cell.tooltip(tooltip(row.tokens_title.clone()));
+        }
+        meta = meta.child(dot()).child(cell);
+    }
+    if let Some(cost) = &row.cost_label {
+        let mut cell = div()
+            .id(("runs-cost", index))
+            .flex_none()
+            .font(tabular(sans(theme, FontWeight::NORMAL)))
+            .child(SharedString::from(cost.clone()));
+        if !row.cost_title.is_empty() {
+            cell = cell.tooltip(tooltip(row.cost_title.clone()));
+        }
+        meta = meta.child(dot()).child(cell);
+    }
+    meta = meta
+        .child(dot())
+        .child(div().flex_none().child(started_cell(row, now_ms, cx)));
+
+    let content = div()
+        .flex()
+        .flex_col()
+        .gap(px(3.0))
+        .min_w(px(0.0))
+        .child(
+            div()
+                .min_w(px(0.0))
+                .font(sans(theme, FontWeight::MEDIUM))
+                .text_size(px(13.0))
+                .text_color(theme.color_text_primary)
+                .child(ellipsis(row.title.clone())),
+        )
+        .child(meta);
+
+    let mut trailing = div().flex_none().flex().items_center().gap(px(8.0));
+    if row.active {
+        let cancel_id = row.id.clone();
+        trailing = trailing.child(
+            div()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(
+                    Button::new(
+                        SharedString::from(format!("run-cancel-{}", row.id)),
+                        ButtonKind::Ghost,
+                    )
+                    .size(ButtonSize::Sm)
+                    .icon(Icon::Stop)
+                    .icon_size(CANCEL_ICON)
+                    .label("Cancel")
+                    .disabled(cancelling)
+                    .on_click(move |window, cx| {
+                        cx.stop_propagation();
+                        on_cancel(&cancel_id, window, cx);
+                    }),
+                ),
+        );
+    }
+    trailing = trailing.child(status_cell(row, cx));
+
+    let open_id = row.id.clone();
+    let row_key = row.id.clone();
+    let item = SidebarItem::new(SharedString::from(format!("runs-item-{}", row.id)), "")
+        .run_row()
+        .leading(
+            agent_avatar_live(&row.agent, avatar_status(&row.status, &row.merged_at), 40.0),
+            36.0,
+        )
+        .content(content)
+        .trailing(trailing)
+        .on_click(move |window, cx| {
+            on_open(&open_id, window, cx);
+        });
+    div()
+        .w_full()
+        .debug_selector(move || format!("runs-row-{row_key}"))
+        .child(item)
         .into_any_element()
 }
 
