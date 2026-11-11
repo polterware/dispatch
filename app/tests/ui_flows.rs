@@ -540,6 +540,8 @@ fn settings_switch_an_agent_on_and_off(cx: &mut TestAppContext) {
     w.scroll_settings_to("settings-agent-fake");
     w.click("settings-agent-fake");
     w.until("the agent is disabled", || !enabled("fake"));
+    // Its models leave the page with it, so the page is shorter and the row may have moved.
+    w.scroll_settings_to("settings-agent-fake");
     w.click("settings-agent-fake");
     w.until("the agent is enabled", || enabled("fake"));
     assert!(w.toasts().is_empty(), "{:?}", w.toasts());

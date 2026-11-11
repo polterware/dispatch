@@ -84,6 +84,9 @@ pub struct SettingsView {
     agent_rows: Vec<DispatchAgent>,
     agent_switches: BTreeMap<String, Entity<Switch>>,
     agents_saving: bool,
+    /// Bumped by each read of the agent and model lists and by each save, so a read that
+    /// started before a later read or save does not put back what it saw.
+    lists_generation: u64,
     models: Vec<ListedModel>,
     setup: Option<crate::models::settings::AgentSetup>,
     setup_ticket: u64,
@@ -220,6 +223,7 @@ impl SettingsView {
             agent_rows: Vec::new(),
             agent_switches: BTreeMap::new(),
             agents_saving: false,
+            lists_generation: 0,
             models: Vec::new(),
             setup: None,
             setup_ticket: 0,
@@ -939,6 +943,8 @@ impl SettingsView {
             return;
         };
         let epoch = self.epoch;
+        self.lists_generation += 1;
+        let generation = self.lists_generation;
         cx.spawn(async move |this, cx| {
             let listed = cx
                 .background_spawn(async move {
@@ -949,7 +955,7 @@ impl SettingsView {
                 })
                 .await;
             let _ = this.update(cx, |view, cx| {
-                if view.epoch != epoch {
+                if view.epoch != epoch || view.lists_generation != generation {
                     return;
                 }
                 if let Some(response) = listed.0 {
@@ -1048,6 +1054,7 @@ impl SettingsView {
             row.enabled = enabled;
         }
         self.agents_saving = true;
+        self.lists_generation += 1;
         let request = SetAgentEnabledRequest {
             agent: agent.to_string(),
             enabled,
@@ -1194,6 +1201,7 @@ impl SettingsView {
             row.enabled = enabled;
         }
         self.models_saving = true;
+        self.lists_generation += 1;
         self.models_ticket = self.models_ticket.wrapping_add(1);
         self.models_inflight = false;
         let request = SetModelEnabledRequest {
