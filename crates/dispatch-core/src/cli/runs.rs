@@ -974,7 +974,7 @@ pub(super) async fn events(db_path: &Path, args: &[String]) -> CliResult {
 fn events_text(events: &[pb::WatchRunResponse]) -> String {
     let mut text = String::new();
     for (index, event) in events.iter().enumerate() {
-        if event.kind == "started" {
+        if event.kind == "started" || event.kind == "phase" {
             continue;
         }
         if event.kind == "output" || event.kind == "agent" {

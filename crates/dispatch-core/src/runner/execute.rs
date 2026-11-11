@@ -20,8 +20,9 @@ use crate::{
     },
     router, sandbox,
     types::{
-        Attempt, Filters, Run, STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED, STATUS_ORPHANED,
-        STATUS_PENDING, STATUS_RUNNING, STATUS_TIMED_OUT, WORKTREE_ACTIVE, WorktreeInfo, new_id,
+        Attempt, Filters, Run, RunEvent, STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED,
+        STATUS_ORPHANED, STATUS_PENDING, STATUS_RUNNING, STATUS_TIMED_OUT, WORKTREE_ACTIVE,
+        WorktreeInfo, new_id,
     },
     worktree,
 };
@@ -435,8 +436,25 @@ impl Deps {
         self.reconcile(cancel).await?;
 
         let mut cool = store_cooldowns(self.store.as_deref(), self.now());
-        let (cands, resume_session) = match self.plan_candidates(&rec, &cool).await {
+        self.phase(&rec, "Preparing worktree");
+        let work_deps = self.clone();
+        let mut work_rec = rec.clone();
+        let work = tokio::task::spawn_blocking(move || {
+            let result = work_deps.prepare_worktree(&mut work_rec);
+            (work_rec, result)
+        });
+        let planned = self.plan_candidates(&rec, &cool).await;
+        let (prepared, work_result) = match work.await {
+            Ok(result) => result,
+            Err(e) => return self.finish_run(rec, None, STATUS_FAILED, &format!("worktree: {e}")),
+        };
+        rec = prepared;
+        let (cands, resume_session) = match planned {
             Ok(v) => v,
+            Err(fail) => return self.finish_run(rec, None, STATUS_FAILED, &fail),
+        };
+        let dir = match work_result {
+            Ok(dir) => dir,
             Err(fail) => return self.finish_run(rec, None, STATUS_FAILED, &fail),
         };
         let views: Vec<router::Candidate> = cands.iter().map(|c| c.route.clone()).collect();
@@ -453,10 +471,6 @@ impl Deps {
             }
         }
         self.record_route_decision(&rec, &priced);
-        let dir = match self.prepare_worktree(&mut rec) {
-            Ok(dir) => dir,
-            Err(fail) => return self.finish_run(rec, None, STATUS_FAILED, &fail),
-        };
 
         let timeout = Duration::from_secs(u64::try_from(rec.timeout_sec).unwrap_or(0));
         let child_env = child_environ(&rec.id, &self.env(RUN_ID_ENV));
@@ -502,6 +516,9 @@ impl Deps {
             let has_next_candidate = cands[idx + 1..]
                 .iter()
                 .any(|next| cooling(&cool, next.agent(), &candidate_provider(next)).is_none());
+            if agent_start.is_none() {
+                self.phase(&rec, &format!("Starting {} ({})", c.agent(), c.route.model));
+            }
             let attempt_start = self.now();
             agent_start = Some(attempt_start);
             let (res, run_err, near_limit_used) = self
@@ -576,6 +593,20 @@ impl Deps {
             last.error
         );
         self.finish_run(rec, agent_start, STATUS_FAILED, &m)
+    }
+
+    fn phase(&self, rec: &Run, text: &str) {
+        if let Some(st) = self.store.as_deref() {
+            let _ = st.append_event(&RunEvent {
+                run_id: rec.id.clone(),
+                project_id: rec.project_id.clone(),
+                kind: "phase".into(),
+                tier: rec.tier.clone(),
+                text: text.into(),
+                at: fmt_time(self.now()),
+                ..RunEvent::default()
+            });
+        }
     }
 
     /// The ordered candidates and the session to resume, or the failure
