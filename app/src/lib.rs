@@ -15,6 +15,7 @@ pub mod ui;
 pub mod updater;
 pub use polterware_ui::window::vibrancy;
 pub mod views;
+pub mod voice_settings;
 pub use polterware_ui::window::window_drag;
 
 use app::{CheckForUpdates, NewConversation, OpenSettings, Quit, register_key_bindings};

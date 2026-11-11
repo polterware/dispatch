@@ -206,6 +206,7 @@ fn every_page_opens_with_data(cx: &mut TestAppContext) {
         Route::Settings(SettingsPage::Classifier),
         Route::Settings(SettingsPage::PickRole),
         Route::Settings(SettingsPage::RoutingPolicy),
+        Route::Settings(SettingsPage::Voice),
     ] {
         w.go(route.clone());
         assert_eq!(w.route(), route);
@@ -703,5 +704,150 @@ fn the_repository_pickers_row_menu_hangs_from_its_row(cx: &mut TestAppContext) {
             "{label} is cut off: {item:?}"
         );
     }
+    assert!(w.toasts().is_empty(), "{:?}", w.toasts());
+}
+
+/// A fake voice engine on 127.0.0.1: the discovery file it would write, a catalog and
+/// settings it answers, and the requests it saw. Only HTTP is answered; a socket request
+/// (a download's progress) is refused, which leaves the catalog as the truth.
+struct FakeVoice {
+    hits: std::sync::Arc<Mutex<Vec<String>>>,
+}
+
+const FAKE_VOICE_CATALOG: &str = r#"{
+  "models": [
+    {"id":"whisper-small-q5_1","kind":"stt","backend":"whisper","name":"Whisper Small","description":"Speech recognition","languages":["pt-br","en"],"size_bytes":190000000,"license":"MIT","installed":true,"active":true},
+    {"id":"kokoro-v1","kind":"tts","backend":"kokoro","name":"Kokoro","description":"Speech","languages":["pt-br","en"],"size_bytes":340000000,"license":"Apache-2.0","installed":false,"active":false}
+  ],
+  "voices": [
+    {"id":"piper:pt_BR-faber-medium","backend":"piper","name":"Faber (Piper)","language":"pt-br","model_id":"piper-pt_BR-faber-medium","installed":false},
+    {"id":"kokoro:af_heart","backend":"kokoro","name":"Heart (Kokoro)","language":"en","model_id":"kokoro-v1","installed":false}
+  ]
+}"#;
+
+const FAKE_VOICE_SETTINGS: &str = r#"{
+  "language":"pt-br","stt_model":"whisper-small-q5_1",
+  "voice_pt":"piper:pt_BR-faber-medium","voice_en":"kokoro:af_heart",
+  "speed":1.0,"partials":true,"model_idle_secs":600,"exit_after_idle_secs":1800
+}"#;
+
+impl FakeVoice {
+    fn start(data: &Path) -> Self {
+        use std::io::Write as _;
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind a fake engine");
+        let port = listener
+            .local_addr()
+            .expect("the fake engine's port")
+            .port();
+        let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let seen = hits.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let seen = seen.clone();
+                std::thread::spawn(move || {
+                    use std::io::{BufRead, BufReader, Read};
+                    let mut reader = BufReader::new(stream.try_clone().expect("the request"));
+                    let mut request = String::new();
+                    if reader.read_line(&mut request).is_err() {
+                        return;
+                    }
+                    let mut length = 0usize;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                        if let Some(value) =
+                            line.to_ascii_lowercase().strip_prefix("content-length:")
+                        {
+                            length = value.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    let mut body = vec![0u8; length];
+                    let _ = reader.read_exact(&mut body);
+                    let parts: Vec<&str> = request.split_whitespace().collect();
+                    let method = parts.first().copied().unwrap_or("GET");
+                    let path = parts.get(1).copied().unwrap_or("/");
+                    let route = path.split('?').next().unwrap_or(path);
+                    seen.lock().unwrap().push(format!("{method} {route}"));
+                    let (status, answer) = match (method, route) {
+                        ("GET", "/v1/catalog") => ("200 OK", FAKE_VOICE_CATALOG),
+                        ("GET", "/v1/settings") | ("PATCH", "/v1/settings") => {
+                            ("200 OK", FAKE_VOICE_SETTINGS)
+                        }
+                        ("POST", route) if route.starts_with("/v1/models/") => ("202 Accepted", ""),
+                        ("DELETE", route) if route.starts_with("/v1/models/") => {
+                            ("204 No Content", "")
+                        }
+                        _ => ("404 Not Found", ""),
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{answer}",
+                        answer.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                });
+            }
+        });
+        let voice = data.join("voice");
+        std::fs::create_dir_all(&voice).expect("the voice data folder");
+        std::fs::write(
+            voice.join("engine.json"),
+            format!(
+                r#"{{"protocol":1,"engine_version":"0.1.0","pid":1,"port":{port},"token":"e2e-token"}}"#
+            ),
+        )
+        .expect("the discovery file");
+        Self { hits }
+    }
+
+    fn hits(&self) -> Vec<String> {
+        self.hits.lock().unwrap().clone()
+    }
+}
+
+/// Settings › Voice against a running fake engine: the sections render, and Download asks
+/// the engine for the model.
+#[gpui::test]
+fn settings_voice_shows_the_engine_and_downloads_a_model(cx: &mut TestAppContext) {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let core = Core::new();
+    let engine = FakeVoice::start(&core.data);
+    let mut w = open(&core, cx);
+    w.go(Route::Settings(SettingsPage::Voice));
+    let mut ready = false;
+    for _ in 0..60 {
+        w.settle();
+        if w.shows("settings-voice-language") {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(ready, "the voice page never read the engine's catalog");
+    for id in [
+        "settings-voice-voice-pt",
+        "settings-voice-voice-en",
+        "settings-voice-test-pt",
+        "settings-voice-speed",
+        "settings-voice-stt",
+        "settings-voice-partials",
+        "settings-voice-read-aloud",
+        "settings-voice-send-when-stop",
+        "settings-voice-download-kokoro-v1",
+        "settings-voice-delete-whisper-small-q5_1",
+    ] {
+        assert!(w.shows(id), "the Voice page has no {id}");
+    }
+    w.scroll_settings_to("settings-voice-download-kokoro-v1");
+    w.click("settings-voice-download-kokoro-v1");
+    w.until("the engine is asked to download the model", || {
+        engine
+            .hits()
+            .iter()
+            .any(|hit| hit == "POST /v1/models/kokoro-v1/download")
+    });
     assert!(w.toasts().is_empty(), "{:?}", w.toasts());
 }
