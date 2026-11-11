@@ -62,7 +62,7 @@ const PAGE_TOP: f32 = 2.0;
 /// `gap-6` between the transcript and the page's `logEnd` marker under it.
 const LOG_END_GAP: f32 = 6.0;
 /// `splitScroll`'s 64px under the column's content.
-const COLUMN_END: f32 = 64.0;
+const COLUMN_END: f32 = 120.0;
 /// How many exact passes the end gets before it stays where it is.
 const SETTLE_PASSES: u8 = 8;
 

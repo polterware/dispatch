@@ -270,6 +270,21 @@ pub const AUTO_NEEDS_CLASSIFIER: &str =
 
 /// The route a new conversation starts on: Auto when there is a classifier, else the
 /// normal tier.
+/// The routes Image mode leaves: Auto and the tiers, which the core narrows to the agents
+/// that make images itself, and the models of those agents only.
+pub fn image_routes(choices: &[RouteChoice], image_agents: &[String]) -> Vec<RouteChoice> {
+    choices
+        .iter()
+        .filter(|choice| {
+            choice
+                .agent
+                .as_ref()
+                .is_none_or(|agent| image_agents.iter().any(|a| a == agent))
+        })
+        .cloned()
+        .collect()
+}
+
 pub fn default_pick(auto: bool) -> &'static str {
     if auto { AUTO } else { NORMAL }
 }
@@ -644,6 +659,28 @@ mod tests {
         assert!(!start_request(NORMAL, "draw a chart", &place, false).images);
         assert!(start_request(NORMAL, "draw a chart", &place, true).images);
         assert_eq!(IMAGE_PILL, "Image");
+    }
+
+    #[test]
+    fn image_mode_keeps_the_tiers_and_the_models_of_agents_that_make_images() {
+        let choice = |value: &str, agent: Option<&str>| RouteChoice {
+            value: value.to_string(),
+            label: value.to_string(),
+            group: String::new(),
+            hint: String::new(),
+            agent: agent.map(str::to_string),
+            disabled: None,
+        };
+        let choices = vec![
+            choice("tier:normal", None),
+            choice("model:codex", Some("codex")),
+            choice("model:claude", Some("claude")),
+        ];
+        let kept: Vec<String> = image_routes(&choices, &["codex".to_string()])
+            .into_iter()
+            .map(|choice| choice.value)
+            .collect();
+        assert_eq!(kept, ["tier:normal", "model:codex"]);
         assert!(image_hint(true).contains("asks for images"));
         assert!(image_hint(false).contains("Ask for images"));
     }

@@ -262,6 +262,8 @@ pub struct DispatchAgent {
     pub cooldown_until: String,
     pub installed: bool,
     pub enabled: bool,
+    /// The agent can make images, for Image mode's routes.
+    pub images: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

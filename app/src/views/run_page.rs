@@ -20,15 +20,15 @@ use super::repository_actions;
 use crate::avatar::{agent_avatar, route_avatar};
 use crate::client::{
     AddWorkspaceRequest, CancelRunRequest, CleanRunRequest, ConfigRequest, CoreClient, CoreError,
-    DispatchAttempt, DispatchRun, DispatchWorktree, GetRouteDecisionRequest, ListModelsRequest,
-    ListTiersRequest, ListWorkspaceCardsRequest, ListWorktreesRequest, MergeRunRequest,
-    RecoverRunRequest, ResultRequest, StartRunRequest, WorkspaceRepository,
+    DispatchAttempt, DispatchRun, DispatchWorktree, GetRouteDecisionRequest, ListAgentsRequest,
+    ListModelsRequest, ListTiersRequest, ListWorkspaceCardsRequest, ListWorktreesRequest,
+    MergeRunRequest, RecoverRunRequest, ResultRequest, StartRunRequest, WorkspaceRepository,
 };
 use crate::models::avatar::avatar_status;
 use crate::models::new_run::{
     FolderChoice, IMAGE_PILL, PLACE_PREFERENCE, PlaceMode, RouteChoice, RouteLabel, RunPlace,
-    default_pick, default_place, folder_choices, image_hint, offers_worktree, pick_label,
-    place_label, route_choices, run_label, start_request,
+    default_pick, default_place, folder_choices, image_hint, image_routes, offers_worktree,
+    pick_label, place_label, route_choices, run_label, start_request,
 };
 use crate::models::run_page::{
     AttemptCard, AttemptSwitch, CandidateExplain, CandidateOutcome, ClassifierBands, LinkedRow,
@@ -141,6 +141,9 @@ pub struct RunPageView {
     voice: VoiceEngine,
     /// The utterance being dictated, from the tap until its final transcript.
     listening: Option<String>,
+    /// A hands-free voice conversation is on: each heard turn is sent, its reply read aloud,
+    /// and the microphone opens again.
+    conversing: bool,
     /// The words a dictation put in the composer, kept until the message starts a run: that run's
     /// turn was voiced.
     voiced_text: Option<String>,
@@ -193,6 +196,8 @@ struct Draft {
     busy: Option<String>,
     /// The Image mode: on, the run asks for images and routes to the agents that make them.
     images: bool,
+    /// The agents that can make images, which Image mode keeps in the route picker.
+    image_agents: Vec<String>,
 }
 
 /// The header pill's key for a new conversation's route, which the run it starts keeps.
@@ -202,6 +207,8 @@ fn draft_key(generation: u64) -> String {
 
 /// The composer's placeholder.
 const MESSAGE_PLACEHOLDER: &str = "Send a message to the agent";
+/// The field's placeholder once a conversation is under way.
+const FOLLOW_UP_PLACEHOLDER: &str = "Send follow-up";
 
 impl RunPageView {
     /// Presses the transcript's jump-to-end button (the screenshot tour).
@@ -313,6 +320,7 @@ impl RunPageView {
             sending: false,
             voice: crate::voice::engine(cx),
             listening: None,
+            conversing: false,
             voiced_text: None,
             voiced: VoicedTurns::default(),
             fetching_reply: HashSet::new(),
@@ -336,6 +344,7 @@ impl RunPageView {
                 folder_anchor: AnchorSlot::default(),
                 busy: None,
                 images: false,
+                image_agents: Vec::new(),
             },
         };
         view.install_bodies(cx);
@@ -380,10 +389,17 @@ impl RunPageView {
                     {
                         self.listening = None;
                     }
+                    self.conversing = false;
                     self.toast(voice::error_message(code, &message), ToastTone::Danger, cx);
                     changed = true;
                 }
-                EngineMessage::SpeakEnded { .. } => changed = true,
+                EngineMessage::SpeakEnded { .. } => {
+                    // The reply was read: the conversation's next turn listens again.
+                    if self.conversing && !self.voice.is_speaking() {
+                        self.listen_hands_free();
+                    }
+                    changed = true;
+                }
                 _ => {}
             }
         }
@@ -418,7 +434,12 @@ impl RunPageView {
     fn finish_dictation(&mut self, said: String, cx: &mut Context<Self>) {
         let said = said.trim().to_string();
         if said.is_empty() {
-            self.toast("Nothing was heard.", ToastTone::Info, cx);
+            if self.conversing {
+                // Silence in a conversation: keep listening.
+                self.listen_hands_free();
+            } else {
+                self.toast("Nothing was heard.", ToastTone::Info, cx);
+            }
             return;
         }
         let current = self.message.read(cx).text().to_string();
@@ -426,7 +447,7 @@ impl RunPageView {
         self.message
             .update(cx, |input, cx| input.set_text(next.clone(), cx));
         self.voiced_text = Some(said);
-        if self.voice.prefs().send_when_i_stop {
+        if self.conversing || self.voice.prefs().send_when_i_stop {
             self.send_dictation(next, cx);
         }
     }
@@ -482,7 +503,10 @@ impl RunPageView {
     /// Speaks a voiced run's reply once, when reading replies is on.
     fn speak_run_reply(&mut self, id: &str, reply: &str) {
         self.voiced.mark_spoken(id);
-        if reply.trim().is_empty() || !self.voice.prefs().read_replies {
+        if reply.trim().is_empty() || !(self.conversing || self.voice.prefs().read_replies) {
+            if self.conversing {
+                self.listen_hands_free();
+            }
             return;
         }
         self.voice.speak_reply(id, reply);
@@ -521,6 +545,47 @@ impl RunPageView {
         .on_click(move |_, cx| {
             let _ = weak.update(cx, |view, cx| view.toggle_dictation(cx));
         })
+    }
+
+    /// The round button while the field is empty: a voice conversation, hands-free. The
+    /// engine ends each utterance when the speaking stops, the message goes at once, the reply
+    /// is read aloud, and the microphone opens again, until the button is pressed again.
+    fn conversation_action(&self, cx: &mut Context<Self>) -> ComposerAction {
+        let weak = cx.weak_entity();
+        ComposerAction::new(
+            "voice-talk",
+            Icon::AudioWave,
+            if self.conversing {
+                "End the conversation"
+            } else {
+                "Talk"
+            },
+        )
+        .active(self.conversing)
+        .on_click(move |_, cx| {
+            let _ = weak.update(cx, |view, cx| view.toggle_conversation(cx));
+        })
+    }
+
+    fn toggle_conversation(&mut self, cx: &mut Context<Self>) {
+        if self.conversing {
+            self.conversing = false;
+            if let Some(id) = self.listening.take() {
+                self.voice.listen_cancel(&id);
+            }
+            self.voice.cancel_speaking();
+        } else {
+            self.conversing = true;
+            self.listen_hands_free();
+        }
+        cx.notify();
+    }
+
+    /// Opens the microphone for the conversation's next turn, unless it is already open.
+    fn listen_hands_free(&mut self) {
+        if self.listening.is_none() {
+            self.listening = Some(self.voice.listen_start_hands_free());
+        }
     }
 
     /// The blob beside the composer, while a dictation or a reply is playing.
@@ -865,15 +930,25 @@ impl RunPageView {
                 view.refresh_route_picker(cx);
                 cx.notify();
             });
-            let models = cx
+            let (models, image_agents) = cx
                 .background_spawn(async move {
-                    models_client
+                    let models = models_client
                         .list_models(&ListModelsRequest {})
                         .map(|response| response.models)
+                        .unwrap_or_default();
+                    let image_agents: Vec<String> = models_client
+                        .list_agents(&ListAgentsRequest {})
+                        .map(|response| response.agents)
                         .unwrap_or_default()
+                        .into_iter()
+                        .filter(|agent| agent.images)
+                        .map(|agent| agent.name)
+                        .collect();
+                    (models, image_agents)
                 })
                 .await;
             let _ = this.update(cx, |view, cx| {
+                view.draft.image_agents = image_agents;
                 view.draft.choices = route_choices(auto, &tiers, &models);
                 view.draft.models_loading = false;
                 view.refresh_route_picker(cx);
@@ -883,12 +958,33 @@ impl RunPageView {
         .detach();
     }
 
+    /// Turns Image mode on or off. On, a model route whose agent makes no images gives way to
+    /// the first tier, since that route could never start.
+    fn toggle_images(&mut self, cx: &mut Context<Self>) {
+        self.draft.images = !self.draft.images;
+        if self.draft.images {
+            let kept = image_routes(&self.draft.choices, &self.draft.image_agents);
+            if !kept.iter().any(|choice| choice.value == self.draft.pick)
+                && let Some(tier) = kept
+                    .iter()
+                    .find(|choice| choice.agent.is_none() && choice.disabled.is_none())
+            {
+                self.draft.pick = tier.value.clone();
+            }
+        }
+        self.refresh_route_picker(cx);
+        cx.notify();
+    }
+
     /// The route picker's rows, from the routes read so far, with a Loading row while the
     /// agents' models are still being asked for.
     fn route_options(&self) -> Vec<PropertyOption> {
-        let mut options: Vec<PropertyOption> = self
-            .draft
-            .choices
+        let choices = if self.draft.images {
+            image_routes(&self.draft.choices, &self.draft.image_agents)
+        } else {
+            self.draft.choices.clone()
+        };
+        let mut options: Vec<PropertyOption> = choices
             .iter()
             .map(|choice| {
                 let mut option = PropertyOption::new(choice.value.clone(), choice.label.clone())
@@ -1067,6 +1163,8 @@ impl RunPageView {
     fn render_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         self.enter_draft(cx);
         self.sync_menu("", &[], cx);
+        self.message
+            .update(cx, |input, _| input.set_placeholder(MESSAGE_PLACEHOLDER));
         let theme = *Theme::global(cx);
         let weak = cx.weak_entity();
         // Nothing has run yet: no rail, and no toggle to open one.
@@ -1078,18 +1176,15 @@ impl RunPageView {
                 let _ = weak.update(cx, |view, cx| view.toggle_route_picker(window, cx));
             }
         });
+        self.load_folders(cx);
+        // The route, beside the microphone as Cursor's model picker: its name, its model
+        // muted, and a chevron; it opens the route picker.
         let route = anchored(
-            route_pill(
-                &draft_key(self.draft.generation),
-                &label,
-                "",
-                Some(open_picker),
-                cx,
-            ),
+            select_trigger("draft-route", &label.name, &label.model, open_picker, cx),
             self.draft.anchor.clone(),
         );
-        self.load_folders(cx);
-        let mut pills = div().flex().items_center().gap(px(6.0)).child(route);
+        // Over the composer, as Cursor's repository and branch: the folder, and Worktree.
+        let mut places = div().flex().items_center().gap(px(2.0));
         if let Some(place) = self.place(cx) {
             let folder_label = {
                 let state = self.state.read(cx);
@@ -1101,18 +1196,41 @@ impl RunPageView {
                     let _ = weak.update(cx, |view, cx| view.toggle_folder_picker(window, cx));
                 }
             });
-            pills = pills.child(anchored(
-                place_pill(
-                    "draft-folder",
-                    Icon::Folder,
-                    &folder_label,
-                    &place.dir,
-                    Some(click),
-                ),
+            places = places.child(anchored(
+                select_trigger("draft-folder", &folder_label, "", click, cx),
                 self.draft.folder_anchor.clone(),
             ));
+            // Worktree: on, the run gets a git worktree and branch of its own; off, it edits
+            // the folder itself.
+            let on = place.mode == PlaceMode::Worktree;
+            let toggle = weak.clone();
+            places = places.child(
+                Button::new(
+                    "draft-worktree",
+                    if on {
+                        ButtonKind::Secondary
+                    } else {
+                        ButtonKind::Ghost
+                    },
+                )
+                .size(ButtonSize::Sm)
+                .height(26.0)
+                .pad_x(8.0)
+                .icon(Icon::GitBranch)
+                .label(PlaceMode::Worktree.label())
+                .selected(on)
+                .tooltip(PlaceMode::Worktree.hint())
+                .on_click(move |_, cx| {
+                    let mode = if on {
+                        PlaceMode::InPlace
+                    } else {
+                        PlaceMode::Worktree
+                    };
+                    let _ = toggle.update(cx, |view, cx| view.pick_place(mode.value(), cx));
+                }),
+            );
         }
-        let bar = rail_page_header(pills, div(), cx).into_any_element();
+        let bar = rail_page_header(div(), div(), cx).into_any_element();
         let header = theme.page_header_height;
         let can_send = self.state.read(cx).current_workspace().is_some();
         let input = self.message.clone();
@@ -1126,66 +1244,37 @@ impl RunPageView {
         if !can_send {
             card = card.can_send(false);
         }
-        card = card.trailing_action(self.dictation_action(cx));
-        // Worktree: a ghost button that takes the primary colors while on, when the run gets
-        // a git worktree and branch of its own; off, it edits the folder itself.
-        if let Some(place) = self.place(cx) {
-            let on = place.mode == PlaceMode::Worktree;
-            let toggle = weak.clone();
-            // A small neutral toggle at its own width, at the footer's start: the raised
-            // secondary face when on.
-            let button = Button::new(
-                "draft-worktree",
-                if on {
-                    ButtonKind::Secondary
-                } else {
-                    ButtonKind::Ghost
-                },
-            )
-            .size(ButtonSize::Sm)
-            .height(24.0)
-            .pad_x(8.0)
-            .icon(Icon::GitBranch)
-            .label(PlaceMode::Worktree.label())
-            .selected(on)
-            .tooltip(PlaceMode::Worktree.hint())
-            .on_click(move |_, cx| {
-                let mode = if on {
-                    PlaceMode::InPlace
-                } else {
-                    PlaceMode::Worktree
-                };
-                let _ = toggle.update(cx, |view, cx| view.pick_place(mode.value(), cx));
-            });
-            card = card.footer_start(div().flex().child(div().flex_none().child(button)));
-        }
-        // Image mode, beside the microphone in Worktree's style: on, the conversation asks
-        // for images.
+        // Image mode: an icon beside the microphone; on, the conversation asks for images and
+        // its routes keep the agents that make them.
         let images_on = self.draft.images;
         let toggle = weak.clone();
-        card = card.footer_end(
-            Button::new(
-                "draft-images",
-                if images_on {
-                    ButtonKind::Secondary
-                } else {
-                    ButtonKind::Ghost
-                },
+        let image = Button::new(
+            "draft-images",
+            if images_on {
+                ButtonKind::Secondary
+            } else {
+                ButtonKind::Ghost
+            },
+        )
+        .size(ButtonSize::Icon)
+        .icon(Icon::Image)
+        .icon_size(16.0)
+        .selected(images_on)
+        .tooltip(image_hint(images_on))
+        .on_click(move |_, cx| {
+            let _ = toggle.update(cx, |view, cx| view.toggle_images(cx));
+        });
+        card = card
+            .footer_end(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(2.0))
+                    .child(route)
+                    .child(image),
             )
-            .size(ButtonSize::Sm)
-            .height(24.0)
-            .pad_x(8.0)
-            .icon(Icon::Eye)
-            .label(IMAGE_PILL)
-            .selected(images_on)
-            .tooltip(image_hint(images_on))
-            .on_click(move |_, cx| {
-                let _ = toggle.update(cx, |view, cx| {
-                    view.draft.images = !view.draft.images;
-                    cx.notify();
-                });
-            }),
-        );
+            .trailing_action(self.dictation_action(cx))
+            .idle_action(self.conversation_action(cx));
         // Another run edits the folder itself: say so over the composer, with Worktree.
         let busy = self.draft.busy.clone().map(|message| {
             let retry = weak.clone();
@@ -1211,15 +1300,19 @@ impl RunPageView {
                     .size(ButtonSize::Sm),
                 )
         });
-        let card = div().w_full().children(busy).child(
-            div()
-                .w_full()
-                .flex()
-                .items_end()
-                .gap(px(8.0))
-                .children(self.voice_mark(cx))
-                .child(div().flex_1().min_w(px(0.0)).child(card)),
-        );
+        let card = div()
+            .w_full()
+            .children(busy)
+            .child(div().w_full().pl(px(6.0)).pb(px(6.0)).child(places))
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_end()
+                    .gap(px(8.0))
+                    .children(self.voice_mark(cx))
+                    .child(div().flex_1().min_w(px(0.0)).child(card)),
+            );
         let column = div()
             .flex_1()
             .min_h(px(0.0))
@@ -1364,6 +1457,8 @@ impl RunPageView {
     ) -> Option<AnyElement> {
         let blocked =
             follow_up_blocker(run, self.state.read(cx).runs()).is_some() || !run.resumable;
+        self.message
+            .update(cx, |input, _| input.set_placeholder(FOLLOW_UP_PLACEHOLDER));
         let weak = cx.weak_entity();
         let input = self.message.clone();
         let mut card = message_composer("run-message", &self.message, &self.message_scroll)
@@ -1375,7 +1470,12 @@ impl RunPageView {
         if blocked {
             card = card.can_send(false);
         }
-        card = card.trailing_action(self.dictation_action(cx));
+        // Under a conversation the composer is one row: the field, the microphone, and the
+        // round button, which talks while the field is empty.
+        card = card
+            .compact(true)
+            .trailing_action(self.dictation_action(cx))
+            .idle_action(self.conversation_action(cx));
         Some(
             div()
                 .w_full()
@@ -2328,6 +2428,44 @@ fn worktree_badge(run: &DispatchRun) -> Option<bool> {
     } else {
         None
     }
+}
+
+/// A quiet select, as Cursor's model and repository pickers: the name, a muted detail, and
+/// a chevron, on a ghost button that opens its picker.
+fn select_trigger(
+    id: &'static str,
+    name: &str,
+    detail: &str,
+    on_click: PillClick,
+    cx: &App,
+) -> AnyElement {
+    let theme = Theme::global(cx);
+    let label = div()
+        .flex()
+        .items_center()
+        .gap(px(4.0))
+        .text_size(px(theme.font_size_sm))
+        .text_color(theme.color_text_secondary)
+        .child(ellipsis(SharedString::from(name.to_string())))
+        .when(!detail.is_empty(), |label| {
+            label.child(
+                div()
+                    .text_color(theme.color_text_muted)
+                    .child(ellipsis(SharedString::from(detail.to_string()))),
+            )
+        })
+        .child(polterware_ui::icon_colored(
+            Icon::ChevronDown,
+            12.0,
+            theme.color_text_muted,
+        ));
+    Button::new(id, ButtonKind::Ghost)
+        .size(ButtonSize::Sm)
+        .height(26.0)
+        .pad_x(8.0)
+        .trailing(label)
+        .on_click(move |window, cx| on_click(window, cx))
+        .into_any_element()
 }
 
 fn anchored(element: AnyElement, anchor: AnchorSlot) -> gpui::Div {

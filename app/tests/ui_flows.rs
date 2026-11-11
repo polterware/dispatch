@@ -225,8 +225,9 @@ fn every_page_opens_with_data(cx: &mut TestAppContext) {
     assert!(w.toasts().is_empty(), "a page complained: {:?}", w.toasts());
 }
 
-/// The new conversation's composer: Worktree at its footer's start, Image beside the
-/// microphone before Send, and the composer in the middle of the empty page.
+/// The new conversation's composer, as Cursor's: the folder and Worktree over it; the route,
+/// Image, and the microphone in it, before the round button, which talks while the field is
+/// empty; and the composer in the middle of the empty page.
 #[gpui::test]
 fn the_new_conversations_composer_waits_in_the_middle_with_its_toggles(cx: &mut TestAppContext) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
@@ -235,16 +236,36 @@ fn the_new_conversations_composer_waits_in_the_middle_with_its_toggles(cx: &mut 
     let mut w = open(&core, cx);
     assert_eq!(w.route(), Route::NewRun);
     let composer = w.cx.debug_bounds("run-message").expect("the composer");
+    let folder = w.cx.debug_bounds("draft-folder").expect("the folder");
     let worktree = w.cx.debug_bounds("draft-worktree").expect("Worktree");
+    let route = w.cx.debug_bounds("draft-route").expect("the route");
     let image = w.cx.debug_bounds("draft-images").expect("Image");
-    let send = w.cx.debug_bounds("run-message-send").expect("Send");
+    let mic = w.cx.debug_bounds("voice-mic").expect("the microphone");
+    let talk =
+        w.cx.debug_bounds("voice-talk")
+            .expect("Talk, while the field is empty");
     assert!(
-        worktree.left() - composer.left() < composer.size.width * 0.25,
-        "Worktree starts the footer: {worktree:?} in {composer:?}"
+        folder.bottom() <= composer.top() && worktree.bottom() <= composer.top(),
+        "the folder and Worktree sit over the composer: {folder:?} {worktree:?} {composer:?}"
     );
     assert!(
-        worktree.right() < image.left() && image.right() < send.left(),
-        "Image sits after Worktree and before Send: {worktree:?} {image:?} {send:?}"
+        folder.right() <= worktree.left(),
+        "the folder, then Worktree"
+    );
+    for (name, inside) in [
+        ("route", route),
+        ("Image", image),
+        ("mic", mic),
+        ("Talk", talk),
+    ] {
+        assert!(
+            inside.top() >= composer.top() && inside.bottom() <= composer.bottom(),
+            "{name} is in the composer: {inside:?} {composer:?}"
+        );
+    }
+    assert!(
+        route.right() <= image.left() && image.right() <= mic.left() && mic.right() <= talk.left(),
+        "the route, Image, the microphone, then Talk: {route:?} {image:?} {mic:?} {talk:?}"
     );
     // The window is 4000 tall: the composer's middle is near the page's, not its bottom.
     let middle = (composer.top() + composer.bottom()) / 2.0;
@@ -252,8 +273,6 @@ fn the_new_conversations_composer_waits_in_the_middle_with_its_toggles(cx: &mut 
         (f32::from(middle) - 2000.0).abs() < 200.0,
         "the empty page holds the composer in its middle: {composer:?}"
     );
-    // Image left the header: it is inside the composer.
-    assert!(image.top() >= composer.top() && image.bottom() <= composer.bottom());
 }
 
 #[gpui::test]

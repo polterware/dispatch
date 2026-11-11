@@ -438,13 +438,7 @@ impl SettingsView {
         self.voice_starting = true;
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_spawn(async {
-                    voice::ensure_engine().ok_or_else(|| {
-                        "The voice engine did not answer after starting.".to_string()
-                    })
-                })
-                .await;
+            let result = cx.background_spawn(async { voice::ensure_engine() }).await;
             let _ = this.update(cx, |view, cx| {
                 view.voice_starting = false;
                 match result {

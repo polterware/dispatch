@@ -298,6 +298,24 @@ impl VoiceEngine {
         id
     }
 
+    /// Opens the microphone hands-free: the engine ends the utterance when the speaking
+    /// stops. Answers the utterance's id, which its final transcript carries.
+    pub fn listen_start_hands_free(&self) -> String {
+        let id = format!("utterance-{}", next_id());
+        *self
+            .inner
+            .listening_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(id.clone());
+        self.inner.listening.store(true, Ordering::SeqCst);
+        self.send_command(ClientMessage::ListenStart {
+            id: id.clone(),
+            language: self.language(),
+            mode: ListenMode::HandsFree,
+        });
+        id
+    }
+
     /// Ends the utterance: the engine transcribes what it heard and answers
     /// `transcript.final`.
     pub fn listen_stop(&self, id: &str) {
@@ -637,14 +655,30 @@ static SETTINGS_START: Mutex<Option<Instant>> = Mutex::new(None);
 /// Start), and waiting at most [`START_WAIT`] for it. Blocking: call it from the background
 /// executor. It reads the same discovery file and starts the same binary as the app's engine,
 /// without needing a [`VoiceEngine`].
-pub(crate) fn ensure_engine() -> Option<EngineInfo> {
+pub(crate) fn ensure_engine() -> Result<EngineInfo, String> {
     let discovery = paths::discovery_file();
     if let Ok(info) = discovery::read(&discovery)
         && healthy(&info)
     {
-        return Some(info);
+        return Ok(info);
+    }
+    // Say why nothing could start: a missing binary is not an engine that went quiet.
+    if engine_binary().is_none() {
+        return Err(
+            "The voice engine (dispatch-voice) is not next to the app or on PATH; set \
+             VOICE_ENGINE_BIN to it, or build it with `cargo build -p voice-server`."
+                .to_string(),
+        );
+    }
+    let started_lately = SETTINGS_START
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_some_and(|at| at.elapsed() < START_GAP);
+    if started_lately {
+        return Err("The voice engine was started moments ago. Try again shortly.".to_string());
     }
     start_engine(&discovery, &SETTINGS_START)
+        .ok_or_else(|| "The voice engine did not answer after starting.".to_string())
 }
 
 /// Starts the engine (it exits at once when one already runs) and waits for its discovery
