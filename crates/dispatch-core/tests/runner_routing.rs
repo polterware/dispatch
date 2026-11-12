@@ -801,7 +801,7 @@ fn image_opts() -> Options {
 }
 
 #[tokio::test]
-async fn image_mode_keeps_only_agents_that_make_images() {
+async fn image_mode_keeps_only_agent_model_pairs_that_make_images() {
     let r = routing_deps();
     // b makes images; a does not.
     r.fakes[1].caps.lock().unwrap().images = true;
@@ -812,6 +812,31 @@ async fn image_mode_keeps_only_agents_that_make_images() {
     );
     assert!(
         why.iter().any(|w| w.contains("cannot make images")),
+        "{why:?}"
+    );
+}
+
+#[tokio::test]
+async fn image_mode_rejects_cursor_claude_and_keeps_cursor_gpt() {
+    let mut r = routing_deps();
+    let ran = ran();
+    let mut cursor = Fake::new("cursor", &ran);
+    cursor.caps.lock().unwrap().images = true;
+    cursor.models = vec!["claude-haiku-5-5".into(), "gpt-6-luna".into()];
+    r.set(vec![cursor]);
+    r.t.deps.table = table(&[(
+        "easy",
+        vec![
+            entry("cursor", "claude-haiku-5-5"),
+            entry("cursor", "gpt-6-luna"),
+        ],
+    )]);
+    let (cs, why) = r.select(image_opts()).await;
+    assert_eq!(cs.len(), 1, "{cs:?} {why:?}");
+    assert_eq!(cs[0].model(), "gpt-6-luna");
+    assert!(
+        why.iter()
+            .any(|w| w == "cursor/claude-haiku-5-5: cannot make images"),
         "{why:?}"
     );
 }

@@ -395,6 +395,8 @@ message DispatchModel {
   // The efforts the agent takes beside the model, which a tier writes into its name
   // (claude-opus-5-5-high); empty when it takes none.
   repeated string efforts = 5;
+  // Whether this specific agent and model pair can make images.
+  bool images = 6;
 }
 
 message ListModelsRequest {}

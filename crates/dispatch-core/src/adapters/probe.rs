@@ -106,6 +106,23 @@ pub fn capabilities(name: &str) -> Capabilities {
     c
 }
 
+/// Whether this agent and model pair can make images. Custom ACP agents may carry their own
+/// image tool, so they remain eligible; Cursor exposes image generation only on GPT and Grok
+/// model families, while Codex and Grok support it across their listed models.
+pub fn makes_images(agent: &str, model: &str) -> bool {
+    if !capabilities(agent).images {
+        return false;
+    }
+    match agent {
+        "codex" | "grok" => true,
+        "cursor" => {
+            let base = model.rsplit_once('/').map_or(model, |(_, base)| base);
+            base.starts_with("gpt-") || base.starts_with("grok-")
+        }
+        _ => super::acp::custom_agents().contains_key(agent),
+    }
+}
+
 pub fn flags(name: &str) -> Vec<ProbeFlag> {
     let entries: &[(&str, &str, &str)] = match name {
         "codex" => &[
@@ -365,7 +382,7 @@ pub fn usage_source(name: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::capabilities;
+    use super::{capabilities, makes_images};
 
     #[test]
     fn only_the_agents_that_make_images_say_so() {
@@ -382,6 +399,26 @@ mod tests {
             "kimi",
         ] {
             assert!(!capabilities(name).images, "{name} makes no images");
+        }
+    }
+
+    #[test]
+    fn image_capability_is_specific_to_agent_and_model() {
+        for (agent, model) in [
+            ("cursor", "claude-haiku-5-5"),
+            ("cursor", "gemini-3-pro"),
+            ("claude", "claude-opus-5-5"),
+        ] {
+            assert!(!makes_images(agent, model), "{agent}/{model}");
+        }
+        for (agent, model) in [
+            ("cursor", "gpt-6-luna"),
+            ("cursor", "openai/gpt-6-luna"),
+            ("cursor", "grok-4"),
+            ("codex", "anything"),
+            ("grok", "anything"),
+        ] {
+            assert!(makes_images(agent, model), "{agent}/{model}");
         }
     }
 }

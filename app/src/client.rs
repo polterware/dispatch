@@ -706,6 +706,7 @@ pub struct DispatchModel {
     pub provider: String,
     pub tier: String,
     pub efforts: Vec<String>,
+    pub images: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

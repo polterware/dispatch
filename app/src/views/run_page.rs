@@ -20,9 +20,9 @@ use super::repository_actions;
 use crate::avatar::{agent_avatar, route_avatar};
 use crate::client::{
     AddWorkspaceRequest, CancelRunRequest, CleanRunRequest, ConfigRequest, CoreClient, CoreError,
-    DispatchAttempt, DispatchRun, DispatchWorktree, GetRouteDecisionRequest, ListAgentsRequest,
-    ListModelsRequest, ListTiersRequest, ListWorkspaceCardsRequest, ListWorktreesRequest,
-    MergeRunRequest, RecoverRunRequest, ResultRequest, StartRunRequest, WorkspaceRepository,
+    DispatchAttempt, DispatchRun, DispatchWorktree, GetRouteDecisionRequest, ListModelsRequest,
+    ListTiersRequest, ListWorkspaceCardsRequest, ListWorktreesRequest, MergeRunRequest,
+    RecoverRunRequest, ResultRequest, StartRunRequest, WorkspaceRepository,
 };
 use crate::models::avatar::avatar_status;
 use crate::models::new_run::{
@@ -196,8 +196,6 @@ struct Draft {
     busy: Option<String>,
     /// The Image mode: on, the run asks for images and routes to the agents that make them.
     images: bool,
-    /// The agents that can make images, which Image mode keeps in the route picker.
-    image_agents: Vec<String>,
 }
 
 /// The header pill's key for a new conversation's route, which the run it starts keeps.
@@ -347,7 +345,6 @@ impl RunPageView {
                 folder_anchor: AnchorSlot::default(),
                 busy: None,
                 images: false,
-                image_agents: Vec::new(),
             },
         };
         view.install_bodies(cx);
@@ -952,25 +949,16 @@ impl RunPageView {
                 view.refresh_route_picker(cx);
                 cx.notify();
             });
-            let (models, image_agents) = cx
+            let models = cx
                 .background_spawn(async move {
                     let models = models_client
                         .list_models(&ListModelsRequest {})
                         .map(|response| response.models)
                         .unwrap_or_default();
-                    let image_agents: Vec<String> = models_client
-                        .list_agents(&ListAgentsRequest {})
-                        .map(|response| response.agents)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter(|agent| agent.images)
-                        .map(|agent| agent.name)
-                        .collect();
-                    (models, image_agents)
+                    models
                 })
                 .await;
             let _ = this.update(cx, |view, cx| {
-                view.draft.image_agents = image_agents;
                 view.draft.choices = route_choices(auto, &tiers, &models);
                 view.draft.models_loading = false;
                 view.refresh_route_picker(cx);
@@ -985,7 +973,7 @@ impl RunPageView {
     fn toggle_images(&mut self, cx: &mut Context<Self>) {
         self.draft.images = !self.draft.images;
         if self.draft.images {
-            let kept = image_routes(&self.draft.choices, &self.draft.image_agents);
+            let kept = image_routes(&self.draft.choices);
             if !kept.iter().any(|choice| choice.value == self.draft.pick)
                 && let Some(tier) = kept
                     .iter()
@@ -1002,7 +990,7 @@ impl RunPageView {
     /// agents' models are still being asked for.
     fn route_options(&self) -> Vec<PropertyOption> {
         let choices = if self.draft.images {
-            image_routes(&self.draft.choices, &self.draft.image_agents)
+            image_routes(&self.draft.choices)
         } else {
             self.draft.choices.clone()
         };
