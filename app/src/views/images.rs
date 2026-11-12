@@ -2,33 +2,36 @@
 //! says where it came from (the app, or the agent and session that delegated it), the run and
 //! its title, the agent and model, the repository, and the date. The toolbar holds the search
 //! over the runs' prompts and the shared `FilterPopover` (Origin, Agent, Repository), whose
-//! pills sit in the `ActiveFilterBar` under it. A click opens the viewer with the image, the
-//! prompt, and the way to its run; Delete asks first and removes the copy through
-//! `DeleteArtifact`.
+//! pills sit in the `ActiveFilterBar` under it. Clicking a tile navigates to `Route::Image`
+//! showing the image large with its properties and actions in a floating rail; Delete asks
+//! first and removes the copy through `DeleteArtifact`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    AnyElement, App, AppContext as _, Context, DispatchPhase, Entity, FocusHandle, FontWeight,
-    IntoElement, KeyDownEvent, ObjectFit, Render, SharedString, Window, canvas, div, img,
-    prelude::*, px,
+    AnyElement, App, AppContext as _, ClipboardItem, Context, DispatchPhase, Entity, FocusHandle,
+    FontWeight, Image, ImageFormat, IntoElement, KeyDownEvent, ObjectFit, Render, SharedString,
+    Window, canvas, div, img, prelude::*, px,
 };
 
 use crate::client::{CoreClient, DeleteArtifactRequest, DispatchArtifact, ListArtifactsRequest};
+use crate::format::agent_display_name;
 use crate::models::images::{
-    ImageTile, agent_text, filter_specs, group_by_day, local_datetime, origin_text, repo_name,
-    visible_tiles,
+    ImageTile, filter_specs, format_bytes, group_by_day, local_datetime, visible_tiles,
 };
-use crate::motion::{Animator, SpringTier, SpringValue};
+use crate::models::runs::{EM_DASH, format_ago};
 use crate::state::{AppState, ConnectionState, Route, ToastTone};
 use crate::theme::Theme;
 use crate::ui::patterns::{ConfirmDialog, modal_layer};
 use crate::ui::{
-    ButtonKind, FilterField, FilterPopover, FiltersChanged, Icon, ImageAction, ImageData,
-    ImageViewer, MascotMood, SkeletonLayout, TextInput, card_grid, ellipsis, page_empty,
-    page_skeleton, page_under, page_under_inset, scroll_area_under, toolbar,
+    Button, ButtonKind, ButtonSize, FilterField, FilterPopover, FiltersChanged, Icon, ImageCard,
+    ImageData, MascotMood, PageWidth, RailPresence, SkeletonLayout, TextInput, card_grid, ellipsis,
+    grid_columns, page_empty, page_skeleton, page_under, page_under_inset, rail_card,
+    rail_page_body_under, rail_page_header, rail_properties, rail_property, rail_section,
+    rail_toggle_label, scroll_area_under, toolbar, trailing_toolbar, wrap_text,
 };
 
 /// The page's chrome state.
@@ -36,12 +39,10 @@ const PAGE: &str = "images-page";
 /// The narrowest a tile gets before the grid drops a column.
 const TILE_MIN: f32 = 220.0;
 const TILE_GAP: f32 = 12.0;
-/// The thumbnail's height, with the image filling its width.
-const THUMB_HEIGHT: f32 = 150.0;
 /// A reload on a state change comes no sooner than this, as the runs and Spend do.
 const RELOAD_GAP: Duration = Duration::from_secs(2);
-/// The width of the prompt and facts under the viewer's image.
-const VIEWER_DETAILS_WIDTH: f32 = 560.0;
+/// Where the rail's open state is remembered.
+const RAIL_PREFERENCE: &str = "polterware.image.rail";
 
 pub struct ImagesView {
     state: Entity<AppState>,
@@ -56,14 +57,13 @@ pub struct ImagesView {
     again: bool,
     last_kick: Instant,
     ticket: u64,
-    /// The tile the viewer shows, kept while it fades out after it closes.
-    viewing: Option<String>,
-    viewer_open: bool,
-    viewer_opacity: SpringValue,
     /// The artifact whose delete is being confirmed.
     deleting: Option<String>,
     confirm_focus: FocusHandle,
-    animator: Animator,
+    rail_open: bool,
+    drawer_open: bool,
+    rail: RailPresence,
+    page_width: PageWidth,
 }
 
 impl ImagesView {
@@ -79,6 +79,14 @@ impl ImagesView {
             .detach();
         cx.observe(&filters, |_, _, cx| cx.notify()).detach();
         cx.observe(&state, |this, _, cx| this.kick(cx)).detach();
+
+        let rail_open = state
+            .read(cx)
+            .read_preference::<String>(RAIL_PREFERENCE)
+            .ok()
+            .flatten()
+            .is_none_or(|value| value != "hidden");
+
         let view = Self {
             state,
             search,
@@ -91,12 +99,12 @@ impl ImagesView {
             again: false,
             last_kick: Instant::now(),
             ticket: 0,
-            viewing: None,
-            viewer_open: false,
-            viewer_opacity: SpringValue::new(0.0, SpringTier::Fast),
             deleting: None,
             confirm_focus: cx.focus_handle(),
-            animator: Animator::new(),
+            rail_open,
+            drawer_open: false,
+            rail: RailPresence::new(rail_open),
+            page_width: PageWidth::default(),
         };
         cx.spawn(async move |this, cx| {
             let _ = this.update(cx, |view, cx| view.kick(cx));
@@ -118,7 +126,8 @@ impl ImagesView {
     /// Loads the gallery on entry and as the app's state moves, at most every two seconds for
     /// a routine reload. A load in flight takes one more after it.
     fn kick(&mut self, cx: &mut Context<Self>) {
-        if !matches!(self.state.read(cx).route(), Route::Images) {
+        let on_images = matches!(self.state.read(cx).route(), Route::Images | Route::Image(_));
+        if !on_images {
             self.on_page = false;
             return;
         }
@@ -172,26 +181,47 @@ impl ImagesView {
         .detach();
     }
 
-    fn open_viewer(&mut self, id: String, cx: &mut Context<Self>) {
-        self.viewing = Some(id);
-        self.viewer_open = true;
-        cx.notify();
+    fn open_image(&mut self, id: String, cx: &mut Context<Self>) {
+        self.state.update(cx, |app, cx| {
+            app.navigate(Route::Image(id));
+            cx.notify();
+        });
     }
 
-    fn close_viewer(&mut self, cx: &mut Context<Self>) {
-        if self.viewer_open {
-            self.viewer_open = false;
+    fn go_back(&mut self, cx: &mut Context<Self>) {
+        self.state.update(cx, |app, cx| {
+            app.navigate(Route::Images);
             cx.notify();
-        }
+        });
     }
 
     fn open_run(&mut self, run_id: String, cx: &mut Context<Self>) {
-        self.viewer_open = false;
         self.state.update(cx, |app, cx| {
             app.navigate(Route::Run(run_id));
             cx.notify();
         });
+    }
+
+    fn toggle_rail(&mut self, cx: &mut Context<Self>) {
+        if self.page_width.is_narrow() {
+            self.drawer_open = !self.drawer_open;
+        } else {
+            self.rail_open = !self.rail_open;
+            let value = if self.rail_open { "open" } else { "hidden" };
+            let _ = self
+                .state
+                .read(cx)
+                .write_preference(RAIL_PREFERENCE, &value);
+        }
         cx.notify();
+    }
+
+    fn rail_visible(&self) -> bool {
+        if self.page_width.is_narrow() {
+            self.drawer_open
+        } else {
+            self.rail_open
+        }
     }
 
     fn ask_delete(&mut self, id: String, cx: &mut Context<Self>) {
@@ -221,8 +251,12 @@ impl ImagesView {
             let _ = this.update(cx, |this, cx| match result {
                 Ok(_) => {
                     this.tiles.retain(|tile| tile.id != id);
-                    if this.viewing.as_deref() == Some(id.as_str()) {
-                        this.viewer_open = false;
+                    if matches!(this.state.read(cx).route(), Route::Image(cur_id) if cur_id == &id)
+                    {
+                        this.state.update(cx, |app, cx| {
+                            app.navigate(Route::Images);
+                            cx.notify();
+                        });
                     }
                     this.state.update(cx, |app, cx| {
                         app.push_toast("Image deleted.", ToastTone::Success);
@@ -236,26 +270,55 @@ impl ImagesView {
         .detach();
     }
 
+    fn reveal_image(&self, path: &str, cx: &mut Context<Self>) {
+        let opened = Command::new("/usr/bin/open")
+            .args(["-R", path])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !opened {
+            self.toast("Could not reveal the image", cx);
+        }
+    }
+
+    fn copy_image(&self, path: &str, cx: &mut Context<Self>) {
+        let format = match path.rsplit('.').next() {
+            Some(extension) if extension.eq_ignore_ascii_case("png") => Some(ImageFormat::Png),
+            Some(extension) if extension.eq_ignore_ascii_case("jpg") => Some(ImageFormat::Jpeg),
+            Some(extension) if extension.eq_ignore_ascii_case("jpeg") => Some(ImageFormat::Jpeg),
+            Some(extension) if extension.eq_ignore_ascii_case("webp") => Some(ImageFormat::Webp),
+            Some(extension) if extension.eq_ignore_ascii_case("gif") => Some(ImageFormat::Gif),
+            _ => None,
+        };
+        let copied = format
+            .and_then(|format| {
+                std::fs::read(Path::new(path))
+                    .ok()
+                    .map(|bytes| Image::from_bytes(format, bytes))
+            })
+            .map(|picture| {
+                cx.write_to_clipboard(ClipboardItem::new_image(&picture));
+            });
+        if copied.is_none() {
+            cx.write_to_clipboard(ClipboardItem::new_string(path.to_string()));
+            self.state.update(cx, |app, cx| {
+                app.push_toast("Copied the image's path", ToastTone::Success);
+                cx.notify();
+            });
+        } else {
+            self.state.update(cx, |app, cx| {
+                app.push_toast("Image copied to clipboard", ToastTone::Success);
+                cx.notify();
+            });
+        }
+    }
+
     fn toast(&self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
         let message = message.into();
         self.state.update(cx, |app, cx| {
             app.push_toast(message, ToastTone::Danger);
             cx.notify();
         });
-    }
-
-    fn tick_motion(&mut self, window: &mut Window) {
-        self.viewer_opacity
-            .set_target(if self.viewer_open { 1.0 } else { 0.0 });
-        let moving = !self.viewer_opacity.settled();
-        let dt = self.animator.dt(window, moving);
-        if dt > 0.0 {
-            self.viewer_opacity.step(dt);
-        }
-        if !self.viewer_open && self.viewer_opacity.settled() && self.viewer_opacity.value() < 0.02
-        {
-            self.viewing = None;
-        }
     }
 
     /// The fields follow the tiles' origins, agents, and repositories, rebuilt only when
@@ -283,20 +346,7 @@ impl ImagesView {
         });
     }
 
-    /// The viewer, while it is open or fading out.
-    fn viewer_layer(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let id = self.viewing.as_ref()?;
-        let tile = self.tiles.iter().find(|tile| &tile.id == id)?;
-        Some(image_viewer(
-            tile,
-            self.viewer_opacity.value(),
-            self.viewer_open,
-            cx.entity(),
-            theme,
-        ))
-    }
-
-    /// The delete's confirmation, over the viewer.
+    /// The delete's confirmation dialog.
     fn confirm_layer(
         &self,
         theme: &Theme,
@@ -308,7 +358,7 @@ impl ImagesView {
         if !self.confirm_focus.is_focused(window) {
             self.confirm_focus.focus(window);
         }
-        let name = repo_name(&tile.rel_path);
+        let name = crate::models::images::repo_name(&tile.rel_path);
         let cancel: crate::ui::Handler = {
             let view = cx.entity();
             Rc::new(move |_, cx: &mut App| {
@@ -340,7 +390,16 @@ impl ImagesView {
 
 impl Render for ImagesView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.tick_motion(window);
+        let route = self.state.read(cx).route().clone();
+        if let Route::Image(artifact_id) = route {
+            return self.render_image_page(&artifact_id, window, cx);
+        }
+        self.render_gallery(window, cx)
+    }
+}
+
+impl ImagesView {
+    fn render_gallery(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         self.sync_fields(cx);
         let theme = *Theme::global(cx);
         let query = self.search.read(cx).text().to_string();
@@ -349,13 +408,15 @@ impl Render for ImagesView {
         let has_tiles = !self.tiles.is_empty();
         let shows_grid = self.loaded && !visible.is_empty();
         let filter_bar = FilterPopover::bar(&self.filters, window, cx);
-        // The toolbar's inset, so the grid's edges line up with its buttons.
         let padding = theme.space_2;
         let top = page_under_inset(PAGE, filter_bar.is_some(), padding, window, cx);
         let view = cx.entity();
 
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as i64);
+
         let content: AnyElement = if !self.loaded {
-            // The gallery, in bones, until the first answer comes back.
             page_skeleton(SkeletonLayout::Page)
                 .without_toolbar()
                 .into_any_element()
@@ -368,12 +429,19 @@ impl Render for ImagesView {
             page_empty(title, mood, cx).into_any_element()
         } else {
             let groups = group_by_day(&visible);
+            let viewport = f32::from(window.viewport_size().width);
+            let available_width = (viewport - theme.sidebar_width - 26.0).max(TILE_MIN);
+            let cols = grid_columns(available_width, TILE_MIN, TILE_GAP);
+            let col_width =
+                (available_width - (f32::from(cols) - 1.0) * TILE_GAP) / f32::from(cols);
+            let thumb_height = ((col_width - 2.0) * 10.0 / 16.0).max(100.0);
+
             let mut body = div().w_full().flex().flex_col().gap(px(theme.space_4));
             for group in groups {
                 let tiles = group
                     .tiles
                     .iter()
-                    .map(|tile| image_tile(tile, &theme, view.clone()))
+                    .map(|tile| image_tile(tile, thumb_height, &theme, view.clone(), now_ms))
                     .collect();
                 body = body.child(
                     div()
@@ -391,7 +459,7 @@ impl Render for ImagesView {
                             SharedString::from(format!("image-grid-{}", group.label)),
                             TILE_MIN,
                             TILE_GAP,
-                            4,
+                            cols,
                             tiles,
                             window,
                             cx,
@@ -401,7 +469,6 @@ impl Render for ImagesView {
             scroll_area_under("images-scroll", top, body, window, cx)
         };
 
-        // The `SearchBar` pill, then `FilterPopover`'s icon button, 8px apart.
         let end = div()
             .flex()
             .items_center()
@@ -409,7 +476,7 @@ impl Render for ImagesView {
             .child(div().w(px(200.0)).child(self.search.clone()))
             .child(self.filters.clone());
         let scrolls = shows_grid;
-        let escape = (self.viewer_open || self.deleting.is_some()).then(|| {
+        let escape = self.deleting.is_some().then(|| {
             let view = cx.entity();
             canvas(
                 |_, _, _| {},
@@ -418,11 +485,7 @@ impl Render for ImagesView {
                     window.on_key_event(move |event: &KeyDownEvent, phase, _, cx| {
                         if phase == DispatchPhase::Bubble && event.keystroke.key == "escape" {
                             view.update(cx, |this, cx| {
-                                if this.deleting.is_some() {
-                                    this.cancel_delete(cx);
-                                } else {
-                                    this.close_viewer(cx);
-                                }
+                                this.cancel_delete(cx);
                             });
                         }
                     });
@@ -431,14 +494,12 @@ impl Render for ImagesView {
             .absolute()
             .size_0()
         });
-        let viewer = self.viewer_layer(&theme, cx);
         let confirm = self.confirm_layer(&theme, window, cx);
         div()
             .size_full()
             .flex()
             .flex_col()
             .text_color(theme.color_text_primary)
-            // The grid runs up under the toolbar, which fades it out on its trail.
             .child(page_under(
                 PAGE,
                 toolbar(div(), end, cx),
@@ -455,8 +516,326 @@ impl Render for ImagesView {
                 cx,
             ))
             .children(escape)
-            .children(viewer)
             .children(confirm)
+            .into_any_element()
+    }
+
+    fn render_image_page(
+        &mut self,
+        artifact_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = *Theme::global(cx);
+        let tile = self.tiles.iter().find(|t| t.id == artifact_id).cloned();
+        let view = cx.entity();
+        let back_view = view.clone();
+
+        let back = Button::new("image-page-back", ButtonKind::Secondary)
+            .size(ButtonSize::Icon)
+            .icon(Icon::ChevronLeft)
+            .tooltip("Back")
+            .on_click(move |_, cx| back_view.update(cx, |this, cx| this.go_back(cx)));
+
+        let visible = self.rail_visible();
+        self.rail.set_open(visible);
+
+        let toggle_view = view.clone();
+        let toggle = Button::new("image-rail-toggle", ButtonKind::Secondary)
+            .size(ButtonSize::Icon)
+            .icon(Icon::SidebarRightIcon)
+            .tooltip(rail_toggle_label(visible))
+            .selected(visible)
+            .on_click(move |_, cx| toggle_view.update(cx, |this, cx| this.toggle_rail(cx)));
+
+        let Some(tile) = tile else {
+            if !self.loaded {
+                return page_skeleton(SkeletonLayout::Page)
+                    .without_toolbar()
+                    .into_any_element();
+            }
+            let header = rail_page_header(back, toggle, cx);
+            return div()
+                .size_full()
+                .relative()
+                .child(header)
+                .child(page_empty("Image not found", MascotMood::Lost, cx))
+                .into_any_element();
+        };
+
+        let title = div()
+            .flex_1()
+            .min_w(px(0.0))
+            .text_size(px(theme.font_size_sm))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(theme.color_text_primary)
+            .child(ellipsis(tile.title.clone()));
+
+        let start = div()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .child(back)
+            .child(title);
+        let header = rail_page_header(start, toggle, cx);
+
+        // Center column: large image fitted inside the surface preserving aspect ratio
+        let column = div()
+            .id("image-viewer")
+            .debug_selector(|| "image-viewer".to_string())
+            .flex_1()
+            .min_w(px(0.0))
+            .h_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .p(px(24.0))
+            .child(
+                img(PathBuf::from(&tile.path))
+                    .max_w_full()
+                    .max_h_full()
+                    .object_fit(ObjectFit::Contain)
+                    .rounded(px(theme.radius_card)),
+            );
+
+        // Details rail
+        let reveal_path = tile.path.clone();
+        let copy_path = tile.path.clone();
+        let delete_id = tile.id.clone();
+        let run_id = tile.run_id.clone();
+        let reveal_view = view.clone();
+        let copy_view = view.clone();
+        let delete_view = view.clone();
+        let run_view = view.clone();
+
+        let actions = div()
+            .w_full()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .child(
+                Button::new("image-reveal", ButtonKind::Secondary)
+                    .size(ButtonSize::Sm)
+                    .icon(Icon::Folder)
+                    .label("Reveal in Finder")
+                    .on_click(move |_, cx| {
+                        reveal_view.update(cx, |this, cx| this.reveal_image(&reveal_path, cx));
+                    }),
+            )
+            .child(
+                Button::new("image-copy", ButtonKind::Secondary)
+                    .size(ButtonSize::Sm)
+                    .icon(Icon::Copy)
+                    .label("Copy")
+                    .on_click(move |_, cx| {
+                        copy_view.update(cx, |this, cx| this.copy_image(&copy_path, cx));
+                    }),
+            )
+            .child(
+                Button::new("image-delete", ButtonKind::Danger)
+                    .size(ButtonSize::Sm)
+                    .icon(Icon::Delete)
+                    .label("Delete")
+                    .on_click(move |_, cx| {
+                        let id = delete_id.clone();
+                        delete_view.update(cx, |this, cx| this.ask_delete(id, cx));
+                    }),
+            );
+
+        let prompt_text = if tile.prompt.trim().is_empty() {
+            "No prompt was recorded.".to_string()
+        } else {
+            tile.prompt.clone()
+        };
+
+        let image_section = rail_section("Image", Icon::Image, cx).child(
+            rail_properties()
+                .child(rail_property(
+                    "Kind",
+                    wrapped(&tile.kind.to_uppercase()),
+                    false,
+                    cx,
+                ))
+                .child(rail_property(
+                    "Dimensions",
+                    wrapped(&format!("{} \u{00d7} {}", tile.width, tile.height)),
+                    false,
+                    cx,
+                ))
+                .child(rail_property(
+                    "Bytes",
+                    wrapped(&format_bytes(tile.bytes)),
+                    false,
+                    cx,
+                ))
+                .child(rail_property(
+                    "Created",
+                    wrapped(&local_datetime(&tile.created_at)),
+                    false,
+                    cx,
+                )),
+        );
+
+        let run_section = rail_section("Run", Icon::InformationCircle, cx).child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .w_full()
+                        .text_size(px(theme.font_size_sm))
+                        .line_height(px(theme.font_size_sm * 1.4))
+                        .text_color(theme.color_text_secondary)
+                        .max_h(px(84.0))
+                        .overflow_hidden()
+                        .child(wrapped(&prompt_text)),
+                )
+                .child(
+                    div().flex().child(
+                        Button::new("image-open-run", ButtonKind::Secondary)
+                            .size(ButtonSize::Sm)
+                            .icon(Icon::ArrowUpRight01Icon)
+                            .label("Open run")
+                            .on_click(move |_, cx| {
+                                let id = run_id.clone();
+                                run_view.update(cx, |this, cx| this.open_run(id, cx));
+                            }),
+                    ),
+                ),
+        );
+
+        let agent_avatar_el = crate::avatar::agent_avatar(&tile.agent, "", 18.0);
+        let agent_section = rail_section("Agent", Icon::Bot, cx).child(
+            rail_properties()
+                .child(rail_property(
+                    "Agent",
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(agent_avatar_el)
+                        .child(wrapped(&agent_display_name(&tile.agent))),
+                    false,
+                    cx,
+                ))
+                .child(rail_property(
+                    "Model",
+                    wrapped(if tile.model.trim().is_empty() {
+                        EM_DASH
+                    } else {
+                        &tile.model
+                    }),
+                    false,
+                    cx,
+                )),
+        );
+
+        let origin_section = rail_section("Origin", Icon::Globe2, cx).child(
+            rail_properties()
+                .child(rail_property(
+                    "Origin",
+                    wrapped(tile.origin.label()),
+                    false,
+                    cx,
+                ))
+                .when(
+                    tile.origin == crate::models::images::Origin::Delegated,
+                    |props| {
+                        let caller = if tile.session.is_empty() {
+                            agent_display_name(&tile.caller_agent)
+                        } else {
+                            format!(
+                                "{} \u{00b7} {}",
+                                agent_display_name(&tile.caller_agent),
+                                tile.session
+                            )
+                        };
+                        props.child(rail_property("Caller", wrapped(&caller), false, cx))
+                    },
+                ),
+        );
+
+        let repo_display = if tile.repo.is_empty() {
+            tile.repo_name.clone()
+        } else {
+            tile.repo.clone()
+        };
+        let repo_section =
+            rail_section("Repository", Icon::Folder, cx).child(rail_properties().child(
+                rail_property("Repository", wrapped(&repo_display), true, cx),
+            ));
+
+        let rail_body = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(16.0))
+            .child(actions)
+            .child(image_section)
+            .child(run_section)
+            .child(agent_section)
+            .child(origin_section)
+            .child(repo_section);
+
+        let rail_container = rail_card(cx).child(rail_body).into_any_element();
+
+        let header_h = theme.page_header_height;
+        let (row, drawer) = rail_page_body_under(
+            column,
+            rail_container,
+            &self.rail,
+            &self.page_width,
+            header_h,
+            window,
+            cx,
+        );
+
+        let confirm = self.confirm_layer(&theme, window, cx);
+        let view_escape = view;
+
+        let escape_canvas = canvas(
+            |_, _, _| {},
+            move |_, _, window, _| {
+                let view = view_escape.clone();
+                window.on_key_event(move |event: &KeyDownEvent, phase, _, cx| {
+                    if phase == DispatchPhase::Bubble && event.keystroke.key == "escape" {
+                        view.update(cx, |this, cx| {
+                            if this.deleting.is_some() {
+                                this.cancel_delete(cx);
+                            } else {
+                                this.go_back(cx);
+                            }
+                        });
+                    }
+                });
+            },
+        )
+        .absolute()
+        .size_0();
+
+        div()
+            .size_full()
+            .relative()
+            .child(self.page_width.probe())
+            .child(row)
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .child(trailing_toolbar(
+                        header,
+                        theme.color_surface,
+                        header_h,
+                        theme.radius_surface,
+                    )),
+            )
+            .children(drawer)
+            .children(confirm)
+            .child(escape_canvas)
+            .into_any_element()
     }
 }
 
@@ -467,209 +846,59 @@ fn load_artifacts(client: &CoreClient) -> Option<Vec<DispatchArtifact>> {
         .map(|response| response.artifacts)
 }
 
-/// One thumbnail on the grid: the image, its run's title, where it came from, its agent and
-/// model, and its repository and date.
-fn image_tile(tile: &ImageTile, theme: &Theme, view: Entity<ImagesView>) -> AnyElement {
+fn wrapped(text: &str) -> AnyElement {
+    wrap_text(text.to_string()).into_any_element()
+}
+
+/// One thumbnail on the grid: the image, its run's title, its small bot + model and relative date.
+fn image_tile(
+    tile: &ImageTile,
+    thumb_height: f32,
+    theme: &Theme,
+    view: Entity<ImagesView>,
+    now_ms: i64,
+) -> AnyElement {
     let selector = format!("image-tile-{}", tile.id);
     let artifact = tile.id.clone();
     let opener = view;
-    let mut meta = div().flex().flex_col().gap(px(4.0));
-    meta = meta
-        .child(
-            div()
-                .text_size(px(theme.font_size_sm))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(theme.color_text_primary)
-                .child(ellipsis(tile.title.clone())),
-        )
-        .child(origin_line(tile, theme))
-        .child(meta_line(agent_text(tile), theme));
-    let mut where_line = tile.repo_name.clone();
-    if !tile.date.is_empty() {
-        if !where_line.is_empty() {
-            where_line.push_str(" · ");
-        }
-        where_line.push_str(&tile.date);
-    }
-    if !where_line.is_empty() {
-        meta = meta.child(meta_line(where_line, theme));
-    }
-    div()
-        .id(SharedString::from(selector.clone()))
-        .debug_selector(move || selector)
-        .flex()
-        .flex_col()
-        .rounded(px(theme.radius_card))
-        .border_1()
-        .border_color(theme.color_border_subtle)
-        .bg(theme.color_surface_subtle)
-        .cursor_pointer()
-        .hover(|style| style.border_color(theme.color_border_strong))
-        .on_click(move |_, _, cx| {
-            let artifact = artifact.clone();
-            opener.update(cx, |this, cx| this.open_viewer(artifact, cx));
-        })
-        .child(
-            div()
-                .w_full()
-                .h(px(THUMB_HEIGHT))
-                .flex_none()
-                .bg(theme.color_surface)
-                .rounded_tl(px(theme.radius_card))
-                .rounded_tr(px(theme.radius_card))
-                .overflow_hidden()
-                .child(
-                    img(PathBuf::from(&tile.path))
-                        .w_full()
-                        .h_full()
-                        .object_fit(ObjectFit::Cover),
-                ),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_none()
-                .flex_col()
-                .px(px(10.0))
-                .py(px(9.0))
-                .child(meta),
-        )
-        .into_any_element()
-}
 
-/// Where a tile came from: "App", or a delegated run's calling bot, agent, and session.
-fn origin_line(tile: &ImageTile, theme: &Theme) -> AnyElement {
-    let mut row = div()
+    let ago = format_ago(&tile.created_at, now_ms);
+    let meta_text = if tile.model.trim().is_empty() {
+        if ago.is_empty() {
+            agent_display_name(&tile.agent)
+        } else {
+            format!("{} \u{00b7} {ago}", agent_display_name(&tile.agent))
+        }
+    } else if ago.is_empty() {
+        tile.model.clone()
+    } else {
+        format!("{} \u{00b7} {ago}", tile.model)
+    };
+
+    let meta = div()
         .flex()
         .items_center()
         .gap(px(5.0))
         .text_size(px(theme.font_size_xs))
-        .text_color(theme.color_text_muted);
-    if tile.origin == crate::models::images::Origin::Delegated {
-        row = row.child(crate::avatar::agent_avatar(&tile.caller_agent, "", 14.0));
-    }
-    row.child(SharedString::from(origin_text(tile)))
-        .into_any_element()
-}
-
-fn meta_line(text: impl Into<SharedString>, theme: &Theme) -> AnyElement {
-    div()
-        .text_size(px(theme.font_size_xs))
         .text_color(theme.color_text_muted)
-        .child(ellipsis(text.into()))
-        .into_any_element()
-}
+        .child(crate::avatar::agent_avatar(&tile.agent, "", 14.0))
+        .child(div().flex_1().min_w(px(0.0)).child(ellipsis(meta_text)));
 
-/// The viewer: polterware-ui's `ImageViewer` with the prompt that made the image and where
-/// it came from under it, and the ways to its run and to delete it.
-fn image_viewer(
-    tile: &ImageTile,
-    presence: f32,
-    interactive: bool,
-    view: Entity<ImagesView>,
-    theme: &Theme,
-) -> AnyElement {
-    let closer = view.clone();
-    let opener = view.clone();
-    let run_id = tile.run_id.clone();
-    let deleter = view;
-    let artifact = tile.id.clone();
-    let prompt = tile.prompt.trim().to_string();
-    let file = format!(
-        "{} \u{00b7} {} \u{00d7} {} \u{00b7} {}",
-        tile.rel_path,
-        tile.width,
-        tile.height,
-        tile.kind.to_uppercase()
-    );
-    let facts = div()
-        .flex()
-        .flex_col()
-        .gap(px(6.0))
-        .text_size(px(theme.font_size_sm))
-        .child(fact("From", origin_text(tile), theme))
-        .child(fact("Run", tile.title.clone(), theme))
-        .child(fact("Agent", agent_text(tile), theme))
-        .child(fact(
-            "Repository",
-            if tile.repo.is_empty() {
-                repo_name(&tile.path)
-            } else {
-                tile.repo.clone()
-            },
-            theme,
-        ))
-        .child(fact("Date", local_datetime(&tile.created_at), theme))
-        .child(fact("File", file, theme));
-    let details = div()
-        .debug_selector(|| "image-viewer".to_string())
-        .w(px(VIEWER_DETAILS_WIDTH))
-        .max_w_full()
-        .flex()
-        .flex_col()
-        .gap(px(12.0))
-        .child(
-            div()
-                .text_size(px(theme.font_size_md))
-                .text_color(theme.color_text_secondary)
-                .when(prompt.is_empty(), |text| {
-                    text.child("No prompt was recorded.")
-                })
-                .when(!prompt.is_empty(), |text| text.child(prompt)),
-        )
-        .child(facts);
-    ImageViewer::new(
-        "image-viewer-modal",
+    let card = ImageCard::new(
+        SharedString::from(format!("card-{}", tile.id)),
+        ImageData::from_path(PathBuf::from(&tile.path)),
         tile.title.clone(),
-        ImageData::from_path(tile.path.clone()),
     )
-    .natural(tile.width.max(0) as f32, tile.height.max(0) as f32)
-    .presence(presence)
-    .interactive(interactive)
-    .details(details)
-    .action(
-        ImageAction::new("image-delete", Icon::Delete, "Delete", move |_, cx| {
-            let artifact = artifact.clone();
-            deleter.update(cx, |this, cx| this.ask_delete(artifact, cx));
-        })
-        .kind(ButtonKind::Danger),
-    )
-    .action(
-        ImageAction::new(
-            "image-open-run",
-            Icon::ArrowUpRight01Icon,
-            "Open run",
-            move |_, cx| {
-                let run_id = run_id.clone();
-                opener.update(cx, |this, cx| this.open_run(run_id, cx));
-            },
-        )
-        .kind(ButtonKind::Primary),
-    )
-    .on_close(move |_, cx| {
-        closer.update(cx, |this, cx| this.close_viewer(cx));
-    })
-    .into_any_element()
-}
+    .thumb_height(thumb_height)
+    .meta(meta)
+    .on_click(move |_, cx| {
+        let artifact = artifact.clone();
+        opener.update(cx, |this, cx| this.open_image(artifact, cx));
+    });
 
-fn fact(label: &'static str, value: String, theme: &Theme) -> AnyElement {
     div()
-        .flex()
-        .items_start()
-        .gap(px(10.0))
-        .child(
-            div()
-                .w(px(78.0))
-                .flex_none()
-                .text_color(theme.color_text_muted)
-                .child(label),
-        )
-        .child(
-            div()
-                .flex_1()
-                .min_w(px(0.0))
-                .text_color(theme.color_text_secondary)
-                .child(value),
-        )
+        .id(SharedString::from(selector.clone()))
+        .debug_selector(move || selector)
+        .child(card)
         .into_any_element()
 }

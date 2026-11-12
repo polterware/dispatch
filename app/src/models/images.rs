@@ -51,6 +51,7 @@ pub struct ImageTile {
     pub rel_path: String,
     /// png, jpeg, webp, or gif.
     pub kind: String,
+    pub bytes: i64,
     pub prompt: String,
     /// The run's prompt's first line, which names it.
     pub title: String,
@@ -86,6 +87,7 @@ impl From<&DispatchArtifact> for ImageTile {
             path: artifact.path.clone(),
             rel_path: artifact.rel_path.clone(),
             kind: artifact.kind.clone(),
+            bytes: artifact.bytes.0,
             prompt: artifact.prompt.clone(),
             title: prompt_first_line(&artifact.prompt, &artifact.run_id),
             origin,
@@ -148,6 +150,18 @@ pub fn agent_text(tile: &ImageTile) -> String {
         agent
     } else {
         format!("{agent} · {}", tile.model.trim())
+    }
+}
+
+/// Formats a file size in bytes as B, kB, or MB.
+pub fn format_bytes(bytes: i64) -> String {
+    let b = bytes.max(0) as f64;
+    if b >= 1024.0 * 1024.0 {
+        format!("{:.1} MB", b / (1024.0 * 1024.0))
+    } else if b >= 1024.0 {
+        format!("{:.1} kB", b / 1024.0)
+    } else {
+        format!("{bytes} B")
     }
 }
 
