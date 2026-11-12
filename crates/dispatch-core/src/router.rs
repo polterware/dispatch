@@ -449,8 +449,7 @@ pub fn select_candidates(
         tiers::{Entry, provider_of},
     };
     let f = &options.filters;
-    // Image mode can only run on an agent that makes images: saying so once is clearer than
-    // naming every candidate it drops.
+    // Keep the installed-agent check as a concise error when no image-capable adapter exists.
     if options.images && !agents.iter().any(|a| a.installed && a.images) {
         return (Vec::new(), vec!["no image-capable agent installed".into()]);
     }
@@ -580,10 +579,6 @@ pub fn select_candidates(
             rejected.push(format!("{label}: does not support fileEditing"));
             continue;
         }
-        if options.images && !a.images {
-            rejected.push(format!("{label}: cannot make images"));
-            continue;
-        }
         let mut model = e.model.clone();
         let mut effort = f.effort.clone();
         if !f.model.is_empty() && !effort_of(&f.model).is_empty() {
@@ -591,6 +586,10 @@ pub fn select_candidates(
             if effort.is_empty() {
                 effort = effort_of(&f.model).into();
             }
+        }
+        if options.images && !crate::adapters::probe::makes_images(&e.agent, &model) {
+            rejected.push(format!("{label}: cannot make images"));
+            continue;
         }
         if effort.is_empty() && options.tier != "auto" {
             effort.clone_from(&e.effort);

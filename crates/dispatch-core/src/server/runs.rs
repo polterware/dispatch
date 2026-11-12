@@ -1256,14 +1256,17 @@ impl Core {
                     } else {
                         Vec::new()
                     };
-                    out.models
-                        .extend(models.into_iter().map(|m| pb::DispatchModel {
+                    out.models.extend(models.into_iter().map(|m| {
+                        let images = crate::adapters::probe::makes_images(&a.name(), &m.id);
+                        pb::DispatchModel {
                             agent: a.name(),
                             provider: provider_of(&a.name(), &m.id),
                             model: m.id,
                             tier: m.tier,
                             efforts: efforts.clone(),
-                        }));
+                            images,
+                        }
+                    }));
                 }
                 Err(e) => out.problems.push(format!("{}: {e}", a.name())),
             }
