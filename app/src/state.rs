@@ -58,6 +58,7 @@ pub enum Route {
     Spend,
     Stats,
     Images,
+    Image(String),
     Settings(SettingsPage),
     Run(String),
     Runs,

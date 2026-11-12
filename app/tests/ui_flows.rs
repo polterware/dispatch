@@ -1139,3 +1139,73 @@ fn the_images_page_filters_delegated_images_and_deletes_one(cx: &mut TestAppCont
     w.settle();
     assert!(w.shows(&app_tile), "the other image went with it");
 }
+
+#[gpui::test]
+fn the_image_page_opens_and_goes_back(cx: &mut TestAppContext) {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let core = Core::new();
+    let run_id = core.start("IMAGE design an app icon", true);
+    core.wait_for(&run_id, "COMPLETED");
+
+    let artifacts = || {
+        core.client
+            .list_artifacts(&ListArtifactsRequest::default())
+            .expect("list artifacts")
+            .artifacts
+    };
+    wait_until("one image is indexed", || artifacts().len() == 1);
+    let artifact = artifacts().into_iter().next().expect("the image");
+
+    let mut w = open(&core, cx);
+    w.click("sidebar-nav-Images");
+    assert_eq!(w.route(), Route::Images);
+
+    let tile = format!("image-tile-{}", artifact.id);
+    for _ in 0..30 {
+        w.settle();
+        if w.shows(&tile) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(w.shows(&tile), "the gallery never showed the image");
+
+    // Apply a filter before navigating
+    let filters = w.images.read_with(w.cx, |view, _| view.filters().clone());
+    filters.update(w.cx, |filters, cx| {
+        filters.add_filter("origin", &["delegated".into()], cx);
+    });
+    w.settle();
+    assert!(w.shows(&tile), "filter hid the tile");
+
+    // Click tile to navigate to Route::Image
+    w.click(&tile);
+    w.pump();
+    assert_eq!(w.route(), Route::Image(artifact.id.clone()));
+    assert!(
+        w.shows("image-viewer"),
+        "the image viewer page did not open"
+    );
+    assert!(w.shows("image-page-back"), "no back button in toolbar");
+
+    // Click back button to return to Route::Images
+    w.click("image-page-back");
+    w.pump();
+    w.settle();
+    assert_eq!(w.route(), Route::Images);
+
+    // Verify filter is preserved and tile is still shown
+    let active_filters = w
+        .images
+        .read_with(w.cx, |view, cx| view.filters().read(cx).filters().clone());
+    let origin_clause = active_filters
+        .clauses
+        .iter()
+        .find(|c| c.field == "origin")
+        .map(|c| c.values.as_slice());
+    assert_eq!(origin_clause, Some(&["delegated".to_string()][..]));
+    assert!(
+        w.shows(&tile),
+        "tile still visible after returning with filter active"
+    );
+}

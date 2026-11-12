@@ -1948,7 +1948,7 @@ fn page_selected(route: &Route, label: &str) -> bool {
         "Intelligence" => matches!(route, Route::Intelligence),
         "Spend" => matches!(route, Route::Spend),
         "Stats" => matches!(route, Route::Stats),
-        "Images" => matches!(route, Route::Images),
+        "Images" => matches!(route, Route::Images | Route::Image(_)),
         _ => false,
     }
 }

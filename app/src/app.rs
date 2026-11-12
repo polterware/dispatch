@@ -463,7 +463,7 @@ fn page_for_route(
         Route::Intelligence => intelligence.clone().into(),
         Route::Spend => spend.clone().into(),
         Route::Stats => stats.clone().into(),
-        Route::Images => images.clone().into(),
+        Route::Images | Route::Image(_) => images.clone().into(),
         // Never the backdrop: Settings draws in its dialog.
         Route::Settings(_) => roles.clone().into(),
         Route::Run(_) | Route::NewRun => run_page.clone().into(),
