@@ -28,9 +28,9 @@ use crate::theme::Theme;
 use crate::ui::patterns::{ConfirmDialog, modal_layer};
 use crate::ui::{
     Button, ButtonKind, ButtonSize, FilterField, FilterPopover, FiltersChanged, Icon, ImageCard,
-    ImageData, MascotMood, PageWidth, RailPresence, SkeletonLayout, TextInput, card_grid, ellipsis,
-    grid_columns, page_empty, page_skeleton, page_under, page_under_inset, rail_card,
-    rail_page_body_under, rail_page_header, rail_properties, rail_property, rail_section,
+    ImageData, MascotMood, PageWidth, RailPresence, SkeletonLayout, TextInput, ZoomableImage,
+    card_grid, ellipsis, grid_columns, page_empty, page_skeleton, page_under, page_under_inset,
+    rail_page_body_flush, rail_page_header, rail_properties, rail_property, rail_section,
     rail_toggle_label, scroll_area_under, toolbar, trailing_toolbar, wrap_text,
 };
 
@@ -64,6 +64,7 @@ pub struct ImagesView {
     drawer_open: bool,
     rail: RailPresence,
     page_width: PageWidth,
+    zoomable: Option<(String, Entity<ZoomableImage>)>,
 }
 
 impl ImagesView {
@@ -105,6 +106,7 @@ impl ImagesView {
             drawer_open: false,
             rail: RailPresence::new(rail_open),
             page_width: PageWidth::default(),
+            zoomable: None,
         };
         cx.spawn(async move |this, cx| {
             let _ = this.update(cx, |view, cx| view.kick(cx));
@@ -563,42 +565,6 @@ impl ImagesView {
                 .into_any_element();
         };
 
-        let title = div()
-            .flex_1()
-            .min_w(px(0.0))
-            .text_size(px(theme.font_size_sm))
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(theme.color_text_primary)
-            .child(ellipsis(tile.title.clone()));
-
-        let start = div()
-            .flex()
-            .items_center()
-            .gap(px(8.0))
-            .child(back)
-            .child(title);
-        let header = rail_page_header(start, toggle, cx);
-
-        // Center column: large image fitted inside the surface preserving aspect ratio
-        let column = div()
-            .id("image-viewer")
-            .debug_selector(|| "image-viewer".to_string())
-            .flex_1()
-            .min_w(px(0.0))
-            .h_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .p(px(24.0))
-            .child(
-                img(PathBuf::from(&tile.path))
-                    .max_w_full()
-                    .max_h_full()
-                    .object_fit(ObjectFit::Contain)
-                    .rounded(px(theme.radius_card)),
-            );
-
-        // Details rail
         let reveal_path = tile.path.clone();
         let copy_path = tile.path.clone();
         let delete_id = tile.id.clone();
@@ -608,8 +574,22 @@ impl ImagesView {
         let delete_view = view.clone();
         let run_view = view.clone();
 
+        let title = div()
+            .max_w(px(360.0))
+            .min_w(px(0.0))
+            .text_size(px(theme.font_size_xs))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(theme.color_text_primary)
+            .child(ellipsis(tile.title.clone()));
+
+        let start = div()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .child(back)
+            .child(title);
+
         let actions = div()
-            .w_full()
             .flex()
             .items_center()
             .gap(px(8.0))
@@ -632,15 +612,60 @@ impl ImagesView {
                     }),
             )
             .child(
-                Button::new("image-delete", ButtonKind::Danger)
-                    .size(ButtonSize::Sm)
+                Button::new("image-delete", ButtonKind::Ghost)
+                    .size(ButtonSize::Icon)
                     .icon(Icon::Delete)
-                    .label("Delete")
+                    .tooltip("Delete image")
                     .on_click(move |_, cx| {
                         let id = delete_id.clone();
                         delete_view.update(cx, |this, cx| this.ask_delete(id, cx));
                     }),
             );
+
+        let end = div()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .child(actions)
+            .child(toggle);
+
+        let header = rail_page_header(start, end, cx);
+        let header_h = theme.page_header_height;
+
+        let zoomable = match &self.zoomable {
+            Some((id, entity)) if id == &tile.id => entity.clone(),
+            _ => {
+                let nat_w = if tile.width > 0 {
+                    tile.width as f32
+                } else {
+                    1024.0
+                };
+                let nat_h = if tile.height > 0 {
+                    tile.height as f32
+                } else {
+                    1024.0
+                };
+                let entity = cx.new(|_| {
+                    ZoomableImage::new(
+                        "image-viewer",
+                        ImageData::from_path(PathBuf::from(&tile.path)),
+                    )
+                    .natural(nat_w, nat_h)
+                    .debug_selector("image-viewer")
+                });
+                self.zoomable = Some((tile.id.clone(), entity.clone()));
+                entity
+            }
+        };
+
+        // Center column: zoomable image fitted inside the surface preserving aspect ratio
+        let column = div()
+            .id("image-viewer-column")
+            .flex_1()
+            .min_w(px(0.0))
+            .h_full()
+            .pt(px(header_h))
+            .child(zoomable);
 
         let prompt_text = if tile.prompt.trim().is_empty() {
             "No prompt was recorded.".to_string()
@@ -766,24 +791,21 @@ impl ImagesView {
                 rail_property("Repository", wrapped(&repo_display), true, cx),
             ));
 
-        let rail_body = div()
+        let rail = div()
             .w_full()
             .flex()
             .flex_col()
             .gap(px(16.0))
-            .child(actions)
             .child(image_section)
             .child(run_section)
             .child(agent_section)
             .child(origin_section)
-            .child(repo_section);
+            .child(repo_section)
+            .into_any_element();
 
-        let rail_container = rail_card(cx).child(rail_body).into_any_element();
-
-        let header_h = theme.page_header_height;
-        let (row, drawer) = rail_page_body_under(
+        let (row, drawer) = rail_page_body_flush(
             column,
-            rail_container,
+            rail,
             &self.rail,
             &self.page_width,
             header_h,
