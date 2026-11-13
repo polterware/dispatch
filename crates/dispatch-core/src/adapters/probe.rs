@@ -110,17 +110,17 @@ pub fn capabilities(name: &str) -> Capabilities {
 /// image tool, so they remain eligible; Cursor exposes image generation only on GPT and Grok
 /// model families, while Codex and Grok support it across their listed models.
 pub fn makes_images(agent: &str, model: &str) -> bool {
-    if !capabilities(agent).images {
-        return false;
+    capabilities(agent).images && model_makes_images(agent, model)
+}
+
+/// Whether `model` keeps an image-capable agent's image tool: only Cursor ties it to the
+/// model family; every other agent that makes images does so with any of its models.
+pub fn model_makes_images(agent: &str, model: &str) -> bool {
+    if agent != "cursor" {
+        return true;
     }
-    match agent {
-        "codex" | "grok" => true,
-        "cursor" => {
-            let base = model.rsplit_once('/').map_or(model, |(_, base)| base);
-            base.starts_with("gpt-") || base.starts_with("grok-")
-        }
-        _ => super::acp::custom_agents().contains_key(agent),
-    }
+    let base = model.rsplit_once('/').map_or(model, |(_, base)| base);
+    base.starts_with("gpt-") || base.starts_with("grok-")
 }
 
 pub fn flags(name: &str) -> Vec<ProbeFlag> {

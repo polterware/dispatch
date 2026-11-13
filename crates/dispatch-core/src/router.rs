@@ -438,6 +438,19 @@ fn tier_effort(tier: &str) -> &str {
     }
 }
 
+/// A role board's entries for a run: in image mode only the ones that make images, so a
+/// board with none of them leaves the run on the general route instead of failing it.
+pub(crate) fn image_entries(
+    entries: &[crate::tiers::Entry],
+    images: bool,
+) -> Vec<crate::tiers::Entry> {
+    entries
+        .iter()
+        .filter(|e| !images || crate::adapters::probe::makes_images(&e.agent, &e.model))
+        .cloned()
+        .collect()
+}
+
 pub fn select_candidates(
     table: &crate::tiers::Table,
     policy: &crate::config::Policy,
@@ -587,7 +600,9 @@ pub fn select_candidates(
                 effort = effort_of(&f.model).into();
             }
         }
-        if options.images && !crate::adapters::probe::makes_images(&e.agent, &model) {
+        if options.images
+            && !(a.images && crate::adapters::probe::model_makes_images(&e.agent, &model))
+        {
             rejected.push(format!("{label}: cannot make images"));
             continue;
         }
@@ -711,9 +726,15 @@ pub fn plan(
             band = kept;
             role_note = note;
         }
-        if let Some(entries) = o.role_board.tiers.get(&band).filter(|e| !e.is_empty()) {
+        if let Some(entries) = o
+            .role_board
+            .tiers
+            .get(&band)
+            .map(|e| image_entries(e, o.images))
+            .filter(|e| !e.is_empty())
+        {
             table.tiers.clear();
-            table.tiers.insert(band.clone(), entries.clone());
+            table.tiers.insert(band.clone(), entries);
             o.tier = band;
             policy.discover = false;
         } else {

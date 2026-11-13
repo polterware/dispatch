@@ -7,7 +7,33 @@ pub fn turn_params(req: &Request, thread_id: &str) -> Value {
     if !req.effort.is_empty() {
         params["effort"] = Value::String(req.effort.clone());
     }
+    let roots = writable_roots(req);
+    if !req.read_only && !roots.is_empty() {
+        params["sandboxPolicy"] = json!({"type":"workspaceWrite","writableRoots":roots});
+    }
     params
+}
+
+/// The folders a writing run may change besides its own: the worktrees of the other
+/// repositories it spans and its artifacts folder. Codex's workspace-write sandbox allows
+/// only the cwd unless they are named, so a `--with` run could not touch its linked
+/// repositories and an image run could not save where its brief said.
+pub fn writable_roots(req: &Request) -> Vec<String> {
+    let value = |name: &str| {
+        req.env
+            .iter()
+            .find_map(|e| e.strip_prefix(name)?.strip_prefix('='))
+            .unwrap_or("")
+    };
+    let mut roots: Vec<String> = value(crate::runner::linked::LINKED_ENV)
+        .split(':')
+        .filter_map(|pair| pair.split_once('=').map(|(_, path)| path))
+        .chain(std::iter::once(value(crate::artifacts::ARTIFACTS_ENV)))
+        .filter(|path| !path.is_empty() && *path != req.dir)
+        .map(str::to_owned)
+        .collect();
+    roots.dedup();
+    roots
 }
 
 use super::{

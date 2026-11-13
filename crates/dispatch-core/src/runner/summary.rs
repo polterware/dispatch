@@ -67,6 +67,25 @@ pub fn resets_in(notice: &str) -> Option<Duration> {
     (secs > 0).then(|| Duration::from_secs(secs))
 }
 
+/// A quota that ran out for one model ("⚠ Individual quota reached. … Resets in 140h9m53s.").
+static MODEL_QUOTA: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)\bindividual quota\b|\bquota\b[^.\n]{0,40}\b(?:reached|exceeded|exhausted|used up)\b",
+    )
+    .unwrap_or_else(|_| never())
+});
+/// Words that make a limit the whole account's rather than one model's.
+static ACCOUNT_WIDE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:account|all models|every model|organi[sz]ation|workspace|project)\b")
+        .unwrap_or_else(|_| never())
+});
+
+/// Whether a quota error names one model's quota, which Antigravity keeps apart for each
+/// model, rather than a limit on the whole account (a 429, a rate limit, an account quota).
+pub fn is_model_quota(err: &str) -> bool {
+    MODEL_QUOTA.is_match(err) && !ACCOUNT_WIDE.is_match(err)
+}
+
 /// A regex that matches nothing, for a pattern that failed to compile.
 fn never() -> Regex {
     Regex::new(r"[^\s\S]").unwrap_or_else(|_| never())

@@ -30,12 +30,12 @@ pub use lifecycle::{pid_alive, process_start};
 pub use ops::MergeResult;
 pub use routing::{
     FiltersJson, RouteCandidate, RouteReport, cooling, credit_key, disabled_request_reason, linear,
-    matches_model, normalize_priority, store_cooldowns, store_disabled, store_disabled_agents,
-    validate_options,
+    matches_model, model_key, normalize_priority, store_cooldowns, store_disabled,
+    store_disabled_agents, validate_options,
 };
 pub use summary::{
-    RunSummary, SUMMARY_SCHEMA, class_of, classify_run, go_duration, limit_notice, observed_ms,
-    page, resets_in, summarize, summary,
+    RunSummary, SUMMARY_SCHEMA, class_of, classify_run, go_duration, is_model_quota, limit_notice,
+    observed_ms, page, resets_in, summarize, summary,
 };
 pub use usage::{add_usage, attempt_usage_from_log, load_catalog, usage_cost, usage_with_log};
 pub use worktrees::{WORKTREES_DIR, WorktreeFolder};

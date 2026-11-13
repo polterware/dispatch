@@ -572,9 +572,16 @@ fn reply_row(
 ) -> AnyElement {
     let on_read = frame.on_read.clone();
     let said = text.to_string();
+    // A row of its own, so the button keeps its content's width at the left, set apart from
+    // the reply above it.
     div()
         .w_full()
         .min_h(px(TERM_LINE_PX))
+        .pt(px(12.0))
+        .flex()
+        .flex_row()
+        .justify_start()
+        .items_start()
         .child(
             Button::new(
                 ElementId::Name(format!("read-{signature:x}").into()),

@@ -60,6 +60,8 @@ pub struct ImageTile {
     pub caller_agent: String,
     /// Its session id, shortened for the tile.
     pub session: String,
+    /// The same session id whole, for the details rail.
+    pub session_id: String,
     pub agent: String,
     pub model: String,
     /// The repository the run worked in, and its folder's name.
@@ -93,6 +95,7 @@ impl From<&DispatchArtifact> for ImageTile {
             origin,
             caller_agent: artifact.caller_agent.trim().to_string(),
             session: short_session(&artifact.conversation_id),
+            session_id: artifact.conversation_id.trim().to_string(),
             agent: artifact.agent.clone(),
             model: artifact.model.clone(),
             repo: artifact.repo.trim_end_matches('/').to_string(),

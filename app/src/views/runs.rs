@@ -550,7 +550,7 @@ fn runs_stack(groups: &[RunGroup], view: &RunsView, cx: &mut Context<RunsView>) 
         .w_full()
         .flex()
         .flex_col()
-        .gap(px(theme.space_3))
+        .gap(px(theme.space_6))
         .pb(px(theme.space_4));
     let mut row_index = 0usize;
     for group in groups {
@@ -559,7 +559,7 @@ fn runs_stack(groups: &[RunGroup], view: &RunsView, cx: &mut Context<RunsView>) 
             .w_full()
             .flex()
             .flex_col()
-            .gap(px(theme.sidebar_row_gap))
+            .gap(px(10.0))
             .child(group_header(group, collapsed, on_toggle.clone(), cx));
         if !collapsed {
             for row in &group.runs {

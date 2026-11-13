@@ -104,6 +104,33 @@ async fn print_cli_streams() {
 }
 
 #[test]
+fn codex_may_write_linked_worktrees_and_artifacts() {
+    let req = dispatch_core::adapters::Request {
+        dir: "/repo/wt".into(),
+        env: vec![
+            "DISPATCH_LINKED_WORKTREES=app=/repo/wt:ui=/ui/wt".into(),
+            "DISPATCH_ARTIFACTS_DIR=/data/artifacts/r1".into(),
+        ],
+        ..Default::default()
+    };
+    let params = dispatch_core::adapters::codex::turn_params(&req, "t-1");
+    assert_eq!(params["sandboxPolicy"]["type"], "workspaceWrite");
+    assert_eq!(
+        params["sandboxPolicy"]["writableRoots"],
+        serde_json::json!(["/ui/wt", "/data/artifacts/r1"])
+    );
+    let read_only = dispatch_core::adapters::Request {
+        read_only: true,
+        ..req
+    };
+    assert!(
+        dispatch_core::adapters::codex::turn_params(&read_only, "t-1")
+            .get("sandboxPolicy")
+            .is_none()
+    );
+}
+
+#[test]
 fn effort_application() {
     let req = dispatch_core::adapters::Request {
         effort: "xhigh".into(),

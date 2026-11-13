@@ -61,15 +61,35 @@ pub fn credit_key(agent: &str, provider: &str) -> String {
     format!("{agent}:{provider}")
 }
 
-/// The cooldown key when the agent, or this provider inside it, is cooling down.
-pub fn cooling(cool: &Cooldowns, agent: &str, provider: &str) -> Option<String> {
+/// Scopes a quota cooldown to one model of one provider inside one CLI (e.g.
+/// "antigravity:google:gemini-4-argon"): Antigravity keeps a quota per model, so
+/// the others keep working. Every effort variant of the model ("gemini-4-argon-high",
+/// "-low") shares its quota, so the key names the model without its effort.
+pub fn model_key(agent: &str, provider: &str, model: &str) -> String {
+    let model = base_model(model);
+    format!("{agent}:{provider}:{model}")
+}
+
+/// The cooldown key when the agent, this provider inside it, or this model of
+/// that provider is cooling down.
+pub fn cooling(cool: &Cooldowns, agent: &str, provider: &str, model: &str) -> Option<String> {
     if cool.contains_key(agent) {
         return Some(agent.to_owned());
     }
-    if !provider.is_empty() && cool.contains_key(&credit_key(agent, provider)) {
-        return Some(credit_key(agent, provider));
+    if provider.is_empty() {
+        return None;
     }
-    None
+    let key = credit_key(agent, provider);
+    if cool.contains_key(&key) {
+        return Some(key);
+    }
+    let key = model_key(agent, provider, model);
+    (!model.is_empty() && cool.contains_key(&key)).then_some(key)
+}
+
+/// The cooldown key of a candidate, when it is cooling down.
+pub(crate) fn candidate_cooling(cool: &Cooldowns, c: &Candidate) -> Option<String> {
+    cooling(cool, c.agent(), &candidate_provider(c), c.model())
 }
 
 /// The provider, or the model when the provider is unknown.
@@ -384,7 +404,7 @@ impl Deps {
         let mut out = Vec::with_capacity(cs.len());
         for c in cs {
             let scope = credit_scope(&c.agent, &c.provider, &c.model);
-            if let Some(key) = cooling(cool, &c.agent, &scope) {
+            if let Some(key) = cooling(cool, &c.agent, &scope, &c.model) {
                 rejected.push(format!("{}/{}: {key} in cooldown", c.agent, c.model));
                 continue;
             }
@@ -503,8 +523,8 @@ impl Deps {
     /// Routes a run whose role has models in the run's band over those alone,
     /// in board order, as a tier route of that band. A band the role deleted
     /// moves to its nearest kept column, the next harder before the next easier.
-    /// A kept but empty band, and a model or provider filter, keep the general
-    /// route.
+    /// A kept but empty band, a band with no model that makes images in image mode, and a
+    /// model or provider filter, keep the general route.
     fn with_role_board(&self, mut o: Options) -> (Deps, Options, String) {
         let mut d = self.clone();
         if o.role_board.tiers.is_empty()
@@ -522,11 +542,17 @@ impl Deps {
         }
         let (band, note) =
             crate::roles::nearest_column(&o.role_columns, &band).unwrap_or((band, String::new()));
-        let Some(entries) = o.role_board.tiers.get(&band).filter(|e| !e.is_empty()) else {
+        let Some(entries) = o
+            .role_board
+            .tiers
+            .get(&band)
+            .map(|e| crate::router::image_entries(e, o.images))
+            .filter(|e| !e.is_empty())
+        else {
             return (d, o, String::new());
         };
         d.table = Table::default();
-        d.table.tiers.insert(band.clone(), entries.clone());
+        d.table.tiers.insert(band.clone(), entries);
         d.policy.discover = false;
         o.tier = band;
         (d, o, note)
@@ -687,7 +713,7 @@ impl Deps {
                 .clone()
         };
         for c in &mut cs {
-            c.route.cooled_down = cooling(cool, &c.route.agent, &candidate_provider(c)).is_some();
+            c.route.cooled_down = candidate_cooling(cool, c).is_some();
             if c.quota.is_none() {
                 let key = quota_key(&c.route.agent, &c.route.model);
                 let latest = snapshots(&key)

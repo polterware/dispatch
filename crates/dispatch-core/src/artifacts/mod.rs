@@ -317,10 +317,11 @@ fn index_external_at(
         let Ok(metadata) = entry.metadata() else {
             continue;
         };
-        if walk
-            .start
-            .is_some_and(|start| metadata.modified().map_or(true, |mtime| mtime < start))
-        {
+        // Without a start time nothing tells the run's images from the folder's old ones.
+        let Some(start) = walk.start else {
+            return added;
+        };
+        if metadata.modified().map_or(true, |mtime| mtime < start) {
             continue;
         }
         let Ok(rel) = path.strip_prefix(walk.root) else {
@@ -334,6 +335,7 @@ fn index_external_at(
         let copy = dest.join(&artifact_rel);
         if std::fs::create_dir_all(copy.parent().unwrap_or(dest)).is_err()
             || image(&path).is_none()
+            || already_in(dest, &path)
             || std::fs::copy(&path, &copy).is_err()
         {
             continue;
@@ -343,6 +345,37 @@ fn index_external_at(
         }
     }
     added
+}
+
+/// Whether the run's folder already holds `source`, byte for byte: an agent that saves its
+/// image there and where the brief asked keeps one gallery entry, not two.
+fn already_in(dir: &Path, source: &Path) -> bool {
+    let Ok(len) = std::fs::metadata(source).map(|m| m.len()) else {
+        return false;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    let mut bytes: Option<Vec<u8>> = None;
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let same_len = entry
+            .metadata()
+            .is_ok_and(|m| m.is_file() && m.len() == len);
+        if !same_len {
+            continue;
+        }
+        if bytes.is_none() {
+            let Ok(read) = std::fs::read(source) else {
+                return false;
+            };
+            bytes = Some(read);
+        }
+        if std::fs::read(&path).ok().as_deref() == bytes.as_deref() {
+            return true;
+        }
+    }
+    false
 }
 
 /// The folder whose changed files belong to `run`: its worktree, else the folder it edited.
@@ -419,7 +452,10 @@ fn index_changed(store: &dyn types::Store, run: &types::Run, dir: &Path, folder:
             continue;
         }
         // A changed file that is not an image by its bytes is not copied at all.
-        if image(&source).is_none() || std::fs::copy(&source, &copy).is_err() {
+        if image(&source).is_none()
+            || already_in(dir, &source)
+            || std::fs::copy(&source, &copy).is_err()
+        {
             continue;
         }
         if save(store, run, &copy, &rel).is_ok() {
@@ -641,5 +677,25 @@ mod tests {
         assert_eq!(rows[0].rel_path, "worktree/new.png");
         assert_eq!((rows[0].width, rows[0].height), (640, 480));
         assert!(dest.join("worktree/new.png").is_file());
+    }
+
+    #[test]
+    fn an_image_already_in_the_run_folder_is_not_indexed_twice() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("plain");
+        let dest = temp.path().join("artifacts");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("lighthouse.png"), png(1280, 720)).unwrap();
+        std::fs::write(folder.join("farol.png"), png(1280, 720)).unwrap();
+        std::fs::write(folder.join("other.png"), png(64, 64)).unwrap();
+        let store = ArtifactStore::default();
+        let mut run = types::Run::default();
+        run.id = "run123".into();
+        run.dir = folder.to_string_lossy().into_owned();
+        run.images = true;
+        run.started_at = "2026-01-01T00:00:00Z".into();
+        assert_eq!(index_external(&store, &run, &dest, &folder), 1);
+        assert_eq!(store.0.lock().unwrap()[0].rel_path, "worktree/other.png");
     }
 }

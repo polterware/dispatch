@@ -13,8 +13,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui::{
     AnyElement, App, AppContext as _, ClipboardItem, Context, DispatchPhase, Entity, FocusHandle,
-    FontWeight, Image, ImageFormat, IntoElement, KeyDownEvent, ObjectFit, Render, SharedString,
-    Window, canvas, div, img, prelude::*, px,
+    FontWeight, Image, ImageFormat, IntoElement, KeyDownEvent, Render, SharedString, Window,
+    canvas, div, prelude::*, px,
 };
 
 use crate::client::{CoreClient, DeleteArtifactRequest, DispatchArtifact, ListArtifactsRequest};
@@ -30,8 +30,8 @@ use crate::ui::{
     Button, ButtonKind, ButtonSize, FilterField, FilterPopover, FiltersChanged, Icon, ImageCard,
     ImageData, MascotMood, PageWidth, RailPresence, SkeletonLayout, TextInput, ZoomableImage,
     card_grid, ellipsis, grid_columns, page_empty, page_skeleton, page_under, page_under_inset,
-    rail_page_body_flush, rail_page_header, rail_properties, rail_property, rail_section,
-    rail_toggle_label, scroll_area_under, toolbar, trailing_toolbar, wrap_text,
+    rail_page_body_flush, rail_page_cover, rail_page_header, rail_properties, rail_property,
+    rail_section, rail_toggle_label, scroll_area_under, toolbar, trailing_toolbar, wrap_text,
 };
 
 /// The page's chrome state.
@@ -436,7 +436,8 @@ impl ImagesView {
             let cols = grid_columns(available_width, TILE_MIN, TILE_GAP);
             let col_width =
                 (available_width - (f32::from(cols) - 1.0) * TILE_GAP) / f32::from(cols);
-            let thumb_height = ((col_width - 2.0) * 10.0 / 16.0).max(100.0);
+            // The card is the picture, its text over a fade: 4:3, as the footer no longer adds height.
+            let thumb_height = (col_width * 3.0 / 4.0).max(120.0);
 
             let mut body = div().w_full().flex().flex_col().gap(px(theme.space_4));
             for group in groups {
@@ -574,20 +575,7 @@ impl ImagesView {
         let delete_view = view.clone();
         let run_view = view.clone();
 
-        let title = div()
-            .max_w(px(360.0))
-            .min_w(px(0.0))
-            .text_size(px(theme.font_size_xs))
-            .font_weight(FontWeight::MEDIUM)
-            .text_color(theme.color_text_primary)
-            .child(ellipsis(tile.title.clone()));
-
-        let start = div()
-            .flex()
-            .items_center()
-            .gap(px(8.0))
-            .child(back)
-            .child(title);
+        let start = div().flex().items_center().gap(px(8.0)).child(back);
 
         let actions = div()
             .flex()
@@ -612,10 +600,10 @@ impl ImagesView {
                     }),
             )
             .child(
-                Button::new("image-delete", ButtonKind::Ghost)
-                    .size(ButtonSize::Icon)
+                Button::new("image-delete", ButtonKind::Danger)
+                    .size(ButtonSize::Sm)
                     .icon(Icon::Delete)
-                    .tooltip("Delete image")
+                    .label("Delete")
                     .on_click(move |_, cx| {
                         let id = delete_id.clone();
                         delete_view.update(cx, |this, cx| this.ask_delete(id, cx));
@@ -651,6 +639,7 @@ impl ImagesView {
                         ImageData::from_path(PathBuf::from(&tile.path)),
                     )
                     .natural(nat_w, nat_h)
+                    .corner_radius(theme.radius_surface)
                     .debug_selector("image-viewer")
                 });
                 self.zoomable = Some((tile.id.clone(), entity.clone()));
@@ -658,14 +647,15 @@ impl ImagesView {
             }
         };
 
-        // Center column: zoomable image fitted inside the surface preserving aspect ratio
-        let column = div()
-            .id("image-viewer-column")
-            .flex_1()
-            .min_w(px(0.0))
-            .h_full()
-            .pt(px(header_h))
-            .child(zoomable);
+        // The viewer fills the whole surface, under the header and the floating rail, so a
+        // panned image runs to every edge. It fits into the room those leave.
+        let cover = rail_page_cover(&self.rail, &self.page_width);
+        zoomable.update(cx, |viewer, cx| {
+            viewer.set_insets(header_h, cover, 0.0, 0.0, cx)
+        });
+        let viewer = div().absolute().inset_0().child(zoomable);
+        // The column holds no content of its own: it only keeps the rail's place.
+        let column = div().id("image-viewer-column").size_full();
 
         let prompt_text = if tile.prompt.trim().is_empty() {
             "No prompt was recorded.".to_string()
@@ -701,11 +691,15 @@ impl ImagesView {
                 )),
         );
 
+        // Inset as the properties' labels and values are, so the prompt lines up with them.
         let run_section = rail_section("Run", Icon::InformationCircle, cx).child(
             div()
                 .flex()
                 .flex_col()
-                .gap(px(8.0))
+                .gap(px(10.0))
+                .pl(px(8.0))
+                .pr(px(10.0))
+                .pt(px(2.0))
                 .child(
                     div()
                         .w_full()
@@ -767,16 +761,18 @@ impl ImagesView {
                 .when(
                     tile.origin == crate::models::images::Origin::Delegated,
                     |props| {
-                        let caller = if tile.session.is_empty() {
-                            agent_display_name(&tile.caller_agent)
-                        } else {
-                            format!(
-                                "{} \u{00b7} {}",
-                                agent_display_name(&tile.caller_agent),
-                                tile.session
-                            )
-                        };
-                        props.child(rail_property("Caller", wrapped(&caller), false, cx))
+                        // The caller, then its session whole on a row of its own, where it wraps.
+                        let caller = agent_display_name(&tile.caller_agent);
+                        props
+                            .child(rail_property("Caller", wrapped(&caller), false, cx))
+                            .when(!tile.session_id.is_empty(), |props| {
+                                props.child(rail_property(
+                                    "Session",
+                                    wrapped(&tile.session_id),
+                                    true,
+                                    cx,
+                                ))
+                            })
                     },
                 ),
         );
@@ -836,10 +832,14 @@ impl ImagesView {
         .absolute()
         .size_0();
 
+        // A column, so the row under the header takes the page's whole height.
         div()
             .size_full()
             .relative()
+            .flex()
+            .flex_col()
             .child(self.page_width.probe())
+            .child(viewer)
             .child(row)
             .child(
                 div()
@@ -902,7 +902,6 @@ fn image_tile(
         .items_center()
         .gap(px(5.0))
         .text_size(px(theme.font_size_xs))
-        .text_color(theme.color_text_muted)
         .child(crate::avatar::agent_avatar(&tile.agent, "", 14.0))
         .child(div().flex_1().min_w(px(0.0)).child(ellipsis(meta_text)));
 

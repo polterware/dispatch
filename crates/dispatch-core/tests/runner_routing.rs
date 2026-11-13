@@ -842,6 +842,26 @@ async fn image_mode_rejects_cursor_claude_and_keeps_cursor_gpt() {
 }
 
 #[tokio::test]
+async fn image_mode_skips_a_role_board_with_no_image_model() {
+    let mut r = routing_deps();
+    let ran = ran();
+    let mut cursor = Fake::new("cursor", &ran);
+    cursor.caps.lock().unwrap().images = true;
+    cursor.models = vec!["claude-haiku-5-5".into(), "gpt-6-luna".into()];
+    r.set(vec![cursor]);
+    r.t.deps.table = table(&[("easy", vec![entry("cursor", "gpt-6-luna")])]);
+    // The role's board holds only a model that cannot make images: the run takes the
+    // general route instead of failing.
+    let o = Options {
+        role_board: table(&[("easy", vec![entry("cursor", "claude-haiku-5-5")])]),
+        ..image_opts()
+    };
+    let (cs, why) = r.select(o).await;
+    assert_eq!(cs.len(), 1, "{cs:?} {why:?}");
+    assert_eq!(cs[0].model(), "gpt-6-luna");
+}
+
+#[tokio::test]
 async fn image_mode_with_no_capable_agent_says_so() {
     let r = routing_deps();
     let (cs, why) = r.select(image_opts()).await;

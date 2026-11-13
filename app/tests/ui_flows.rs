@@ -1186,6 +1186,12 @@ fn the_image_page_opens_and_goes_back(cx: &mut TestAppContext) {
         w.shows("image-viewer"),
         "the image viewer page did not open"
     );
+    // The viewer must take real room on the page, or the image draws nowhere.
+    let viewer = w.cx.debug_bounds("image-viewer").expect("the viewer");
+    assert!(
+        f32::from(viewer.size.width) > 100.0 && f32::from(viewer.size.height) > 100.0,
+        "the image viewer has no room: {viewer:?}"
+    );
     assert!(w.shows("image-page-back"), "no back button in toolbar");
 
     // Click back button to return to Route::Images

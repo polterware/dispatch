@@ -1,6 +1,6 @@
-//! Parts for the Runs page: collapsible group headers (`SidebarSectionLabel` + count) and
-//! full-width stacked run rows (`SidebarItem::run_row` with the live bot avatar, title, muted
-//! metadata line, Cancel while active, and `StatusChip` at the right).
+//! Parts for the Runs page: collapsible group headers (`SidebarSectionLabel` + count) and a
+//! card per run (the live bot avatar, title, Cancel while active and `StatusChip` on top, the
+//! run's facts as labeled values under a hairline).
 
 use std::rc::Rc;
 
@@ -15,8 +15,8 @@ use crate::models::runs::{EM_DASH, RunGroup, RunRow, format_ago};
 use crate::models::sidebar::group_title_tooltip;
 use crate::theme::{Theme, status_tone, tw};
 use crate::ui::{
-    Button, ButtonKind, ButtonSize, CountBadge, CountTone, Icon, SidebarItem, SidebarSectionLabel,
-    chip, ellipsis, icon_colored, mono, primary_cell, sans, tabular, text_width, tooltip,
+    Button, ButtonKind, ButtonSize, CountBadge, CountTone, Icon, SidebarSectionLabel, chip,
+    ellipsis, icon_colored, mono, primary_cell, sans, tabular, text_width, tooltip,
 };
 
 /// `DispatchAgentAvatar size={32}`; a row is the bot and 5px above and below it.
@@ -200,10 +200,9 @@ pub fn group_header(
         .into_any_element()
 }
 
-/// One full-width stacked run row under a group header: the live 40px bot in a 36px box,
-/// the run title over the muted metadata line (`agent / model`, repository, tier, `+/-`
-/// changes, tokens/cost when known, and time ago), Cancel while running, and the status chip
-/// at the right.
+/// One run as a card under a group header: the live bot, the run's title, Cancel while it
+/// runs and the status chip on top; a hairline; then each fact (agent and model, repository,
+/// tier, changes, tokens, cost, when it started) as a small label over its value.
 pub fn run_stack_row(
     index: usize,
     row: &RunRow,
@@ -214,77 +213,56 @@ pub fn run_stack_row(
     cx: &App,
 ) -> AnyElement {
     let theme = Theme::global(cx);
-    let dot = || {
+    let fact = |label: &'static str, value: AnyElement| {
         div()
-            .flex_none()
-            .text_color(theme.color_text_muted)
-            .child("\u{00b7}")
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .min_w(px(0.0))
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .font(sans(theme, FontWeight::MEDIUM))
+                    .text_color(theme.color_text_muted)
+                    .child(label),
+            )
+            .child(value)
     };
-    let mut meta = div()
-        .flex()
-        .items_center()
-        .gap(px(6.0))
-        .min_w(px(0.0))
-        .overflow_hidden()
-        .whitespace_nowrap()
-        .text_size(px(12.0))
-        .text_color(theme.color_text_muted)
-        .child(div().flex_none().child(agent_cell(index, row, cx)))
-        .child(dot())
-        .child(div().flex_none().child(source_cell(index, row, cx)));
-    if !row.tier.trim().is_empty() {
-        meta = meta.child(dot()).child(
-            div()
-                .flex_none()
-                .font(sans(theme, FontWeight::NORMAL))
-                .child(SharedString::from(row.tier.clone())),
-        );
-    }
-    if row.has_changes() {
-        meta = meta
-            .child(dot())
-            .child(div().flex_none().child(changes_cell(row, cx)));
-    }
-    if let Some(tokens) = &row.tokens_label {
+    let figure = |id: &'static str, text: &str, title: &str| {
         let mut cell = div()
-            .id(("runs-tokens", index))
-            .flex_none()
+            .id((id, index))
+            .whitespace_nowrap()
             .font(tabular(sans(theme, FontWeight::NORMAL)))
-            .child(SharedString::from(tokens.clone()));
-        if !row.tokens_title.is_empty() {
-            cell = cell.tooltip(tooltip(row.tokens_title.clone()));
+            .text_size(px(12.0))
+            .text_color(theme.color_text_secondary)
+            .child(SharedString::from(text.to_string()));
+        if !title.is_empty() {
+            cell = cell.tooltip(tooltip(SharedString::from(title.to_string())));
         }
-        meta = meta.child(dot()).child(cell);
+        cell.into_any_element()
+    };
+
+    let mut facts = div()
+        .flex()
+        .flex_wrap()
+        .gap_x(px(28.0))
+        .gap_y(px(12.0))
+        .child(fact("Agent", agent_cell(index, row, cx)))
+        .child(fact("Repository", source_cell(index, row, cx)));
+    if !row.tier.trim().is_empty() {
+        facts = facts.child(fact("Tier", figure("runs-tier", &row.tier, "")));
+    }
+    facts = facts.child(fact("Changes", changes_cell(row, cx)));
+    if let Some(tokens) = &row.tokens_label {
+        facts = facts.child(fact(
+            "Tokens",
+            figure("runs-tokens", tokens, &row.tokens_title),
+        ));
     }
     if let Some(cost) = &row.cost_label {
-        let mut cell = div()
-            .id(("runs-cost", index))
-            .flex_none()
-            .font(tabular(sans(theme, FontWeight::NORMAL)))
-            .child(SharedString::from(cost.clone()));
-        if !row.cost_title.is_empty() {
-            cell = cell.tooltip(tooltip(row.cost_title.clone()));
-        }
-        meta = meta.child(dot()).child(cell);
+        facts = facts.child(fact("Cost", figure("runs-cost", cost, &row.cost_title)));
     }
-    meta = meta
-        .child(dot())
-        .child(div().flex_none().child(started_cell(row, now_ms, cx)));
-
-    let content = div()
-        .flex()
-        .flex_col()
-        .gap(px(3.0))
-        .min_w(px(0.0))
-        .child(
-            div()
-                .min_w(px(0.0))
-                .font(sans(theme, FontWeight::MEDIUM))
-                .text_size(px(13.0))
-                .text_color(theme.color_text_primary)
-                .child(ellipsis(row.title.clone())),
-        )
-        .child(meta);
+    facts = facts.child(fact("Started", started_cell(row, now_ms, cx)));
 
     let mut trailing = div().flex_none().flex().items_center().gap(px(8.0));
     if row.active {
@@ -311,23 +289,60 @@ pub fn run_stack_row(
     }
     trailing = trailing.child(status_cell(row, cx));
 
+    let head = div()
+        .flex()
+        .items_center()
+        .gap(px(12.0))
+        .child(
+            div()
+                .flex_none()
+                .size(px(36.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(agent_avatar_live(
+                    &row.agent,
+                    avatar_status(&row.status, &row.merged_at),
+                    40.0,
+                )),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .font(sans(theme, FontWeight::MEDIUM))
+                .text_size(px(14.0))
+                .line_height(px(20.0))
+                .text_color(theme.color_text_primary)
+                .child(ellipsis(row.title.clone())),
+        )
+        .child(trailing);
+
     let open_id = row.id.clone();
     let row_key = row.id.clone();
-    let item = SidebarItem::new(SharedString::from(format!("runs-item-{}", row.id)), "")
-        .run_row()
-        .leading(
-            agent_avatar_live(&row.agent, avatar_status(&row.status, &row.merged_at), 40.0),
-            36.0,
-        )
-        .content(content)
-        .trailing(trailing)
-        .on_click(move |window, cx| {
-            on_open(&open_id, window, cx);
-        });
+    let card = div()
+        .id(SharedString::from(format!("runs-item-{}", row.id)))
+        .relative()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px(14.0))
+        .px(px(18.0))
+        .py(px(16.0))
+        .rounded(px(theme.radius_card))
+        .bg(theme.color_surface_subtle)
+        .border_1()
+        .border_color(theme.color_border_subtle)
+        .cursor_pointer()
+        .hover(|style| style.border_color(theme.color_border_strong))
+        .on_click(move |_, window, cx| on_open(&open_id, window, cx))
+        .child(head)
+        .child(div().h(px(1.0)).w_full().bg(theme.color_border_subtle))
+        .child(facts);
     div()
         .w_full()
         .debug_selector(move || format!("runs-row-{row_key}"))
-        .child(item)
+        .child(card)
         .into_any_element()
 }
 

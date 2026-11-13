@@ -3,9 +3,9 @@ use super::{
     ERR_RECURSIVE, NO_DELEGATE_ENV, Options, PARENT_RUN_ID_ENV, PRIORITY_BALANCED, RUN_ID_ENV,
     Started, TIER_AUTO, add_usage,
     classify::record_difficulty,
-    classify_run, cooling, credit_key, fmt_time, go_duration, matches_model, msg, non_neg_ms,
+    classify_run, credit_key, fmt_time, go_duration, matches_model, model_key, msg, non_neg_ms,
     normalize_priority, parse_time, process_start,
-    routing::{Cooldowns, candidate_provider, store_cooldowns},
+    routing::{Cooldowns, candidate_cooling, candidate_provider, store_cooldowns},
     run_difficulty, store_disabled_agents,
     summary::class_of,
     tier_warning, validate_options,
@@ -504,7 +504,7 @@ impl Deps {
         let mut last_attempt_output = String::new();
 
         for (idx, c) in cands.iter().enumerate() {
-            if let Some(key) = cooling(&cool, c.agent(), &candidate_provider(c)) {
+            if let Some(key) = candidate_cooling(&cool, c) {
                 skipped.push(format!("{key} in cooldown"));
                 continue;
             }
@@ -538,7 +538,7 @@ impl Deps {
             };
             let has_next_candidate = cands[idx + 1..]
                 .iter()
-                .any(|next| cooling(&cool, next.agent(), &candidate_provider(next)).is_none());
+                .any(|next| candidate_cooling(&cool, next).is_none());
             let first_attempt = agent_start.is_none();
             let attempt_start = self.now();
             agent_start = Some(attempt_start);
@@ -1165,15 +1165,18 @@ impl Deps {
                 }
                 "rate_limit" => {
                     // Until the reset the notice names, else an hour. Antigravity keeps a
-                    // quota per family of models, so only this provider inside it waits.
+                    // quota per model, so a model's quota running out cools only that model;
+                    // any other limit there is the provider's account, so its models all wait.
                     let wait = super::summary::resets_in(err)
                         .and_then(|d| chrono::TimeDelta::from_std(d).ok())
                         .filter(|d| *d <= super::MAX_COOLDOWN_FOR)
                         .unwrap_or(COOLDOWN_FOR);
-                    let key = if c.agent() == "antigravity" {
-                        credit_key(c.agent(), &candidate_provider(c))
-                    } else {
+                    let key = if c.agent() != "antigravity" {
                         c.agent().to_owned()
+                    } else if super::summary::is_model_quota(err) {
+                        model_key(c.agent(), &candidate_provider(c), c.model())
+                    } else {
+                        credit_key(c.agent(), &candidate_provider(c))
                     };
                     let _ = st.set_cooldown(&key, &fmt_time(now + wait));
                     cooled = true;

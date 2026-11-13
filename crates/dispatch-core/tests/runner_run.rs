@@ -8,9 +8,10 @@ use dispatch_core::{
         probe::{FlagCheck, ProbeReport},
         quota::{Quota, SOURCE_EMPIRICAL},
     },
+    router::Filters,
     runner::{
-        AttemptError, CREDIT_COOLDOWN_FOR, Options, agent_log_path, empirical_quota, is_recursive,
-        limit_notice, page, resets_in, store_cooldowns, summary,
+        AttemptError, CREDIT_COOLDOWN_FOR, Options, agent_log_path, empirical_quota,
+        is_model_quota, is_recursive, limit_notice, page, resets_in, store_cooldowns, summary,
     },
     types::{
         Attempt, Run, STATUS_COMPLETED, STATUS_FAILED, STATUS_ORPHANED, STATUS_RUNNING,
@@ -515,16 +516,22 @@ async fn test_a_quota_reply_fails_the_attempt_and_falls_back() {
     );
 }
 
+/// The notice Antigravity gave when gemini-4-argon's own quota ran out on 2026-11-11.
+const AGY_ARGON_QUOTA: &str = "⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 140h9m53s.";
+
 #[tokio::test]
-async fn test_antigravity_quota_cools_only_that_provider() {
+async fn test_antigravity_model_quota_cools_only_that_model() {
     let r = ran();
     let mut t = test_deps(vec![
-        Fake::new("antigravity", &r).out(AGY_QUOTA).arc(),
+        Fake::new("antigravity", &r).out(AGY_ARGON_QUOTA).arc(),
         Fake::new("b", &r).out("ok").arc(),
     ]);
     t.deps.table = table(&[(
         "easy",
-        vec![entry("antigravity", "claude-opus-5-5"), entry("b", "m2")],
+        vec![
+            entry("antigravity", "gemini-4-argon-high"),
+            entry("b", "m2"),
+        ],
     )]);
     let rec = run(&t, read_only("p")).await.unwrap();
     assert!(
@@ -536,9 +543,105 @@ async fn test_antigravity_quota_cools_only_that_provider() {
         "{rec:?}"
     );
     let cool = store_cooldowns(Some(t.store.as_ref()), Utc::now());
-    // Its Gemini models keep their own quota: only Anthropic's inside Antigravity waits.
-    assert!(!cool.contains_key("antigravity"), "{cool:?}");
-    assert!(cool.contains_key("antigravity:anthropic"), "{cool:?}");
+    // Each Antigravity model keeps its own quota: only argon waits, until the reset it named.
+    assert!(
+        !cool.contains_key("antigravity") && !cool.contains_key("antigravity:google"),
+        "{cool:?}"
+    );
+    let until = cool.get("antigravity:google:gemini-4-argon").copied();
+    assert!(
+        until.is_some_and(|u| u > Utc::now() + chrono::TimeDelta::hours(140)),
+        "cooldown until {until:?}"
+    );
+
+    // Flash, from the same provider, still routes, and argon is the one left out.
+    t.deps.table = table(&[(
+        "easy",
+        vec![
+            entry("antigravity", "gemini-4-argon-low"),
+            entry("antigravity", "gemini-3.8-flash-high"),
+        ],
+    )]);
+    let route = |model: &str| Options {
+        tier: "easy".into(),
+        filters: Filters {
+            agent: "antigravity".into(),
+            model: model.into(),
+            ..Filters::default()
+        },
+        ..Options::default()
+    };
+    let rep = t.deps.route(route("gemini-3.8-flash")).await.unwrap();
+    assert!(
+        rep.winner
+            .as_ref()
+            .is_some_and(|w| w.agent == "antigravity" && w.model == "gemini-3.8-flash-high"),
+        "{rep:?}"
+    );
+    let rep = t.deps.route(route("")).await.unwrap();
+    assert!(
+        rep.winner
+            .as_ref()
+            .is_some_and(|w| w.model == "gemini-3.8-flash-high")
+            && rep
+                .eliminated
+                .iter()
+                .any(|e| e.contains("antigravity:google:gemini-4-argon in cooldown")),
+        "{rep:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_antigravity_account_limit_cools_the_provider() {
+    let r = ran();
+    let mut t = test_deps(vec![
+        Fake::new("antigravity", &r)
+            .error(AttemptError::Failed(
+                "429 Too Many Requests: rate limit exceeded for this account".into(),
+            ))
+            .arc(),
+        Fake::new("b", &r).out("ok").arc(),
+    ]);
+    t.deps.table = table(&[(
+        "easy",
+        vec![entry("antigravity", "gemini-4-argon"), entry("b", "m2")],
+    )]);
+    let rec = run(&t, read_only("p")).await.unwrap();
+    assert_eq!(rec.agent, "b", "{rec:?}");
+    let cool = store_cooldowns(Some(t.store.as_ref()), Utc::now());
+    // An account-wide limit holds every model of the provider, but not Antigravity's others.
+    assert!(
+        cool.contains_key("antigravity:google")
+            && !cool.contains_key("antigravity:google:gemini-4-argon")
+            && !cool.contains_key("antigravity"),
+        "{cool:?}"
+    );
+    t.deps.table = table(&[("easy", vec![entry("antigravity", "gemini-3.8-flash")])]);
+    let rep = t
+        .deps
+        .route(Options {
+            tier: "easy".into(),
+            ..Options::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        rep.winner.is_none()
+            && rep
+                .eliminated
+                .iter()
+                .any(|e| e.contains("antigravity:google in cooldown")),
+        "{rep:?}"
+    );
+}
+
+#[test]
+fn test_model_quota_is_told_from_an_account_limit() {
+    assert!(is_model_quota(AGY_QUOTA) && is_model_quota(AGY_ARGON_QUOTA));
+    assert!(is_model_quota("Quota exceeded for model gemini-4-argon."));
+    assert!(!is_model_quota("429 Too Many Requests"));
+    assert!(!is_model_quota("rate limit exceeded, try again later"));
+    assert!(!is_model_quota("Account quota reached. Resets in 2h."));
 }
 
 #[tokio::test]
