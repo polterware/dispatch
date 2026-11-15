@@ -436,17 +436,13 @@ impl ImagesView {
             let viewport = f32::from(window.viewport_size().width);
             let available_width = (viewport - theme.sidebar_width - 26.0).max(TILE_MIN);
             let cols = grid_columns(available_width, TILE_MIN, TILE_GAP);
-            let col_width =
-                (available_width - (f32::from(cols) - 1.0) * TILE_GAP) / f32::from(cols);
-            // The card is the picture, its text over a fade: 4:3, as the footer no longer adds height.
-            let thumb_height = (col_width * 3.0 / 4.0).max(120.0);
 
             let mut body = div().w_full().flex().flex_col().gap(px(theme.space_4));
             for group in groups {
                 let tiles = group
                     .tiles
                     .iter()
-                    .map(|tile| image_tile(tile, thumb_height, &theme, view.clone(), now_ms))
+                    .map(|tile| image_tile(tile, &theme, view.clone(), now_ms))
                     .collect();
                 body = body.child(
                     div()
@@ -895,7 +891,6 @@ fn wrapped(text: &str) -> AnyElement {
 /// One thumbnail on the grid: the image, its run's title, its small bot + model and relative date.
 fn image_tile(
     tile: &ImageTile,
-    thumb_height: f32,
     theme: &Theme,
     view: Entity<ImagesView>,
     now_ms: i64,
@@ -930,7 +925,9 @@ fn image_tile(
         ImageData::from_path(PathBuf::from(&tile.path)),
         tile.title.clone(),
     )
-    .thumb_height(thumb_height)
+    // The card takes its height from its own width, so every card is 4:3 whatever width its
+    // column gets.
+    .aspect(4.0 / 3.0)
     .meta(meta)
     .on_click(move |_, cx| {
         let artifact = artifact.clone();
