@@ -267,6 +267,38 @@ pub fn write_preference<T: Serialize>(
     fs::write(path, raw).map_err(|err| err.to_string())
 }
 
+/// The order of the core reads in flight: a read lands only if no newer one has landed and
+/// nothing since it began made it stale (runs deleted under it).
+#[derive(Default, Clone, Copy, Debug)]
+struct LoadOrder {
+    /// The last read begun.
+    begun: u64,
+    /// Reads before this one are stale.
+    floor: u64,
+}
+
+impl LoadOrder {
+    /// A new read's number.
+    fn begin(&mut self) -> u64 {
+        self.begun += 1;
+        self.begun
+    }
+
+    /// Whether read `generation` may land; landing makes every older read stale.
+    fn accept(&mut self, generation: u64) -> bool {
+        if generation < self.floor {
+            return false;
+        }
+        self.floor = generation;
+        true
+    }
+
+    /// Every read begun so far is stale: it read the core before a change it cannot show.
+    fn supersede(&mut self) {
+        self.floor = self.begun + 1;
+    }
+}
+
 struct Snapshot {
     connection: ConnectionState,
     client: Option<CoreClient>,
@@ -501,8 +533,8 @@ pub struct AppState {
     /// A repository the app asks about removing, until the person answers.
     removing: Option<crate::views::repository_actions::Repository>,
     commander_open: bool,
-    generation: u64,
-    applied_generation: u64,
+    /// Which core reads may still land on the state.
+    loads: LoadOrder,
     /// Moves on whenever [`Self::runs`] changes, so views can keep what they build from the
     /// runs until it does.
     runs_revision: u64,
@@ -543,8 +575,7 @@ impl AppState {
             next_toast: 0,
             removing: None,
             commander_open: false,
-            generation: 0,
-            applied_generation: 0,
+            loads: LoadOrder::default(),
             runs_revision: 0,
             models_revision: 0,
         };
@@ -897,6 +928,9 @@ impl AppState {
         if ids.is_empty() {
             return;
         }
+        // A read already on its way began before these runs were deleted: it would bring them
+        // back until the next one. Only reads begun from here on may land.
+        self.loads.supersede();
         let runs = self
             .runs
             .iter()
@@ -994,7 +1028,7 @@ impl AppState {
     }
 
     fn begin_load(&mut self) -> (u64, PathBuf, Option<String>) {
-        self.generation = self.generation.wrapping_add(1);
+        let generation = self.loads.begin();
         let selected = match self.navigation.route() {
             Route::Run(id) => Some(id.clone()),
             _ => None,
@@ -1004,14 +1038,13 @@ impl AppState {
         {
             self.pending_reply = Some(id.clone());
         }
-        (self.generation, self.data_dir.clone(), selected)
+        (generation, self.data_dir.clone(), selected)
     }
 
     fn finish_load(&mut self, generation: u64, snapshot: Snapshot) {
-        if generation < self.applied_generation {
+        if !self.loads.accept(generation) {
             return;
         }
-        self.applied_generation = generation;
         self.last_error = snapshot.last_error;
         match snapshot.connection {
             ConnectionState::Offline { core_json_path } => {
@@ -1060,10 +1093,34 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::{
-        Navigation, Route, SettingsPage, WorkspaceGroup, preference_path, read_preference,
-        sanitize_preference_name, workspace_groups, write_preference,
+        LoadOrder, Navigation, Route, SettingsPage, WorkspaceGroup, preference_path,
+        read_preference, sanitize_preference_name, workspace_groups, write_preference,
     };
     use crate::client::{DispatchRun, Workspace};
+
+    #[test]
+    fn a_read_begun_before_a_delete_never_brings_its_runs_back() {
+        let mut loads = LoadOrder::default();
+        let before = loads.begin();
+        // The delete answers and its runs are forgotten while that read is still out.
+        loads.supersede();
+        let after = loads.begin();
+        assert!(
+            !loads.accept(before),
+            "the read from before the delete is stale"
+        );
+        assert!(loads.accept(after));
+    }
+
+    #[test]
+    fn an_older_read_never_lands_over_a_newer_one() {
+        let mut loads = LoadOrder::default();
+        let first = loads.begin();
+        let second = loads.begin();
+        assert!(loads.accept(second));
+        assert!(!loads.accept(first));
+        assert!(loads.accept(second), "the same read may land again");
+    }
 
     #[test]
     fn navigation_skips_duplicates_and_pops_history() {
