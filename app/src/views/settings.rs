@@ -454,6 +454,36 @@ impl SettingsView {
         .detach();
     }
 
+    /// Stops the running engine and starts this app's in its place: Restart, and Update when
+    /// the one running is another binary or older than this app's.
+    fn restart_voice_engine(&mut self, cx: &mut Context<Self>) {
+        if self.voice_starting {
+            return;
+        }
+        self.voice_starting = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx.background_spawn(async { voice::restart_engine() }).await;
+            let _ = this.update(cx, |view, cx| {
+                view.voice_starting = false;
+                match result {
+                    Ok(info) => {
+                        view.toast(
+                            format!("Voice engine {} is running.", info.engine_version),
+                            ToastTone::Info,
+                            cx,
+                        );
+                        view.voice = None;
+                        view.load_voice(cx);
+                    }
+                    Err(err) => view.toast(err, ToastTone::Danger, cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Sends one settings patch to the engine, newest wins, and keeps what it answers.
     fn patch_voice(&mut self, patch: SettingsPatch, cx: &mut Context<Self>) {
         let Some(engine) = self.voice_engine() else {
@@ -1019,52 +1049,128 @@ impl SettingsView {
         .detach();
     }
 
+    /// The switch on each agent's card in Settings > Models: on while the agent runs any of
+    /// its models. It is a batch over the models below it, not a lock: turning it off turns
+    /// every model off, turning it on turns every model on, and each model keeps its own
+    /// switch either way.
     fn sync_agent_switches(&mut self, cx: &mut Context<Self>) {
         let view = cx.entity().downgrade();
+        let settings = self.model_settings.clone().unwrap_or_default();
         for agent in &self.agent_rows {
             let name = agent.name.clone();
-            let enabled = agent.enabled;
+            let models = settings
+                .iter()
+                .find(|entry| entry.agent.eq_ignore_ascii_case(&name))
+                .map(|entry| entry.models.as_slice())
+                .unwrap_or_default();
+            let shown = agent.enabled && (models.is_empty() || models.iter().any(|m| m.enabled));
             let toggle = self.agent_switches.entry(name.clone()).or_insert_with(|| {
                 let name = name.clone();
-                switch(enabled, view.clone(), cx, move |this, on, cx| {
-                    this.set_agent_enabled(&name, on, cx);
+                switch(shown, view.clone(), cx, move |this, on, cx| {
+                    this.set_agent_models(&name, on, cx);
                 })
             });
-            toggle.update(cx, |toggle, _| toggle.set_on(enabled));
+            toggle.update(cx, |toggle, _| toggle.set_on(shown));
         }
     }
 
-    fn set_agent_enabled(&mut self, agent: &str, enabled: bool, cx: &mut Context<Self>) {
-        if self.agents_saving {
+    /// The agent's switch: every model of the agent on or off at once. Turning it on also
+    /// turns the agent itself back on when it was off.
+    fn set_agent_models(&mut self, agent: &str, on: bool, cx: &mut Context<Self>) {
+        let agent_on = self.agent_on(agent);
+        let changes: Vec<(String, bool)> = self
+            .agent_models(agent)
+            .iter()
+            .filter(|model| !agent_on || model.enabled != on)
+            .map(|model| (model.id.clone(), on))
+            .collect();
+        self.apply_model_batch(agent, on && !agent_on, changes, cx);
+    }
+
+    fn agent_on(&self, agent: &str) -> bool {
+        self.agent_rows
+            .iter()
+            .find(|row| row.name == agent)
+            .is_some_and(|row| row.enabled)
+    }
+
+    fn agent_models(&self, agent: &str) -> Vec<crate::client::DispatchModelSetting> {
+        self.model_settings
+            .as_ref()
+            .and_then(|settings| settings.iter().find(|entry| entry.agent == agent))
+            .map(|entry| entry.models.clone())
+            .unwrap_or_default()
+    }
+
+    /// Saves model switches for one agent in one go, turning the agent on first when asked.
+    /// The page shows the result at once and goes back to what it was if the core refuses.
+    fn apply_model_batch(
+        &mut self,
+        agent: &str,
+        enable_agent: bool,
+        changes: Vec<(String, bool)>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.models_saving || self.agents_saving || (changes.is_empty() && !enable_agent) {
             self.sync_agent_switches(cx);
+            self.sync_model_switches(cx);
             return;
         }
         let Some(client) = self.client(cx) else {
             self.sync_agent_switches(cx);
+            self.sync_model_switches(cx);
             return;
         };
-        let previous = self.agent_rows.clone();
-        if let Some(row) = self.agent_rows.iter_mut().find(|row| row.name == agent) {
-            row.enabled = enabled;
+        let previous = (self.agent_rows.clone(), self.model_settings.clone());
+        if enable_agent && let Some(row) = self.agent_rows.iter_mut().find(|r| r.name == agent) {
+            row.enabled = true;
         }
+        if let Some(entry) = self
+            .model_settings
+            .as_mut()
+            .and_then(|settings| settings.iter_mut().find(|entry| entry.agent == agent))
+        {
+            for (id, on) in &changes {
+                if let Some(row) = entry.models.iter_mut().find(|row| &row.id == id) {
+                    row.enabled = *on;
+                }
+            }
+        }
+        self.models_saving = true;
         self.agents_saving = true;
         self.lists_generation += 1;
-        let request = SetAgentEnabledRequest {
-            agent: agent.to_string(),
-            enabled,
-        };
+        self.models_ticket = self.models_ticket.wrapping_add(1);
+        self.models_inflight = false;
         self.sync_agent_switches(cx);
         self.sync_model_switches(cx);
+        let agent = agent.to_string();
         cx.spawn(async move |this, cx| {
             let result = cx
-                .background_spawn(async move { client.set_agent_enabled(&request) })
+                .background_spawn(async move {
+                    if enable_agent {
+                        client.set_agent_enabled(&SetAgentEnabledRequest {
+                            agent: agent.clone(),
+                            enabled: true,
+                        })?;
+                    }
+                    for (model, enabled) in changes {
+                        client.set_model_enabled(&SetModelEnabledRequest {
+                            provider: String::new(),
+                            model,
+                            enabled,
+                            agent: agent.clone(),
+                        })?;
+                    }
+                    Ok::<(), _>(())
+                })
                 .await;
             let _ = this.update(cx, |view, cx| {
+                view.models_saving = false;
                 view.agents_saving = false;
                 if let Err(err) = result {
-                    view.agent_rows = previous;
+                    (view.agent_rows, view.model_settings) = previous;
                     view.toast(
-                        core_message(&err, "Could not save agent settings."),
+                        core_message(&err, "Could not save model settings."),
                         ToastTone::Danger,
                         cx,
                     );
@@ -1085,8 +1191,8 @@ impl SettingsView {
     }
 
     /// Makes each installed agent's model switches, one set per card so the same model
-    /// under two agents has a switch of its own. An agent turned off shows them off and
-    /// inert; its stored states stay as they are.
+    /// under two agents has a switch of its own. An agent turned off shows them off, and each
+    /// one can still be turned on.
     fn sync_model_switches(&mut self, cx: &mut Context<Self>) {
         let view = cx.entity().downgrade();
         let agents: Vec<DispatchAgent> = self
@@ -1163,8 +1269,8 @@ impl SettingsView {
         .detach();
     }
 
-    /// A model switch inside an agent's card: it changes that agent's model alone, and its
-    /// agent turned off leaves the stored state alone and the switch inert.
+    /// A model switch inside an agent's card: it changes that agent's model alone. On an agent
+    /// that is off, turning a model on turns the agent on with that model only.
     fn set_agent_model_enabled(
         &mut self,
         agent: &str,
@@ -1172,65 +1278,23 @@ impl SettingsView {
         enabled: bool,
         cx: &mut Context<Self>,
     ) {
-        let agent_on = self
-            .agent_rows
-            .iter()
-            .find(|row| row.name == agent)
-            .is_some_and(|row| row.enabled);
-        if !agent_on || self.models_saving {
+        if self.agent_on(agent) {
+            self.apply_model_batch(agent, false, vec![(model.to_string(), enabled)], cx);
+            return;
+        }
+        if !enabled {
             self.sync_model_switches(cx);
             return;
         }
-        let Some(client) = self.client(cx) else {
-            self.sync_model_switches(cx);
-            return;
-        };
-        let previous = self.model_settings.clone();
-        if let Some(entry) = self
-            .model_settings
-            .as_mut()
-            .and_then(|settings| settings.iter_mut().find(|entry| entry.agent == agent))
-            && let Some(row) = entry.models.iter_mut().find(|row| row.id == model)
-        {
-            row.enabled = enabled;
-        }
-        self.models_saving = true;
-        self.lists_generation += 1;
-        self.models_ticket = self.models_ticket.wrapping_add(1);
-        self.models_inflight = false;
-        let request = SetModelEnabledRequest {
-            provider: String::new(),
-            model: model.to_string(),
-            enabled,
-            agent: agent.to_string(),
-        };
-        self.sync_model_switches(cx);
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_spawn(async move { client.set_model_enabled(&request) })
-                .await;
-            let _ = this.update(cx, |view, cx| {
-                view.models_saving = false;
-                if let Err(err) = result {
-                    view.model_settings = previous;
-                    view.toast(
-                        core_message(&err, "Could not save model settings."),
-                        ToastTone::Danger,
-                        cx,
-                    );
-                } else {
-                    view.load_lists(cx);
-                    view.state.update(cx, |state, cx| {
-                        state.models_changed(cx);
-                        state.reload_all(cx);
-                        cx.notify();
-                    });
-                }
-                view.sync_model_switches(cx);
-                cx.notify();
-            });
-        })
-        .detach();
+        let changes = self
+            .agent_models(agent)
+            .into_iter()
+            .filter_map(|row| {
+                let on = row.id == model;
+                (row.enabled != on).then_some((row.id, on))
+            })
+            .collect();
+        self.apply_model_batch(agent, true, changes, cx);
     }
 
     /// One agent's models, flat, each with a switch of its own.
@@ -1245,7 +1309,7 @@ impl SettingsView {
                 rows = rows.child(settings_row(
                     model.id.clone(),
                     None,
-                    model_switch(selector, toggle.clone(), group.enabled),
+                    model_switch(selector, toggle.clone()),
                     cx,
                 ));
             }
@@ -1292,9 +1356,6 @@ impl SettingsView {
                 models = models.child(note("No models listed by this agent.", theme));
             }
             models = models.child(self.model_rows(&group, cx));
-            if !group.enabled {
-                models = models.opacity(0.45);
-            }
             let switch = self
                 .agent_switches
                 .get(&group.agent)
@@ -1969,12 +2030,14 @@ impl SettingsView {
                 "The voice engine is not running.",
                 "Speaking and listening need Dispatch's local engine, which keeps the audio on this computer."
                     .to_string(),
+                false,
                 theme,
                 cx,
             ),
             Loaded::Unreachable(err) => self.voice_notice(
                 "The voice engine did not answer.",
                 err.clone(),
+                true,
                 theme,
                 cx,
             ),
@@ -1982,22 +2045,28 @@ impl SettingsView {
         }
     }
 
-    /// The Voice page's notice with a Start for the engine.
+    /// The Voice page's notice with a Start for the engine, or a Restart for one that went
+    /// quiet (`restart`).
     fn voice_notice(
         &self,
         title: &str,
         detail: String,
+        restart: bool,
         theme: Theme,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let view = cx.entity().downgrade();
         let start = dim_button(
             "settings-voice-start",
-            "Start",
+            if restart { "Restart" } else { "Start" },
             ButtonKind::Secondary,
             !self.voice_starting,
-            gated(!self.voice_starting, view, |this, cx| {
-                this.start_voice_engine(cx);
+            gated(!self.voice_starting, view, move |this, cx| {
+                if restart {
+                    this.restart_voice_engine(cx);
+                } else {
+                    this.start_voice_engine(cx);
+                }
             }),
             cx,
         );
@@ -2021,6 +2090,33 @@ impl SettingsView {
         let view = cx.entity().downgrade();
         let settings = &data.settings;
         let mut rows = div().flex().flex_col();
+        let outdated = data.origin.as_ref().is_some_and(|origin| origin.outdated);
+        let restart = dim_button(
+            "settings-voice-restart",
+            if self.voice_starting {
+                "Restarting…"
+            } else if outdated {
+                "Update"
+            } else {
+                "Restart"
+            },
+            if outdated {
+                ButtonKind::Primary
+            } else {
+                ButtonKind::Secondary
+            },
+            !self.voice_starting,
+            gated(!self.voice_starting, view.clone(), |this, cx| {
+                this.restart_voice_engine(cx);
+            }),
+            cx,
+        );
+        rows = rows.child(settings_row(
+            "Engine",
+            Some(voice_settings::engine_detail(data.origin.as_ref()).into()),
+            restart,
+            cx,
+        ));
         rows = rows.child(settings_row(
             "Language",
             Some("The language you speak and hear.".into()),
@@ -3185,17 +3281,11 @@ fn note(text: &str, theme: Theme) -> gpui::AnyElement {
 
 /// A switch at a row's end, held inert while its agent is off so only the agent's own
 /// switch brings its rows back.
-fn model_switch(selector: String, toggle: Entity<Switch>, enabled: bool) -> gpui::AnyElement {
-    let slot = div()
-        .relative()
+fn model_switch(selector: String, toggle: Entity<Switch>) -> gpui::AnyElement {
+    div()
         .debug_selector(move || selector)
-        .child(toggle);
-    if enabled {
-        slot.into_any_element()
-    } else {
-        slot.child(div().absolute().inset_0().occlude())
-            .into_any_element()
-    }
+        .child(toggle)
+        .into_any_element()
 }
 
 /// A path under the home folder as `~/…`.

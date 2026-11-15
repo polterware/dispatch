@@ -571,29 +571,54 @@ fn settings_switch_an_agents_hook(cx: &mut TestAppContext) {
     w.until("the hook is off", || hook_on("claude") == Some(false));
 }
 
+/// The agent's switch is a batch over its models: off turns every model off, a model can then
+/// be turned back on by itself, and on turns them all on. The agent itself stays on.
 #[gpui::test]
-fn settings_switch_an_agent_on_and_off(cx: &mut TestAppContext) {
+fn settings_switch_an_agents_models_as_a_batch(cx: &mut TestAppContext) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let core = Core::new();
-    let enabled = |agent: &str| {
+    let models = || {
+        let mut ids: Vec<String> = core
+            .client
+            .list_models(&dispatch_app::client::ListModelsRequest::default())
+            .unwrap()
+            .models
+            .into_iter()
+            .filter(|m| m.agent == "fake")
+            .map(|m| m.model)
+            .collect();
+        ids.sort();
+        ids
+    };
+    let agent_on = || {
         core.client
             .list_agents(&dispatch_app::client::ListAgentsRequest::default())
             .unwrap()
             .agents
             .iter()
-            .any(|a| a.name == agent && a.enabled)
+            .any(|a| a.name == "fake" && a.enabled)
     };
-    assert!(enabled("fake"));
+    let all = models();
+    assert!(all.len() > 1, "{all:?}");
     let mut w = open(&core, cx);
     w.go(Route::Settings(SettingsPage::Models));
 
     w.scroll_settings_to("settings-agent-fake");
     w.click("settings-agent-fake");
-    w.until("the agent is disabled", || !enabled("fake"));
-    // Its models leave the page with it, so the page is shorter and the row may have moved.
+    w.until("every model is off", || models().is_empty());
+    assert!(agent_on(), "the agent itself stays on");
+
+    // A model under the switched-off agent still turns on, alone.
+    w.scroll_settings_to("settings-model-fake-fake-fast");
+    w.click("settings-model-fake-fake-fast");
+    w.until("that model alone is on", || models() == ["fake-fast"]);
+
     w.scroll_settings_to("settings-agent-fake");
     w.click("settings-agent-fake");
-    w.until("the agent is enabled", || enabled("fake"));
+    w.until("every model is off again", || models().is_empty());
+    w.scroll_settings_to("settings-agent-fake");
+    w.click("settings-agent-fake");
+    w.until("every model is on", || models() == all);
     assert!(w.toasts().is_empty(), "{:?}", w.toasts());
 }
 

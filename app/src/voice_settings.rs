@@ -277,14 +277,16 @@ pub struct VoiceData {
     pub catalog: Catalog,
     pub settings: EngineSettings,
     pub chat: ChatVoice,
+    /// Which engine answers, and whether a restart would put this app's newer one in place.
+    pub origin: Option<crate::voice::EngineOrigin>,
 }
 
 /// Reads the engine's catalog and settings, and the app's chat choices, in one blocking
 /// call on the background executor.
 pub fn load(engine: &VoiceEngine) -> Loaded {
-    if engine.info().is_none() {
+    let Some(info) = engine.info() else {
         return Loaded::Stopped;
-    }
+    };
     let catalog = match engine.catalog().map_err(|error| failure(error, "")) {
         Ok(catalog) => catalog,
         Err(err) => return Loaded::Unreachable(err),
@@ -298,7 +300,26 @@ pub fn load(engine: &VoiceEngine) -> Loaded {
         catalog,
         settings,
         chat: read_chat(&resolve_data_dir()),
+        origin: Some(crate::voice::engine_origin(&info)),
     }))
+}
+
+/// The Engine row's line: which engine answers, and why Update shows when it does.
+pub fn engine_detail(origin: Option<&crate::voice::EngineOrigin>) -> String {
+    let Some(origin) = origin else {
+        return "The local engine that listens and speaks.".to_string();
+    };
+    let version = format!("Version {}", origin.version);
+    match (&origin.running, origin.outdated) {
+        (Some(running), true) if Some(running) != origin.bundled.as_ref() => format!(
+            "{version}, from {}. Update restarts it with this app's engine.",
+            running.display()
+        ),
+        (_, true) => format!(
+            "{version}. This app's engine was rebuilt since it started: Update restarts it."
+        ),
+        _ => format!("{version}. Restart stops it and starts it again."),
+    }
 }
 
 /// Which setting a voice menu changes.
@@ -513,6 +534,44 @@ impl Socket {
 
 #[cfg(test)]
 mod tests {
+    use super::engine_detail;
+    use crate::voice::EngineOrigin;
+    use std::path::PathBuf;
+
+    fn origin(running: &str, bundled: &str, outdated: bool) -> EngineOrigin {
+        EngineOrigin {
+            version: "0.1.0".into(),
+            running: Some(PathBuf::from(running)),
+            bundled: Some(PathBuf::from(bundled)),
+            outdated,
+        }
+    }
+
+    #[test]
+    fn the_engine_row_says_why_update_shows() {
+        let other = engine_detail(Some(&origin(
+            "/Applications/D.app/dispatch-voice",
+            "/t/dispatch-voice",
+            true,
+        )));
+        assert!(
+            other.contains("from /Applications/D.app/dispatch-voice"),
+            "{other}"
+        );
+        let rebuilt = engine_detail(Some(&origin(
+            "/t/dispatch-voice",
+            "/t/dispatch-voice",
+            true,
+        )));
+        assert!(rebuilt.contains("rebuilt"), "{rebuilt}");
+        let current = engine_detail(Some(&origin(
+            "/t/dispatch-voice",
+            "/t/dispatch-voice",
+            false,
+        )));
+        assert!(current.contains("Restart stops it"), "{current}");
+    }
+
     use super::*;
 
     fn entry(id: &str, kind: ModelKind, installed: bool) -> CatalogEntry {

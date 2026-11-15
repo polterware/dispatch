@@ -681,6 +681,134 @@ pub(crate) fn ensure_engine() -> Result<EngineInfo, String> {
         .ok_or_else(|| "The voice engine did not answer after starting.".to_string())
 }
 
+/// Which engine answers, and whether it is the one this app ships.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EngineOrigin {
+    /// The running engine's version, as its discovery file says.
+    pub version: String,
+    /// The running engine's binary, when the system says.
+    pub running: Option<PathBuf>,
+    /// The binary this app starts.
+    pub bundled: Option<PathBuf>,
+    /// The running engine is another binary than this app's, or this app's was rebuilt or
+    /// replaced after it started: a restart puts this app's engine in its place.
+    pub outdated: bool,
+}
+
+/// Where the engine in `info` came from, against the binary this app would start.
+pub(crate) fn engine_origin(info: &EngineInfo) -> EngineOrigin {
+    let running = process_binary(info.pid);
+    let bundled = engine_binary().and_then(|path| path.canonicalize().ok());
+    let outdated = match (&running, &bundled) {
+        (Some(running), Some(bundled)) => {
+            running != bundled
+                || process_started(info.pid)
+                    .zip(modified(bundled))
+                    .is_some_and(|(started, built)| built > started)
+        }
+        _ => false,
+    };
+    EngineOrigin {
+        version: info.engine_version.clone(),
+        running,
+        bundled,
+        outdated,
+    }
+}
+
+fn modified(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+}
+
+/// The executable of process `pid`.
+#[cfg(target_os = "macos")]
+fn process_binary(pid: u32) -> Option<PathBuf> {
+    let mut buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let pid = libc::c_int::try_from(pid).ok()?;
+    // SAFETY: the buffer is as long as the size passed, and the call writes at most that.
+    let len = unsafe { libc::proc_pidpath(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
+    if len <= 0 {
+        return None;
+    }
+    buffer.truncate(len as usize);
+    let path = PathBuf::from(String::from_utf8(buffer).ok()?);
+    path.canonicalize().ok().or(Some(path))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn process_binary(pid: u32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+}
+
+/// When process `pid` started.
+#[cfg(target_os = "macos")]
+fn process_started(pid: u32) -> Option<std::time::SystemTime> {
+    let pid = libc::c_int::try_from(pid).ok()?;
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: `info` is a `proc_bsdinfo` of the size passed, which PROC_PIDTBSDINFO fills.
+    let read =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
+    if read != size {
+        return None;
+    }
+    Some(
+        std::time::UNIX_EPOCH
+            + Duration::from_secs(info.pbi_start_tvsec)
+            + Duration::from_micros(info.pbi_start_tvusec),
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn process_started(_pid: u32) -> Option<std::time::SystemTime> {
+    None
+}
+
+/// How long a restart waits for the old engine to stop answering.
+const STOP_WAIT: Duration = Duration::from_secs(8);
+
+/// Stops the running engine, if one answers, and starts this app's in its place (Settings ›
+/// Voice's Restart and Update). Blocking: call it from the background executor. The app's
+/// connection reconnects to the new engine by itself.
+pub(crate) fn restart_engine() -> Result<EngineInfo, String> {
+    let discovery = paths::discovery_file();
+    if engine_binary().is_none() {
+        return Err(
+            "The voice engine (dispatch-voice) is not next to the app or on PATH; set \
+             VOICE_ENGINE_BIN to it, or build it with `cargo build -p voice-server`."
+                .to_string(),
+        );
+    }
+    if let Ok(old) = discovery::read(&discovery) {
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(CONNECT_TIMEOUT)
+            .timeout_read(READ_TIMEOUT)
+            .build();
+        // An engine that is already gone answers nothing: that is fine, it is stopped.
+        let _ = agent
+            .post(&format!("{}/v1/shutdown", old.base_url()))
+            .set("Authorization", &format!("Bearer {}", old.token))
+            .call();
+        let deadline = Instant::now() + STOP_WAIT;
+        while healthy(&old) {
+            if Instant::now() > deadline {
+                return Err("The voice engine did not stop. Try again shortly.".to_string());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // Its discovery file may outlive it a moment: the new engine must not read it as
+        // one already running. A file another engine wrote since stays.
+        let _ = discovery::remove_if_owned(&discovery, old.pid);
+    }
+    *SETTINGS_START
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    start_engine(&discovery, &SETTINGS_START)
+        .ok_or_else(|| "The voice engine did not answer after starting.".to_string())
+}
+
 /// Starts the engine (it exits at once when one already runs) and waits for its discovery
 /// file.
 fn start_engine(discovery_file: &Path, last_start: &Mutex<Option<Instant>>) -> Option<EngineInfo> {
