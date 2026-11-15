@@ -1304,6 +1304,28 @@ fn a_conversation_is_renamed_and_named_by_its_prompt_again() {
 }
 
 #[test]
+fn a_runs_title_names_its_conversation() {
+    let env = Env::new();
+    let id = env.run(
+        "say hi",
+        &["--readonly", "--title", "  Greeting\n the   agent "],
+    );
+    env.wait_for(&id, "COMPLETED");
+    let clients = coreclient::new(&runstate::read_core(env.db()).unwrap(), "e2e");
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let names = rt
+        .block_on(clients.dispatch.list_sections(&pb::ListSectionsRequest {}))
+        .unwrap()
+        .conversation_names;
+    let conversation = format!("claude:{}", env.session);
+    let name = names
+        .iter()
+        .find(|n| n.conversation_id == conversation)
+        .map(|n| n.name.as_str());
+    assert_eq!(name, Some("Greeting the agent"), "{names:?}");
+}
+
+#[test]
 fn a_conversations_usage_reads_its_runs_and_calling_session() {
     let env = Env::new();
     // The calling agent's own transcript, in the fake home the core resolves.

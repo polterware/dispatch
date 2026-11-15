@@ -6,7 +6,7 @@ description: Delegate a task to another coding agent (Codex, Claude Code, Cursor
 # dispatch
 
 `dispatch run` routes a task to an installed agent CLI and returns a compact result.
-With no `--tier` and a classifier on (`dispatch config set classifier jev|openai|cli`), **Auto** asks the classifier how hard the task is, then weighs each model's chance to do it (from public benchmarks: CursorBench, else the Epoch Capabilities Index), its cost, and the account's quota, and picks the cheapest model likely to succeed. If none meets the priority's bound, it picks the cheapest within 0.02 of the best bound. `--tier` routes that tier's table instead: its first model, or the next one when that account's quota is low (90% used, or running out before it resets) or rate limited. The core falls back when an agent fails. Routing reads only the model catalog's benchmarks (CursorBench, ECI, and models.dev prices), the classifier, and the CLIs' quota; a model no benchmark rates counts as mid-field.
+With no `--tier` and a classifier on (`dispatch config set classifier jev|openai|cli`; `off` turns it off), **Auto** asks the classifier how hard the task is, then weighs each model's chance to do it (from public benchmarks: CursorBench, else the Epoch Capabilities Index), its cost, and the account's quota, and picks the cheapest model likely to succeed. If none meets the priority's bound, it picks the cheapest within 0.02 of the best bound. `--tier` routes that tier's table instead: its first model, or the next one when that account's quota is low (90% used, or running out before it resets) or rate limited. The core falls back when an agent fails. Routing reads only the model catalog's benchmarks (CursorBench, ECI, and models.dev prices), the classifier, and the CLIs' quota; a model no benchmark rates counts as mid-field.
 You are the conductor: delegate, read short summaries, integrate.
 
 ## When to delegate
@@ -28,40 +28,43 @@ Without a classifier there is no Auto: a run with no `--tier` takes `normal`, an
 1. **Start the run.** It returns right away with an `id`; the core executes it in the background.
 
 ```bash
-dispatch run --card <slug> - <<'BRIEF'
+dispatch run --card <slug> --title "<conversation name>" - <<'BRIEF'
 <goal; what it may and may not touch; the exact test command; final report in <= 10 lines>
 BRIEF
 ```
    The brief carries **paths, never pasted code**.
-2. **Wait:** `dispatch wait <id> --timeout 9m`. Exit 3 means still running: call `wait` again. Do not end the turn with runs pending.
-3. **Read the summary** (compact JSON). The agent text is in `dispatch result <id> --section agent`. Check `git -C <worktree> diff --stat` and run the tests. Do not read the whole diff.
+   `--title` names this conversation in the Dispatch app's sidebar: a summary of what the work is about, 3 to 6 words in the user's language (`Blob de voz na conversa`, not the brief's first line). Pass it on the first run of a conversation, and again only when the work changes subject. It names the calling session's conversation, so a run with no conversation (started outside an agent session) ignores it.
+2. **Wait:** `dispatch wait <id> --timeout 9m`. Exit 3 means still running: call `wait` again. Do not end the turn with runs pending. `dispatch status <id>` reads where a run is without waiting.
+3. **Read the summary** (`wait` prints it as JSON; `run` prints text unless `--json`). The agent text is in `dispatch result <id> --section agent`. Check `git -C <worktree> diff --stat` and run the tests. Do not read the whole diff.
    **Follow up** on a small miss (a failing test, a missed file) with `dispatch send <id> - <<< "<what to fix>"`: it goes to the same agent's session, in the same worktree, as a new run to `wait` on, and the agent keeps what it already read. When the run's model was not up to the task, start a new `run` with a higher `--tier` and the findings instead.
 4. **Integrate:** `dispatch merge <id>` (COMPLETED runs only) merges the run's branch and removes its worktree; you run the tests before it. A merge conflict is detected with `git merge-tree` before the working tree is touched, and the merge stops there. The result prints the `git revert` that undoes it. A failed run: `dispatch clean <id>`.
 
 ## Parallelism
 
-Independent delegations go in the same response, each with its own `id`; then one `wait` per id. Write runs in a git repo get their own worktree and branch, so they do not conflict: any number run in one folder at once. That is the default; `--worktree-mode worktree` asks for it outright (refused outside git), and `--worktree-mode in-place` edits the folder itself (`--dir <repo>` says which folder). Only a second run that would edit the folder itself (in-place, outside git, or `--worktree <folder>`) is refused while the first works: start it with `--worktree-mode worktree` instead.
+Independent delegations go in the same response, each with its own `id`; then one `wait` per id. Write runs in a git repo get their own worktree and branch, so they do not conflict: any number run in one folder at once. That is the default; `--worktree-mode worktree` asks for it outright (refused outside git), and `--worktree-mode in-place` edits the folder itself (`--dir <repo>` says which folder). A second run that would edit the folder itself (in-place, outside git, or `--worktree <folder>`) while another does waits in line as PENDING and starts by itself once the folder is free; start it with `--worktree-mode worktree` to run it at once.
 
 A run that changed nothing leaves no worktree or branch behind; one with changes keeps them for `merge` or `clean`.
 
 ## Result
 
-`run` and `wait` print a summary: `status`, `agent`, `model`, `tier`, `run_ms`, files and +/-, `attempts`, `branch`, `worktree`, and pointers in `details`. Read more with `dispatch result <id> --section summary|agent|files|attempts|meta`.
+`run` and `wait` print a summary: `status`, `agent`, `model`, `tier`, `run_ms`, files and +/-, `attempts`, `branch`, `worktree`, `usage` (tokens, API-equivalent `cost_usd`, how full the context window got), and pointers in `details`. Read more with `dispatch result <id> --section summary|agent|files|attempts|meta|output` (`--offset <n> --limit <n>` pages a long section; `--limit 0` reads it all).
 
-- `attempts` > 1 means a **fallback** happened; a rate limit puts the agent on a 1h cooldown.
-- Exit codes: 0 ok, 124 timeout, 1 other failures; `wait` returns 3 while the run is still going.
+- `attempts` > 1 means a **fallback** happened; a rate limit cools the account down until the reset its notice names (at most 7 days), else for 1h.
+- Exit codes: 0 ok, 124 the run timed out, 1 other failures, 2 a usage error; `wait` returns 3 while the run is still going (also when its own `--timeout` passes).
+- `run --timeout <dur>` caps each attempt (0 keeps the default).
 
 ## Manage runs
 
 ```bash
-dispatch runs                  # history
+dispatch runs [--conversation <id>] [--limit <n>]  # history, the 20 latest by default
 dispatch cancel <id>         # cancel a running run
 dispatch recover <id>        # ORPHANED: commit the preserved work
 dispatch clean <id> [--force]  # discard the worktree
 dispatch worktrees [--prune]   # list leftover worktrees; --prune removes the ones with nothing to merge
 dispatch delete <id>... | --conversation <id>  # delete ended runs and the worktrees Dispatch cut for them
-dispatch rename <conversation-id> <name>  # name a conversation as the app shows it
+dispatch rename <conversation-id> <name>  # rename a conversation later (run --title names it at the start)
 dispatch repo ls|add|rm        # the repositories Dispatch knows (same as dispatch workspace); rm deletes their runs
+dispatch usage --conversation <id>  # what a conversation's runs and its calling session used
 ```
 
 ## Roles
@@ -80,7 +83,7 @@ Explicit flags win over the role. `prefer` and `avoid` are weights in the rankin
 
 ## Images
 
-A run asked for images (`dispatch run --images`) routes only to the agents that can make them (Codex, Cursor, and Grok today, plus ACP agents you added), or fails with "no image-capable agent installed", and its brief says to write each image into `$DISPATCH_ARTIFACTS_DIR` with a name that says what it is; `dispatch route --images` shows the narrowed candidates. Images a normal run happens to write in its folder or in its worktree are collected all the same. No price covers an image unless the agent's own usage names one, so an unpriced one leaves the run's cost as it was, marked partial.
+A run asked for images (`dispatch run --images`) routes only to the agents that can make them (Codex, Cursor, and Grok today, plus ACP agents you added), or fails with "no image-capable agent installed", and its brief says to write each image into `$DISPATCH_ARTIFACTS_DIR` with a name that says what it is; `dispatch route --images` shows the narrowed candidates. Images a normal run happens to write in its folder or in its worktree are collected all the same; `dispatch artifacts [--conversation <id>] [--agent <a>] [--repo <folder>] [--query <text>] [--json]` lists them, newest first, each with the path of its copy. No price covers an image unless the agent's own usage names one, so an unpriced one leaves the run's cost as it was, marked partial.
 
 ## Filters and routing (optional; Auto is the default with a classifier, else normal)
 
@@ -108,4 +111,5 @@ dispatch doctor [--json]   # version, flags, capabilities; never calls a model
 dispatch tiers [--check]   # effective table, validated against installed agents
 dispatch roles --check     # validate roles
 dispatch usage --by model --since 7d
+dispatch models refresh    # fetch the catalog's prices and benchmarks again
 ```

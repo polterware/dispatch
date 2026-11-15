@@ -18,7 +18,7 @@ use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 
-const RUN_USAGE: &str = "usage: dispatch run [--tier <auto|easy|normal|hard>] [--role <name|none>] [--card <slug>] [--agent <name>] [--provider <p>] [--model <m>] [--effort <e>] [--priority <p>] [--relax] [--readonly] [--images] [--timeout <dur>] [--dir <repo>] [--worktree-mode worktree|in-place] [--worktree <dir>] [--json] [--compact] <prompt|->
+const RUN_USAGE: &str = "usage: dispatch run [--tier <auto|easy|normal|hard>] [--role <name|none>] [--card <slug>] [--title <name>] [--agent <name>] [--provider <p>] [--model <m>] [--effort <e>] [--priority <p>] [--relax] [--readonly] [--images] [--timeout <dur>] [--dir <repo>] [--with <dir,dir>] [--worktree-mode worktree|in-place] [--worktree <dir>] [--json] [--compact] <prompt|->
        dispatch send <id> [--json] [--compact] <message|->
        dispatch runs [--conversation <id>] [--project <id>] [--json] [--compact]
        dispatch status <id> [--json] [--compact]
@@ -555,6 +555,11 @@ pub(super) async fn run(db_path: &Path, args: &[String]) -> CliResult {
         "auto (the default with a classifier, else normal) or a tier: easy|normal|hard",
     )
     .string("card", "", "optional Work card slug")
+    .string(
+        "title",
+        "",
+        "a short name for the run's conversation, as the app's sidebar shows it (default: its first prompt)",
+    )
     .string("agent", "", "optional agent pin")
     .string("worktree", "", "optional worktree path")
     .string("provider", "", "restrict to a provider")
@@ -651,11 +656,30 @@ pub(super) async fn run(db_path: &Path, args: &[String]) -> CliResult {
         })
         .await
         .map_err(run_error)?;
-    write_proto_run(
-        &res.run.unwrap_or_default(),
-        f.flag("json"),
-        f.flag("compact"),
-    )
+    let run = res.run.unwrap_or_default();
+    name_conversation(&c, &run.conversation_id, &f.str("title")).await?;
+    write_proto_run(&run, f.flag("json"), f.flag("compact"))
+}
+
+/// Gives the run's conversation the caller's `--title`, so the sidebar shows a summary
+/// rather than the first prompt. No title, or a run outside a conversation, leaves it be.
+async fn name_conversation(
+    c: &crate::coreclient::Clients,
+    conversation_id: &str,
+    title: &str,
+) -> CliResult {
+    let (conversation_id, title) = (conversation_id.trim(), one_line(title));
+    if conversation_id.is_empty() || title.is_empty() {
+        return Ok(());
+    }
+    c.dispatch
+        .rename_conversation(&pb::RenameConversationRequest {
+            conversation_id: conversation_id.to_owned(),
+            name: title,
+        })
+        .await
+        .map_err(run_error)?;
+    Ok(())
 }
 
 /// `dispatch send <id> <message|->`: a follow-up to an ended run, in its agent's session
