@@ -5,6 +5,8 @@
 
 pub mod catalog;
 pub mod discovery;
+#[cfg(feature = "onnx")]
+pub mod onnx;
 pub mod paths;
 pub mod protocol;
 

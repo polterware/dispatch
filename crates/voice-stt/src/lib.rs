@@ -234,9 +234,7 @@ impl VadModel {
         if !path.is_file() {
             return Err(SttError::ModelMissing(path.to_owned()));
         }
-        let environment = ort::init()
-            .build()
-            .map_err(|e| SttError::Load(e.to_string()))?;
+        let environment = voice_core::onnx::environment().map_err(SttError::Load)?;
         // ort registers CoreML automatically on macOS; keep inference on CPU.
         let session = Session::builder(&environment)
             .map_err(|e| SttError::Load(e.to_string()))?

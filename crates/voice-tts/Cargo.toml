@@ -8,7 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 tokenizers.workspace = true
-voice-core.workspace = true
+voice-core = { workspace = true, features = ["onnx"] }
 thiserror.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

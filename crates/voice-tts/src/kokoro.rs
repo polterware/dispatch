@@ -91,7 +91,7 @@ pub(super) fn load(options: KokoroOptions) -> Result<KokoroTts> {
     } else {
         options.threads
     };
-    let environment = ort::init().build().map_err(load_err)?;
+    let environment = voice_core::onnx::environment().map_err(TtsError::Load)?;
     // ort registers CoreML automatically on macOS; keep inference on CPU.
     let session = Session::builder(&environment)
         .map_err(load_err)?

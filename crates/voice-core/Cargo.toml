@@ -12,3 +12,8 @@ serde_json.workspace = true
 thiserror.workspace = true
 directories.workspace = true
 tracing.workspace = true
+# The process's one ONNX Runtime environment (`onnx`), for the crates that load ONNX models.
+ort = { workspace = true, optional = true }
+
+[features]
+onnx = ["dep:ort"]

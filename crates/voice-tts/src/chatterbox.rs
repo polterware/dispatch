@@ -81,7 +81,7 @@ impl ChatterboxTts {
         } else {
             options.threads
         };
-        let environment = ort::init().build().map_err(load_err)?;
+        let environment = voice_core::onnx::environment().map_err(TtsError::Load)?;
         let speech_path = options.dir.join("onnx/speech_encoder.onnx");
         let mut speech_encoder = make_session(&environment, &speech_path, threads)?;
         log_io("Chatterbox speech encoder", &speech_encoder);

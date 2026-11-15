@@ -7,7 +7,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-voice-core.workspace = true
+voice-core = { workspace = true, features = ["onnx"] }
 thiserror.workspace = true
 tracing.workspace = true
 ort.workspace = true
