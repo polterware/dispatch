@@ -175,6 +175,9 @@ pub struct TranscriptView {
     /// The room the run page keeps after the text: its rows stop that far from the list's
     /// end, where the scrollbar sits flush (`rail_page_end_pad`).
     end_pad: f32,
+    /// Room the run page keeps clear under the last row for what floats over the list's end
+    /// (the voice blob over the composer), beyond the column's own `COLUMN_END`.
+    bottom_inset: f32,
     /// The jump-to-end button's presence: in while the reader is away from the end.
     end_button: SpringValue,
     /// Text may come before what the stream opened with, and no read has said otherwise.
@@ -283,6 +286,7 @@ impl TranscriptView {
             measured_width: Rc::new(Cell::new(0.0)),
             top_inset: 0.0,
             end_pad: 0.0,
+            bottom_inset: 0.0,
             end_button: SpringValue::new(0.0, SpringTier::Moderate),
             earlier_more: false,
             earlier_inflight: false,
@@ -1103,7 +1107,7 @@ impl TranscriptView {
             window.request_animation_frame();
             return;
         }
-        let left = page_scroll(&self.list).map_or(0.0, |page| {
+        let left = page_scroll(&self.list, self.column_end()).map_or(0.0, |page| {
             let scrolled = -f32::from(self.list.scroll_px_offset_for_scrollbar().y);
             page.content - page.viewport - scrolled
         });
@@ -1194,6 +1198,20 @@ impl TranscriptView {
         }
     }
 
+    /// Keeps `inset` clear under the last row, so what floats over the list's end (the voice
+    /// blob) never covers the text. A reader at the end stays there as it grows.
+    pub(crate) fn set_bottom_inset(&mut self, inset: f32, cx: &mut Context<Self>) {
+        if (self.bottom_inset - inset).abs() > 0.5 {
+            self.bottom_inset = inset;
+            cx.notify();
+        }
+    }
+
+    /// The room under the last row: the column's end, or more while something floats there.
+    fn column_end(&self) -> f32 {
+        COLUMN_END.max(self.bottom_inset)
+    }
+
     /// The jump-to-end button: glide down to the end, where the log follows again.
     pub(crate) fn jump_to_end(&mut self, cx: &mut Context<Self>) {
         self.glide = true;
@@ -1249,6 +1267,7 @@ impl TranscriptView {
 
 impl Render for TranscriptView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let column_end = self.column_end();
         let top_inset = self.top_inset;
         // The scrollbar's gutter is part of the room after the rows, once the text overflows.
         let row_end = (self.end_pad
@@ -1347,7 +1366,7 @@ impl Render for TranscriptView {
         .size_full()
         // On the run page the space over the transcript, the gap to `logEnd`, and the
         // column's 64px under it scroll with the text, as they do in `splitScroll`.
-        .when(!compact, |list| list.pb(px(tw(LOG_END_GAP) + COLUMN_END)));
+        .when(!compact, |list| list.pb(px(tw(LOG_END_GAP) + column_end)));
         let root = div()
             .size_full()
             .min_h(px(0.0))
@@ -1369,7 +1388,7 @@ impl Render for TranscriptView {
             self.measured_width.set(width);
             let _ = self.list.clone().measure_all();
         }
-        let page = page_scroll(&self.list);
+        let page = page_scroll(&self.list, column_end);
         let overflows = page.is_some_and(|page| page.content > page.viewport + 0.5);
         self.overflowed.set(overflows);
         // Overflow and width are known once the list has laid out, so a frame whose layout
@@ -1385,8 +1404,8 @@ impl Render for TranscriptView {
         let measured_width = self.measured_width.clone();
         let watcher = canvas(
             move |_, window, _| {
-                let now =
-                    page_scroll(&watched).is_some_and(|page| page.content > page.viewport + 0.5);
+                let now = page_scroll(&watched, column_end)
+                    .is_some_and(|page| page.content > page.viewport + 0.5);
                 let width = f32::from(watched.viewport_bounds().size.width);
                 let at = -f32::from(watched.scroll_px_offset_for_scrollbar().y);
                 if now != overflowed.get()
@@ -1515,7 +1534,7 @@ struct PageScroll {
     viewport: f32,
 }
 
-fn page_scroll(list: &ListState) -> Option<PageScroll> {
+fn page_scroll(list: &ListState, column_end: f32) -> Option<PageScroll> {
     let bounds = list.viewport_bounds();
     let viewport = f32::from(bounds.size.height);
     let count = list.item_count();
@@ -1528,7 +1547,7 @@ fn page_scroll(list: &ListState) -> Option<PageScroll> {
         None => f32::from(list.max_offset_for_scrollbar().height) + viewport,
     };
     Some(PageScroll {
-        content: items + tw(LOG_END_GAP) + COLUMN_END,
+        content: items + tw(LOG_END_GAP) + column_end,
         viewport,
     })
 }

@@ -46,7 +46,7 @@ use crate::state::{AppState, ConnectionState, Route, observe};
 use crate::theme::{Theme, status_tone, tw};
 use crate::ui::ellipsis;
 use crate::ui::parts::run_page::{context_meter, file_change_line};
-use crate::ui::parts::voice::voice_blob;
+use crate::ui::parts::voice::{VoiceMark, voice_blob};
 use crate::ui::patterns::{
     AnchorSlot, ComposerAction, message_composer, message_input, trailing_toolbar, window_anchor,
 };
@@ -151,8 +151,9 @@ pub struct RunPageView {
     voiced: VoicedTurns,
     /// Voiced runs whose reply was asked of the core, so it is asked once.
     fetching_reply: HashSet<String>,
-    /// What the last tick saw, so the page redraws only when the blob comes or goes.
-    voice_active: bool,
+    /// What the last tick saw (listening, speaking), so the page redraws only when the blob
+    /// comes, goes, or changes ink.
+    voice_active: (bool, bool),
     /// The new conversation (⌘N) before its first message.
     draft: Draft,
 }
@@ -206,8 +207,8 @@ fn draft_key(generation: u64) -> String {
 /// The composer's placeholder.
 const MESSAGE_PLACEHOLDER: &str = "Send a message to the agent";
 /// The voice blob's size, and the room between it and the composer it floats over, centered.
-const VOICE_MARK_SIZE: f32 = 22.0;
-const VOICE_MARK_GAP: f32 = 40.0;
+const VOICE_MARK_SIZE: f32 = 128.0;
+const VOICE_MARK_GAP: f32 = 16.0;
 /// The field's placeholder once a conversation is under way.
 const FOLLOW_UP_PLACEHOLDER: &str = "Send follow-up";
 
@@ -325,7 +326,7 @@ impl RunPageView {
             voiced_text: None,
             voiced: VoicedTurns::default(),
             fetching_reply: HashSet::new(),
-            voice_active: false,
+            voice_active: (false, false),
             draft: Draft {
                 open: false,
                 generation: 0,
@@ -418,7 +419,7 @@ impl RunPageView {
                 self.read_run_reply(id, reply, cx);
             }
         }
-        let active = self.voice.is_listening() || self.voice.is_speaking();
+        let active = (self.voice.is_listening(), self.voice.is_speaking());
         if active != self.voice_active {
             self.voice_active = active;
             changed = true;
@@ -552,9 +553,14 @@ impl RunPageView {
     /// is read aloud, and the microphone opens again, until the button is pressed again.
     fn conversation_action(&self, cx: &mut Context<Self>) -> ComposerAction {
         let weak = cx.weak_entity();
+        // While the conversation is on, the same button ends it: a stop mark, not the wave.
         ComposerAction::new(
             "voice-talk",
-            Icon::AudioWave,
+            if self.conversing {
+                Icon::Stop
+            } else {
+                Icon::AudioWave
+            },
             if self.conversing {
                 "End the conversation"
             } else {
@@ -607,14 +613,32 @@ impl RunPageView {
             }))
     }
 
-    /// The blob beside the composer, while a dictation or a reply is playing.
+    /// Whether the voice blob shows over the composer.
+    fn voice_mark_shown(&self) -> bool {
+        self.voice.is_speaking()
+            || self.listening.is_some()
+            || self.voice.is_listening()
+            || self.conversing
+    }
+
+    /// The blob over the composer, while a dictation or a reply is playing, and between the
+    /// turns of a hands-free conversation.
     fn voice_mark(&self, cx: &Context<Self>) -> Option<AnyElement> {
-        let listening = self.listening.is_some() || self.voice.is_listening();
-        let speaking = self.voice.is_speaking();
-        if !listening && !speaking {
+        let mark = if self.voice.is_speaking() {
+            VoiceMark::Speaking
+        } else if self.listening.is_some() || self.voice.is_listening() {
+            VoiceMark::Listening
+        } else if self.conversing {
+            VoiceMark::Waiting
+        } else {
             return None;
-        }
-        Some(voice_blob(&self.voice, speaking, Theme::global(cx)))
+        };
+        Some(voice_blob(
+            &self.voice,
+            mark,
+            VOICE_MARK_SIZE,
+            Theme::global(cx),
+        ))
     }
 
     fn install_bodies(&mut self, cx: &mut Context<Self>) {
@@ -2208,6 +2232,15 @@ impl Render for RunPageView {
             let end_pad = rail_page_end_pad(&self.rail, &self.page_width);
             self.transcript
                 .update(cx, |transcript, cx| transcript.set_end_pad(end_pad, cx));
+            // The voice blob floats over the transcript's end: keep the last reply above it.
+            let voice_inset = if self.voice_mark_shown() {
+                VOICE_MARK_SIZE + VOICE_MARK_GAP + 24.0
+            } else {
+                0.0
+            };
+            self.transcript.update(cx, |transcript, cx| {
+                transcript.set_bottom_inset(voice_inset, cx)
+            });
             // `flex min-w-0 flex-col gap-6 pt-2` around the transcript and `logEnd`: the
             // transcript's list holds the `pt-2` and the gap as its padding, so they scroll.
             let column = div()
