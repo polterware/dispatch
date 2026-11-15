@@ -26,8 +26,8 @@ use crate::models::sidebar::{
     HOVER_OPEN_MS, REVEALED_PREFERENCE, RunsNotice, SEEN_PREFERENCE, SIDEBAR_PAGE_ROWS, Show,
     SidebarDisplay, SidebarGroup, SidebarRun, SortBy, conversation_ref, ended_run_ids,
     group_sidebar_runs, group_title_tooltip, has_unseen_update, holding_section, now_unix_ms,
-    page_sidebar_rows, parse_sidebar_display, repository_ref, run_mark, runs_notice, section_ref,
-    sidebar_run_title, sidebar_runs,
+    page_sidebar_rows, parse_sidebar_display, repository_ref, row_delete_ids, run_mark,
+    runs_notice, section_ref, sidebar_run_title, sidebar_runs,
 };
 use crate::motion::{Animator, SpringTier, SpringValue};
 use crate::state::{AppState, ConnectionState, Route, SettingsPage, observe};
@@ -908,9 +908,12 @@ impl SidebarView {
         .detach();
     }
 
+    /// A row's menu: `delete` is every run the row stands for (a folded chat's earlier ones
+    /// too), which Delete run takes together.
     fn open_run_menu(
         &mut self,
         run_id: &str,
+        delete: Vec<String>,
         x: f32,
         y: f32,
         window: &mut Window,
@@ -920,7 +923,7 @@ impl SidebarView {
         items.push(self.delete_entry(
             "Delete run",
             DeleteRunsRequest {
-                ids: vec![run_id.to_string()],
+                ids: delete,
                 ..Default::default()
             },
             cx,
@@ -1619,10 +1622,14 @@ impl SidebarView {
             .on_right_click({
                 let view = view.clone();
                 let run_id = run_id.clone();
+                let delete = row_delete_ids(run);
                 move |event, window, cx| {
                     let id = run_id.clone();
+                    let delete = delete.clone();
                     let (x, y) = (px_of(event.position.x), px_of(event.position.y));
-                    let _ = view.update(cx, |this, cx| this.open_run_menu(&id, x, y, window, cx));
+                    let _ = view.update(cx, |this, cx| {
+                        this.open_run_menu(&id, delete, x, y, window, cx)
+                    });
                 }
             })
             .on_click(move |_, cx| {

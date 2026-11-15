@@ -210,6 +210,17 @@ impl SidebarRun {
     }
 }
 
+/// What a row's Delete run deletes: the row is a chat of follow-ups folded into one, so its
+/// earlier runs go with it, oldest first. Deleting only the latest left the row showing the
+/// one before it, and a chat took one delete per message.
+pub fn row_delete_ids(run: &SidebarRun) -> Vec<String> {
+    let mut ids = run.earlier.clone();
+    if !ids.contains(&run.id) {
+        ids.push(run.id.clone());
+    }
+    ids
+}
+
 /// The runs a group's Delete runs takes: each ended row's run and the earlier runs folded
 /// into it. A row still working is left out, since the core refuses to delete it.
 pub fn ended_run_ids(runs: &[SidebarRun]) -> Vec<String> {
@@ -1239,6 +1250,13 @@ mod tests {
             super::holding_section(&sections, "conversation", &["c2"]),
             None
         );
+    }
+
+    #[test]
+    fn a_rows_delete_takes_the_whole_chat_it_folds() {
+        let row = run("c", |run| run.earlier = vec!["a".into(), "b".into()]);
+        assert_eq!(super::row_delete_ids(&row), ["a", "b", "c"]);
+        assert_eq!(super::row_delete_ids(&run("solo", |_| {})), ["solo"]);
     }
 
     #[test]
