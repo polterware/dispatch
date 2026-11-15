@@ -1393,7 +1393,7 @@ impl Render for TranscriptView {
                     || (width - measured_width.get()).abs() > 0.5
                     || (at - scrolled).abs() > 0.5
                 {
-                    window.refresh();
+                    polterware_ui::frame::draw_again(window);
                 }
             },
             |_, _, _, _| {},

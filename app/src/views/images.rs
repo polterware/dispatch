@@ -31,7 +31,7 @@ use crate::ui::{
     ImageData, MascotMood, PageWidth, RailPresence, SkeletonLayout, TextInput, ZoomableImage,
     card_grid, ellipsis, grid_columns, page_empty, page_skeleton, page_under, page_under_inset,
     rail_page_body_flush, rail_page_cover, rail_page_header, rail_properties, rail_property,
-    rail_section, rail_toggle_label, scroll_area_under, toolbar, trailing_toolbar, wrap_text,
+    rail_section, rail_toggle_label, scroll_area_under, toolbar, wrap_text,
 };
 
 /// The page's chrome state.
@@ -191,6 +191,8 @@ impl ImagesView {
     }
 
     fn go_back(&mut self, cx: &mut Context<Self>) {
+        // The next image opens fitted, not where this one was left.
+        self.zoomable = None;
         self.state.update(cx, |app, cx| {
             app.navigate(Route::Images);
             cx.notify();
@@ -540,8 +542,22 @@ impl ImagesView {
             .tooltip("Back")
             .on_click(move |_, cx| back_view.update(cx, |this, cx| this.go_back(cx)));
 
+        // Before the page has measured itself, judge narrow from the window, so the first
+        // frame already lays out the rail it will keep.
+        self.page_width
+            .seed(f32::from(window.viewport_size().width) - theme.sidebar_width - 16.0);
         let visible = self.rail_visible();
-        self.rail.set_open(visible);
+        // A freshly opened image starts with the rail where it stays; only a toggle on the
+        // page animates it. Otherwise the fit would follow a rail sliding shut on open.
+        let fresh = self
+            .zoomable
+            .as_ref()
+            .is_none_or(|(id, _)| id.as_str() != artifact_id);
+        if fresh {
+            self.rail = RailPresence::new(visible);
+        } else {
+            self.rail.set_open(visible);
+        }
 
         let toggle_view = view.clone();
         let toggle = Button::new("image-rail-toggle", ButtonKind::Secondary)
@@ -575,7 +591,13 @@ impl ImagesView {
         let delete_view = view.clone();
         let run_view = view.clone();
 
-        let start = div().flex().items_center().gap(px(8.0)).child(back);
+        // The header's controls take the press, so clicking one never pans the picture under it.
+        let start = div()
+            .occlude()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .child(back);
 
         let actions = div()
             .flex()
@@ -611,6 +633,7 @@ impl ImagesView {
             );
 
         let end = div()
+            .occlude()
             .flex()
             .items_center()
             .gap(px(8.0))
@@ -847,12 +870,9 @@ impl ImagesView {
                     .top_0()
                     .left_0()
                     .right_0()
-                    .child(trailing_toolbar(
-                        header,
-                        theme.color_surface,
-                        header_h,
-                        theme.radius_surface,
-                    )),
+                    // No fade under the header: the picture runs to the top, and a fade
+                    // inset from the rounded corners would leave them unshaded.
+                    .child(header),
             )
             .children(drawer)
             .children(confirm)

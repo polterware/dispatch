@@ -1941,7 +1941,7 @@ dependencies = [
  "libc",
  "objc",
  "polterware-ui",
- "pulldown-cmark",
+ "pulldown-cmark 0.12.2",
  "raw-window-handle",
  "serde",
  "serde_json",
@@ -5030,7 +5030,7 @@ dependencies = [
  "polterware-motion",
  "polterware-theme",
  "polterware-window",
- "pulldown-cmark",
+ "pulldown-cmark 0.13.6",
  "smallvec",
  "unicode-segmentation",
 ]
@@ -5039,6 +5039,8 @@ dependencies = [
 name = "polterware-window"
 version = "0.1.0"
 dependencies = [
+ "async-channel 2.5.0",
+ "block",
  "gpui",
  "image",
  "objc",
@@ -5230,6 +5232,17 @@ name = "pulldown-cmark"
 version = "0.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f86ba2052aebccc42cbbb3ed234b8b13ce76f75c3551a303cb2bcffcff12bb14"
+dependencies = [
+ "bitflags 2.13.2",
+ "memchr",
+ "unicase",
+]
+
+[[package]]
+name = "pulldown-cmark"
+version = "0.13.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3db2be46835f013dd3f4fa7f5f7402c537787b54ebb6fe2b94bbdd7e2669bb7b"
 dependencies = [
  "bitflags 2.13.2",
  "memchr",

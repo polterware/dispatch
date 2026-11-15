@@ -491,7 +491,7 @@ fn table_body(
             let last = width.get();
             width.set(now);
             if (now < COMPACT_WIDTH) != (last < COMPACT_WIDTH) || last == 0.0 {
-                window.refresh();
+                polterware_ui::frame::draw_again(window);
             }
         },
         |_, _, _, _| {},
