@@ -1,10 +1,13 @@
 //! Agent setup: reports and changes how the agent CLIs on this machine reach
 //! dispatch: the `dispatch` command on the PATH, the dispatch skill in the
-//! skills folders they read, and each agent's SessionStart hook.
+//! skills folders they read, the Claude Code mod, and each agent's
+//! SessionStart hook.
 
+mod claude_mod;
 mod jsonc;
 mod opencode;
 
+pub use claude_mod::{ClaudeMod, install as install_claude_mod, remove as remove_claude_mod};
 pub use opencode::{opencode_config_path, opencode_plugin_dir, remove_legacy_opencode_plugin};
 
 use std::collections::HashSet;
@@ -61,6 +64,8 @@ pub struct Hook {
 pub struct Report {
     pub cli: Cli,
     pub skills: Vec<Skill>,
+    /// The mod Dispatch installs in Claude Code.
+    pub claude_mod: ClaudeMod,
     /// The hook of every agent on this machine that has one, and of any
     /// other agent whose hook is still registered.
     pub hooks: Vec<Hook>,
@@ -103,6 +108,7 @@ pub fn cli_path(home: &Path) -> PathBuf {
 pub fn read(home: &Path, binary: &str, state_dir: &Path) -> Report {
     let mut r = Report {
         cli: read_cli(home, binary),
+        claude_mod: claude_mod::read(state_dir),
         ..Report::default()
     };
     let mut seen = HashSet::new();

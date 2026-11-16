@@ -19,19 +19,25 @@ struct Fixture {
 }
 
 // fixture clears CLAUDE_CONFIG_DIR, CODEX_HOME, and XDG_CONFIG_HOME while it
-// lives, so the tests never touch the real agent folders.
+// lives, so the tests never touch the real agent folders. It also points
+// DISPATCH_CLAUDE_BIN at a stand-in that lists no plugin, so a read never asks
+// the real Claude Code here.
 fn fixture() -> Fixture {
     let env = ENV.lock().unwrap_or_else(|e| e.into_inner());
-    unsafe {
-        std::env::remove_var("CLAUDE_CONFIG_DIR");
-        std::env::remove_var("CODEX_HOME");
-        std::env::remove_var("XDG_CONFIG_HOME");
-    }
     let home = tempfile::tempdir().unwrap();
     let bin = tempfile::tempdir().unwrap();
     let binary = bin.path().join("dispatch");
     fs::write(&binary, "new").unwrap();
     fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+    let claude = bin.path().join("claude");
+    fs::write(&claude, "#!/bin/sh\necho '[]'\n").unwrap();
+    fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).unwrap();
+    unsafe {
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        std::env::remove_var("CODEX_HOME");
+        std::env::remove_var("XDG_CONFIG_HOME");
+        std::env::set_var("DISPATCH_CLAUDE_BIN", &claude);
+    }
     Fixture {
         home: home.path().to_path_buf(),
         binary: binary.to_string_lossy().into_owned(),
@@ -78,6 +84,29 @@ fn read_starts_missing() {
     for s in &r.skills {
         assert!(s.state == MISSING && !s.extra, "{s:?}");
     }
+    assert_eq!(
+        r.claude_mod.state, "not_installed",
+        "no mod is installed in the state folder yet"
+    );
+    assert_eq!(
+        r.claude_mod.dir,
+        f.state.join("claude-marketplace").to_string_lossy()
+    );
+}
+
+#[test]
+fn install_claude_mod_writes_the_marketplace_folder() {
+    let f = fixture();
+    let dir = install_claude_mod(&f.state).unwrap();
+    assert_eq!(dir, f.state.join("claude-marketplace"));
+    assert!(dir.join(".claude-plugin/marketplace.json").is_file());
+    assert!(
+        dir.join("plugins/dispatch-delegate/hooks/register.tsx")
+            .is_file(),
+        "the mod's files are written under the marketplace"
+    );
+    remove_claude_mod(&f.state).unwrap();
+    assert!(!dir.exists(), "removing takes the folder with it");
 }
 
 #[test]

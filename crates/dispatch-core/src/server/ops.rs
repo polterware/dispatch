@@ -920,6 +920,8 @@ impl Core {
             "link_cli" => setup::link_cli(&home, &binary).map(|_| ()),
             "install_skill" => setup::install_skill(&home, &m.agent).map(|_| ()),
             "remove_skill" => setup::remove_skill(&home, &m.agent).map(|_| ()),
+            "install_claude_mod" => setup::install_claude_mod(&state).map(|_| ()),
+            "remove_claude_mod" => setup::remove_claude_mod(&state).map(|_| ()),
             "hook_on" | "hook_off" => {
                 setup::set_hook(&home, &binary, &state, &m.agent, m.action == "hook_on")
             }

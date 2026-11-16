@@ -1,0 +1,1 @@
+{ "name": "dispatch-delegate", "version": "0.1.0", "description": "Default or mandatory delegation to Dispatch, with the model picked from Dispatch's enabled list", "types": "./types/index.d.ts" }
