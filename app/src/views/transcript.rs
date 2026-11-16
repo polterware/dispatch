@@ -37,13 +37,14 @@ use crate::motion::{Animator, SpringTier, SpringValue};
 use crate::state::{AppState, observe};
 use crate::theme::{Theme, tw};
 use crate::ui::parts::transcript::{
-    HighlightCache, PREVIEW_ENTRIES, PromptToggle, RowFrame, TranscriptRow, flatten_transcript,
-    gap_row, offset_entries, prompt_transcript_row, render_row, terminal_font,
+    HighlightCache, PREVIEW_ENTRIES, PromptToggle, RowBody, RowFrame, TranscriptRow,
+    flatten_transcript, gap_row, offset_entries, prompt_transcript_row, render_row, terminal_font,
 };
 use crate::ui::patterns::{JUMP_TO_END_REST, SCROLL_FADE, jump_to_end};
 use crate::ui::text_skeleton;
 use crate::ui::{
-    ListScroll, SCROLLBAR_GUTTER, ScrollAxis, ScrollGeometry, WIDE_MEASURE, scrollbar,
+    ListScroll, MessageRail, MessageRailItem, SCROLLBAR_GUTTER, ScrollAxis, ScrollGeometry,
+    WIDE_MEASURE, message_rail_visible, scrollbar,
 };
 
 /// How fast the glide to the end closes the distance left: the share left after `t` seconds
@@ -219,6 +220,9 @@ pub struct TranscriptView {
     images_asked: bool,
     /// The viewer a thumbnail opens.
     viewer: Entity<super::image_viewer::ImageViewerView>,
+    /// The chat's messages, oldest first: the list row each one's prompt bubble is on, and
+    /// its text. The message rail indexes them.
+    messages: Vec<(usize, String)>,
 }
 
 impl TranscriptView {
@@ -305,6 +309,7 @@ impl TranscriptView {
             images_for: String::new(),
             images_asked: false,
             viewer,
+            messages: Vec::new(),
         };
         view.ensure_stream(cx);
         view.ensure_earlier_runs(cx);
@@ -800,6 +805,7 @@ impl TranscriptView {
                 rows.splice(0..0, earlier);
             }
         }
+        self.messages = message_rows(&rows);
         let rows_now = rows.len();
         self.install_rows(rows);
         if let Some(before) = self.rows_before_page.take() {
@@ -1212,6 +1218,33 @@ impl TranscriptView {
         COLUMN_END.max(self.bottom_inset)
     }
 
+    /// The message rail's click: scrolls the list so the prompt bubble of message `message`
+    /// (oldest first) is at the top. The reader chose the place, so the log stops following
+    /// its end unless the message is by it.
+    pub(crate) fn reveal_message(&mut self, message: usize, cx: &mut Context<Self>) {
+        let Some(&(row, _)) = self.messages.get(message) else {
+            return;
+        };
+        self.glide = false;
+        self.follow = Follow::Idle;
+        self.list.scroll_to(ListOffset {
+            item_ix: row,
+            offset_in_item: px(0.0),
+        });
+        self.on_scroll(true, row, cx);
+        cx.notify();
+    }
+
+    /// The message rail's active bar: the last message whose bubble has begun at the top of
+    /// the list.
+    fn message_in_view(&self) -> usize {
+        let first = self.list.logical_scroll_top().item_ix;
+        self.messages
+            .iter()
+            .rposition(|&(row, _)| row <= first)
+            .unwrap_or(0)
+    }
+
     /// The jump-to-end button: glide down to the end, where the log follows again.
     pub(crate) fn jump_to_end(&mut self, cx: &mut Context<Self>) {
         self.glide = true;
@@ -1519,6 +1552,37 @@ impl Render for TranscriptView {
                     .child(bar),
             );
         }
+        // The message rail: one bar per message of the chat, along the right edge clear of
+        // the scrollbar's gutter and centered under the header. It draws nothing for one.
+        if message_rail_visible(self.messages.len()) {
+            let items = self
+                .messages
+                .iter()
+                .enumerate()
+                .map(|(index, (_, text))| MessageRailItem::new(format!("message-{index}"), text))
+                .collect();
+            let entity = cx.entity();
+            area = area.child(
+                div()
+                    .absolute()
+                    .top(px(top_inset))
+                    .bottom(px(0.0))
+                    .right(px(SCROLLBAR_GUTTER))
+                    .flex()
+                    .items_center()
+                    .child(
+                        MessageRail::new(SharedString::from(format!(
+                            "message-rail-{}",
+                            cx.entity_id()
+                        )))
+                        .items(items)
+                        .active(Some(self.message_in_view()))
+                        .on_select(move |index, _, cx| {
+                            entity.update(cx, |view, cx| view.reveal_message(index, cx));
+                        }),
+                    ),
+            );
+        }
         // The viewer a thumbnail opens: deferred over the whole window, and nothing at all
         // while it is closed.
         area = area.child(self.viewer.clone());
@@ -1550,6 +1614,18 @@ fn page_scroll(list: &ListState, column_end: f32) -> Option<PageScroll> {
         content: items + tw(LOG_END_GAP) + column_end,
         viewport,
     })
+}
+
+/// The chat's messages among the list's rows, oldest first: the row of each prompt bubble
+/// and its text.
+fn message_rows(rows: &[TranscriptRow]) -> Vec<(usize, String)> {
+    rows.iter()
+        .enumerate()
+        .filter_map(|(index, row)| match &row.body {
+            RowBody::Prompt { text, .. } => Some((index, text.clone())),
+            _ => None,
+        })
+        .collect()
 }
 
 /// How the list moved since the last frame: by the wheel, by the view itself (following,
@@ -1675,8 +1751,31 @@ async fn next_batch(rx: &mut mpsc::UnboundedReceiver<StreamMsg>) -> Option<Vec<S
 
 #[cfg(test)]
 mod tests {
-    use super::kept_top;
+    use super::{gap_row, kept_top, message_rows};
+    use crate::models::transcript::PromptBubble;
+    use crate::ui::parts::transcript::prompt_transcript_row;
     use gpui::{ListOffset, px};
+
+    #[test]
+    fn the_rail_indexes_each_prompt_bubble_by_its_row() {
+        let bubble = |text: &str| PromptBubble {
+            text: text.to_string(),
+            meta_label: String::new(),
+            time: None,
+        };
+        let rows = vec![
+            prompt_transcript_row(&bubble("first"), true),
+            gap_row(),
+            gap_row(),
+            prompt_transcript_row(&bubble("second"), true),
+            gap_row(),
+        ];
+        assert_eq!(
+            message_rows(&rows),
+            vec![(0, "first".to_string()), (3, "second".to_string())]
+        );
+        assert!(message_rows(&rows[1..3]).is_empty());
+    }
 
     fn at(item_ix: usize, offset: f32) -> ListOffset {
         ListOffset {

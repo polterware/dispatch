@@ -455,6 +455,10 @@ fn the_run_page_sends_a_message_to_an_ended_run(cx: &mut TestAppContext) {
     w.go(Route::Run(id.clone()));
 
     assert!(w.shows("run-message"), "an ended run offers no composer");
+    assert!(
+        !w.shows("message-rail-0"),
+        "one message has nothing to index"
+    );
     // A press on the card writes in its field; Enter sends what it holds.
     w.click("run-message");
     w.cx.simulate_input("now say bye");
@@ -488,6 +492,16 @@ fn the_run_page_sends_a_message_to_an_ended_run(cx: &mut TestAppContext) {
         w.shows("transcript-prompt:now say bye"),
         "the chat never showed the message sent"
     );
+    // The message rail indexes the two messages; a click on the first reveals its bubble.
+    assert!(
+        w.shows("message-rail-0") && w.shows("message-rail-1"),
+        "the chat's two messages have no rail bars"
+    );
+    assert!(!w.shows("message-rail-2"));
+    w.click("message-rail-0");
+    w.pump();
+    assert!(w.shows("transcript-prompt:say hi"));
+    assert!(w.toasts().is_empty(), "{:?}", w.toasts());
 }
 
 /// From the Runs page: a running run's own page follows its live output, which the test's
