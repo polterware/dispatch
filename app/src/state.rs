@@ -56,6 +56,8 @@ pub enum Route {
     RoleBoard(String),
     Intelligence,
     Spend,
+    /// Every spend entry of one agent (the Spend page's card opens it).
+    SpendAgent(String),
     Stats,
     Images,
     Image(String),
@@ -79,11 +81,13 @@ pub enum ConnectionState {
     Online,
 }
 
-/// Route plus a back stack. `navigate` does not push when the route is unchanged.
+/// Route plus a back stack and a forward stack. `navigate` does not push when the route is
+/// unchanged, and a new route drops the forward stack.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Navigation {
     route: Route,
     history: Vec<Route>,
+    forward: Vec<Route>,
 }
 
 impl Navigation {
@@ -91,6 +95,7 @@ impl Navigation {
         Self {
             route,
             history: Vec::new(),
+            forward: Vec::new(),
         }
     }
 
@@ -102,6 +107,7 @@ impl Navigation {
         if self.route == route {
             return;
         }
+        self.forward.clear();
         // Settings is a dialog over a page: moving between its sections is not history.
         if !(matches!(self.route, Route::Settings(_)) && matches!(route, Route::Settings(_))) {
             self.history.push(self.route.clone());
@@ -130,6 +136,7 @@ impl Navigation {
         if !matches!(self.route, Route::Settings(_)) {
             return;
         }
+        self.forward.clear();
         while let Some(previous) = self.history.pop() {
             if !matches!(previous, Route::Settings(_)) {
                 self.route = previous;
@@ -139,9 +146,28 @@ impl Navigation {
         self.route = Route::default();
     }
 
+    pub fn can_go_back(&self) -> bool {
+        !self.history.is_empty()
+    }
+
+    pub fn can_go_forward(&self) -> bool {
+        !self.forward.is_empty()
+    }
+
     pub fn go_back(&mut self) -> bool {
         if let Some(previous) = self.history.pop() {
-            self.route = previous;
+            let current = std::mem::replace(&mut self.route, previous);
+            self.forward.push(current);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn go_forward(&mut self) -> bool {
+        if let Some(next) = self.forward.pop() {
+            let current = std::mem::replace(&mut self.route, next);
+            self.history.push(current);
             true
         } else {
             false
@@ -539,6 +565,8 @@ pub struct AppState {
     /// runs until it does.
     runs_revision: u64,
     models_revision: u64,
+    /// [`Self::begin_load`] changed something the views paint, before the snapshot lands.
+    load_dirty: bool,
 }
 
 impl AppState {
@@ -578,6 +606,7 @@ impl AppState {
             loads: LoadOrder::default(),
             runs_revision: 0,
             models_revision: 0,
+            load_dirty: false,
         };
         Self::spawn_poll(cx);
         state
@@ -774,15 +803,34 @@ impl AppState {
         }
     }
 
+    pub fn can_go_back(&self) -> bool {
+        self.navigation.can_go_back()
+    }
+
+    pub fn can_go_forward(&self) -> bool {
+        self.navigation.can_go_forward()
+    }
+
     pub fn go_back(&mut self) -> bool {
         let moved = self.navigation.go_back();
+        self.after_history_move(moved);
+        moved
+    }
+
+    pub fn go_forward(&mut self) -> bool {
+        let moved = self.navigation.go_forward();
+        self.after_history_move(moved);
+        moved
+    }
+
+    /// A run reached through history reads its reply again if none is held.
+    fn after_history_move(&mut self, moved: bool) {
         if moved
             && let Route::Run(id) = self.navigation.route()
             && !self.replies.contains_key(id)
         {
             self.pending_reply = Some(id.clone());
         }
-        moved
     }
 
     pub fn route(&self) -> &Route {
@@ -851,40 +899,48 @@ impl AppState {
         self.runs_revision
     }
 
-    fn set_runs(&mut self, runs: Vec<DispatchRun>) {
-        if self.runs != runs {
-            // A run that waited in line for its folder says so once it starts.
-            let started: Vec<String> = runs
-                .iter()
-                .filter(|run| !crate::format::is_waiting_in_line(&run.status, &run.note))
-                .filter(|run| {
-                    !["cancelled", "orphaned"].contains(&run.status.to_ascii_lowercase().as_str())
-                })
-                .filter(|run| {
-                    self.runs.iter().any(|before| {
-                        before.id == run.id
-                            && crate::format::is_waiting_in_line(&before.status, &before.note)
-                    })
-                })
-                .map(|run| {
-                    let folder = run
-                        .dir
-                        .trim_end_matches('/')
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or("");
-                    format!(
-                        "Run {} started: {folder} is free",
-                        &run.id[..run.id.len().min(8)]
-                    )
-                })
-                .collect();
-            for message in started {
-                self.push_toast(message, ToastTone::Info);
-            }
-            self.runs = runs;
-            self.runs_revision = self.runs_revision.wrapping_add(1);
+    /// Replaces the runs when they differ. Equal runs leave the revision where it is.
+    fn set_runs(&mut self, runs: Vec<DispatchRun>) -> bool {
+        if self.runs == runs {
+            return false;
         }
+        // A run that waited in line for its folder says so once it starts.
+        let started: Vec<String> = runs
+            .iter()
+            .filter(|run| !crate::format::is_waiting_in_line(&run.status, &run.note))
+            .filter(|run| {
+                !["cancelled", "orphaned"].contains(&run.status.to_ascii_lowercase().as_str())
+            })
+            .filter(|run| {
+                self.runs.iter().any(|before| {
+                    before.id == run.id
+                        && crate::format::is_waiting_in_line(&before.status, &before.note)
+                })
+            })
+            .map(|run| {
+                let folder = run
+                    .dir
+                    .trim_end_matches('/')
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("");
+                format!(
+                    "Run {} started: {folder} is free",
+                    &run.id[..run.id.len().min(8)]
+                )
+            })
+            .collect();
+        for message in started {
+            self.push_toast(message, ToastTone::Info);
+        }
+        self.runs = runs;
+        self.bump_run_inputs();
+        true
+    }
+
+    /// Workspaces, sections, names, or runs moved: lists keyed on [`Self::runs_revision`] rebuild.
+    fn bump_run_inputs(&mut self) {
+        self.runs_revision = self.runs_revision.wrapping_add(1);
     }
 
     /// The name given to `conversation_id`, if any.
@@ -896,11 +952,20 @@ impl AppState {
 
     /// Shows a new name at once, before the next refresh brings it.
     pub fn note_conversation_name(&mut self, conversation_id: &str, name: &str) {
-        if name.trim().is_empty() {
-            self.conversation_names.remove(conversation_id);
+        let changed = if name.trim().is_empty() {
+            self.conversation_names.remove(conversation_id).is_some()
         } else {
-            self.conversation_names
-                .insert(conversation_id.to_string(), name.trim().to_string());
+            let trimmed = name.trim();
+            if self.conversation_names.get(conversation_id).map(String::as_str) == Some(trimmed) {
+                false
+            } else {
+                self.conversation_names
+                    .insert(conversation_id.to_string(), trimmed.to_string());
+                true
+            }
+        };
+        if changed {
+            self.bump_run_inputs();
         }
     }
 
@@ -997,8 +1062,9 @@ impl AppState {
                     .await;
                 let alive = this
                     .update(cx, |state, cx| {
-                        state.finish_load(snapshot.0, snapshot.1);
-                        cx.notify();
+                        if state.finish_load(snapshot.0, snapshot.1) {
+                            cx.notify();
+                        }
                     })
                     .is_ok();
                 if !alive {
@@ -1020,8 +1086,9 @@ impl AppState {
                 })
                 .await;
             let _ = this.update(cx, |state, cx| {
-                state.finish_load(generation, snapshot);
-                cx.notify();
+                if state.finish_load(generation, snapshot) {
+                    cx.notify();
+                }
             });
         })
         .detach();
@@ -1035,47 +1102,107 @@ impl AppState {
         };
         if let Some(id) = &selected
             && !self.replies.contains_key(id)
+            && self.pending_reply.as_deref() != Some(id.as_str())
         {
             self.pending_reply = Some(id.clone());
+            self.load_dirty = true;
         }
         (generation, self.data_dir.clone(), selected)
     }
 
-    fn finish_load(&mut self, generation: u64, snapshot: Snapshot) {
+    /// Applies `snapshot` when it is still the newest read. Returns whether anything the
+    /// views paint moved, so an unchanged poll does not redraw them.
+    fn finish_load(&mut self, generation: u64, snapshot: Snapshot) -> bool {
         if !self.loads.accept(generation) {
-            return;
+            return false;
         }
-        self.last_error = snapshot.last_error;
+        let mut changed = std::mem::take(&mut self.load_dirty);
+        changed |= assign(&mut self.last_error, snapshot.last_error);
         match snapshot.connection {
             ConnectionState::Offline { core_json_path } => {
-                self.connection = ConnectionState::Offline { core_json_path };
-                self.client = None;
-                self.workspaces.clear();
-                self.linked = false;
-                self.sections.clear();
-                self.set_runs(Vec::new());
-                self.replies.clear();
-                self.pending_reply = None;
+                changed |= assign(
+                    &mut self.connection,
+                    ConnectionState::Offline { core_json_path },
+                );
+                if self.client.take().is_some() {
+                    changed = true;
+                }
+                if !self.workspaces.is_empty() {
+                    self.workspaces.clear();
+                    changed = true;
+                }
+                if self.linked {
+                    self.linked = false;
+                    changed = true;
+                }
+                if !self.sections.is_empty() {
+                    self.sections.clear();
+                    changed = true;
+                }
+                if !self.conversation_names.is_empty() {
+                    self.conversation_names.clear();
+                    changed = true;
+                }
+                changed |= self.set_runs(Vec::new());
+                if !self.replies.is_empty() {
+                    self.replies.clear();
+                    changed = true;
+                }
+                if self.pending_reply.take().is_some() {
+                    changed = true;
+                }
             }
             ConnectionState::Online => {
-                self.connection = ConnectionState::Online;
-                if snapshot.client.is_some() {
-                    self.client = snapshot.client;
+                changed |= assign(&mut self.connection, ConnectionState::Online);
+                if let Some(next) = snapshot.client {
+                    let same = self
+                        .client
+                        .as_ref()
+                        .is_some_and(|have| have.endpoint() == next.endpoint());
+                    if !same {
+                        self.client = Some(next);
+                        changed = true;
+                    }
                 }
-                self.workspaces = snapshot.workspaces;
-                self.linked = snapshot.linked;
-                self.sections = snapshot.sections;
-                self.conversation_names = snapshot.conversation_names;
-                self.set_runs(snapshot.runs);
+                let workspaces_changed = assign(&mut self.workspaces, snapshot.workspaces);
+                let linked_changed = assign(&mut self.linked, snapshot.linked);
+                let sections_changed = assign(&mut self.sections, snapshot.sections);
+                let names_changed = assign(&mut self.conversation_names, snapshot.conversation_names);
+                let runs_changed = self.set_runs(snapshot.runs);
+                // A workspace, section, or name can move while the runs stay put. Lists keyed
+                // on the runs revision rebuild either way.
+                if (workspaces_changed || sections_changed || names_changed) && !runs_changed {
+                    self.bump_run_inputs();
+                }
+                changed |= workspaces_changed
+                    || linked_changed
+                    || sections_changed
+                    || names_changed
+                    || runs_changed;
                 if let Some((id, reply)) = snapshot.reply {
-                    self.replies.insert(id.clone(), reply);
+                    let same = self.replies.get(&id).is_some_and(|have| have == &reply);
+                    if !same {
+                        self.replies.insert(id.clone(), reply);
+                        changed = true;
+                    }
                     if self.pending_reply.as_deref() == Some(id.as_str()) {
                         self.pending_reply = None;
+                        changed = true;
                     }
                 }
             }
             ConnectionState::Connecting => {}
         }
+        changed
+    }
+}
+
+fn assign<T: PartialEq>(slot: &mut T, next: T) -> bool {
+    if *slot == next {
+        false
+    } else {
+        *slot = next;
+        true
     }
 }
 
@@ -1136,6 +1263,37 @@ mod tests {
         assert!(navigation.go_back());
         assert!(!navigation.go_back());
         assert_eq!(navigation.route(), &Route::Roles);
+    }
+
+    #[test]
+    fn forward_retraces_back_and_a_new_route_clears_it() {
+        let mut navigation = Navigation::new(Route::Roles);
+        assert!(!navigation.can_go_back());
+        assert!(!navigation.can_go_forward());
+        assert!(!navigation.go_forward());
+        navigation.navigate(Route::Spend);
+        navigation.navigate(Route::Stats);
+        assert!(navigation.can_go_back());
+        assert!(!navigation.can_go_forward());
+
+        assert!(navigation.go_back());
+        assert!(navigation.go_back());
+        assert_eq!(navigation.route(), &Route::Roles);
+        assert!(!navigation.can_go_back());
+        assert!(navigation.can_go_forward());
+
+        assert!(navigation.go_forward());
+        assert_eq!(navigation.route(), &Route::Spend);
+        assert!(navigation.can_go_back());
+        assert!(navigation.can_go_forward());
+
+        navigation.navigate(Route::Images);
+        assert!(!navigation.can_go_forward());
+        assert!(!navigation.go_forward());
+        assert!(navigation.go_back());
+        assert_eq!(navigation.route(), &Route::Spend);
+        assert!(navigation.go_forward());
+        assert_eq!(navigation.route(), &Route::Images);
     }
 
     #[test]

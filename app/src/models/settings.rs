@@ -558,10 +558,10 @@ pub fn classifier_trailing(
     cli: Option<&CliModel>,
 ) -> Option<String> {
     let radio = radio_value(value);
-    if radio == picked_radio {
-        return None;
-    }
     if keyed_classifier(value).is_some() {
+        if radio == picked_radio {
+            return None;
+        }
         if status == "missing" {
             return Some("Needs a key".to_string());
         }
@@ -962,8 +962,8 @@ mod tests {
             None
         );
         assert_eq!(
-            classifier_trailing("cli", "cli", "missing", Some(&cli)),
-            None
+            classifier_trailing("cli", "cli", "missing", Some(&cli)).as_deref(),
+            Some("codex · gpt-5-codex-mini")
         );
         assert_eq!(classifier_trailing("cli", "off", "missing", None), None);
     }

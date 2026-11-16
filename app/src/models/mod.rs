@@ -12,5 +12,6 @@ pub mod settings;
 pub mod sidebar;
 pub use polterware_ui::sort;
 pub mod spend;
+pub mod spend_agent;
 pub mod stats;
 pub mod transcript;

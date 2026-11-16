@@ -12,14 +12,15 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use gpui::{
-    AppContext as _, Context, DispatchPhase, Entity, FontWeight, IntoElement, KeyDownEvent, Render,
-    SharedString, Window, canvas, div, prelude::*, px,
+    App, AppContext as _, Context, DispatchPhase, Entity, FontWeight, IntoElement, KeyDownEvent,
+    Render, SharedString, Window, canvas, div, prelude::*, px,
 };
 
 use crate::client::{CoreClient, CoreError, ListModelCatalogRequest, RefreshModelCatalogRequest};
+use crate::models::filter::Filters;
 use crate::models::intelligence::{
-    COLUMNS, Catalog, DEFAULT_SORT, ModelRow, SkillColumn, SkillSort, band_of, bar_note,
-    empty_catalog, empty_title, group_models, map_dispatch_catalog, map_refresh,
+    COLUMNS, Catalog, DEFAULT_SORT, ModelRow, ScoreDetail, SkillColumn, SkillSort, band_of,
+    bar_note, empty_catalog, empty_title, group_models, map_dispatch_catalog, map_refresh,
     model_filter_fields, percent_text, policy_bar, refresh_failure, score_detail, should_load,
     skill_digits, visible_rows,
 };
@@ -50,6 +51,11 @@ pub struct IntelligenceView {
     catalog: Catalog,
     /// The catalog's entries, one per model@effort.
     rows: Vec<ModelRow>,
+    /// Bumped when `rows` is replaced, so the visible table can keep its key.
+    rows_gen: u64,
+    visible_rows: Rc<Vec<ModelRow>>,
+    visible_details: Rc<Vec<ScoreDetail>>,
+    visible_key: Option<VisibleKey>,
     loaded: bool,
     /// The last paint had no core client. A later client starts a real load.
     awaiting_core: bool,
@@ -96,6 +102,10 @@ impl IntelligenceView {
             fields_key: String::new(),
             catalog: empty_catalog(),
             rows: Vec::new(),
+            rows_gen: 0,
+            visible_rows: Rc::default(),
+            visible_details: Rc::default(),
+            visible_key: None,
             loaded: false,
             awaiting_core: false,
             loading: false,
@@ -164,6 +174,7 @@ impl IntelligenceView {
                         view.failed = false;
                         view.catalog = map_dispatch_catalog(&json);
                         view.rows = group_models(&view.catalog.entries);
+                        view.rows_gen = view.rows_gen.wrapping_add(1);
                     }
                     Err(error) => {
                         // Said once: the tries after it, every few seconds, stay quiet.
@@ -253,20 +264,8 @@ impl IntelligenceView {
 
     /// The first model's dialog, in the table's order (the screenshot tour).
     pub(crate) fn open_first_detail(&mut self, cx: &mut Context<Self>) {
-        let bar = policy_bar(&self.catalog);
-        let filters = self.filters.read(cx).filters().clone();
-        let query = self.search.read(cx).text().to_string();
-        let first = visible_rows(
-            &self.rows,
-            &query,
-            &filters,
-            bar,
-            self.catalog.discover,
-            self.sort,
-        )
-        .into_iter()
-        .next();
-        if let Some(row) = first {
+        self.ensure_visible(cx);
+        if let Some(row) = self.visible_rows.first().cloned() {
             self.open_detail(row, cx);
         }
     }
@@ -344,14 +343,12 @@ impl IntelligenceView {
 impl Render for IntelligenceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_fields(cx);
+        self.ensure_visible(cx);
         let theme = *Theme::global(cx);
         let query = self.search.read(cx).text().to_string();
         let discover = self.catalog.discover;
         let bar = policy_bar(&self.catalog);
-        let rows = {
-            let filters = self.filters.read(cx).filters();
-            visible_rows(&self.rows, &query, filters, bar, discover, self.sort)
-        };
+        let rows = self.visible_rows.clone();
         let filtered = !query.trim().is_empty() || !self.filters.read(cx).filters().is_empty();
         let has_entries = !self.rows.is_empty();
         self.empty_enter
@@ -410,7 +407,14 @@ impl Render for IntelligenceView {
                     .flex_col()
                     .overflow_hidden()
                     .child(
-                        models_table(rows, &self.catalog, bar, self.sort, view.clone())
+                        models_table(
+                            rows,
+                            self.visible_details.clone(),
+                            discover,
+                            bar,
+                            self.sort,
+                            view.clone(),
+                        )
                             .inset_top(top)
                             .fades(theme.color_surface),
                     ),
@@ -485,17 +489,62 @@ impl Render for IntelligenceView {
 
 /// The models `DataTable`: Score at 96px, Model at its content's width, and the bands
 /// right-aligned, the last taking what is left.
+/// What the visible table was built from.
+struct VisibleKey {
+    rows_gen: u64,
+    query: String,
+    filters: Filters,
+    bar: f64,
+    discover: bool,
+    sort: SkillSort,
+}
+
+impl IntelligenceView {
+    /// The rows and score details on show. A poll that does not change the catalog, the
+    /// search, the filters, or the sort keeps the ones already built.
+    fn ensure_visible(&mut self, cx: &App) {
+        let query = self.search.read(cx).text();
+        let filters = self.filters.read(cx).filters();
+        let bar = policy_bar(&self.catalog);
+        let discover = self.catalog.discover;
+        if self.visible_key.as_ref().is_some_and(|key| {
+            key.rows_gen == self.rows_gen
+                && key.query == query
+                && key.filters == *filters
+                && key.bar == bar
+                && key.discover == discover
+                && key.sort == self.sort
+        }) {
+            return;
+        }
+        let query = query.to_string();
+        let filters = filters.clone();
+        let rows = visible_rows(&self.rows, &query, &filters, bar, discover, self.sort);
+        let details = rows
+            .iter()
+            .map(|row| score_detail(row, &self.catalog))
+            .collect();
+        self.visible_rows = Rc::new(rows);
+        self.visible_details = Rc::new(details);
+        self.visible_key = Some(VisibleKey {
+            rows_gen: self.rows_gen,
+            query,
+            filters,
+            bar,
+            discover,
+            sort: self.sort,
+        });
+    }
+}
+
 fn models_table(
-    rows: Vec<ModelRow>,
-    catalog: &Catalog,
+    rows: Rc<Vec<ModelRow>>,
+    details: Rc<Vec<ScoreDetail>>,
+    discover: bool,
     bar: f64,
     sort: SkillSort,
     view: Entity<IntelligenceView>,
 ) -> DataTable {
-    let discover = catalog.discover;
-    let details: Vec<_> = rows.iter().map(|row| score_detail(row, catalog)).collect();
-    let details = Rc::new(details);
-    let rows = Rc::new(rows);
     let columns = COLUMNS
         .iter()
         .map(|column| {

@@ -213,17 +213,22 @@ pub fn run_stack_row(
     cx: &App,
 ) -> AnyElement {
     let theme = Theme::global(cx);
-    let fact = |label: &'static str, value: AnyElement| {
+    let fact = |icon: Icon, label: &'static str, value: AnyElement| {
         div()
+            .flex_none()
             .flex()
             .flex_col()
             .gap(px(4.0))
             .min_w(px(0.0))
             .child(
                 div()
+                    .flex()
+                    .items_center()
+                    .gap(px(5.0))
                     .text_size(px(11.0))
                     .font(sans(theme, FontWeight::MEDIUM))
                     .text_color(theme.color_text_muted)
+                    .child(icon_colored(icon, 12.0, theme.color_text_muted))
                     .child(label),
             )
             .child(value)
@@ -242,27 +247,29 @@ pub fn run_stack_row(
         cell.into_any_element()
     };
 
+    // One row, spread apart: when it runs short, Agent and Repository (the long texts) give
+    // way and end in an ellipsis, so Started never drops to a line of its own.
     let mut facts = div()
         .flex()
-        .flex_wrap()
+        .justify_between()
         .gap_x(px(28.0))
-        .gap_y(px(12.0))
-        .child(fact("Agent", agent_cell(index, row, cx)))
-        .child(fact("Repository", source_cell(index, row, cx)));
+        .child(fact(Icon::Bot, "Agent", agent_cell(index, row, cx)).flex_shrink())
+        .child(fact(Icon::Folder, "Repository", source_cell(index, row, cx)).flex_shrink());
     if !row.tier.trim().is_empty() {
-        facts = facts.child(fact("Tier", figure("runs-tier", &row.tier, "")));
+        facts = facts.child(fact(Icon::Gauge, "Tier", figure("runs-tier", &row.tier, "")));
     }
-    facts = facts.child(fact("Changes", changes_cell(row, cx)));
+    facts = facts.child(fact(Icon::FileDiff, "Changes", changes_cell(row, cx)));
     if let Some(tokens) = &row.tokens_label {
         facts = facts.child(fact(
+            Icon::Cpu,
             "Tokens",
             figure("runs-tokens", tokens, &row.tokens_title),
         ));
     }
     if let Some(cost) = &row.cost_label {
-        facts = facts.child(fact("Cost", figure("runs-cost", cost, &row.cost_title)));
+        facts = facts.child(fact(Icon::CreditCard, "Cost", figure("runs-cost", cost, &row.cost_title)));
     }
-    facts = facts.child(fact("Started", started_cell(row, now_ms, cx)));
+    facts = facts.child(fact(Icon::Clock, "Started", started_cell(row, now_ms, cx)));
 
     let mut trailing = div().flex_none().flex().items_center().gap(px(8.0));
     if row.active {

@@ -13,7 +13,7 @@ use crate::ui::patterns::{main_surface, modal_layer};
 use crate::ui::{toast_lifetime, toast_stack};
 use crate::views::{
     CommanderView, ImagesView, IntelligenceView, RolesView, RunPageView, RunsView, SettingsView,
-    SidebarView, SpendView, StatsView,
+    SidebarView, SpendAgentView, SpendView, StatsView,
 };
 
 actions!(
@@ -22,6 +22,7 @@ actions!(
         Quit,
         CloseWindow,
         GoBack,
+        GoForward,
         ToggleCommander,
         OpenSettings,
         NewConversation,
@@ -36,6 +37,7 @@ pub fn register_key_bindings(cx: &mut App) {
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-w", CloseWindow, None),
         KeyBinding::new("cmd-[", GoBack, None),
+        KeyBinding::new("cmd-]", GoForward, None),
         KeyBinding::new("cmd-k", ToggleCommander, None),
         KeyBinding::new("cmd-,", OpenSettings, None),
         KeyBinding::new("cmd-n", NewConversation, None),
@@ -49,6 +51,7 @@ pub struct AppView {
     roles: gpui::Entity<RolesView>,
     intelligence: gpui::Entity<IntelligenceView>,
     spend: gpui::Entity<SpendView>,
+    spend_agent: gpui::Entity<SpendAgentView>,
     stats: gpui::Entity<StatsView>,
     images: gpui::Entity<ImagesView>,
     settings: gpui::Entity<SettingsView>,
@@ -81,6 +84,11 @@ impl AppView {
     /// The Images page, which the tests read.
     pub fn images(&self) -> gpui::Entity<ImagesView> {
         self.images.clone()
+    }
+
+    /// The Settings dialog, whose Models list the tests scroll by item.
+    pub fn settings(&self) -> gpui::Entity<SettingsView> {
+        self.settings.clone()
     }
 
     /// Starts the countdown of every toast that has none yet, and forgets the ones gone.
@@ -137,6 +145,7 @@ impl AppView {
             roles: cx.new(|cx| RolesView::new(state.clone(), cx)),
             intelligence: cx.new(|cx| IntelligenceView::new(state.clone(), cx)),
             spend: cx.new(|cx| SpendView::new(state.clone(), cx)),
+            spend_agent: cx.new(|cx| SpendAgentView::new(state.clone(), cx)),
             stats: cx.new(|cx| StatsView::new(state.clone(), cx)),
             images: cx.new(|cx| ImagesView::new(state.clone(), cx)),
             settings: cx.new(|cx| SettingsView::new(state.clone(), cx)),
@@ -168,6 +177,7 @@ impl AppView {
                 stats: view.stats.clone(),
                 intelligence: view.intelligence.clone(),
                 settings: view.settings.clone(),
+                runs: view.runs.clone(),
             };
             crate::shots::start_tour(dir, view.state.clone(), filters, views, window, cx);
         }
@@ -257,6 +267,7 @@ impl Render for AppView {
             &self.roles,
             &self.intelligence,
             &self.spend,
+            &self.spend_agent,
             &self.stats,
             &self.images,
             &self.run_page,
@@ -327,6 +338,7 @@ impl Render for AppView {
                     Route::Runs => this.runs.read(cx).filters().clone(),
                     Route::Intelligence => this.intelligence.read(cx).filters().clone(),
                     Route::Spend => this.spend.read(cx).filters().clone(),
+                    Route::SpendAgent(_) => this.spend_agent.read(cx).filters().clone(),
                     Route::Images => this.images.read(cx).filters().clone(),
                     _ => return,
                 };
@@ -342,6 +354,14 @@ impl Render for AppView {
             .on_action(cx.listener(|this, _: &GoBack, _window, cx| {
                 this.state.update(cx, |state, cx| {
                     if state.go_back() {
+                        state.request_refresh(cx);
+                    }
+                    cx.notify();
+                });
+            }))
+            .on_action(cx.listener(|this, _: &GoForward, _window, cx| {
+                this.state.update(cx, |state, cx| {
+                    if state.go_forward() {
                         state.request_refresh(cx);
                     }
                     cx.notify();
@@ -448,11 +468,13 @@ impl Render for AppView {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn page_for_route(
     route: &Route,
     roles: &gpui::Entity<RolesView>,
     intelligence: &gpui::Entity<IntelligenceView>,
     spend: &gpui::Entity<SpendView>,
+    spend_agent: &gpui::Entity<SpendAgentView>,
     stats: &gpui::Entity<StatsView>,
     images: &gpui::Entity<ImagesView>,
     run_page: &gpui::Entity<RunPageView>,
@@ -462,6 +484,7 @@ fn page_for_route(
         Route::Roles | Route::RoleBoard(_) => roles.clone().into(),
         Route::Intelligence => intelligence.clone().into(),
         Route::Spend => spend.clone().into(),
+        Route::SpendAgent(_) => spend_agent.clone().into(),
         Route::Stats => stats.clone().into(),
         Route::Images | Route::Image(_) => images.clone().into(),
         // Never the backdrop: Settings draws in its dialog.

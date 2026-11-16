@@ -5,12 +5,14 @@
 //! into a label, a toast, or the view's own fields.
 
 use std::collections::BTreeMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    App, AppContext as _, Context, Entity, IntoElement, MouseButton, Render, SharedString,
-    WeakEntity, Window, div, prelude::*, px,
+    App, AppContext as _, Context, Entity, IntoElement, ListAlignment, ListOffset, ListState,
+    MouseButton, Render, SharedString, WeakEntity, Window, div, prelude::*, px,
 };
 
 use crate::avatar::agent_avatar;
@@ -32,12 +34,17 @@ use crate::models::settings::{
 use crate::motion::{Animator, Spring, SpringTier, SpringValue};
 use crate::state::{AppState, Route, SettingsPage, ToastTone};
 use crate::theme::{StatusTone, Theme};
-use crate::ui::parts::settings::{agent_section, radio_mark, settings_row, settings_section, wash};
+use crate::ui::parts::settings::{
+    agent_card_bottom, agent_card_folded, agent_card_note, agent_card_row, agent_card_top,
+    radio_mark, settings_row, settings_section, wash,
+};
 use crate::ui::patterns::{
-    AnchorSlot, SETTINGS_SECTION_GAP, SettingsNavItem, settings_dialog, window_anchor,
+    AnchorSlot, SETTINGS_SECTION_GAP, SettingsNavItem, settings_content_height, settings_dialog,
+    window_anchor,
 };
 use crate::ui::{
-    ButtonKind, Icon, Menu, MenuItem, Popover, Switch, TextInput, TileTone, button, chip, icon,
+    ButtonKind, Icon, Menu, MenuItem, Popover, STACK_OVERDRAW, Switch, TextInput, TileTone, button,
+    chip, icon, sync_virtual_list, virtual_stack,
 };
 use crate::ui::{SkeletonLayout, page_skeleton};
 use crate::voice;
@@ -60,6 +67,43 @@ const RAIL: [(SettingsPage, &str, Icon); 7] = [
     (SettingsPage::Voice, "Voice", Icon::Globe),
 ];
 
+/// One row of Settings › Models' virtual list: the section itself, then each agent's card,
+/// drawn as segments so that only the rows in view are built.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModelItem {
+    /// The Models section: the search and its note, or the bones while the core answers.
+    Section,
+    /// An agent folded to its header alone.
+    Folded(usize),
+    /// The first segment of an open agent's card: its header and the hairline.
+    Top(usize),
+    /// One model row of an open agent's card.
+    Model(usize, usize),
+    /// An open agent that lists no models.
+    Empty(usize),
+    /// The last segment of an open agent's card: its bottom padding.
+    Bottom(usize),
+}
+
+/// What the Models list's rows depend on: the section's readiness, each card's agent and
+/// fold, and the models under it. A model's `enabled` is not here: its switch carries that.
+fn model_structure(groups: &[AgentModelGroup], collapsed: &[(String, bool)], ready: bool) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    ready.hash(&mut hasher);
+    for (index, group) in groups.iter().enumerate() {
+        group.agent.hash(&mut hasher);
+        collapsed
+            .get(index)
+            .map(|(_, folded)| *folded)
+            .hash(&mut hasher);
+        group.models.len().hash(&mut hasher);
+        for model in &group.models {
+            model.id.hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
 pub struct SettingsView {
     state: Entity<AppState>,
     started: bool,
@@ -67,6 +111,21 @@ pub struct SettingsView {
     policy: Option<Policy>,
     policy_ticket: u64,
     model_settings: Option<Vec<DispatchAgentModels>>,
+    /// Settings › Models cards, rebuilt when the agents, their settings, or the search move.
+    model_groups: Rc<Vec<AgentModelGroup>>,
+    model_groups_agents: Vec<DispatchAgent>,
+    model_groups_settings: Option<Vec<DispatchAgentModels>>,
+    model_groups_query: String,
+    model_groups_ready: bool,
+    /// The Models page's rows as the virtual list draws them, and the structure they were
+    /// built from: a switch that only changes an `enabled` leaves the rows as they are.
+    model_items: Rc<Vec<ModelItem>>,
+    model_items_groups: Rc<Vec<AgentModelGroup>>,
+    model_items_collapsed: Vec<(String, bool)>,
+    model_items_ready: bool,
+    model_items_key: Option<u64>,
+    /// The Models list: only the rows in view, plus its overdraw, are built.
+    models_list: ListState,
     models_ticket: u64,
     models_search: Entity<TextInput>,
     models_inflight: bool,
@@ -187,6 +246,17 @@ impl SettingsView {
             policy: None,
             policy_ticket: 0,
             model_settings: None,
+            model_groups: Rc::default(),
+            model_groups_agents: Vec::new(),
+            model_groups_settings: None,
+            model_groups_query: String::new(),
+            model_groups_ready: false,
+            model_items: Rc::default(),
+            model_items_groups: Rc::default(),
+            model_items_collapsed: Vec::new(),
+            model_items_ready: false,
+            model_items_key: None,
+            models_list: ListState::new(0, ListAlignment::Top, px(STACK_OVERDRAW)),
             models_ticket: 0,
             models_search,
             models_inflight: false,
@@ -1297,101 +1367,183 @@ impl SettingsView {
         self.apply_model_batch(agent, true, changes, cx);
     }
 
-    /// One agent's models, flat, each with a switch of its own.
-    fn model_rows(&self, group: &AgentModelGroup, cx: &App) -> gpui::AnyElement {
-        let mut rows = div().flex().flex_col();
-        for model in &group.models {
-            if let Some(toggle) = self
-                .agent_model_switches
-                .get(&(group.agent.clone(), model.id.clone()))
-            {
-                let selector = format!("settings-model-{}-{}", group.agent, model.id);
-                rows = rows.child(settings_row(
-                    model.id.clone(),
-                    None,
-                    model_switch(selector, toggle.clone()),
-                    cx,
-                ));
+    /// Scrolls Settings › Models to the row a debug selector names, at the list's top: the
+    /// page builds only the rows in view, so a test asks for the row's item rather than
+    /// scrolling by bounds it does not have yet. Answers whether the page holds the row.
+    pub fn scroll_models_to(&self, id: &str, cx: &mut Context<Self>) -> bool {
+        let target = self.model_items.iter().position(|item| match *item {
+            ModelItem::Folded(group) | ModelItem::Top(group) => {
+                self.model_groups.get(group).is_some_and(|group| {
+                    id == format!("settings-agent-{}", group.agent)
+                        || id == format!("settings-agent-fold-{}", group.agent)
+                })
             }
-        }
-        rows.into_any_element()
+            ModelItem::Model(group, model) => self.model_groups.get(group).is_some_and(|group| {
+                group.models.get(model).is_some_and(|model| {
+                    id == format!("settings-model-{}-{}", group.agent, model.id)
+                })
+            }),
+            ModelItem::Section | ModelItem::Empty(_) | ModelItem::Bottom(_) => false,
+        });
+        let Some(target) = target else {
+            return false;
+        };
+        self.models_list.scroll_to(ListOffset {
+            item_ix: target,
+            offset_in_item: px(0.0),
+        });
+        cx.notify();
+        true
     }
 
-    fn models_page(&self, theme: Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let groups = agent_model_groups(
-            &self.agent_rows,
-            self.model_settings.as_deref().unwrap_or_default(),
-            self.models_search.read(cx).text(),
-        );
-        let mut body = div()
-            .flex()
-            .flex_col()
-            .gap(px(theme.space_3))
-            .child(self.models_search.clone());
-        if self.model_settings.is_none() {
-            body = body.child(settings_skeleton(4));
-        } else {
-            body = body.child(note("Switches apply to that agent only.", theme));
-        }
-        let mut column = div()
+    /// The Models page as a virtual stack: the section, then each agent's card drawn as a
+    /// header segment, one segment per model row, and a bottom segment, so only the rows in
+    /// view are built. The segments together keep the single card's look.
+    fn models_page(
+        &mut self,
+        theme: Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        self.ensure_model_items();
+        let groups = self.model_groups.clone();
+        let items = self.model_items.clone();
+        let switches = self.agent_model_switches.clone();
+        let agent_switches = self.agent_switches.clone();
+        let search = self.models_search.clone();
+        let ready = self.model_settings.is_some();
+        let view = cx.entity().downgrade();
+        div()
             .w_full()
-            .flex()
-            .flex_col()
-            .gap(px(SETTINGS_SECTION_GAP))
-            .child(settings_section(
-                Icon::Cpu,
-                TileTone::Architecture,
-                "Models",
-                "Choose the agents and models Dispatch shows and runs.",
-                None,
-                body,
+            .h(px(settings_content_height(window)))
+            .child(virtual_stack(
+                "settings-models-scroll",
+                &self.models_list,
+                0.0,
+                0.0,
+                move |index, _, cx| {
+                    let Some(item) = items.get(index).copied() else {
+                        return div().into_any_element();
+                    };
+                    if item == ModelItem::Section {
+                        let mut body = div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(theme.space_3))
+                            .child(search.clone());
+                        body = if ready {
+                            body.child(note("Switches apply to that agent only.", theme))
+                        } else {
+                            body.child(settings_skeleton(4))
+                        };
+                        let mut section = div()
+                            .w_full()
+                            .flex()
+                            .flex_col()
+                            .gap(px(SETTINGS_SECTION_GAP))
+                            .child(settings_section(
+                                Icon::Cpu,
+                                TileTone::Architecture,
+                                "Models",
+                                "Choose the agents and models Dispatch shows and runs.",
+                                None,
+                                body,
+                                cx,
+                            ));
+                        if ready && groups.is_empty() {
+                            section = section.child(note("No agents to show.", theme));
+                        }
+                        return div()
+                            .w_full()
+                            .pb(px(SETTINGS_SECTION_GAP))
+                            .child(section)
+                            .into_any_element();
+                    }
+                    let group_index = match item {
+                        ModelItem::Folded(index)
+                        | ModelItem::Top(index)
+                        | ModelItem::Model(index, _)
+                        | ModelItem::Empty(index)
+                        | ModelItem::Bottom(index) => index,
+                        ModelItem::Section => return div().into_any_element(),
+                    };
+                    let Some(group) = groups.get(group_index) else {
+                        return div().into_any_element();
+                    };
+                    let fold = || {
+                        let fold_agent = group.agent.clone();
+                        click(view.clone(), move |this, cx| {
+                            let collapsed = this
+                                .collapsed_agents
+                                .entry(fold_agent.clone())
+                                .or_insert(false);
+                            *collapsed = !*collapsed;
+                            cx.notify();
+                        })
+                    };
+                    let switch = || {
+                        agent_switches
+                            .get(&group.agent)
+                            .cloned()
+                            .map(|toggle| {
+                                let selector = format!("settings-agent-{}", group.agent);
+                                div()
+                                    .debug_selector(move || selector)
+                                    .child(toggle)
+                                    .into_any_element()
+                            })
+                            .unwrap_or_else(|| div().into_any_element())
+                    };
+                    match item {
+                        ModelItem::Folded(_) => div()
+                            .w_full()
+                            .pb(px(SETTINGS_SECTION_GAP))
+                            .child(agent_card_folded(
+                                &group.agent,
+                                group.name.clone(),
+                                switch(),
+                                fold(),
+                                cx,
+                            ))
+                            .into_any_element(),
+                        ModelItem::Top(_) => {
+                            agent_card_top(&group.agent, group.name.clone(), switch(), fold(), cx)
+                        }
+                        ModelItem::Model(_, model_index) => {
+                            let Some(model) = group.models.get(model_index) else {
+                                return div().into_any_element();
+                            };
+                            let Some(toggle) =
+                                switches.get(&(group.agent.clone(), model.id.clone()))
+                            else {
+                                return div().into_any_element();
+                            };
+                            let selector = format!("settings-model-{}-{}", group.agent, model.id);
+                            agent_card_row(
+                                settings_row(
+                                    model.id.clone(),
+                                    None,
+                                    model_switch(selector, toggle.clone()),
+                                    cx,
+                                ),
+                                cx,
+                            )
+                        }
+                        ModelItem::Empty(_) => {
+                            agent_card_note(note("No models listed by this agent.", theme), cx)
+                        }
+                        ModelItem::Bottom(_) => div()
+                            .w_full()
+                            .pb(px(SETTINGS_SECTION_GAP))
+                            .child(agent_card_bottom(cx))
+                            .into_any_element(),
+                        ModelItem::Section => div().into_any_element(),
+                    }
+                },
+                window,
                 cx,
-            ));
-        if self.model_settings.is_some() && groups.is_empty() {
-            column = column.child(note("No agents to show.", theme));
-        }
-        for group in groups {
-            let mut models = div().flex().flex_col().gap(px(theme.space_2));
-            if group.models.is_empty() {
-                models = models.child(note("No models listed by this agent.", theme));
-            }
-            models = models.child(self.model_rows(&group, cx));
-            let switch = self
-                .agent_switches
-                .get(&group.agent)
-                .cloned()
-                .map(|toggle| {
-                    let selector = format!("settings-agent-{}", group.agent);
-                    div()
-                        .debug_selector(move || selector)
-                        .child(toggle)
-                        .into_any_element()
-                });
-            let fold_agent = group.agent.clone();
-            let on_fold = click(cx.entity().downgrade(), move |this, cx| {
-                let collapsed = this
-                    .collapsed_agents
-                    .entry(fold_agent.clone())
-                    .or_insert(false);
-                *collapsed = !*collapsed;
-                cx.notify();
-            });
-            let collapsed = self
-                .collapsed_agents
-                .get(&group.agent)
-                .copied()
-                .unwrap_or(false);
-            column = column.child(agent_section(
-                &group.agent,
-                group.name,
-                switch.unwrap_or_else(|| div().into_any_element()),
-                collapsed,
-                on_fold,
-                models,
-                cx,
-            ));
-        }
-        column.into_any_element()
+            ))
+            .into_any_element()
     }
 
     fn load_policy(&mut self, cx: &mut Context<Self>) {
@@ -1961,10 +2113,21 @@ impl SettingsView {
             }
             self.enter.set_target(1.0);
             self.shown = Some(page.clone());
+            // The Models page scrolls itself, so it opens at its top as the panel does.
+            if page == SettingsPage::Models {
+                self.models_list.scroll_to(ListOffset {
+                    item_ix: 0,
+                    offset_in_item: px(0.0),
+                });
+            }
         }
         let open = matches!(self.state.read(cx).route(), Route::Settings(_));
         self.open.set_target(if open { 1.0 } else { 0.0 });
-        let editor_open = matches!(page, SettingsPage::Classifier) && self.classifier_on();
+        let editor_open = matches!(page, SettingsPage::Classifier)
+            && self
+                .policy
+                .as_ref()
+                .is_some_and(|policy| keyed_classifier(&policy.classifier).is_some());
         if editor_open && let Some(policy) = &self.policy {
             self.editor_slot = Some(picked_index(&policy.classifier));
         }
@@ -1999,14 +2162,15 @@ impl SettingsView {
     }
 
     fn page_body(
-        &self,
+        &mut self,
         page: &SettingsPage,
         theme: Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         match page {
             SettingsPage::Agents => self.agents_page(theme, cx),
-            SettingsPage::Models => self.models_page(theme, cx),
+            SettingsPage::Models => self.models_page(theme, window, cx),
             SettingsPage::Classifier => self.classifier_page(theme, cx),
             SettingsPage::PickRole => self.roles_page(theme, cx),
             SettingsPage::RoutingPolicy => self.policy_page(theme, cx),
@@ -2616,8 +2780,8 @@ impl SettingsView {
     }
 
     fn classifier_page(&self, theme: Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let body = if self.policy.is_none() {
-            settings_skeleton(4)
+        let (classifier_body, cli_body) = if self.policy.is_none() {
+            (settings_skeleton(4), settings_skeleton(1))
         } else {
             let picked = self
                 .policy
@@ -2745,24 +2909,37 @@ impl SettingsView {
             if self.classify_report.is_some() {
                 column = column.child(self.classify_result(theme, cx));
             }
-            column.into_any_element()
+            (column.into_any_element(), self.cli_editor(cx))
         };
-        settings_section(
-            Icon::AiBrain01Icon,
-            TileTone::Knowledge,
-            "Difficulty classifier",
-            "What judges how hard a task is before it is routed. Auto exists only with one; without it, every run takes a tier. A key is saved in Dispatch's data folder, readable only by your user, and never shown again.",
-            None,
-            body,
-            cx,
-        )
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(SETTINGS_SECTION_GAP))
+            .child(settings_section(
+                Icon::AiBrain01Icon,
+                TileTone::Knowledge,
+                "Difficulty classifier",
+                "What judges how hard a task is before it is routed. Auto exists only with one; without it, every run takes a tier. A key is saved in Dispatch's data folder, readable only by your user, and never shown again.",
+                None,
+                classifier_body,
+                cx,
+            ))
+            .child(settings_section(
+                Icon::SquareTerminal,
+                TileTone::Execution,
+                "Agent CLI model",
+                "The model the CLI classifier asks. When none is picked, it falls back to the easy tier's agent.",
+                None,
+                cli_body,
+                cx,
+            ))
+            .into_any_element()
     }
 
     fn classifier_editor(&self, value: &str, cx: &mut Context<Self>) -> gpui::AnyElement {
         if keyed_classifier(value).is_some() {
             self.key_editor(value, cx)
-        } else if value == "cli" {
-            self.cli_editor(cx)
         } else {
             div().into_any_element()
         }
@@ -3088,9 +3265,94 @@ impl SettingsView {
     }
 }
 
+impl SettingsView {
+    /// The model cards. Compared, not cloned, until the agents, the saved settings, or the
+    /// search actually change.
+    fn ensure_model_groups(&mut self, cx: &App) {
+        let query = self.models_search.read(cx).text();
+        let ready = self.model_settings.is_some();
+        if self.model_groups_ready == ready
+            && self.model_groups_query == query
+            && self.model_groups_agents == self.agent_rows
+            && self.model_groups_settings == self.model_settings
+        {
+            return;
+        }
+        let groups = agent_model_groups(
+            &self.agent_rows,
+            self.model_settings.as_deref().unwrap_or_default(),
+            query,
+        );
+        self.model_groups = Rc::new(groups);
+        self.model_groups_agents = self.agent_rows.clone();
+        self.model_groups_settings = self.model_settings.clone();
+        self.model_groups_query = query.to_string();
+        self.model_groups_ready = ready;
+    }
+
+    /// The Models list's rows, flattened only when the cards' structure, the folds, or the
+    /// section's readiness change: a new structure remeasures the list, while a model turned
+    /// on and off only moves its switch.
+    fn ensure_model_items(&mut self) {
+        let collapsed: Vec<(String, bool)> = self
+            .model_groups
+            .iter()
+            .map(|group| {
+                (
+                    group.agent.clone(),
+                    self.collapsed_agents
+                        .get(&group.agent)
+                        .copied()
+                        .unwrap_or(false),
+                )
+            })
+            .collect();
+        let ready = self.model_settings.is_some();
+        if Rc::ptr_eq(&self.model_items_groups, &self.model_groups)
+            && self.model_items_collapsed == collapsed
+            && self.model_items_ready == ready
+        {
+            return;
+        }
+        let key = model_structure(&self.model_groups, &collapsed, ready);
+        self.model_items_groups = self.model_groups.clone();
+        self.model_items_collapsed = collapsed.clone();
+        self.model_items_ready = ready;
+        if self.model_items_key == Some(key) {
+            return;
+        }
+        self.model_items_key = Some(key);
+        let mut items = Vec::with_capacity(
+            self.model_groups
+                .iter()
+                .map(|group| group.models.len() + 3)
+                .sum::<usize>()
+                + 1,
+        );
+        items.push(ModelItem::Section);
+        for (index, group) in self.model_groups.iter().enumerate() {
+            if collapsed[index].1 {
+                items.push(ModelItem::Folded(index));
+                continue;
+            }
+            items.push(ModelItem::Top(index));
+            if group.models.is_empty() {
+                items.push(ModelItem::Empty(index));
+            }
+            for model in 0..group.models.len() {
+                items.push(ModelItem::Model(index, model));
+            }
+            items.push(ModelItem::Bottom(index));
+        }
+        self.model_items = Rc::new(items);
+        sync_virtual_list(&self.models_list, self.model_items.len(), true);
+    }
+}
+
 impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_motion(window, cx);
+        self.ensure_model_groups(cx);
         let theme = *Theme::global(cx);
         let page = self.page(cx);
         let entered = self.enter.value().clamp(0.0, 1.0);
@@ -3130,7 +3392,7 @@ impl Render for SettingsView {
                 div()
                     .opacity(entered)
                     .font_family(theme.font_sans)
-                    .child(self.page_body(&page, theme, cx)),
+                    .child(self.page_body(&page, theme, window, cx)),
             );
         for overlay in self.overlays(&page) {
             dialog = dialog.overlay(overlay);

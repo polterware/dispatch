@@ -11,14 +11,42 @@ use crate::client::{DispatchRun, Workspace};
 use super::filter::{FilterOption, FilterSpec, Filters};
 use super::run_page::{format_tokens, run_cost, stored_usage, token_breakdown, total_tokens};
 use super::sidebar::{
-    Direction, GroupBy, GroupKind, Show, SidebarDisplay, SidebarRun, SortBy, group_sidebar_runs,
-    parse_display_with,
+    Direction, GroupBy, GroupKind, SIDEBAR_PAGE_ROWS, Show, SidebarDisplay, SidebarRun, SortBy,
+    group_sidebar_runs, parse_display_with,
 };
 use super::sort::{SortDirection, SortValue, sort_rows};
 
 pub const EM_DASH: &str = "\u{2014}";
 pub const DISPLAY_PREFERENCE: &str = "pwdispatch.runs.display";
 pub const COLLAPSED_PREFERENCE: &str = "pwdispatch.runs.collapsed";
+/// How many rows each group shows, by group id, for the groups a Show more revealed.
+pub const REVEALED_PREFERENCE: &str = "pwdispatch.runs.revealed";
+
+/// A group's rows as the Runs page lists them, paged like the sidebar's groups: the first
+/// page, then a page more per Show more, and a Show less once past the first page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RunsPage {
+    /// The rows the group shows.
+    pub shown: usize,
+    /// The rows left out.
+    pub hidden: usize,
+    /// The limit a Show more asks for.
+    pub next_limit: usize,
+    /// Whether a Show less shows: more than the first page is on show.
+    pub can_show_less: bool,
+}
+
+/// Pages `total` rows at `limit` (the group's revealed limit, or [`SIDEBAR_PAGE_ROWS`]).
+pub fn page_run_rows(total: usize, limit: usize) -> RunsPage {
+    let limit = limit.max(1);
+    let shown = total.min(limit);
+    RunsPage {
+        shown,
+        hidden: total - shown,
+        next_limit: limit.saturating_add(SIDEBAR_PAGE_ROWS),
+        can_show_less: shown > SIDEBAR_PAGE_ROWS,
+    }
+}
 
 /// The Runs table's columns: Run, Repository, Status, Agent, Changes, and Started.
 pub const COLUMNS: [&str; 6] = ["Run", "Repository", "Status", "Agent", "Changes", "Started"];
@@ -511,6 +539,28 @@ fn parse_i32(bytes: &[u8]) -> Option<i32> {
 mod tests {
     use super::*;
     use crate::models::filter::FILTER_IS_NOT;
+
+    #[test]
+    fn pages_a_groups_runs_five_at_a_time_with_show_less_past_the_first_page() {
+        let page = page_run_rows(12, SIDEBAR_PAGE_ROWS);
+        assert_eq!((page.shown, page.hidden, page.next_limit), (5, 7, 10));
+        assert!(!page.can_show_less);
+
+        let page = page_run_rows(12, page.next_limit);
+        assert_eq!((page.shown, page.hidden, page.next_limit), (10, 2, 15));
+        assert!(page.can_show_less);
+
+        let page = page_run_rows(12, page.next_limit);
+        assert_eq!((page.shown, page.hidden), (12, 0));
+        assert!(page.can_show_less, "everything shows, so it can fold back");
+
+        // A group within the first page has neither control.
+        let page = page_run_rows(5, SIDEBAR_PAGE_ROWS);
+        assert_eq!((page.shown, page.hidden), (5, 0));
+        assert!(!page.can_show_less);
+        let page = page_run_rows(0, SIDEBAR_PAGE_ROWS);
+        assert_eq!((page.shown, page.hidden), (0, 0));
+    }
 
     fn run(id: &str, prompt: &str, status: &str, agent: &str, created: &str) -> DispatchRun {
         DispatchRun {

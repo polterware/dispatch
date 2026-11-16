@@ -7,6 +7,7 @@
 //! and the shared `FilterPopover` (Provider and the Spend window), whose pills sit in the
 //! `ActiveFilterBar`.
 
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
@@ -15,6 +16,7 @@ use gpui::{
 };
 
 use crate::client::{CoreClient, DispatchAgent, DispatchStatsRow, ListAgentsRequest, StatsRequest};
+use crate::models::filter::Filters;
 use crate::models::spend::{
     SpendRow, agent_rows, filter_specs, repository_value, row_matches, since_value, spend_totals,
     spent_rows,
@@ -24,8 +26,8 @@ use crate::state::{AppState, ConnectionState, Route};
 use crate::theme::Theme;
 use crate::ui::parts::spend as parts;
 use crate::ui::{
-    FilterField, FilterPopover, FiltersChanged, Icon, MascotMood, TextInput, card_grid, page_empty,
-    page_under, page_under_inset, scroll_area_under, toolbar,
+    FilterField, FilterPopover, FiltersChanged, Handler, Icon, MascotMood, TextInput, card_grid,
+    page_empty, page_under, page_under_inset, scroll_area_under, toolbar,
 };
 use crate::ui::{SkeletonLayout, page_skeleton};
 
@@ -56,6 +58,8 @@ pub struct SpendView {
     query: String,
     agents: Vec<DispatchAgent>,
     stats: Vec<DispatchStatsRow>,
+    /// The cards, kept while the agents, the stats, the search, and the filters stay put.
+    row_cache: Option<RowCache>,
     loaded: bool,
     on_page: bool,
     in_flight: bool,
@@ -98,6 +102,7 @@ impl SpendView {
             query: String::new(),
             agents: Vec::new(),
             stats: Vec::new(),
+            row_cache: None,
             loaded: false,
             on_page: false,
             in_flight: false,
@@ -268,20 +273,52 @@ impl SpendView {
     }
 
     /// The agents Dispatch ran in the window, and those the search and the filters keep.
-    fn rows(&self, cx: &App) -> (Vec<SpendRow>, Vec<SpendRow>) {
-        let all = spent_rows(&agent_rows(&self.agents, &self.stats));
-        let mut visible = all.clone();
+    fn ensure_rows(&mut self, cx: &App) {
         let filters = self.filters.read(cx).filters();
-        visible.retain(|row| row_matches(row, &self.query, filters));
-        (all, visible)
+        if let Some(cache) = &self.row_cache
+            && cache.query == self.query
+            && cache.filters == *filters
+            && cache.agents == self.agents
+            && cache.stats == self.stats
+        {
+            return;
+        }
+        let filters = filters.clone();
+        let all = spent_rows(&agent_rows(&self.agents, &self.stats));
+        let visible = all
+            .iter()
+            .filter(|row| row_matches(row, &self.query, &filters))
+            .cloned()
+            .collect::<Vec<_>>();
+        self.row_cache = Some(RowCache {
+            agents: self.agents.clone(),
+            stats: self.stats.clone(),
+            query: self.query.clone(),
+            filters,
+            all: Rc::new(all),
+            visible: Rc::new(visible),
+        });
     }
+}
+
+struct RowCache {
+    agents: Vec<DispatchAgent>,
+    stats: Vec<DispatchStatsRow>,
+    query: String,
+    filters: Filters,
+    all: Rc<Vec<SpendRow>>,
+    visible: Rc<Vec<SpendRow>>,
 }
 
 impl Render for SpendView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.tick_motion(window);
         let theme = *Theme::global(cx);
-        let (all, visible) = self.rows(cx);
+        self.ensure_rows(cx);
+        let (all, visible) = {
+            let cache = self.row_cache.as_ref().expect("spend rows");
+            (Rc::clone(&cache.all), Rc::clone(&cache.visible))
+        };
         self.sync_fields(&all, cx);
         let enter = self.enter.value().clamp(0.0, 1.0);
         let filter_bar = FilterPopover::bar(&self.filters, window, cx);
@@ -304,7 +341,17 @@ impl Render for SpendView {
         } else {
             let cards = visible
                 .iter()
-                .map(|row| parts::agent_card(row, cx))
+                .map(|row| {
+                    let state = self.state.clone();
+                    let agent = row.agent.clone();
+                    let open: Handler = Rc::new(move |_, cx| {
+                        state.update(cx, |state, cx| {
+                            state.navigate(Route::SpendAgent(agent.clone()));
+                            cx.notify();
+                        });
+                    });
+                    parts::agent_card(row, open, cx)
+                })
                 .collect();
             let body = div()
                 .w_full()

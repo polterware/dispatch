@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use crate::window_drag::WindowDragRegion;
 use gpui::{
-    Bounds, Context, Entity, Focusable, IntoElement, MouseButton, Pixels, Render, ScrollHandle,
-    SharedString, Window, canvas, deferred, div, prelude::*, px,
+    App, Bounds, Context, Entity, Focusable, IntoElement, ListAlignment, ListOffset, ListState,
+    MouseButton, Pixels, Render, SharedString, Window, canvas, deferred, div, prelude::*, px,
 };
 
 use super::TranscriptView;
@@ -34,12 +34,11 @@ use crate::state::{AppState, ConnectionState, Route, SettingsPage, observe};
 use crate::theme::Theme;
 use crate::ui::list_skeleton;
 use crate::ui::parts::sidebar::{preview_surface, run_dot, run_none};
-use crate::ui::patterns::{
-    FadeEdges, composer_card, composer_footer, fade_item, fade_scroll, modal_layer,
-};
+use crate::ui::patterns::{FadeEdges, composer_card, composer_footer, modal_layer};
 use crate::ui::{
-    Button, ButtonKind, ButtonSize, Icon, MascotMood, Menu, MenuEntry, MenuItem, SidebarItem,
-    SidebarSectionLabel, TextInput, ToastTone, button, ellipsis, icon_button, kbd, list_empty,
+    Button, ButtonKind, ButtonSize, Icon, MascotMood, Menu, MenuEntry, MenuItem, STACK_OVERDRAW,
+    SidebarItem, SidebarSectionLabel, TextInput, ToastTone, button, ellipsis, icon_button, kbd,
+    list_empty, sync_virtual_list, virtual_fade_list,
 };
 
 /// The Display menu's width (`min-w-48`, 12rem).
@@ -62,7 +61,7 @@ enum SectionJob {
 struct Snapshot {
     /// The core has not answered yet: the runs show as bones.
     connecting: bool,
-    groups: Vec<SidebarGroup>,
+    groups: Rc<Vec<SidebarGroup>>,
     route: Route,
     show_error: bool,
 }
@@ -111,8 +110,63 @@ pub struct SidebarView {
     rename_y: SpringValue,
     /// The conversation Usage dialog, once a conversation menu opened it.
     usage: Option<Entity<ConversationUsageView>>,
-    scroll: ScrollHandle,
+    list: ListState,
+    slots: Rc<Vec<SidebarSlot>>,
+    /// The groups, collapsed ids, revealed limits, and open run the slots were built from.
+    slot_groups: Rc<Vec<SidebarGroup>>,
+    slot_collapsed: Vec<String>,
+    slot_revealed: HashMap<String, usize>,
+    slot_selected: Option<String>,
+    slot_notice: bool,
+    /// The structure of `slots`, so an input that moved without changing it keeps the list.
+    slots_key: String,
     animator: Animator,
+    /// Grouped runs for the last revision, display, and minute. A hover frame reuses them.
+    groups: Rc<Vec<SidebarGroup>>,
+    groups_key: Option<(u64, SidebarDisplay, i64)>,
+}
+
+/// One item of the sidebar's stack: a page row, the Runs header, the list's notice, or one
+/// group's heading, a shown run, or its Show more. The stack is replaced only when `after` or
+/// `item` changes for an index; a row reads its run from the groups at render time.
+#[derive(Clone, Copy)]
+struct SidebarSlot {
+    item: StackRow,
+    /// The gap under it.
+    after: f32,
+}
+
+#[derive(Clone, Copy)]
+enum StackRow {
+    Nav(usize),
+    Header,
+    Notice,
+    Group { group: usize, collapsed: bool },
+    Run { group: usize, row: usize },
+    More { group: usize, next: usize },
+}
+
+impl SidebarSlot {
+    /// Names the item across a structure change, so the scroll stays on it.
+    fn key(&self, groups: &[SidebarGroup]) -> String {
+        match self.item {
+            StackRow::Nav(index) => format!("n:{index}"),
+            StackRow::Header => "h:runs".to_string(),
+            StackRow::Notice => "h:notice".to_string(),
+            StackRow::Group { group, .. } => match groups.get(group) {
+                Some(group) => format!("g:{}", group.id),
+                None => format!("g:{group}"),
+            },
+            StackRow::Run { group, row } => match groups.get(group).and_then(|g| g.runs.get(row)) {
+                Some(run) => format!("r:{}", run.id),
+                None => format!("r:{group}:{row}"),
+            },
+            StackRow::More { group, .. } => match groups.get(group) {
+                Some(group) => format!("m:{}", group.id),
+                None => format!("m:{group}"),
+            },
+        }
+    }
 }
 
 impl SidebarView {
@@ -225,26 +279,48 @@ impl SidebarView {
             rename_opacity: SpringValue::new(0.0, SpringTier::Fast),
             rename_y: SpringValue::new(8.0, SpringTier::Fast),
             usage: None,
-            scroll: ScrollHandle::new(),
+            list: ListState::new(0, ListAlignment::Top, px(STACK_OVERDRAW)),
+            slots: Rc::new(Vec::new()),
+            slot_groups: Rc::new(Vec::new()),
+            slot_collapsed: Vec::new(),
+            slot_revealed: HashMap::new(),
+            slot_selected: None,
+            slot_notice: false,
+            slots_key: String::new(),
             animator: Animator::new(),
+            groups: Rc::new(Vec::new()),
+            groups_key: None,
         }
     }
 
-    fn read_snapshot(&self, cx: &gpui::App) -> Snapshot {
-        let app = self.state.read(cx);
-        let runs = sidebar_runs(app.workspaces(), app.runs());
-        let mut groups = group_sidebar_runs(&runs, app.sections(), &self.display, now_unix_ms());
-        // A conversation someone named shows that name over its first message.
-        for group in &mut groups {
-            if let Some(name) = conversation_ref(&group.id).and_then(|id| app.conversation_name(id))
-            {
-                group.title = name.to_string();
-            }
+    fn read_snapshot(&mut self, cx: &gpui::App) -> Snapshot {
+        let now = now_unix_ms();
+        let minute = now / 60_000;
+        let revision = self.state.read(cx).runs_revision();
+        let key = (revision, self.display, minute);
+        if self.groups_key != Some(key) {
+            let grouped = {
+                let app = self.state.read(cx);
+                let runs = sidebar_runs(app.workspaces(), app.runs());
+                let mut groups = group_sidebar_runs(&runs, app.sections(), &self.display, now);
+                // A conversation someone named shows that name over its first message.
+                for group in &mut groups {
+                    if let Some(name) =
+                        conversation_ref(&group.id).and_then(|id| app.conversation_name(id))
+                    {
+                        group.title = name.to_string();
+                    }
+                }
+                groups
+            };
+            self.groups = Rc::new(grouped);
+            self.groups_key = Some(key);
         }
+        let app = self.state.read(cx);
         let show_error = matches!(app.connection(), ConnectionState::Offline { .. })
             || app.last_error().is_some();
         Snapshot {
-            groups,
+            groups: Rc::clone(&self.groups),
             route: app.route().clone(),
             show_error,
             connecting: matches!(app.connection(), ConnectionState::Connecting),
@@ -296,10 +372,6 @@ impl SidebarView {
             || !self.rename_y.settled()
     }
 
-    fn is_collapsed(&self, id: &str) -> bool {
-        self.collapsed.iter().any(|item| item == id)
-    }
-
     fn selected_id(&self, route: &Route) -> Option<String> {
         match route {
             Route::Run(id) => Some(id.clone()),
@@ -345,15 +417,6 @@ impl SidebarView {
             .state
             .read(cx)
             .write_preference(COLLAPSED_PREFERENCE, &self.collapsed);
-    }
-
-    /// The rows a group shows: its first page, or as many as its Show more revealed.
-    fn revealed_limit(&self, id: &str) -> usize {
-        self.revealed
-            .get(id)
-            .copied()
-            .unwrap_or(SIDEBAR_PAGE_ROWS)
-            .max(1)
     }
 
     fn persist_revealed(&self, cx: &gpui::App) {
@@ -405,7 +468,7 @@ impl SidebarView {
     }
 
     /// The Display menu, as the Solid app's `DropdownMenu`: Group by, Sort by, and Show as
-    /// submenus of radio items, then Reset to defaults and View all. It hangs
+    /// submenus of radio items, then Reset to defaults (View all is the Runs title). It hangs
     /// under its button with their right edges lined up.
     pub(crate) fn toggle_display(&mut self, cx: &mut Context<Self>) {
         if self.display_open && self.context_menu.read(cx).is_open() {
@@ -489,7 +552,6 @@ impl SidebarView {
             Self::pick_direction,
         ));
         let reset = view.clone();
-        let all = view.clone();
         vec![
             MenuItem::submenu(
                 "Group by",
@@ -523,13 +585,6 @@ impl SidebarView {
                 Some(Icon::RefreshCw),
                 Rc::new(move |_, cx| {
                     let _ = reset.update(cx, |this, cx| this.reset_display(cx));
-                }),
-            ),
-            MenuItem::action(
-                "View all",
-                Some(Icon::ListOrdered),
-                Rc::new(move |_, cx| {
-                    let _ = all.update(cx, |this, cx| this.view_all(cx));
                 }),
             ),
         ]
@@ -829,6 +884,23 @@ impl SidebarView {
             }),
         });
         items
+    }
+
+    /// A custom section's "…": its Rename and Delete entries, at `x`, `y`.
+    fn open_section_menu(
+        &mut self,
+        id: String,
+        name: String,
+        x: f32,
+        y: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(raw) = section_ref(&id) else {
+            return;
+        };
+        let items = self.section_entries(raw.to_string(), name, cx);
+        self.place_menu(x, y, items, window, cx);
     }
 
     fn section_entries(&self, id: String, title: String, cx: &mut Context<Self>) -> Vec<MenuEntry> {
@@ -1229,156 +1301,276 @@ impl SidebarView {
         .detach();
     }
 
-    /// The pages: `<nav class="pw-sidebar-group">`, New (+), Commander (their ⌘N and ⌘K show
-    /// under the pointer), and then each
-    /// page, 2px apart.
-    fn nav_block(
-        &self,
+    /// The pages as rows of the stack: `<nav class="pw-sidebar-group">`, New (+), Commander
+    /// (their ⌘N and ⌘K show under the pointer), and then each page, 2px apart.
+    fn nav_item(
+        index: usize,
+        view: &Entity<SidebarView>,
         theme: Theme,
         route: &Route,
-        window: &mut Window,
-        cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let view = cx.entity();
-        let mut column = div()
-            .flex_none()
-            .flex()
-            .flex_col()
-            .gap(px(theme.sidebar_row_gap))
-            .child({
+        match index {
+            0 => {
                 let view = view.clone();
-                let item = SidebarItem::new("sidebar-nav-New", "New")
+                SidebarItem::new("sidebar-nav-New", "New")
                     .icon(Icon::Plus)
                     .trailing(kbd("⌘N", &theme))
                     .trailing_on_hover()
                     .active(matches!(route, Route::NewRun))
                     .on_click(move |_, cx| {
                         let _ = view.update(cx, |this, cx| this.go(Route::NewRun, false, cx));
-                    });
-                fade_item(
-                    "sidebar-nav-New",
-                    &self.scroll,
-                    fade_edges(theme),
-                    item,
-                    window,
-                    cx,
-                )
-            })
-            .child({
+                    })
+                    .into_any_element()
+            }
+            1 => {
                 let view = view.clone();
-                let item = SidebarItem::new("sidebar-nav-Commander", "Commander")
+                SidebarItem::new("sidebar-nav-Commander", "Commander")
                     .icon(Icon::Search)
                     .trailing(kbd("⌘K", &theme))
                     .trailing_on_hover()
                     .on_click(move |_, cx| {
                         let _ = view.update(cx, |this, cx| this.open_commander(cx));
+                    })
+                    .into_any_element()
+            }
+            index => {
+                let Some((label, icon, target)) = NAV.get(index - 2) else {
+                    return div().into_any_element();
+                };
+                let view = view.clone();
+                let target = target.clone();
+                let selector = format!("sidebar-nav-{label}");
+                let item = SidebarItem::new(SharedString::from(selector.clone()), *label)
+                    .icon(*icon)
+                    .active(page_selected(route, label))
+                    .on_click(move |_, cx| {
+                        let _ = view.update(cx, |this, cx| this.go(target.clone(), false, cx));
                     });
-                fade_item(
-                    "sidebar-nav-Commander",
-                    &self.scroll,
-                    fade_edges(theme),
-                    item,
-                    window,
-                    cx,
-                )
-            });
-        for (label, icon_name, target) in NAV.iter() {
-            let view = view.clone();
-            let target = target.clone();
-            let selector = format!("sidebar-nav-{label}");
-            let id = SharedString::from(selector.clone());
-            let item = SidebarItem::new(id.clone(), *label)
-                .icon(*icon_name)
-                .active(page_selected(route, label))
-                .on_click(move |_, cx| {
-                    let _ = view.update(cx, |this, cx| this.go(target.clone(), false, cx));
-                });
-            column = column.child(
                 div()
                     .w_full()
                     .debug_selector(move || selector.clone())
-                    .child(fade_item(
-                        id,
-                        &self.scroll,
-                        fade_edges(theme),
-                        item,
-                        window,
-                        cx,
-                    )),
-            );
+                    .child(item)
+                    .into_any_element()
+            }
         }
-        column.into_any_element()
     }
 
-    /// `.dispatch-sidebar-runs`: 8px below the pages, the header and then the groups 8px
-    /// apart, scrolling between the pages and the footer.
-    fn runs_block(
+    /// The list's notice, when it has one: the runs in bones while the core starts, or the
+    /// mascot asleep or sad.
+    fn notice_item(
+        notice: RunsNotice,
+        theme: Theme,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<gpui::AnyElement> {
+        match notice {
+            RunsNotice::None => None,
+            // The core is starting: the runs, in bones, until it answers.
+            RunsNotice::Loading => Some(
+                div()
+                    .px(px(theme.space_2))
+                    .child(list_skeleton(6, 32.0, window, cx))
+                    .into_any_element(),
+            ),
+            RunsNotice::Empty => {
+                Some(list_empty("No runs to show.", MascotMood::Sleeping, cx).into_any_element())
+            }
+            RunsNotice::Unreachable => {
+                Some(list_empty(REFRESH_FAILED, MascotMood::Sad, cx).into_any_element())
+            }
+            RunsNotice::Stale => Some(run_none(REFRESH_FAILED, &theme).into_any_element()),
+        }
+    }
+
+    /// The pages and the runs as one virtual stack between the titlebar and the footer: only
+    /// the items in view are built, and each fades itself as it nears an end of the scroll.
+    fn stack(
         &self,
         theme: Theme,
         snapshot: &Snapshot,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        let view = cx.entity();
+        let state = self.state.clone();
+        let slots = self.slots.clone();
+        let groups = snapshot.groups.clone();
+        let route = snapshot.route.clone();
         let selected = self.selected_id(&snapshot.route);
-        let mut column = div()
-            .mt(px(theme.space_2))
-            .flex()
-            .flex_col()
-            .gap(px(theme.space_2))
-            .child({
-                let header = self.runs_header(theme, cx);
-                fade_item(
-                    "sidebar-runs-header",
-                    &self.scroll,
-                    fade_edges(theme),
-                    header,
-                    window,
-                    cx,
-                )
-            });
+        let row_bounds = self.row_bounds.clone();
+        let notice = runs_notice(!groups.is_empty(), snapshot.connecting, snapshot.show_error);
+        // The shown rows whose page has not shown them since their last update.
+        let unseen: Rc<std::collections::HashSet<String>> = Rc::new(match &self.seen {
+            Some(seen) => slots
+                .iter()
+                .filter_map(|slot| match slot.item {
+                    StackRow::Run { group, row } => groups
+                        .get(group)
+                        .and_then(|group| group.runs.get(row))
+                        .filter(|run| has_unseen_update(run, seen))
+                        .map(|run| run.id.clone()),
+                    _ => None,
+                })
+                .collect(),
+            None => std::collections::HashSet::new(),
+        });
+        let edges = fade_edges(theme);
+        virtual_fade_list(
+            "sidebar-scroll",
+            &self.list,
+            theme.titlebar_height + theme.space_3,
+            footer_height(theme) + theme.space_2,
+            edges,
+            move |index, window, cx| {
+                let Some(slot) = slots.get(index) else {
+                    return div().into_any_element();
+                };
+                let body = match slot.item {
+                    StackRow::Nav(index) => SidebarView::nav_item(index, &view, theme, &route),
+                    StackRow::Header => SidebarView::runs_header(&view, state.clone(), theme, cx),
+                    StackRow::Notice => {
+                        let Some(item) = SidebarView::notice_item(notice, theme, window, cx) else {
+                            return div().into_any_element();
+                        };
+                        item
+                    }
+                    StackRow::Group { group, collapsed } => {
+                        let Some(group) = groups.get(group) else {
+                            return div().into_any_element();
+                        };
+                        SidebarView::group_heading(group, collapsed, &view, theme)
+                    }
+                    StackRow::Run { group, row } => {
+                        let Some(run) = groups.get(group).and_then(|group| group.runs.get(row))
+                        else {
+                            return div().into_any_element();
+                        };
+                        SidebarView::run_row(
+                            run,
+                            selected.as_deref() == Some(run.id.as_str()),
+                            unseen.contains(&run.id),
+                            &view,
+                            row_bounds.clone(),
+                            theme,
+                        )
+                    }
+                    StackRow::More { group, next } => {
+                        let Some(group) = groups.get(group) else {
+                            return div().into_any_element();
+                        };
+                        SidebarView::show_more_row(group, next, &view)
+                    }
+                };
+                div()
+                    .w_full()
+                    .when(slot.after > 0.0, |item| item.mb(px(slot.after)))
+                    .child(body)
+                    .into_any_element()
+            },
+            window,
+            cx,
+        )
+    }
+
+    /// The items of the stack: the pages, the Runs header, the list's notice, and each
+    /// group's heading, shown rows, and Show more. Replaced only when one of them moves, so a
+    /// hover or a bot's frame reuses the stack.
+    fn sync_slots(&mut self, snapshot: &Snapshot, cx: &mut Context<Self>) {
+        let theme = *Theme::global(cx);
+        let selected = self.selected_id(&snapshot.route);
         let notice = runs_notice(
             !snapshot.groups.is_empty(),
             snapshot.connecting,
             snapshot.show_error,
         );
-        column = match notice {
-            RunsNotice::None => column,
-            // The core is starting: the runs, in bones, until it answers.
-            RunsNotice::Loading => column.child(
-                div()
-                    .px(px(theme.space_2))
-                    .child(list_skeleton(6, 32.0, window, cx)),
-            ),
-            RunsNotice::Empty => {
-                column.child(list_empty("No runs to show.", MascotMood::Sleeping, cx))
-            }
-            RunsNotice::Unreachable => {
-                column.child(list_empty(REFRESH_FAILED, MascotMood::Sad, cx))
-            }
-            RunsNotice::Stale => column.child(run_none(REFRESH_FAILED, &theme)),
-        };
-        for group in &snapshot.groups {
-            column = column.child(self.group_block(group, selected.as_deref(), theme, window, cx));
+        let notice_shown = notice != RunsNotice::None;
+        let changed = !Rc::ptr_eq(&self.slot_groups, &snapshot.groups)
+            || self.slot_collapsed != self.collapsed
+            || self.slot_revealed != self.revealed
+            || self.slot_selected != selected
+            || self.slot_notice != notice_shown;
+        if !changed {
+            return;
         }
-        column.into_any_element()
+        let (slots, key) = sidebar_slots(
+            &snapshot.groups,
+            &self.collapsed,
+            &self.revealed,
+            selected.as_deref(),
+            notice_shown,
+            theme,
+        );
+        let anchor = (key != self.slots_key).then(|| self.scroll_anchor());
+        self.slot_groups = snapshot.groups.clone();
+        self.slot_collapsed = self.collapsed.clone();
+        self.slot_revealed = self.revealed.clone();
+        self.slot_selected = selected;
+        self.slot_notice = notice_shown;
+        let Some(anchor) = anchor else {
+            return;
+        };
+        self.slots = slots;
+        self.slots_key = key;
+        sync_virtual_list(&self.list, self.slots.len(), true);
+        self.restore_scroll(anchor);
     }
 
-    /// `.dispatch-runs-header`: "Runs" in 12px/500 muted with 8px before it, then the Display
-    /// menu's ghost icon button and Add repository's `+` at the end. A repository added there
-    /// opens New on it.
-    fn runs_header(&self, theme: Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let view = cx.entity();
-        let state = self.state.clone();
+    /// The item under the scroll, so a fold above it does not jump to another row.
+    fn scroll_anchor(&self) -> Option<(String, Pixels)> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        let top = self.list.logical_scroll_top();
+        let index = top.item_ix.min(self.slots.len() - 1);
+        Some((self.slots[index].key(&self.slot_groups), top.offset_in_item))
+    }
+
+    fn restore_scroll(&self, anchor: Option<(String, Pixels)>) {
+        let Some((key, offset)) = anchor else {
+            return;
+        };
+        let Some(item_ix) = self
+            .slots
+            .iter()
+            .position(|slot| slot.key(&self.slot_groups) == key)
+        else {
+            return;
+        };
+        self.list.scroll_to(ListOffset {
+            item_ix,
+            offset_in_item: offset,
+        });
+    }
+
+    /// `.dispatch-runs-header`: "Runs" as a ghost button that opens View all ([`Route::Runs`]),
+    /// then the Display menu's ghost icon button and Add repository's `+` at the end. A
+    /// repository added there opens New on it.
+    fn runs_header(
+        view: &Entity<SidebarView>,
+        state: Entity<AppState>,
+        _theme: Theme,
+        cx: &App,
+    ) -> gpui::AnyElement {
+        let view = view.clone();
+        let all = view.clone();
         div()
             .flex_none()
-            .pl(px(theme.space_2))
             .flex()
             .items_center()
             .justify_between()
-            .text_size(px(theme.font_size_sm))
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .text_color(theme.color_text_muted)
-            .child("Runs")
+            .child(
+                div()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        Button::new("sidebar-view-all", ButtonKind::Ghost)
+                            .size(ButtonSize::Sm)
+                            .label("Runs")
+                            .tooltip("View all runs")
+                            .on_click(move |_, cx| {
+                                let _ = all.update(cx, |this, cx| this.view_all(cx));
+                            }),
+                    ),
+            )
             .child(
                 div()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -1410,19 +1602,16 @@ impl SidebarView {
             .into_any_element()
     }
 
-    /// `.dispatch-run-section`: the group's toggle label (after a 20px bot for a conversation,
-    /// before the "…" of a custom section) and its runs, 2px apart, while it is open.
-    fn group_block(
-        &self,
+    /// `.dispatch-run-section`'s heading: the group's toggle label (after a 20px bot for a
+    /// conversation, before the "…" of a custom section). Its runs follow it as their own
+    /// items.
+    fn group_heading(
         group: &SidebarGroup,
-        selected: Option<&str>,
+        collapsed: bool,
+        view: &Entity<SidebarView>,
         theme: Theme,
-        window: &mut Window,
-        cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let collapsed = self.is_collapsed(&group.id);
         let custom = group.kind == GroupKind::Section;
-        let view = cx.entity();
         let label = {
             let toggle_id = group.id.clone();
             let menu_group = group.clone();
@@ -1482,86 +1671,49 @@ impl SidebarView {
                             let position = window.mouse_position();
                             let (x, y) = (px_of(position.x), px_of(position.y));
                             let _ = view.update(cx, |this, cx| {
-                                if let Some(raw) = section_ref(&id) {
-                                    let items = this.section_entries(raw.to_string(), name, cx);
-                                    this.place_menu(x, y, items, window, cx);
-                                }
+                                this.open_section_menu(id, name, x, y, window, cx);
                             });
                         }),
                     ),
             );
         }
-        let mut section = div()
-            .relative()
+        heading.into_any_element()
+    }
+
+    /// The Show more row under a group's shown runs: it asks for `next` rows.
+    fn show_more_row(
+        group: &SidebarGroup,
+        next: usize,
+        view: &Entity<SidebarView>,
+    ) -> gpui::AnyElement {
+        let more_id = format!("sidebar-show-more-{}", group.id);
+        let reveal_id = group.id.clone();
+        let reveal_view = view.clone();
+        let more = SidebarItem::new(SharedString::from(more_id.clone()), "Show more").on_click(
+            move |_, cx| {
+                let id = reveal_id.clone();
+                let _ = reveal_view.update(cx, |this, cx| this.reveal_more(id, next, cx));
+            },
+        );
+        div()
             .w_full()
-            .flex_none()
-            .flex()
-            .flex_col()
-            .gap(px(theme.sidebar_row_gap))
-            .child(fade_item(
-                format!("sidebar-header-{}", group.id),
-                &self.scroll,
-                fade_edges(theme),
-                heading,
-                window,
-                cx,
-            ));
-        if !collapsed {
-            // Five rows, strictly: only the open run stays past the page, in the Display order.
-            // A running row or one with an unseen update keeps its dot and bot state but does
-            // not bypass the page.
-            let page = page_sidebar_rows(&group.runs, self.revealed_limit(&group.id), |run| {
-                selected == Some(run.id.as_str())
-            });
-            for run in page.rows.iter().copied() {
-                let row = self.run_row(run, selected == Some(run.id.as_str()), theme, cx);
-                section = section.child(fade_item(
-                    format!("sidebar-run-{}", run.id),
-                    &self.scroll,
-                    fade_edges(theme),
-                    row,
-                    window,
-                    cx,
-                ));
-            }
-            if page.hidden > 0 {
-                let more_id = format!("sidebar-show-more-{}", group.id);
-                let reveal_id = group.id.clone();
-                let next = page.next_limit;
-                let reveal_view = view.clone();
-                let more = SidebarItem::new(SharedString::from(more_id.clone()), "Show more")
-                    .on_click(move |_, cx| {
-                        let id = reveal_id.clone();
-                        let _ = reveal_view.update(cx, |this, cx| this.reveal_more(id, next, cx));
-                    });
-                let debug_id = more_id.clone();
-                section = section.child(fade_item(
-                    more_id,
-                    &self.scroll,
-                    fade_edges(theme),
-                    div()
-                        .w_full()
-                        .debug_selector(move || debug_id.clone())
-                        .child(more),
-                    window,
-                    cx,
-                ));
-            }
-        }
-        section.into_any_element()
+            .debug_selector(move || more_id.clone())
+            .child(more)
+            .into_any_element()
     }
 
     /// A run row (`SidebarItem.dispatch-run-item`): the 40px bot in a 36px box, the agent in
     /// 14px/500 primary with the model in 11px muted 6px after it, over the prompt's first
     /// line in 12px muted, and the 6px status dot. A long hover opens its transcript.
     fn run_row(
-        &self,
         run: &SidebarRun,
         active: bool,
+        unseen: bool,
+        view: &Entity<SidebarView>,
+        row_bounds: Rc<RefCell<HashMap<String, Bounds<Pixels>>>>,
         theme: Theme,
-        cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let view = cx.entity();
+        let view = view.clone();
         let run_id = run.id.clone();
         let model = run.model.trim().to_string();
         let mut agent_line = div()
@@ -1605,12 +1757,7 @@ impl SidebarView {
                 36.0,
             )
             .content(content)
-            .when(
-                self.seen
-                    .as_ref()
-                    .is_some_and(|seen| has_unseen_update(run, seen)),
-                |item| item.trailing(run_dot(&run.status, &theme)),
-            )
+            .when(unseen, |item| item.trailing(run_dot(&run.status, &theme)))
             .on_hover({
                 let view = view.clone();
                 let run_id = run_id.clone();
@@ -1636,7 +1783,7 @@ impl SidebarView {
                 let id = run_id.clone();
                 let _ = view.update(cx, |this, cx| this.go(Route::Run(id), true, cx));
             });
-        let bounds = self.row_bounds.clone();
+        let bounds = row_bounds;
         let key = run.id.clone();
         let row_key = run.id.clone();
         div()
@@ -1687,16 +1834,17 @@ impl SidebarView {
 
     /// Scrolls the list `y` down from its top (the screenshot tour).
     pub(crate) fn scroll_to(&mut self, y: f32, cx: &mut Context<Self>) {
-        self.scroll.set_offset(gpui::point(px(0.0), px(-y)));
+        let offset = -f32::from(self.list.scroll_px_offset_for_scrollbar().y);
+        self.list.scroll_by(px(y - offset));
         cx.notify();
     }
 
     fn overlay_top(&self, theme: Theme) -> f32 {
-        let bounds = self.scroll.bounds();
+        let bounds = self.list.viewport_bounds();
         if px_of(bounds.size.height) > 1.0 {
             // The runs header sits under the pages, inside the same scroll.
             px_of(bounds.origin.y)
-                + px_of(self.scroll.offset().y)
+                + (-f32::from(self.list.scroll_px_offset_for_scrollbar().y)).max(0.0)
                 + theme.titlebar_height
                 + theme.space_3
                 + nav_height(theme)
@@ -1875,8 +2023,8 @@ impl Render for SidebarView {
                 .focus(window);
             self.rename_focus = false;
         }
-        let nav = self.nav_block(theme, &snapshot.route, window, cx);
-        let runs = self.runs_block(theme, &snapshot, window, cx);
+        self.sync_slots(&snapshot, cx);
+        let stack = self.stack(theme, &snapshot, window, cx);
         let footer = self.footer_block(theme, &snapshot.route, cx);
         let editor = self.editor_panel(theme, window, cx);
         let preview = self.preview_card(theme, &snapshot, window, cx);
@@ -1902,24 +2050,11 @@ impl Render for SidebarView {
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| this.dismiss_panels(cx)),
             )
-            // The pages and the runs scroll as one list that runs up under the titlebar and
-            // down under Settings, which stays put; the rows fade out before either covers
-            // them.
-            .child(
-                fade_scroll("sidebar-scroll", &self.scroll, theme.color_shell_glass)
-                    // Over the glass and the window material: the rows fade themselves.
-                    .bands(false)
-                    .column(|column| {
-                        column
-                            .flex()
-                            .flex_col()
-                            .gap(px(theme.space_2))
-                            .pt(px(theme.titlebar_height + theme.space_3))
-                            .pb(px(footer_height(theme) + theme.space_2))
-                    })
-                    .child(nav)
-                    .child(runs),
-            )
+            // The pages and the runs are one virtual stack that runs up under the titlebar and
+            // down under Settings, which stays put; each row fades out before either covers
+            // it, and only the rows in view are built.
+            .child(stack)
+            .child(history_buttons(&self.state, theme, cx))
             .child(
                 div()
                     .absolute()
@@ -1949,11 +2084,58 @@ impl Render for SidebarView {
     }
 }
 
+/// Go back and Go forward at the top right, on the traffic lights' row.
+fn history_buttons(state: &Entity<AppState>, theme: Theme, cx: &mut App) -> impl IntoElement {
+    let app = state.read(cx);
+    let (can_back, can_forward) = (app.can_go_back(), app.can_go_forward());
+    let back_state = state.clone();
+    let forward_state = state.clone();
+    div()
+        .absolute()
+        .top(px(0.0))
+        .right(px(theme.space_2))
+        .h(px(theme.titlebar_height))
+        .flex()
+        .items_center()
+        // A press on a button is the button's, never the window drag's.
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .child(
+            Button::new("sidebar-back", ButtonKind::Ghost)
+                .size(ButtonSize::Icon)
+                .icon(Icon::ChevronLeft)
+                .tooltip("Go back")
+                .disabled(!can_back)
+                .on_click(move |_, cx| {
+                    back_state.update(cx, |state, cx| {
+                        if state.go_back() {
+                            state.request_refresh(cx);
+                        }
+                        cx.notify();
+                    });
+                }),
+        )
+        .child(
+            Button::new("sidebar-forward", ButtonKind::Ghost)
+                .size(ButtonSize::Icon)
+                .icon(Icon::ChevronRight)
+                .tooltip("Go forward")
+                .disabled(!can_forward)
+                .on_click(move |_, cx| {
+                    forward_state.update(cx, |state, cx| {
+                        if state.go_forward() {
+                            state.request_refresh(cx);
+                        }
+                        cx.notify();
+                    });
+                }),
+        )
+}
+
 fn page_selected(route: &Route, label: &str) -> bool {
     match label {
         "Roles" => matches!(route, Route::Roles | Route::RoleBoard(_)),
         "Intelligence" => matches!(route, Route::Intelligence),
-        "Spend" => matches!(route, Route::Spend),
+        "Spend" => matches!(route, Route::Spend | Route::SpendAgent(_)),
         "Stats" => matches!(route, Route::Stats),
         "Images" => matches!(route, Route::Images | Route::Image(_)),
         _ => false,
@@ -1963,6 +2145,117 @@ fn page_selected(route: &Route, label: &str) -> bool {
 /// Settings at the foot, over the list: its 8px above, its row, and the sidebar's 8px under.
 fn footer_height(theme: Theme) -> f32 {
     theme.space_2 * 2.0 + theme.sidebar_row_height
+}
+
+/// How many rows the pages take: New, Commander, then each page in [`NAV`].
+fn nav_items() -> usize {
+    2 + NAV.len()
+}
+
+/// The sidebar's items in order: the pages, the Runs header (8px more below them), the
+/// list's notice, and each group's heading with its first page of runs and its Show more.
+/// `key` names the structure, so a change that leaves it whole (a new title, a status) does
+/// not measure the stack again.
+fn sidebar_slots(
+    groups: &[SidebarGroup],
+    collapsed: &[String],
+    revealed: &HashMap<String, usize>,
+    selected: Option<&str>,
+    notice_shown: bool,
+    theme: Theme,
+) -> (Rc<Vec<SidebarSlot>>, String) {
+    let gap = theme.space_2;
+    let row_gap = theme.sidebar_row_gap;
+    let mut slots = Vec::new();
+    let mut key = String::new();
+
+    let nav = nav_items();
+    for index in 0..nav {
+        key.push('n');
+        slots.push(SidebarSlot {
+            item: StackRow::Nav(index),
+            after: if index + 1 == nav { gap * 2.0 } else { row_gap },
+        });
+    }
+
+    // The Runs header, then its notice, then the groups, 8px apart.
+    let anything_below = notice_shown || !groups.is_empty();
+    slots.push(SidebarSlot {
+        item: StackRow::Header,
+        after: if anything_below { gap } else { 0.0 },
+    });
+    if notice_shown {
+        key.push('t');
+        slots.push(SidebarSlot {
+            item: StackRow::Notice,
+            after: if groups.is_empty() { 0.0 } else { gap },
+        });
+    }
+
+    let last_group = groups.len().saturating_sub(1);
+    for (group_index, group) in groups.iter().enumerate() {
+        let after_group = if group_index == last_group { 0.0 } else { gap };
+        let folded = collapsed.iter().any(|id| id == &group.id);
+        key.push('\u{1e}');
+        key.push_str(&group.id);
+        key.push(if folded { 'c' } else { 'o' });
+        // Five rows, strictly: only the open run stays past the page, in the Display order.
+        let limit = revealed
+            .get(&group.id)
+            .copied()
+            .unwrap_or(SIDEBAR_PAGE_ROWS)
+            .max(1);
+        let page = (!folded).then(|| {
+            page_sidebar_rows(&group.runs, limit, |run| selected == Some(run.id.as_str()))
+        });
+        let shown: Vec<usize> = page
+            .as_ref()
+            .map(|page| {
+                page.rows
+                    .iter()
+                    .filter_map(|run| group.runs.iter().position(|row| row.id == run.id))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let hidden = page.as_ref().map_or(0, |page| page.hidden);
+        let next = page.as_ref().map_or(limit, |page| page.next_limit);
+        let has_rows = !shown.is_empty() || hidden > 0;
+        slots.push(SidebarSlot {
+            item: StackRow::Group {
+                group: group_index,
+                collapsed: folded,
+            },
+            after: if has_rows { row_gap } else { after_group },
+        });
+        for (position, row) in shown.iter().copied().enumerate() {
+            key.push('\u{1f}');
+            key.push_str(&group.runs[row].id);
+            let last_row = position + 1 == shown.len();
+            slots.push(SidebarSlot {
+                item: StackRow::Run {
+                    group: group_index,
+                    row,
+                },
+                after: if !last_row || hidden > 0 {
+                    row_gap
+                } else {
+                    after_group
+                },
+            });
+        }
+        if hidden > 0 {
+            key.push('m');
+            slots.push(SidebarSlot {
+                item: StackRow::More {
+                    group: group_index,
+                    next,
+                },
+                after: after_group,
+            });
+        }
+    }
+
+    (Rc::new(slots), key)
 }
 
 /// Where the list's rows fade: out under the traffic lights by the titlebar's middle, and
@@ -1990,4 +2283,97 @@ fn actions_of(entries: Vec<MenuEntry>) -> Vec<MenuItem> {
 
 fn px_of(value: impl Into<f32>) -> f32 {
     value.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::DispatchRun;
+
+    fn group(id: &str, runs: usize) -> SidebarGroup {
+        SidebarGroup {
+            id: id.to_string(),
+            kind: GroupKind::Conversation,
+            title: id.to_string(),
+            agent: None,
+            runs: (0..runs)
+                .map(|index| {
+                    let run = DispatchRun {
+                        id: format!("{id}-{index}"),
+                        prompt: format!("say hi {index}"),
+                        ..Default::default()
+                    };
+                    SidebarRun::from_dispatch(&run, "repo", "/tmp/repo")
+                })
+                .collect(),
+        }
+    }
+
+    fn rows(slots: &[SidebarSlot], group: usize) -> Vec<&SidebarSlot> {
+        slots
+            .iter()
+            .filter(|slot| matches!(slot.item, StackRow::Run { group: g, .. } if g == group))
+            .collect()
+    }
+
+    /// A group is its heading, its first page of rows, and Show more: the rows past the page
+    /// are never items, so the list never builds them.
+    #[test]
+    fn the_stack_holds_a_groups_page_and_its_show_more() {
+        let theme = Theme::dark();
+        let groups = vec![group("a", 17)];
+        let (slots, key) = sidebar_slots(&groups, &[], &HashMap::new(), None, false, theme);
+        assert_eq!(
+            slots.len(),
+            nav_items() + 1 + 1 + SIDEBAR_PAGE_ROWS + 1,
+            "the pages, the header, the heading, a page of rows, and Show more"
+        );
+        assert_eq!(rows(&slots, 0).len(), SIDEBAR_PAGE_ROWS);
+        assert!(matches!(
+            slots.last().map(|slot| slot.item),
+            Some(StackRow::More { group: 0, next: 10 })
+        ));
+        assert!(key.contains("a-4") && !key.contains("a-5"));
+    }
+
+    /// Show more adds a page; collapsed, a group is its heading alone; and the open run stays
+    /// past the page.
+    #[test]
+    fn the_stack_follows_revealed_collapsed_and_the_open_run() {
+        let theme = Theme::dark();
+        let groups = vec![group("a", 17), group("b", 2)];
+        let revealed = HashMap::from([("a".to_string(), 10)]);
+        let (slots, _) = sidebar_slots(&groups, &[], &revealed, None, false, theme);
+        assert_eq!(rows(&slots, 0).len(), 10);
+        assert!(
+            slots
+                .iter()
+                .any(|slot| matches!(slot.item, StackRow::More { group: 0, next: 15 }))
+        );
+
+        let selected = "a-12".to_string();
+        let (slots, _) = sidebar_slots(
+            &groups,
+            &["a".into()],
+            &HashMap::new(),
+            Some(&selected),
+            false,
+            theme,
+        );
+        assert!(rows(&slots, 0).is_empty(), "a folded group shows no rows");
+
+        let (slots, _) =
+            sidebar_slots(&groups, &[], &HashMap::new(), Some(&selected), false, theme);
+        let shown = rows(&slots, 0);
+        assert_eq!(
+            shown.len(),
+            SIDEBAR_PAGE_ROWS + 1,
+            "the open run joins the page"
+        );
+        assert!(
+            shown
+                .iter()
+                .any(|slot| matches!(slot.item, StackRow::Run { row, .. } if row == 12))
+        );
+    }
 }

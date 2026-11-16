@@ -8,7 +8,7 @@ use gpui::{
 };
 
 use crate::theme::Theme;
-use crate::ui::{Icon, TileTone, card, icon};
+use crate::ui::{Icon, TileTone, icon};
 
 /// A settings section as a card: its tile, title and description, an optional action, and
 /// its rows (polterware-ui's [`SettingsSection`](crate::ui::patterns::SettingsSection)).
@@ -34,22 +34,23 @@ pub fn settings_section(
 /// What an agent card's fold does when it is pressed.
 pub type AgentFold = Rc<dyn Fn(&mut Window, &mut App)>;
 
-/// An agent's card on Settings > Models: its bot and display name over its models, with its
-/// switch at the heading's right and a view-only fold before it.
-pub fn agent_section(
+/// An agent card's heading on Settings > Models: its bot and display name, the fold before
+/// its switch at the right.
+fn agent_heading(
     agent: &str,
     name: impl Into<SharedString>,
     switch: AnyElement,
     collapsed: bool,
     on_fold: AgentFold,
-    body: impl IntoElement,
     cx: &App,
 ) -> AnyElement {
     let theme = *Theme::global(cx);
     let name: SharedString = name.into();
     let fold_id = SharedString::from(format!("settings-agent-fold-{agent}"));
+    let fold_selector = fold_id.clone();
     let fold = div()
         .id(fold_id)
+        .debug_selector(move || fold_selector.to_string())
         .cursor_pointer()
         .rounded(px(theme.radius_control))
         .p(px(4.0))
@@ -64,7 +65,7 @@ pub fn agent_section(
             14.0,
             cx,
         ));
-    let heading = div()
+    div()
         .w_full()
         .flex()
         .items_center()
@@ -85,26 +86,108 @@ pub fn agent_section(
                 .child(name),
         )
         .child(fold)
-        .child(div().flex_none().child(switch));
-    card(cx)
+        .child(div().flex_none().child(switch))
+        .into_any_element()
+}
+
+/// The face and edge color every segment of an agent card shares; each segment draws the
+/// edges its part of the card keeps.
+fn card_segment(cx: &App) -> gpui::Div {
+    let theme = Theme::global(cx);
+    div()
         .w_full()
+        .bg(theme.color_surface_subtle)
+        .border_color(theme.color_border_default)
+}
+
+/// A folded agent's card: its heading alone, with all four corners and edges.
+pub fn agent_card_folded(
+    agent: &str,
+    name: impl Into<SharedString>,
+    switch: AnyElement,
+    on_fold: AgentFold,
+    cx: &App,
+) -> AnyElement {
+    let theme = *Theme::global(cx);
+    card_segment(cx)
+        .rounded(px(theme.radius_card))
+        .border(px(0.5))
         .p(px(16.0))
-        .flex()
-        .flex_col()
-        .gap(px(theme.space_3))
-        .child(heading)
-        .when(!collapsed, |card| {
-            card.child(
-                div()
-                    .w_full()
-                    .flex()
-                    .flex_col()
-                    .gap(px(theme.space_2))
-                    // A hairline sets the header apart from its model rows.
-                    .child(div().w_full().h(px(1.0)).bg(theme.color_border_default))
-                    .child(body),
-            )
-        })
+        .child(agent_heading(agent, name, switch, true, on_fold, cx))
+        .into_any_element()
+}
+
+/// An open agent's card, first segment: its heading, the hairline that sets the rows apart,
+/// its top and side edges, and the card's top corners.
+pub fn agent_card_top(
+    agent: &str,
+    name: impl Into<SharedString>,
+    switch: AnyElement,
+    on_fold: AgentFold,
+    cx: &App,
+) -> AnyElement {
+    let theme = *Theme::global(cx);
+    card_segment(cx)
+        .rounded_t(px(theme.radius_card))
+        .border_t(px(0.5))
+        .border_l(px(0.5))
+        .border_r(px(0.5))
+        .px(px(16.0))
+        .pt(px(16.0))
+        // The 8px the first row's segment keeps above its row.
+        .pb(px(theme.space_2))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .child(agent_heading(agent, name, switch, false, on_fold, cx))
+                .child(
+                    div()
+                        .w_full()
+                        .mt(px(theme.space_3))
+                        .h(px(1.0))
+                        .bg(theme.color_border_default),
+                ),
+        )
+        .into_any_element()
+}
+
+/// One model row of an open agent's card: its row and the 8px between it and the next, with
+/// the card's sides alone; [`agent_card_bottom`] closes the card under it.
+pub fn agent_card_row(row: impl IntoElement, cx: &App) -> AnyElement {
+    let theme = *Theme::global(cx);
+    card_segment(cx)
+        .border_l(px(0.5))
+        .border_r(px(0.5))
+        .px(px(16.0))
+        .pb(px(theme.space_2))
+        .child(row)
+        .into_any_element()
+}
+
+/// An agent that lists no models: its note under the card's hairline, drawn as a row would
+/// be between [`agent_card_top`] and [`agent_card_bottom`].
+pub fn agent_card_note(note: impl IntoElement, cx: &App) -> AnyElement {
+    let theme = *Theme::global(cx);
+    card_segment(cx)
+        .border_l(px(0.5))
+        .border_r(px(0.5))
+        .px(px(16.0))
+        .pb(px(theme.space_2))
+        .child(note)
+        .into_any_element()
+}
+
+/// An open agent's card, last segment: the card's bottom padding with its bottom corners and
+/// its side and bottom edges.
+pub fn agent_card_bottom(cx: &App) -> AnyElement {
+    let theme = *Theme::global(cx);
+    card_segment(cx)
+        .h(px(theme.space_2))
+        .rounded_b(px(theme.radius_card))
+        .border_l(px(0.5))
+        .border_r(px(0.5))
+        .border_b(px(0.5))
         .into_any_element()
 }
 

@@ -53,6 +53,7 @@ pub struct TourViews {
     pub stats: Entity<crate::views::StatsView>,
     pub intelligence: Entity<crate::views::IntelligenceView>,
     pub settings: Entity<SettingsView>,
+    pub runs: Entity<crate::views::RunsView>,
 }
 
 /// The directory to write to, when the tour is on.
@@ -106,8 +107,10 @@ pub fn start_tour(
                 ),
                 ("03-intelligence", Route::Intelligence),
                 ("04-spend", Route::Spend),
+                ("04-spend-agent", Route::SpendAgent("opencode".into())),
                 ("05-stats", Route::Stats),
                 ("06-settings-agents", Route::Settings(SettingsPage::Agents)),
+                ("07-settings-models", Route::Settings(SettingsPage::Models)),
                 (
                     "08-settings-classifier",
                     Route::Settings(SettingsPage::Classifier),
@@ -322,6 +325,44 @@ pub fn start_tour(
                         .update(app, |sidebar, cx| sidebar.toggle_display(cx));
                 });
                 settle(cx, 400).await;
+            }
+            // `17-add-column`: the planner board's Add column picker, hung under its button.
+            if wanted("17-add-column") {
+                let _ = cx.update(|_, app| {
+                    state.update(app, |state, cx| {
+                        state.set_commander_open(false);
+                        state.navigate(Route::RoleBoard("planner".into()));
+                        state.request_refresh(cx);
+                        cx.notify();
+                    });
+                });
+                front(cx);
+                settle(cx, 2500).await;
+                let _ = cx.update(|window, app| {
+                    views
+                        .roles
+                        .update(app, |roles, cx| roles.toggle_column_picker(window, cx));
+                });
+                settle(cx, 1500).await;
+                capture(cx, &dir.join("17-add-column.png"));
+            }
+            // `12-runs-paged`: the Runs page scrolled to its first group's fifth run, over its
+            // Show more.
+            if wanted("12-runs-paged") {
+                let _ = cx.update(|_, app| {
+                    state.update(app, |state, cx| {
+                        state.set_commander_open(false);
+                        state.navigate(Route::Runs);
+                        cx.notify();
+                    });
+                });
+                front(cx);
+                settle(cx, 2500).await;
+                let _ = cx.update(|_, app| {
+                    views.runs.update(app, |runs, cx| runs.tour_scroll_to(3, cx));
+                });
+                settle(cx, 1500).await;
+                capture(cx, &dir.join("12-runs-paged.png"));
             }
             if wanted("17-model-palette") {
                 let _ = cx.update(|_, app| {

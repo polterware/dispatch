@@ -1328,7 +1328,7 @@ impl RolesView {
     }
 
     /// Opens the Add column picker under its button, or closes it.
-    fn toggle_column_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_column_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(name) = self.board_name(cx) else {
             return;
         };
@@ -1351,12 +1351,15 @@ impl RolesView {
         if options.is_empty() {
             return;
         }
-        let height = self
-            .column_anchor
-            .get()
-            .map_or(28.0, |bounds| f32::from(bounds.size.height));
+        // The probe spans the button's row, whose right edge is the button's: the picker
+        // hangs from it with their right edges lined up.
+        let (width, height) = self.column_anchor.get().map_or((28.0, 28.0), |bounds| {
+            (f32::from(bounds.size.width), f32::from(bounds.size.height))
+        });
         self.column_picker.update(cx, |picker, cx| {
-            picker.set_options("Column", options, None, 200.0, cx);
+            picker.set_options("Column", options, None, 240.0, cx);
+            picker.set_align_end(true);
+            picker.set_trigger_width(width);
             picker.set_trigger_height(height);
             picker.open(window, cx);
         });

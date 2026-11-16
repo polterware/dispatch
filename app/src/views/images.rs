@@ -13,12 +13,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui::{
     AnyElement, App, AppContext as _, ClipboardItem, Context, DispatchPhase, Entity, FocusHandle,
-    FontWeight, Image, ImageFormat, IntoElement, KeyDownEvent, Render, SharedString, Window,
-    canvas, div, prelude::*, px,
+    FontWeight, Image, ImageFormat, IntoElement, KeyDownEvent, ListAlignment, ListState, Render,
+    SharedString, Window, canvas, div, prelude::*, px,
 };
 
 use crate::client::{CoreClient, DeleteArtifactRequest, DispatchArtifact, ListArtifactsRequest};
 use crate::format::agent_display_name;
+use crate::models::filter::Filters;
 use crate::models::images::{
     ImageTile, filter_specs, format_bytes, group_by_day, local_datetime, visible_tiles,
 };
@@ -28,10 +29,10 @@ use crate::theme::Theme;
 use crate::ui::patterns::{ConfirmDialog, modal_layer};
 use crate::ui::{
     Button, ButtonKind, ButtonSize, FilterField, FilterPopover, FiltersChanged, Icon, ImageCard,
-    ImageData, MascotMood, PageWidth, RailPresence, SkeletonLayout, TextInput, ZoomableImage,
-    card_grid, ellipsis, grid_columns, page_empty, page_skeleton, page_under, page_under_inset,
+    ImageData, MascotMood, PageWidth, RailPresence, STACK_OVERDRAW, SkeletonLayout, TextInput,
+    ZoomableImage, ellipsis, grid_columns, page_empty, page_skeleton, page_under, page_under_inset,
     rail_page_body_flush, rail_page_cover, rail_page_header, rail_properties, rail_property,
-    rail_section, rail_toggle_label, scroll_area_under, toolbar, wrap_text,
+    rail_section, rail_toggle_label, sync_virtual_list, toolbar, virtual_stack, wrap_text,
 };
 
 /// The page's chrome state.
@@ -44,6 +45,19 @@ const RELOAD_GAP: Duration = Duration::from_secs(2);
 /// Where the rail's open state is remembered.
 const RAIL_PREFERENCE: &str = "polterware.image.rail";
 
+/// One virtual item in the gallery: a day heading, or one row of tiles.
+struct GallerySlot {
+    before: f32,
+    after: f32,
+    kind: GalleryKind,
+}
+
+enum GalleryKind {
+    Heading(String),
+    /// Indexes into the cached visible tiles.
+    Row(Vec<usize>),
+}
+
 pub struct ImagesView {
     state: Entity<AppState>,
     search: Entity<TextInput>,
@@ -51,6 +65,16 @@ pub struct ImagesView {
     /// The option ids the filter fields were last built from.
     fields_key: String,
     tiles: Vec<ImageTile>,
+    /// Bumped when `tiles` actually changes, so a reload of the same gallery does no work.
+    tiles_gen: u64,
+    /// The tiles on show, and the heading and row slots built from them.
+    gallery_tiles: Rc<Vec<ImageTile>>,
+    gallery_slots: Rc<Vec<GallerySlot>>,
+    gallery_list: ListState,
+    gallery_gen: u64,
+    gallery_query: String,
+    gallery_filters: Option<Filters>,
+    gallery_cols: u16,
     loaded: bool,
     on_page: bool,
     in_flight: bool,
@@ -94,6 +118,14 @@ impl ImagesView {
             filters,
             fields_key: String::new(),
             tiles: Vec::new(),
+            tiles_gen: 0,
+            gallery_tiles: Rc::default(),
+            gallery_slots: Rc::default(),
+            gallery_list: ListState::new(0, ListAlignment::Top, px(STACK_OVERDRAW)),
+            gallery_gen: 0,
+            gallery_query: String::new(),
+            gallery_filters: None,
+            gallery_cols: 0,
             loaded: false,
             on_page: false,
             in_flight: false,
@@ -170,7 +202,11 @@ impl ImagesView {
                 }
                 this.in_flight = false;
                 if let Some(artifacts) = result {
-                    this.tiles = artifacts.iter().map(ImageTile::from).collect();
+                    let next: Vec<ImageTile> = artifacts.iter().map(ImageTile::from).collect();
+                    if next != this.tiles {
+                        this.tiles = next;
+                        this.tiles_gen = this.tiles_gen.wrapping_add(1);
+                    }
                 }
                 this.loaded = true;
                 if this.again {
@@ -254,7 +290,11 @@ impl ImagesView {
                 .await;
             let _ = this.update(cx, |this, cx| match result {
                 Ok(_) => {
+                    let before = this.tiles.len();
                     this.tiles.retain(|tile| tile.id != id);
+                    if this.tiles.len() != before {
+                        this.tiles_gen = this.tiles_gen.wrapping_add(1);
+                    }
                     if matches!(this.state.read(cx).route(), Route::Image(cur_id) if cur_id == &id)
                     {
                         this.state.update(cx, |app, cx| {
@@ -403,18 +443,56 @@ impl Render for ImagesView {
 }
 
 impl ImagesView {
+    /// The visible tiles and their heading and row slots, rebuilt only when the tiles, the
+    /// search, the filters, or the column count moved.
+    fn ensure_gallery(&mut self, cols: u16, theme: &Theme, cx: &App) {
+        let query = self.search.read(cx).text();
+        let filters = self.filters.read(cx).filters();
+        let same_inputs = self.gallery_gen == self.tiles_gen
+            && self.gallery_query == query
+            && self.gallery_filters.as_ref() == Some(filters);
+        if same_inputs && self.gallery_cols == cols {
+            return;
+        }
+        if !same_inputs {
+            let query = query.to_string();
+            let filters = filters.clone();
+            let visible = visible_tiles(&self.tiles, &query, &filters);
+            self.gallery_tiles = Rc::new(visible.into_iter().cloned().collect());
+            self.gallery_gen = self.tiles_gen;
+            self.gallery_query = query;
+            self.gallery_filters = Some(filters);
+        }
+        self.gallery_cols = cols;
+        self.gallery_slots = Rc::new(gallery_slots(
+            &self.gallery_tiles,
+            cols.max(1) as usize,
+            theme.space_2,
+            theme.space_4,
+        ));
+        sync_virtual_list(&self.gallery_list, self.gallery_slots.len(), true);
+    }
+
     fn render_gallery(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         self.sync_fields(cx);
         let theme = *Theme::global(cx);
-        let query = self.search.read(cx).text().to_string();
-        let filters = self.filters.read(cx).filters().clone();
-        let visible = visible_tiles(&self.tiles, &query, &filters);
         let has_tiles = !self.tiles.is_empty();
-        let shows_grid = self.loaded && !visible.is_empty();
+        let probed = window.use_keyed_state("images-cols", cx, |_, _| 0u16);
+        let known = *probed.read(cx);
+        let cols = if known > 0 {
+            known
+        } else {
+            let viewport = f32::from(window.viewport_size().width);
+            let available = (viewport - theme.sidebar_width - 26.0).max(TILE_MIN);
+            grid_columns(available, TILE_MIN, TILE_GAP)
+        };
+        if self.loaded {
+            self.ensure_gallery(cols, &theme, cx);
+        }
+        let shows_grid = self.loaded && !self.gallery_tiles.is_empty();
         let filter_bar = FilterPopover::bar(&self.filters, window, cx);
         let padding = theme.space_2;
         let top = page_under_inset(PAGE, filter_bar.is_some(), padding, window, cx);
-        let view = cx.entity();
 
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -424,7 +502,7 @@ impl ImagesView {
             page_skeleton(SkeletonLayout::Page)
                 .without_toolbar()
                 .into_any_element()
-        } else if visible.is_empty() {
+        } else if self.gallery_tiles.is_empty() {
             let (title, mood) = if has_tiles {
                 ("No matches", MascotMood::Lost)
             } else {
@@ -432,42 +510,84 @@ impl ImagesView {
             };
             page_empty(title, mood, cx).into_any_element()
         } else {
-            let groups = group_by_day(&visible);
-            let viewport = f32::from(window.viewport_size().width);
-            let available_width = (viewport - theme.sidebar_width - 26.0).max(TILE_MIN);
-            let cols = grid_columns(available_width, TILE_MIN, TILE_GAP);
-
-            let mut body = div().w_full().flex().flex_col().gap(px(theme.space_4));
-            for group in groups {
-                let tiles = group
-                    .tiles
-                    .iter()
-                    .map(|tile| image_tile(tile, &theme, view.clone(), now_ms))
-                    .collect();
-                body = body.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(theme.space_2))
-                        .child(
-                            div()
+            let tiles = self.gallery_tiles.clone();
+            let slots = self.gallery_slots.clone();
+            let view = cx.entity();
+            let list = self.gallery_list.clone();
+            let watcher = window.current_view();
+            let probe = canvas(
+                move |_, window, cx| {
+                    let seen = f32::from(list.viewport_bounds().size.width);
+                    if seen <= 1.0 {
+                        return;
+                    }
+                    let next = grid_columns(seen, TILE_MIN, TILE_GAP);
+                    if *probed.read(cx) == next {
+                        return;
+                    }
+                    probed.update(cx, |slot, _| *slot = next);
+                    // The frame was built with `cols`. A different count lays the rows out again.
+                    if next != cols {
+                        cx.notify(watcher);
+                        crate::ui::frame::draw_again(window);
+                    }
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_0();
+            div()
+                .size_full()
+                .min_h(px(0.0))
+                .child(virtual_stack(
+                    "images-scroll",
+                    &self.gallery_list,
+                    top,
+                    0.0,
+                    move |index, _, _cx| {
+                        let Some(slot) = slots.get(index) else {
+                            return div().into_any_element();
+                        };
+                        let before = slot.before;
+                        let after = slot.after;
+                        let body = match &slot.kind {
+                            GalleryKind::Heading(label) => div()
                                 .text_size(px(theme.font_size_sm))
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(theme.color_text_muted)
-                                .child(SharedString::from(group.label.clone())),
-                        )
-                        .child(card_grid(
-                            SharedString::from(format!("image-grid-{}", group.label)),
-                            TILE_MIN,
-                            TILE_GAP,
-                            cols,
-                            tiles,
-                            window,
-                            cx,
-                        )),
-                );
-            }
-            scroll_area_under("images-scroll", top, body, window, cx)
+                                .child(SharedString::from(label.clone()))
+                                .into_any_element(),
+                            GalleryKind::Row(indexes) => {
+                                let mut row = div()
+                                    .w_full()
+                                    .grid()
+                                    .grid_cols(cols)
+                                    .gap(px(TILE_GAP));
+                                for index in indexes {
+                                    if let Some(tile) = tiles.get(*index) {
+                                        row = row.child(image_tile(
+                                            tile,
+                                            &theme,
+                                            view.clone(),
+                                            now_ms,
+                                        ));
+                                    }
+                                }
+                                row.into_any_element()
+                            }
+                        };
+                        div()
+                            .w_full()
+                            .when(before > 0.0, |item| item.mt(px(before)))
+                            .when(after > 0.0, |item| item.mb(px(after)))
+                            .child(body)
+                            .into_any_element()
+                    },
+                    window,
+                    cx,
+                ))
+                .child(probe)
+                .into_any_element()
         };
 
         let end = div()
@@ -875,6 +995,37 @@ impl ImagesView {
             .child(escape_canvas)
             .into_any_element()
     }
+}
+
+/// Day headings and rows of `cols` tiles. Later headings keep a group gap above them, and
+/// every heading keeps a small gap under it. Rows keep the tile gap, except a group's last.
+fn gallery_slots(tiles: &[ImageTile], cols: usize, heading_gap: f32, group_gap: f32) -> Vec<GallerySlot> {
+    let refs: Vec<&ImageTile> = tiles.iter().collect();
+    let groups = group_by_day(&refs);
+    let mut slots = Vec::new();
+    let mut index = 0usize;
+    let cols = cols.max(1);
+    for (group_index, group) in groups.iter().enumerate() {
+        slots.push(GallerySlot {
+            before: if group_index == 0 { 0.0 } else { group_gap },
+            after: heading_gap,
+            kind: GalleryKind::Heading(group.label.clone()),
+        });
+        let count = group.tiles.len();
+        let mut start = 0usize;
+        while start < count {
+            let end = (start + cols).min(count);
+            let last = end == count;
+            slots.push(GallerySlot {
+                before: 0.0,
+                after: if last { 0.0 } else { TILE_GAP },
+                kind: GalleryKind::Row((index + start..index + end).collect()),
+            });
+            start = end;
+        }
+        index += count;
+    }
+    slots
 }
 
 fn load_artifacts(client: &CoreClient) -> Option<Vec<DispatchArtifact>> {

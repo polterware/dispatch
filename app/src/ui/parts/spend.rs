@@ -6,7 +6,7 @@ use gpui::{AnyElement, App, IntoElement, div, prelude::*, px};
 use crate::avatar::agent_avatar;
 use crate::models::spend::{API_EQUIVALENT, SpendRow, SpendTotals, format_cost, format_tokens};
 use crate::theme::Theme;
-use crate::ui::{Icon, IconTile, StatTile, TileTone, UsageCard};
+use crate::ui::{Handler, Icon, IconTile, StatTile, TileTone, UsageCard};
 
 const DASH: &str = "\u{2014}";
 const AVATAR: f32 = 28.0;
@@ -76,8 +76,9 @@ pub fn totals_row(totals: &SpendTotals) -> AnyElement {
 }
 
 /// The agent's card: its bot, name, and provider; the window's cost; its tokens and runs; the
-/// tokens split into input, cache, and output.
-pub fn agent_card(row: &SpendRow, cx: &App) -> AnyElement {
+/// tokens split into input, cache, and output. A click on it calls `on_open`, which opens the
+/// agent's entries.
+pub fn agent_card(row: &SpendRow, on_open: Handler, cx: &App) -> AnyElement {
     let theme = *Theme::global(cx);
     let runs = if row.runs == 1 {
         "1 run".to_string()
@@ -106,7 +107,8 @@ pub fn agent_card(row: &SpendRow, cx: &App) -> AnyElement {
     .leading(agent_avatar(&row.agent, "", AVATAR))
     .aside(row.provider.clone())
     .figure_tooltip(figure_tip)
-    .caption(caption);
+    .caption(caption)
+    .on_click(on_open);
     if let Some(tokens) = row.tokens.as_ref() {
         card = card.caption_tooltip(tokens.title.clone());
     }

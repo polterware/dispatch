@@ -20,6 +20,7 @@ struct Window<'a> {
     cx: &'a mut VisualTestContext,
     state: Entity<AppState>,
     images: Entity<ImagesView>,
+    settings: Entity<dispatch_app::views::SettingsView>,
 }
 
 /// Opens the app's window on `core`.
@@ -35,9 +36,15 @@ fn open<'a>(core: &Core, cx: &'a mut TestAppContext) -> Window<'a> {
     let (view, cx) = cx.add_window_view(AppView::new);
     let state = view.read_with(cx, |view, _| view.state());
     let images = view.read_with(cx, |view, _| view.images());
+    let settings = view.read_with(cx, |view, _| view.settings());
     // Tall enough that every row of a page is on screen, where a click lands.
     cx.simulate_resize(gpui::size(gpui::px(1400.0), gpui::px(4000.0)));
-    let mut window = Window { cx, state, images };
+    let mut window = Window {
+        cx,
+        state,
+        images,
+        settings,
+    };
     window.settle();
     assert_eq!(
         window
@@ -109,31 +116,53 @@ impl Window<'_> {
         self.pump();
     }
 
-    /// Scrolls the Settings section with the wheel until `id` is in its view, as a person
-    /// scrolls to a row below the fold.
+    /// Scrolls the Settings section until `id` is in its view, as a person scrolls to a row
+    /// below the fold. The Models page builds only the rows in view, so it scrolls that list
+    /// to the row's item, where a row has no bounds until it is drawn.
     fn scroll_settings_to(&mut self, id: &str) {
         let id: &'static str = Box::leak(id.to_owned().into_boxed_str());
-        for _ in 0..20 {
+        if matches!(self.route(), Route::Settings(SettingsPage::Models)) {
+            let settings = self.settings.clone();
+            if settings.update(self.cx, |view, cx| view.scroll_models_to(id, cx)) {
+                self.settle();
+                return;
+            }
+        }
+        for _ in 0..40 {
             let view = self
                 .cx
                 .debug_bounds("settings-content")
                 .expect("the Settings section");
-            let row = self
-                .cx
-                .debug_bounds(id)
-                .unwrap_or_else(|| panic!("no {id}"));
+            let Some(row) = self.cx.debug_bounds(id) else {
+                self.wheel_settings(-200.0);
+                continue;
+            };
             if row.bottom() <= view.bottom() && row.top() >= view.top() {
                 return;
             }
-            self.cx.simulate_event(gpui::ScrollWheelEvent {
-                position: view.center(),
-                delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.0), gpui::px(-200.0))),
-                modifiers: Modifiers::none(),
-                touch_phase: gpui::TouchPhase::Moved,
-            });
-            self.settle();
+            let delta = if row.top() < view.top() {
+                200.0
+            } else {
+                -200.0
+            };
+            self.wheel_settings(delta);
         }
         panic!("{id} never scrolled into view");
+    }
+
+    /// One wheel step over the Settings section.
+    fn wheel_settings(&mut self, delta: f32) {
+        let view = self
+            .cx
+            .debug_bounds("settings-content")
+            .expect("the Settings section");
+        self.cx.simulate_event(gpui::ScrollWheelEvent {
+            position: view.center(),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.0), gpui::px(delta))),
+            modifiers: Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        self.settle();
     }
 
     fn shows(&mut self, id: &str) -> bool {
@@ -196,12 +225,20 @@ fn every_page_opens_with_data(cx: &mut TestAppContext) {
         s.runs().iter().map(|r| r.id.clone()).collect::<Vec<_>>()
     });
     assert!(runs.contains(&write) && runs.contains(&read), "{runs:?}");
+    let agent = w.state.read_with(w.cx, |s, _| {
+        s.runs()
+            .iter()
+            .map(|run| run.agent.clone())
+            .find(|agent| !agent.is_empty())
+            .unwrap_or_default()
+    });
 
     for route in [
         Route::Roles,
         Route::RoleBoard("explorer".into()),
         Route::Intelligence,
         Route::Spend,
+        Route::SpendAgent(agent),
         Route::Stats,
         Route::Images,
         Route::Runs,
@@ -219,6 +256,12 @@ fn every_page_opens_with_data(cx: &mut TestAppContext) {
             assert!(
                 w.shows("intelligence-refresh"),
                 "Intelligence has no Refresh"
+            );
+        }
+        if matches!(route, Route::SpendAgent(_)) {
+            assert!(
+                w.shows("spend-agent-back"),
+                "the agent's spend page has no Back"
             );
         }
     }
@@ -517,11 +560,14 @@ fn the_runs_page_groups_by_status_with_running_first_and_switches_to_repository(
         "the running row is not above the completed row: {running_row:?} vs {done_row:?}"
     );
 
-    w.click("runs-display");
+    w.click("run-filters-trigger");
     w.pump();
-    w.click("menu-item-0");
+    w.click("run-filters-display-group");
     w.pump();
-    w.pick("menu-sub-item-1");
+    w.pick("run-filters-Sub-display:group-repository-body");
+    // Picking keeps the filter menu open; its trigger closes it.
+    w.click("run-filters-trigger");
+    w.pump();
 
     let repo_group = format!("runs-group-repository:{}", core.repo.display());
     assert!(
@@ -678,7 +724,7 @@ fn settings_menus_pick_the_priority_and_classifier_model(cx: &mut TestAppContext
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let core = Core::new();
     core.cli(&["workspace", "add", &core.repo.to_string_lossy()]);
-    core.config("set", "classifier", &["cli"]);
+    core.config("set", "classifier", &["jev"]);
     let global = core.data.join("dispatch").join("config.json");
     let mut w = open(&core, cx);
 
@@ -696,9 +742,8 @@ fn settings_menus_pick_the_priority_and_classifier_model(cx: &mut TestAppContext
         std::fs::read_to_string(&global).is_ok_and(|body| body.contains("speed"))
     });
 
-    // The CLI classifier asks the model typed into its picker.
+    // The CLI model picker is in its own card, always visible (e.g. while Jev stays selected).
     w.go(Route::Settings(SettingsPage::Classifier));
-    // The picked option's editor opens on a spring.
     w.pump();
     w.click("settings-cli-model");
     w.pump();
@@ -712,6 +757,7 @@ fn settings_menus_pick_the_priority_and_classifier_model(cx: &mut TestAppContext
         core.config("get", "classifier_cli", &[]),
         serde_json::json!({"agent": "fake", "model": "fake-mini"})
     );
+    assert_eq!(core.config("get", "classifier", &[]), "jev");
     assert!(w.toasts().is_empty(), "{:?}", w.toasts());
 }
 
@@ -809,6 +855,75 @@ fn the_sidebar_pages_a_groups_runs(cx: &mut TestAppContext) {
     toggle(&mut w);
     assert!(
         !revealed(&mut w).contains_key(&group),
+        "closing the group kept its extra pages"
+    );
+    toggle(&mut w);
+    assert!(w.toasts().is_empty(), "{:?}", w.toasts());
+}
+
+/// The Runs page pages each group as the sidebar does: five runs, Show more for five more,
+/// Show less back to five, and closing the group forgets the pages it opened.
+#[gpui::test]
+fn the_runs_page_pages_a_groups_runs(cx: &mut TestAppContext) {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let core = Core::new();
+    let mut ids = Vec::new();
+    for index in 0..7 {
+        let id = core.start(&format!("say hi {index}"), true);
+        core.wait_for(&id, "COMPLETED");
+        ids.push(id);
+    }
+    let mut w = open(&core, cx);
+    w.go(Route::Runs);
+    let rows = |w: &mut Window| {
+        ids.iter()
+            .filter(|id| w.shows(&format!("runs-row-{id}")))
+            .count()
+    };
+    let more = "runs-show-more-status:Done";
+    let less = "runs-show-less-status:Done";
+    // A test frame keeps the bounds of controls it no longer draws, so what a group shows is
+    // read from the limits the page keeps, not from the screen.
+    let revealed = |w: &mut Window| {
+        w.state.read_with(w.cx, |s, _| {
+            s.read_preference::<std::collections::HashMap<String, usize>>(
+                dispatch_app::models::runs::REVEALED_PREFERENCE,
+            )
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+            .get("status:Done")
+            .copied()
+        })
+    };
+    assert_eq!(
+        rows(&mut w),
+        5,
+        "the Done group does not start at five runs"
+    );
+    assert!(w.shows(more), "no Show more under the first five");
+    assert_eq!(revealed(&mut w), None);
+    w.click(more);
+    assert_eq!(rows(&mut w), 7, "Show more revealed no runs");
+    assert_eq!(revealed(&mut w), Some(10), "Show more asked for no page");
+    assert!(w.shows(less), "no Show less once past five");
+    w.click(less);
+    assert_eq!(revealed(&mut w), None, "Show less did not go back to five");
+
+    w.click(more);
+    assert_eq!(revealed(&mut w), Some(10));
+    let toggle = |w: &mut Window| {
+        let bounds =
+            w.cx.debug_bounds("runs-group-status:Done")
+                .expect("the Done group's heading");
+        let at = gpui::point(bounds.left() + gpui::px(24.0), bounds.center().y);
+        w.cx.simulate_click(at, Modifiers::none());
+        w.settle();
+    };
+    toggle(&mut w);
+    assert_eq!(
+        revealed(&mut w),
+        None,
         "closing the group kept its extra pages"
     );
     toggle(&mut w);

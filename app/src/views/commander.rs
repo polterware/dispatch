@@ -17,6 +17,8 @@ use crate::ui::{
 pub struct CommanderView {
     state: Entity<AppState>,
     commander: Entity<Commander>,
+    /// The runs revision the open palette was last built from.
+    recent_key: Option<u64>,
 }
 
 impl CommanderView {
@@ -48,11 +50,16 @@ impl CommanderView {
         // The overlay stays mounted while the palette plays out.
         cx.observe(&commander, |_, _, cx| cx.notify()).detach();
         cx.observe_in(&state, window, move |this, state, window, cx| {
-            let open = state.read(cx).commander_open();
-            if open {
-                let groups = groups(&with_recent(&recent_runs(state.read(cx))));
+            let (open, revision) = {
+                let app = state.read(cx);
+                (app.commander_open(), app.runs_revision())
+            };
+            if open && this.recent_key != Some(revision) {
+                let recent = recent_runs(state.read(cx));
+                let built = groups(&with_recent(&recent));
+                this.recent_key = Some(revision);
                 this.commander
-                    .update(cx, |commander, cx| commander.set_groups(groups, cx));
+                    .update(cx, |commander, cx| commander.set_groups(built, cx));
             }
             this.commander
                 .update(cx, |commander, cx| commander.set_open(open, window, cx));
@@ -61,7 +68,11 @@ impl CommanderView {
             }
         })
         .detach();
-        Self { state, commander }
+        Self {
+            state,
+            commander,
+            recent_key: None,
+        }
     }
 
     /// How far the palette is presented, 0 to 1, for the overlay behind it.

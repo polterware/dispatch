@@ -5,6 +5,7 @@ pub mod runs;
 pub mod settings;
 pub mod sidebar;
 pub mod spend;
+pub mod spend_agent;
 pub mod stats;
 pub mod transcript;
 pub mod voice;

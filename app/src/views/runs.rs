@@ -1,38 +1,63 @@
 //! Runs, the sidebar's View all ([`Route::Runs`]): every workspace's runs as a grouped stack
 //! of full-width rows (grouped by Status by default, with running work on top), searched from
 //! the toolbar, filtered by Repository, Status, Agent, and Tier through the shared
-//! `FilterPopover` (`ActiveFilterBar` under the toolbar), and grouped/sorted through the
-//! toolbar's Display menu.
+//! `FilterPopover` (`ActiveFilterBar` under the toolbar), whose Display section groups,
+//! sorts, and narrows what shows: one toolbar button for all of it.
 
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    AnyElement, AppContext as _, Context, Entity, IntoElement, Render, Window, div, prelude::*, px,
+    AnyElement, AppContext as _, Context, Entity, IntoElement, ListAlignment, ListOffset, ListState,
+    Pixels, Render, SharedString, Window, div, prelude::*, px,
 };
 
 use crate::client::{CancelRunRequest, CoreError};
 use crate::models::filter::Filters;
 use crate::models::runs::{
-    COLLAPSED_PREFERENCE, DISPLAY_PREFERENCE, RunGroup, RunRow, all_rows, filter_specs,
-    group_run_rows, parse_runs_display, runs_default_display, visible_rows,
+    COLLAPSED_PREFERENCE, DISPLAY_PREFERENCE, REVEALED_PREFERENCE, RunGroup, RunRow, all_rows,
+    filter_specs, group_run_rows, page_run_rows, parse_runs_display, runs_default_display,
+    visible_rows,
 };
-use crate::models::sidebar::{Direction, GroupBy, Show, SidebarDisplay, SortBy, conversation_ref};
+use crate::models::sidebar::{
+    Direction, GroupBy, SIDEBAR_PAGE_ROWS, Show, SidebarDisplay, SortBy, conversation_ref,
+};
 use crate::state::{AppState, ConnectionState, Route};
 use crate::theme::Theme;
 use crate::ui::parts::runs::{RunAction, group_header, run_stack_row};
 use crate::ui::{
-    Button, ButtonKind, ButtonSize, FilterField, FilterPopover, FiltersChanged, Icon, MascotMood,
-    Menu, MenuItem, TextInput, ToastTone, page_empty, page_under, page_under_inset,
-    scroll_area_under, toolbar,
+    FilterField, FilterPopover, FiltersChanged, Icon, MascotMood, STACK_OVERDRAW, TextInput,
+    SidebarItem, ToastTone, page_empty, page_under, page_under_inset, sync_virtual_list, toolbar, virtual_stack,
 };
+use polterware_ui::filter::FilterOption;
+use polterware_ui::{DisplayPick, DisplayRow};
 
 /// The page's chrome state.
 const PAGE: &str = "runs-page";
 /// `formatAgo` labels move on the page's 15s clock.
 const CLOCK: Duration = Duration::from_secs(15);
-/// The Display menu's width (`min-w-48`, 12rem).
-const DISPLAY_MENU_WIDTH: f32 = 12.0 * crate::theme::REM;
+/// The Display section's choices: (value, label), in menu order.
+const GROUPINGS: [(&str, &str); 6] = [
+    ("conversation", "Conversation"),
+    ("repository", "Repository"),
+    ("date", "Date"),
+    ("status", "Status"),
+    ("agent", "Agent"),
+    ("none", "None"),
+];
+const ORDERINGS: [(&str, &str); 3] = [
+    ("updated", "Last updated"),
+    ("created", "Date created"),
+    ("name", "Name"),
+];
+const SHOWS: [(&str, &str); 3] = [
+    ("all", "All runs"),
+    ("unmerged", "Hide merged"),
+    ("active", "Running and needs merge"),
+];
+/// The gap inside a group, between its header and its cards and between the cards.
+const ROW_GAP: f32 = 10.0;
 
 pub struct RunsView {
     state: Entity<AppState>,
@@ -40,7 +65,9 @@ pub struct RunsView {
     filters: Entity<FilterPopover>,
     display: SidebarDisplay,
     collapsed: Vec<String>,
-    display_menu: Entity<Menu>,
+    /// How many rows each group shows, by group id, once a Show more revealed past the first
+    /// page; absent groups show [`SIDEBAR_PAGE_ROWS`].
+    revealed: HashMap<String, usize>,
     query: String,
     /// The option ids the filter fields were last built from.
     fields_key: String,
@@ -53,14 +80,90 @@ pub struct RunsView {
     /// The rows the filters and the search keep, for the inputs that kept them.
     visible: Rc<Vec<RunRow>>,
     visible_key: Option<VisibleKey>,
-    /// The grouped rows shown on the page.
+    /// The grouped rows shown on the page, for the visible rows, the display, and the clock.
     groups: Rc<Vec<RunGroup>>,
+    group_key: Option<(VisibleKey, SidebarDisplay, i64)>,
+    /// One virtual item per header and card. Only a new structure replaces them.
+    list: ListState,
+    slots: Rc<Vec<StackSlot>>,
+    slots_key: String,
+    /// The collapsed ids the slots were built from.
+    slot_collapsed: Vec<String>,
+    /// The revealed limits the slots were built from.
+    slot_revealed: HashMap<String, usize>,
+}
+
+/// One item in the runs stack. `after` is the gap under it; the list's own padding is separate.
+enum StackSlot {
+    Header {
+        group: usize,
+        collapsed: bool,
+        after: f32,
+        key: String,
+    },
+    Row {
+        group: usize,
+        row: usize,
+        index: usize,
+        after: f32,
+        key: String,
+    },
+    /// The Show more row under a group's shown runs; it asks for `next` rows.
+    More {
+        group: usize,
+        next: usize,
+        after: f32,
+        key: String,
+    },
+    /// The Show less row, back to the group's first page.
+    Less {
+        group: usize,
+        after: f32,
+        key: String,
+    },
+}
+
+/// Copies of a slot the list closure can hold without borrowing the slot list.
+enum StackItem {
+    Header { group: usize, collapsed: bool },
+    Row(usize, usize, usize),
+    More(usize, usize),
+    Less(usize),
+}
+
+impl StackSlot {
+    fn key(&self) -> &str {
+        match self {
+            Self::Header { key, .. }
+            | Self::Row { key, .. }
+            | Self::More { key, .. }
+            | Self::Less { key, .. } => key,
+        }
+    }
+
+    fn after(&self) -> f32 {
+        match self {
+            Self::Header { after, .. }
+            | Self::Row { after, .. }
+            | Self::More { after, .. }
+            | Self::Less { after, .. } => *after,
+        }
+    }
 }
 
 /// What the visible rows depend on: the rows, the filters, and the search.
 type VisibleKey = (u64, Filters, String);
 
 impl RunsView {
+    /// The screenshot tour: scrolls the stack to item `index`.
+    pub(crate) fn tour_scroll_to(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.list.scroll_to(ListOffset {
+            item_ix: index,
+            offset_in_item: px(0.0),
+        });
+        cx.notify();
+    }
+
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let display = match state
             .read(cx)
@@ -75,8 +178,12 @@ impl RunsView {
             .ok()
             .flatten()
             .unwrap_or_default();
-        let display_menu = cx.new(Menu::new);
-        cx.observe(&display_menu, |_, _, cx| cx.notify()).detach();
+        let revealed = state
+            .read(cx)
+            .read_preference::<HashMap<String, usize>>(REVEALED_PREFERENCE)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
         let search = cx.new(|cx| TextInput::new(cx).placeholder("Search runs…").pill());
         cx.observe(&search, |this, input, cx| {
             let text = input.read(cx).text().to_string();
@@ -90,6 +197,13 @@ impl RunsView {
         cx.subscribe(&filters, |_, _, _: &FiltersChanged, cx| cx.notify())
             .detach();
         cx.observe(&filters, |_, _, cx| cx.notify()).detach();
+        filters.update(cx, |popover, cx| {
+            popover.set_display_rows(display_rows(&display), cx)
+        });
+        cx.subscribe(&filters, |this, _, pick: &DisplayPick, cx| {
+            this.pick_display(pick, cx);
+        })
+        .detach();
         cx.observe(&state, |_, _, cx| cx.notify()).detach();
         cx.spawn(async move |this, cx| {
             loop {
@@ -112,7 +226,8 @@ impl RunsView {
             filters,
             display,
             collapsed,
-            display_menu,
+            slot_revealed: revealed.clone(),
+            revealed,
             query: String::new(),
             fields_key: String::new(),
             cancelling: None,
@@ -122,6 +237,11 @@ impl RunsView {
             visible: Rc::default(),
             visible_key: None,
             groups: Rc::default(),
+            group_key: None,
+            list: ListState::new(0, ListAlignment::Top, px(STACK_OVERDRAW)),
+            slots: Rc::default(),
+            slots_key: String::new(),
+            slot_collapsed: Vec::new(),
         }
     }
 
@@ -144,22 +264,81 @@ impl RunsView {
             self.rows = Rc::new(rows);
             self.rows_key = Some(revision);
         }
-        let filters = self.filters.read(cx).filters().clone();
-        let visible_key = (revision, filters, self.query.clone());
-        if self.visible_key.as_ref() != Some(&visible_key) {
-            self.visible = Rc::new(visible_rows(&self.rows, &visible_key.1, &self.query, None));
-            self.visible_key = Some(visible_key);
+        let filters = self.filters.read(cx).filters();
+        let visible_fresh = self.visible_key.as_ref().is_some_and(|(rev, cached, query)| {
+            *rev == revision && cached == filters && query == &self.query
+        });
+        if !visible_fresh {
+            let filters = filters.clone();
+            self.visible = Rc::new(visible_rows(&self.rows, &filters, &self.query, None));
+            self.visible_key = Some((revision, filters, self.query.clone()));
         }
-        let mut groups = group_run_rows(&self.visible, &self.display, self.now_ms);
-        let state = self.state.read(cx);
-        for group in &mut groups {
-            if let Some(name) =
-                conversation_ref(&group.id).and_then(|id| state.conversation_name(id))
-            {
-                group.title = name.to_string();
+        let groups_stale = match &self.group_key {
+            Some((key, display, now)) => {
+                self.visible_key.as_ref() != Some(key)
+                    || *display != self.display
+                    || *now != self.now_ms
+            }
+            None => true,
+        };
+        if groups_stale {
+            let mut groups = group_run_rows(&self.visible, &self.display, self.now_ms);
+            let state = self.state.read(cx);
+            for group in &mut groups {
+                if let Some(name) =
+                    conversation_ref(&group.id).and_then(|id| state.conversation_name(id))
+                {
+                    group.title = name.to_string();
+                }
+            }
+            self.groups = Rc::new(groups);
+            self.group_key = self
+                .visible_key
+                .clone()
+                .map(|key| (key, self.display, self.now_ms));
+        }
+        let collapsed_changed = self.slot_collapsed != self.collapsed;
+        let revealed_changed = self.slot_revealed != self.revealed;
+        if groups_stale || collapsed_changed || revealed_changed {
+            let gap = Theme::global(cx).space_6;
+            let (slots, structure) = stack_slots(&self.groups, &self.collapsed, &self.revealed, gap);
+            if structure != self.slots_key {
+                let anchor = self.scroll_anchor();
+                self.slots = slots;
+                self.slots_key = structure;
+                sync_virtual_list(&self.list, self.slots.len(), true);
+                self.restore_scroll(anchor);
+            }
+            if collapsed_changed {
+                self.slot_collapsed = self.collapsed.clone();
+            }
+            if revealed_changed {
+                self.slot_revealed = self.revealed.clone();
             }
         }
-        self.groups = Rc::new(groups);
+    }
+
+    /// The item under the scroll, so a collapse above it does not jump to another card.
+    fn scroll_anchor(&self) -> Option<(String, Pixels)> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        let top = self.list.logical_scroll_top();
+        let index = top.item_ix.min(self.slots.len() - 1);
+        Some((self.slots[index].key().to_string(), top.offset_in_item))
+    }
+
+    fn restore_scroll(&self, anchor: Option<(String, Pixels)>) {
+        let Some((key, offset)) = anchor else {
+            return;
+        };
+        let Some(item_ix) = self.slots.iter().position(|slot| slot.key() == key) else {
+            return;
+        };
+        self.list.scroll_to(ListOffset {
+            item_ix,
+            offset_in_item: offset,
+        });
     }
 
     /// The fields follow the runs' distinct values, rebuilt only when those change.
@@ -190,18 +369,41 @@ impl RunsView {
         });
     }
 
-    fn is_collapsed(&self, id: &str) -> bool {
-        self.collapsed.iter().any(|item| item == id)
-    }
-
     fn toggle_group(&mut self, id: String, cx: &mut Context<Self>) {
         if let Some(pos) = self.collapsed.iter().position(|item| item == &id) {
             self.collapsed.remove(pos);
         } else {
+            // Collapsing forgets the pages a Show more opened: opened again, the group
+            // shows its first rows only.
+            if self.revealed.remove(&id).is_some() {
+                self.persist_revealed(cx);
+            }
             self.collapsed.push(id);
         }
         self.persist_collapsed(cx);
         cx.notify();
+    }
+
+    /// A Show more adds a page of rows to its group.
+    fn reveal_more(&mut self, id: String, limit: usize, cx: &mut Context<Self>) {
+        self.revealed.insert(id, limit);
+        self.persist_revealed(cx);
+        cx.notify();
+    }
+
+    /// A Show less folds its group back to the first page.
+    fn show_less(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.revealed.remove(&id).is_some() {
+            self.persist_revealed(cx);
+        }
+        cx.notify();
+    }
+
+    fn persist_revealed(&self, cx: &gpui::App) {
+        let _ = self
+            .state
+            .read(cx)
+            .write_preference(REVEALED_PREFERENCE, &self.revealed);
     }
 
     fn persist_display(&self, cx: &gpui::App) {
@@ -218,177 +420,33 @@ impl RunsView {
             .write_preference(COLLAPSED_PREFERENCE, &self.collapsed);
     }
 
-    fn toggle_display(&mut self, cx: &mut Context<Self>) {
-        if self.display_menu.read(cx).is_open() {
-            self.display_menu.update(cx, |menu, cx| {
-                menu.set_open(false);
-                cx.notify();
-            });
-            cx.notify();
-            return;
+    /// Display picks change only the page's presentation, never its filter clauses.
+    fn pick_display(&mut self, pick: &DisplayPick, cx: &mut Context<Self>) {
+        match pick {
+            DisplayPick::Reset => self.display = runs_default_display(),
+            DisplayPick::Value { row, value } => match (row.as_str(), value.as_str()) {
+                ("group", "conversation") => self.display.group_by = GroupBy::Conversation,
+                ("group", "repository") => self.display.group_by = GroupBy::Repository,
+                ("group", "date") => self.display.group_by = GroupBy::Date,
+                ("group", "status") => self.display.group_by = GroupBy::Status,
+                ("group", "agent") => self.display.group_by = GroupBy::Agent,
+                ("group", "none") => self.display.group_by = GroupBy::None,
+                ("sort", "updated") => self.display.sort_by = SortBy::Updated,
+                ("sort", "created") => self.display.sort_by = SortBy::Created,
+                ("sort", "name") => self.display.sort_by = SortBy::Name,
+                ("sort", "desc") => self.display.direction = Direction::Desc,
+                ("sort", "asc") => self.display.direction = Direction::Asc,
+                ("show", "all") => self.display.show = Show::All,
+                ("show", "unmerged") => self.display.show = Show::Unmerged,
+                ("show", "active") => self.display.show = Show::Active,
+                _ => return,
+            },
         }
-        let items = self.display_items(cx);
-        self.display_menu.update(cx, |menu, cx| {
-            menu.set_menu(items);
-            menu.set_width(DISPLAY_MENU_WIDTH);
-            menu.set_open(true);
-            cx.notify();
+        self.persist_display(cx);
+        self.filters.update(cx, |popover, cx| {
+            popover.set_display_rows(display_rows(&self.display), cx)
         });
         cx.notify();
-    }
-
-    fn display_items(&self, cx: &mut Context<Self>) -> Vec<MenuItem> {
-        let view = cx.entity();
-        let reset = view.clone();
-        let radios = |labels: &[&str],
-                      picked: usize,
-                      pick: fn(&mut Self, usize, &mut Context<Self>)|
-         -> Vec<MenuItem> {
-            labels
-                .iter()
-                .enumerate()
-                .map(|(index, label)| {
-                    let view = view.clone();
-                    MenuItem::radio(
-                        label.to_string(),
-                        index == picked,
-                        Rc::new(move |_, cx| {
-                            let _ = view.update(cx, |this, cx| pick(this, index, cx));
-                        }),
-                    )
-                })
-                .collect()
-        };
-        let group_index = match self.display.group_by {
-            GroupBy::Conversation => 0,
-            GroupBy::Repository => 1,
-            GroupBy::Date => 2,
-            GroupBy::Status => 3,
-            GroupBy::Agent => 4,
-            GroupBy::None => 5,
-        };
-        let sort_index = match self.display.sort_by {
-            SortBy::Updated => 0,
-            SortBy::Created => 1,
-            SortBy::Name => 2,
-        };
-        let direction_index = match self.display.direction {
-            Direction::Desc => 0,
-            Direction::Asc => 1,
-        };
-        let show_index = match self.display.show {
-            Show::All => 0,
-            Show::Unmerged => 1,
-            Show::Active => 2,
-        };
-        let mut sort = radios(
-            &["Last updated", "Date created", "Name"],
-            sort_index,
-            Self::pick_sort,
-        );
-        sort.push(MenuItem::Separator);
-        sort.extend(radios(
-            &["Descending", "Ascending"],
-            direction_index,
-            Self::pick_direction,
-        ));
-        vec![
-            MenuItem::submenu(
-                "Group by",
-                Some(Icon::Layers),
-                radios(
-                    &[
-                        "Conversation",
-                        "Repository",
-                        "Date",
-                        "Status",
-                        "Agent",
-                        "None",
-                    ],
-                    group_index,
-                    Self::pick_group,
-                ),
-            ),
-            MenuItem::submenu("Sort by", Some(Icon::ListOrdered), sort),
-            MenuItem::submenu(
-                "Show",
-                Some(Icon::ListFilter),
-                radios(
-                    &["All runs", "Hide merged", "Running and needs merge"],
-                    show_index,
-                    Self::pick_show,
-                ),
-            ),
-            MenuItem::Separator,
-            MenuItem::action(
-                "Reset to defaults",
-                Some(Icon::RefreshCw),
-                Rc::new(move |_, cx| {
-                    let _ = reset.update(cx, |this, cx| this.reset_display(cx));
-                }),
-            ),
-        ]
-    }
-
-    fn reset_display(&mut self, cx: &mut Context<Self>) {
-        self.display = runs_default_display();
-        self.persist_display(cx);
-        cx.notify();
-    }
-
-    fn pick_group(&mut self, index: usize, cx: &mut Context<Self>) {
-        let value = match index {
-            0 => GroupBy::Conversation,
-            1 => GroupBy::Repository,
-            2 => GroupBy::Date,
-            3 => GroupBy::Status,
-            4 => GroupBy::Agent,
-            _ => GroupBy::None,
-        };
-        if self.display.group_by != value {
-            self.display.group_by = value;
-            self.persist_display(cx);
-            cx.notify();
-        }
-    }
-
-    fn pick_sort(&mut self, index: usize, cx: &mut Context<Self>) {
-        let value = match index {
-            1 => SortBy::Created,
-            2 => SortBy::Name,
-            _ => SortBy::Updated,
-        };
-        if self.display.sort_by != value {
-            self.display.sort_by = value;
-            self.persist_display(cx);
-            cx.notify();
-        }
-    }
-
-    fn pick_direction(&mut self, index: usize, cx: &mut Context<Self>) {
-        let value = if index == 0 {
-            Direction::Desc
-        } else {
-            Direction::Asc
-        };
-        if self.display.direction != value {
-            self.display.direction = value;
-            self.persist_display(cx);
-            cx.notify();
-        }
-    }
-
-    fn pick_show(&mut self, index: usize, cx: &mut Context<Self>) {
-        let value = match index {
-            1 => Show::Unmerged,
-            2 => Show::Active,
-            _ => Show::All,
-        };
-        if self.display.show != value {
-            self.display.show = value;
-            self.persist_display(cx);
-            cx.notify();
-        }
     }
 
     fn open_run(&mut self, id: String, cx: &mut Context<Self>) {
@@ -453,8 +511,7 @@ impl Render for RunsView {
         let scrolls = !groups.is_empty();
 
         let content: AnyElement = if scrolls {
-            let body = runs_stack(&groups, self, cx);
-            scroll_area_under("runs-scroll", top, body, window, cx)
+            self.runs_stack(top, theme.space_4, window, cx)
         } else if connecting {
             div().into_any_element()
         } else {
@@ -466,28 +523,12 @@ impl Render for RunsView {
             page_empty(title, mood, cx).into_any_element()
         };
 
-        let display_open = self.display_menu.read(cx).is_open();
-        let view = cx.entity();
-        let display_button = Button::new("runs-display", ButtonKind::Secondary)
-            .size(ButtonSize::Icon)
-            .icon(Icon::Layers)
-            .selected(display_open)
-            .on_click(move |_, cx| {
-                let _ = view.update(cx, |this, cx| this.toggle_display(cx));
-            });
-        let display_button = if display_open {
-            display_button
-        } else {
-            display_button.tooltip("Display")
-        };
-
         let end = div()
             .flex()
             .items_center()
             .gap(px(8.0))
             .child(div().w(px(200.0)).child(self.search.clone()))
-            .child(self.filters.clone())
-            .child(display_button);
+            .child(self.filters.clone());
         div()
             .relative()
             .size_full()
@@ -510,75 +551,284 @@ impl Render for RunsView {
                 window,
                 cx,
             ))
-            .child(
-                div()
-                    .absolute()
-                    .top(px(theme.space_2))
-                    .right(px(DISPLAY_MENU_WIDTH * 2.0 + theme.space_4))
-                    .w(px(DISPLAY_MENU_WIDTH))
-                    .child(self.display_menu.clone()),
-            )
     }
 }
 
-fn runs_stack(groups: &[RunGroup], view: &RunsView, cx: &mut Context<RunsView>) -> AnyElement {
-    let theme = *Theme::global(cx);
-    let entity = cx.entity();
-    let on_toggle: RunAction = {
-        let entity = entity.clone();
-        Rc::new(move |id: &str, _, cx| {
-            let id = id.to_string();
-            entity.update(cx, |this, cx| this.toggle_group(id, cx));
-        })
-    };
-    let on_open: RunAction = {
-        let entity = entity.clone();
-        Rc::new(move |id: &str, _, cx| {
-            let id = id.to_string();
-            entity.update(cx, |this, cx| this.open_run(id, cx));
-        })
-    };
-    let on_cancel: RunAction = {
-        let entity = entity.clone();
-        Rc::new(move |id: &str, _, cx| {
-            let id = id.to_string();
-            entity.update(cx, |this, cx| this.cancel_run(id, cx));
-        })
-    };
+impl RunsView {
+    /// The groups as a virtual stack: a header, then its cards, only the ones in view.
+    fn runs_stack(
+        &self,
+        top: f32,
+        bottom: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let entity = cx.entity();
+        let on_toggle: RunAction = {
+            let entity = entity.clone();
+            Rc::new(move |id: &str, _, cx| {
+                let id = id.to_string();
+                entity.update(cx, |this, cx| this.toggle_group(id, cx));
+            })
+        };
+        let on_open: RunAction = {
+            let entity = entity.clone();
+            Rc::new(move |id: &str, _, cx| {
+                let id = id.to_string();
+                entity.update(cx, |this, cx| this.open_run(id, cx));
+            })
+        };
+        let on_cancel: RunAction = {
+            let entity = entity.clone();
+            Rc::new(move |id: &str, _, cx| {
+                let id = id.to_string();
+                entity.update(cx, |this, cx| this.cancel_run(id, cx));
+            })
+        };
+        let on_more: Rc<dyn Fn(&str, usize, &mut gpui::App)> = {
+            let entity = entity.clone();
+            Rc::new(move |id: &str, limit, cx| {
+                let id = id.to_string();
+                entity.update(cx, |this, cx| this.reveal_more(id, limit, cx));
+            })
+        };
+        let on_less: RunAction = {
+            let entity = entity.clone();
+            Rc::new(move |id: &str, _, cx| {
+                let id = id.to_string();
+                entity.update(cx, |this, cx| this.show_less(id, cx));
+            })
+        };
+        let slots = self.slots.clone();
+        let groups = self.groups.clone();
+        let now_ms = self.now_ms;
+        let cancelling = self.cancelling.clone();
+        virtual_stack(
+            "runs-scroll",
+            &self.list,
+            top,
+            bottom,
+            move |index, _, cx| {
+                let Some((after, item)) = slots.get(index).map(|slot| {
+                    let after = slot.after();
+                    let item = match slot {
+                        StackSlot::Header {
+                            group, collapsed, ..
+                        } => StackItem::Header {
+                            group: *group,
+                            collapsed: *collapsed,
+                        },
+                        StackSlot::Row {
+                            group,
+                            row,
+                            index,
+                            ..
+                        } => StackItem::Row(*group, *row, *index),
+                        StackSlot::More { group, next, .. } => StackItem::More(*group, *next),
+                        StackSlot::Less { group, .. } => StackItem::Less(*group),
+                    };
+                    (after, item)
+                }) else {
+                    return div().into_any_element();
+                };
+                let body = match item {
+                    StackItem::Header {
+                        group: group_index,
+                        collapsed,
+                    } => {
+                        let Some(group) = groups.get(group_index) else {
+                            return div().into_any_element();
+                        };
+                        group_header(group, collapsed, on_toggle.clone(), cx)
+                    }
+                    StackItem::More(group, next) => {
+                        let Some(group) = groups.get(group) else {
+                            return div().into_any_element();
+                        };
+                        let id = group.id.clone();
+                        let on_more = on_more.clone();
+                        page_control("show-more", "Show more", &group.id, move |_, cx| {
+                            on_more(&id, next, cx)
+                        })
+                    }
+                    StackItem::Less(group) => {
+                        let Some(group) = groups.get(group) else {
+                            return div().into_any_element();
+                        };
+                        let id = group.id.clone();
+                        let on_less = on_less.clone();
+                        page_control("show-less", "Show less", &group.id, move |window, cx| {
+                            on_less(&id, window, cx)
+                        })
+                    }
+                    StackItem::Row(group, row, row_index) => {
+                        let Some(row) = groups.get(group).and_then(|group| group.runs.get(row))
+                        else {
+                            return div().into_any_element();
+                        };
+                        let busy = cancelling.as_deref() == Some(row.id.as_str());
+                        run_stack_row(
+                            row_index,
+                            row,
+                            busy,
+                            now_ms,
+                            on_open.clone(),
+                            on_cancel.clone(),
+                            cx,
+                        )
+                    }
+                };
+                div()
+                    .w_full()
+                    .when(after > 0.0, |item| item.mb(px(after)))
+                    .child(body)
+                    .into_any_element()
+            },
+            window,
+            cx,
+        )
+    }
+}
 
-    let mut stack = div()
+/// A group's Show more or Show less row, as the sidebar's: a `SidebarItem` with its label.
+fn page_control(
+    kind: &str,
+    label: &'static str,
+    group: &str,
+    on_click: impl Fn(&mut Window, &mut gpui::App) + 'static,
+) -> AnyElement {
+    let id = format!("runs-{kind}-{group}");
+    let debug_id = id.clone();
+    div()
         .w_full()
-        .flex()
-        .flex_col()
-        .gap(px(theme.space_6))
-        .pb(px(theme.space_4));
+        .debug_selector(move || debug_id.clone())
+        .child(SidebarItem::new(SharedString::from(id), label).on_click(on_click))
+        .into_any_element()
+}
+
+/// Headers and cards, in order. The structure key ignores titles, so a clock tick that only
+/// rewrites an "ago" label does not measure the stack again.
+fn stack_slots(
+    groups: &[RunGroup],
+    collapsed: &[String],
+    revealed: &HashMap<String, usize>,
+    group_gap: f32,
+) -> (Rc<Vec<StackSlot>>, String) {
+    let mut slots = Vec::new();
+    let mut structure = String::new();
     let mut row_index = 0usize;
-    for group in groups {
-        let collapsed = view.is_collapsed(&group.id);
-        let mut section = div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .gap(px(10.0))
-            .child(group_header(group, collapsed, on_toggle.clone(), cx));
-        if !collapsed {
-            for row in &group.runs {
-                let busy = view.cancelling.as_deref() == Some(row.id.as_str());
-                section = section.child(run_stack_row(
-                    row_index,
+    let last = groups.len().saturating_sub(1);
+    for (group_index, group) in groups.iter().enumerate() {
+        let folded = collapsed.iter().any(|id| id == &group.id);
+        structure.push_str(&group.id);
+        structure.push(if folded { 'c' } else { 'o' });
+        let show_rows = !folded && !group.runs.is_empty();
+        let header_after = if show_rows {
+            ROW_GAP
+        } else if group_index == last {
+            0.0
+        } else {
+            group_gap
+        };
+        slots.push(StackSlot::Header {
+            group: group_index,
+            collapsed: folded,
+            after: header_after,
+            key: format!("h:{}", group.id),
+        });
+        if show_rows {
+            let limit = revealed
+                .get(&group.id)
+                .copied()
+                .unwrap_or(SIDEBAR_PAGE_ROWS);
+            let page = page_run_rows(group.runs.len(), limit);
+            // The rows past the page wait behind Show more; Show less folds them back.
+            let controls = usize::from(page.hidden > 0) + usize::from(page.can_show_less);
+            let tail_after = |last_item: bool| {
+                if !last_item {
+                    ROW_GAP
+                } else if group_index == last {
+                    0.0
+                } else {
+                    group_gap
+                }
+            };
+            for (row, run) in group.runs.iter().take(page.shown).enumerate() {
+                structure.push('\u{1f}');
+                structure.push_str(&run.id);
+                let after = tail_after(controls == 0 && row + 1 == page.shown);
+                slots.push(StackSlot::Row {
+                    group: group_index,
                     row,
-                    busy,
-                    view.now_ms,
-                    on_open.clone(),
-                    on_cancel.clone(),
-                    cx,
-                ));
+                    index: row_index,
+                    after,
+                    key: format!("r:{}", run.id),
+                });
                 row_index += 1;
             }
+            if page.hidden > 0 {
+                structure.push('m');
+                slots.push(StackSlot::More {
+                    group: group_index,
+                    next: page.next_limit,
+                    after: tail_after(!page.can_show_less),
+                    key: format!("m:{}", group.id),
+                });
+            }
+            if page.can_show_less {
+                structure.push('l');
+                slots.push(StackSlot::Less {
+                    group: group_index,
+                    after: tail_after(true),
+                    key: format!("l:{}", group.id),
+                });
+            }
         }
-        stack = stack.child(section);
+        structure.push('\u{1e}');
     }
-    stack.into_any_element()
+    (Rc::new(slots), structure)
+}
+
+/// The page's display as the Display section's values.
+fn display_rows(display: &SidebarDisplay) -> Vec<DisplayRow> {
+    let grouping = match display.group_by {
+        GroupBy::Conversation => "conversation",
+        GroupBy::Repository => "repository",
+        GroupBy::Date => "date",
+        GroupBy::Status => "status",
+        GroupBy::Agent => "agent",
+        GroupBy::None => "none",
+    };
+    let ordering = match display.sort_by {
+        SortBy::Updated => "updated",
+        SortBy::Created => "created",
+        SortBy::Name => "name",
+    };
+    let show = match display.show {
+        Show::All => "all",
+        Show::Unmerged => "unmerged",
+        Show::Active => "active",
+    };
+    let options = |choices: &[(&str, &str)]| {
+        choices
+            .iter()
+            .map(|(id, label)| FilterOption::new(*id, *label))
+            .collect()
+    };
+    vec![
+        DisplayRow::new("group", "Group by", Icon::Layers).group(options(&GROUPINGS), grouping),
+        DisplayRow::new("sort", "Sort by", Icon::ListOrdered)
+            .group(options(&ORDERINGS), ordering)
+            .group(
+                options(&[("desc", "Descending"), ("asc", "Ascending")]),
+                if display.direction == Direction::Desc {
+                    "desc"
+                } else {
+                    "asc"
+                },
+            ),
+        DisplayRow::new("show", "Show", Icon::ListFilter).group(options(&SHOWS), show),
+    ]
 }
 
 fn unix_ms() -> i64 {
