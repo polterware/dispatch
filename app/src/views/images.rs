@@ -558,11 +558,8 @@ impl ImagesView {
                                 .child(SharedString::from(label.clone()))
                                 .into_any_element(),
                             GalleryKind::Row(indexes) => {
-                                let mut row = div()
-                                    .w_full()
-                                    .grid()
-                                    .grid_cols(cols)
-                                    .gap(px(TILE_GAP));
+                                let mut row =
+                                    div().w_full().grid().grid_cols(cols).gap(px(TILE_GAP));
                                 for index in indexes {
                                     if let Some(tile) = tiles.get(*index) {
                                         row = row.child(image_tile(
@@ -999,7 +996,12 @@ impl ImagesView {
 
 /// Day headings and rows of `cols` tiles. Later headings keep a group gap above them, and
 /// every heading keeps a small gap under it. Rows keep the tile gap, except a group's last.
-fn gallery_slots(tiles: &[ImageTile], cols: usize, heading_gap: f32, group_gap: f32) -> Vec<GallerySlot> {
+fn gallery_slots(
+    tiles: &[ImageTile],
+    cols: usize,
+    heading_gap: f32,
+    group_gap: f32,
+) -> Vec<GallerySlot> {
     let refs: Vec<&ImageTile> = tiles.iter().collect();
     let groups = group_by_day(&refs);
     let mut slots = Vec::new();

@@ -39,12 +39,12 @@ use crate::ui::parts::settings::{
     radio_mark, settings_row, settings_section, wash,
 };
 use crate::ui::patterns::{
-    AnchorSlot, SETTINGS_SECTION_GAP, SettingsNavItem, settings_content_height, settings_dialog,
-    window_anchor,
+    AnchorSlot, SETTINGS_SECTION_GAP, SettingsNavItem, SettingsSearchEntry,
+    scroll_to_settings_section, settings_content_height, settings_dialog, window_anchor,
 };
 use crate::ui::{
-    ButtonKind, Icon, Menu, MenuItem, Popover, STACK_OVERDRAW, Switch, TextInput, TileTone, button,
-    chip, icon, sync_virtual_list, virtual_stack,
+    ButtonKind, FieldSize, Icon, Menu, MenuItem, Popover, STACK_OVERDRAW, Switch, TextInput,
+    TileTone, button, chip, icon, sync_virtual_list, virtual_stack,
 };
 use crate::ui::{SkeletonLayout, page_skeleton};
 use crate::voice;
@@ -128,6 +128,8 @@ pub struct SettingsView {
     models_list: ListState,
     models_ticket: u64,
     models_search: Entity<TextInput>,
+    /// The rail's search over every page's settings; cleared when the dialog closes.
+    settings_search: Entity<TextInput>,
     models_inflight: bool,
     models_saving: bool,
     /// One switch per (agent, model): the same model switches on its own in each agent's card.
@@ -207,6 +209,12 @@ impl SettingsView {
         let view = cx.entity().downgrade();
         let models_search =
             cx.new(|cx| TextInput::new(cx).placeholder("Search providers and models"));
+        let settings_search = cx.new(|cx| {
+            TextInput::new(cx)
+                .placeholder("Search settings")
+                .size(FieldSize::Sm)
+                .pill()
+        });
         let jev_key = key_input("jev", "Paste a key", view.clone(), cx);
         let openai_key = key_input("openai", "Paste a key", view.clone(), cx);
         let roles = switch(true, view.clone(), cx, |this, on, cx| this.on_roles(on, cx));
@@ -236,6 +244,7 @@ impl SettingsView {
         })
         .detach();
         watch_input(&models_search, cx);
+        watch_input(&settings_search, cx);
         watch_input(&jev_key, cx);
         watch_input(&openai_key, cx);
         watch_input(&cli_filter, cx);
@@ -259,6 +268,7 @@ impl SettingsView {
             models_list: ListState::new(0, ListAlignment::Top, px(STACK_OVERDRAW)),
             models_ticket: 0,
             models_search,
+            settings_search,
             models_inflight: false,
             models_saving: false,
             agent_model_switches: BTreeMap::new(),
@@ -3366,6 +3376,10 @@ impl Render for SettingsView {
             .collect();
         let select = self.state.clone();
         let close = self.state.clone();
+        let close_search = self.settings_search.clone();
+        let open_state = self.state.clone();
+        let open_search = self.settings_search.clone();
+        let query = self.settings_search.read(cx).text().to_string();
         let mut dialog = settings_dialog(self.presence())
             .items(items)
             .active(active)
@@ -3383,11 +3397,35 @@ impl Render for SettingsView {
                 },
             ))
             .on_close(Rc::new(move |_, cx| {
+                close_search.update(cx, |field, cx| field.set_text("", cx));
                 close.update(cx, |state, cx| {
                     state.close_settings();
                     cx.notify();
                 });
             }))
+            .search(
+                div()
+                    .debug_selector(|| "settings-search".to_string())
+                    .child(self.settings_search.clone()),
+                query,
+                search_entries(),
+                Rc::new(move |entry: &SettingsSearchEntry, window, cx: &mut App| {
+                    let Some((page, _, _)) = RAIL
+                        .iter()
+                        .find(|(_, label, _)| *label == entry.item.as_ref())
+                    else {
+                        return;
+                    };
+                    open_search.update(cx, |field, cx| field.set_text("", cx));
+                    open_state.update(cx, |state, cx| {
+                        state.navigate(Route::Settings(page.clone()));
+                        cx.notify();
+                    });
+                    if let Some(section) = &entry.section {
+                        scroll_to_settings_section(section.clone(), window, cx);
+                    }
+                }),
+            )
             .child(
                 div()
                     .opacity(entered)
@@ -3567,6 +3605,49 @@ fn text_or_none(text: &str) -> Option<SharedString> {
     } else {
         Some(text.to_string().into())
     }
+}
+
+/// What the rail's search finds: each page's sections, by the title its card shows, with the
+/// words a setting inside goes by.
+fn search_entries() -> Vec<SettingsSearchEntry> {
+    let entry = |page: &str, section: &str| {
+        SettingsSearchEntry::new(page.to_string(), section.to_string()).section(section.to_string())
+    };
+    vec![
+        entry("Agents", "Command line")
+            .description("Agents delegate by running dispatch in their shell.")
+            .keywords("cli dispatch path link install shell"),
+        entry("Agents", "Skill")
+            .description("Teaches agents when to delegate with dispatch run.")
+            .keywords("skills install remove agents claude codex antigravity gemini cursor"),
+        entry("Agents", "Session hook")
+            .description("The line each agent reads at the start of a session.")
+            .keywords("hooks session start codex claude cursor grok copilot"),
+        entry("Models", "Models")
+            .description("Choose the agents and models Dispatch shows and runs.")
+            .keywords("providers enable disable switch agents"),
+        entry("Classifier", "Difficulty classifier")
+            .description("What judges how hard a task is before it is routed.")
+            .keywords("auto tier jev openai cli key api"),
+        entry("Classifier", "Agent CLI model")
+            .description("The model the CLI classifier asks.")
+            .keywords("classifier cli model cheap"),
+        entry("Pick a role", "Roles")
+            .description("Whether Auto picks a role for each run.")
+            .keywords("role explorer implementer reviewer tester planner"),
+        entry("Routing policy", "Model choice")
+            .description("How Auto picks a model.")
+            .keywords("priority speed balanced quality auto routing"),
+        entry("Worktrees", "Worktrees")
+            .description("Where runs work and how leftover worktrees are cleaned up.")
+            .keywords("branch clean up git folders"),
+        entry("Voice", "Voice")
+            .description("What Dispatch hears and speaks with.")
+            .keywords("engine microphone speech language chat"),
+        entry("Voice", "Models")
+            .description("The voice models you can download.")
+            .keywords("voice download license whisper tts"),
+    ]
 }
 
 fn watch_input(input: &Entity<TextInput>, cx: &mut Context<SettingsView>) {

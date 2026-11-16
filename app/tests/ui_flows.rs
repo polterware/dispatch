@@ -762,6 +762,28 @@ fn settings_menus_pick_the_priority_and_classifier_model(cx: &mut TestAppContext
 }
 
 #[gpui::test]
+fn the_settings_search_opens_a_result_on_its_page(cx: &mut TestAppContext) {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let core = Core::new();
+    let mut w = open(&core, cx);
+
+    // A query swaps the content for what it matches; picking one opens its page.
+    w.go(Route::Settings(SettingsPage::Agents));
+    w.pump();
+    w.click("settings-search");
+    w.cx.simulate_input("balanced quality");
+    w.pump();
+    w.click("settings-result-0");
+    w.pump();
+    assert!(
+        matches!(w.route(), Route::Settings(SettingsPage::RoutingPolicy)),
+        "{:?}",
+        w.route()
+    );
+    assert!(w.cx.debug_bounds("settings-priority").is_some());
+}
+
+#[gpui::test]
 fn settings_models_switch_models_one_agent_at_a_time(cx: &mut TestAppContext) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let core = Core::new();

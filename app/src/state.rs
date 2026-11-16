@@ -956,7 +956,12 @@ impl AppState {
             self.conversation_names.remove(conversation_id).is_some()
         } else {
             let trimmed = name.trim();
-            if self.conversation_names.get(conversation_id).map(String::as_str) == Some(trimmed) {
+            if self
+                .conversation_names
+                .get(conversation_id)
+                .map(String::as_str)
+                == Some(trimmed)
+            {
                 false
             } else {
                 self.conversation_names
@@ -1167,7 +1172,8 @@ impl AppState {
                 let workspaces_changed = assign(&mut self.workspaces, snapshot.workspaces);
                 let linked_changed = assign(&mut self.linked, snapshot.linked);
                 let sections_changed = assign(&mut self.sections, snapshot.sections);
-                let names_changed = assign(&mut self.conversation_names, snapshot.conversation_names);
+                let names_changed =
+                    assign(&mut self.conversation_names, snapshot.conversation_names);
                 let runs_changed = self.set_runs(snapshot.runs);
                 // A workspace, section, or name can move while the runs stay put. Lists keyed
                 // on the runs revision rebuild either way.

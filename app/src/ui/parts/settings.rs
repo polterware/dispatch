@@ -21,14 +21,16 @@ pub fn settings_section(
     body: impl IntoElement,
     _cx: &App,
 ) -> AnyElement {
-    let mut section = crate::ui::patterns::settings_section(title)
+    let title: SharedString = title.into();
+    let mut section = crate::ui::patterns::settings_section(title.clone())
         .description(description)
         .icon(icon, tone)
         .child(body);
     if let Some(action) = action {
         section = section.action(action);
     }
-    section.into_any_element()
+    // Named for the rail's search, which scrolls a picked result's section into view.
+    crate::ui::patterns::settings_anchor(title, section).into_any_element()
 }
 
 /// What an agent card's fold does when it is pressed.

@@ -256,7 +256,11 @@ pub fn run_stack_row(
         .child(fact(Icon::Bot, "Agent", agent_cell(index, row, cx)).flex_shrink())
         .child(fact(Icon::Folder, "Repository", source_cell(index, row, cx)).flex_shrink());
     if !row.tier.trim().is_empty() {
-        facts = facts.child(fact(Icon::Gauge, "Tier", figure("runs-tier", &row.tier, "")));
+        facts = facts.child(fact(
+            Icon::Gauge,
+            "Tier",
+            figure("runs-tier", &row.tier, ""),
+        ));
     }
     facts = facts.child(fact(Icon::FileDiff, "Changes", changes_cell(row, cx)));
     if let Some(tokens) = &row.tokens_label {
@@ -267,7 +271,11 @@ pub fn run_stack_row(
         ));
     }
     if let Some(cost) = &row.cost_label {
-        facts = facts.child(fact(Icon::CreditCard, "Cost", figure("runs-cost", cost, &row.cost_title)));
+        facts = facts.child(fact(
+            Icon::CreditCard,
+            "Cost",
+            figure("runs-cost", cost, &row.cost_title),
+        ));
     }
     facts = facts.child(fact(Icon::Clock, "Started", started_cell(row, now_ms, cx)));
 

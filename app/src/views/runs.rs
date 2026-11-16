@@ -9,8 +9,8 @@ use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    AnyElement, AppContext as _, Context, Entity, IntoElement, ListAlignment, ListOffset, ListState,
-    Pixels, Render, SharedString, Window, div, prelude::*, px,
+    AnyElement, AppContext as _, Context, Entity, IntoElement, ListAlignment, ListOffset,
+    ListState, Pixels, Render, SharedString, Window, div, prelude::*, px,
 };
 
 use crate::client::{CancelRunRequest, CoreError};
@@ -27,8 +27,9 @@ use crate::state::{AppState, ConnectionState, Route};
 use crate::theme::Theme;
 use crate::ui::parts::runs::{RunAction, group_header, run_stack_row};
 use crate::ui::{
-    FilterField, FilterPopover, FiltersChanged, Icon, MascotMood, STACK_OVERDRAW, TextInput,
-    SidebarItem, ToastTone, page_empty, page_under, page_under_inset, sync_virtual_list, toolbar, virtual_stack,
+    FilterField, FilterPopover, FiltersChanged, Icon, MascotMood, STACK_OVERDRAW, SidebarItem,
+    TextInput, ToastTone, page_empty, page_under, page_under_inset, sync_virtual_list, toolbar,
+    virtual_stack,
 };
 use polterware_ui::filter::FilterOption;
 use polterware_ui::{DisplayPick, DisplayRow};
@@ -265,9 +266,12 @@ impl RunsView {
             self.rows_key = Some(revision);
         }
         let filters = self.filters.read(cx).filters();
-        let visible_fresh = self.visible_key.as_ref().is_some_and(|(rev, cached, query)| {
-            *rev == revision && cached == filters && query == &self.query
-        });
+        let visible_fresh = self
+            .visible_key
+            .as_ref()
+            .is_some_and(|(rev, cached, query)| {
+                *rev == revision && cached == filters && query == &self.query
+            });
         if !visible_fresh {
             let filters = filters.clone();
             self.visible = Rc::new(visible_rows(&self.rows, &filters, &self.query, None));
@@ -301,7 +305,8 @@ impl RunsView {
         let revealed_changed = self.slot_revealed != self.revealed;
         if groups_stale || collapsed_changed || revealed_changed {
             let gap = Theme::global(cx).space_6;
-            let (slots, structure) = stack_slots(&self.groups, &self.collapsed, &self.revealed, gap);
+            let (slots, structure) =
+                stack_slots(&self.groups, &self.collapsed, &self.revealed, gap);
             if structure != self.slots_key {
                 let anchor = self.scroll_anchor();
                 self.slots = slots;
@@ -619,10 +624,7 @@ impl RunsView {
                             collapsed: *collapsed,
                         },
                         StackSlot::Row {
-                            group,
-                            row,
-                            index,
-                            ..
+                            group, row, index, ..
                         } => StackItem::Row(*group, *row, *index),
                         StackSlot::More { group, next, .. } => StackItem::More(*group, *next),
                         StackSlot::Less { group, .. } => StackItem::Less(*group),

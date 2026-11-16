@@ -359,7 +359,9 @@ pub fn start_tour(
                 front(cx);
                 settle(cx, 2500).await;
                 let _ = cx.update(|_, app| {
-                    views.runs.update(app, |runs, cx| runs.tour_scroll_to(3, cx));
+                    views
+                        .runs
+                        .update(app, |runs, cx| runs.tour_scroll_to(3, cx));
                 });
                 settle(cx, 1500).await;
                 capture(cx, &dir.join("12-runs-paged.png"));

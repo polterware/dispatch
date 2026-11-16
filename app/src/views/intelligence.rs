@@ -415,8 +415,8 @@ impl Render for IntelligenceView {
                             self.sort,
                             view.clone(),
                         )
-                            .inset_top(top)
-                            .fades(theme.color_surface),
+                        .inset_top(top)
+                        .fades(theme.color_surface),
                     ),
             );
         }
