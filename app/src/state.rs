@@ -21,7 +21,7 @@ use crate::client::{
 };
 pub use crate::ui::{Toast, ToastTone};
 
-const POLL_INTERVAL: Duration = Duration::from_secs(3);
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_secs(3);
 /// The current workspace, kept across launches (`pwdispatch.workspace` in the Electron app).
 const WORKSPACE_PREF: &str = "workspace";
 /// The sidebar's width (`pwdispatch.shell.sidebar.sizes` in the Electron app).

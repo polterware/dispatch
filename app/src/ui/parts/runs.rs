@@ -1,6 +1,6 @@
 //! Parts for the Runs page: collapsible group headers (`SidebarSectionLabel` + count) and a
-//! card per run (the live bot avatar, title, Cancel while active and `StatusChip` on top, the
-//! run's facts as labeled values under a hairline).
+//! card per run in two columns (the prompt and the run's facts beside a live preview of what
+//! its agent printed).
 
 use std::rc::Rc;
 
@@ -11,12 +11,14 @@ use gpui::{
 
 use crate::avatar::{agent_avatar, agent_avatar_live};
 use crate::models::avatar::avatar_status;
+use crate::models::run_preview::RunPreview;
 use crate::models::runs::{EM_DASH, RunGroup, RunRow, format_ago};
 use crate::models::sidebar::group_title_tooltip;
 use crate::theme::{Theme, status_tone, tw};
 use crate::ui::{
-    Button, ButtonKind, ButtonSize, CountBadge, CountTone, Icon, SidebarSectionLabel, chip,
-    ellipsis, icon_colored, mono, primary_cell, sans, tabular, text_width, tooltip,
+    Button, ButtonKind, ButtonSize, CountBadge, CountTone, Icon, SidebarSectionLabel, TailLine,
+    TailTone, chip, ellipsis, icon_colored, mono, primary_cell, sans, tabular, tail_preview,
+    text_width, tooltip,
 };
 
 /// `DispatchAgentAvatar size={32}`; a row is the bot and 5px above and below it.
@@ -30,6 +32,23 @@ const CHANGE_ICON: f32 = 14.0;
 const CANCEL_ICON: f32 = 12.0;
 /// `PrimaryCell`'s gap before its trailing slot.
 const TRAILING_GAP: f32 = 10.0;
+
+/// The card's inner padding, in px.
+const CARD_PAD_X: f32 = 18.0;
+const CARD_PAD_Y: f32 = 16.0;
+/// The gap between the card's two columns.
+const CARD_GAP: f32 = 18.0;
+/// The head of the left column: the bot's box, then the gap under it.
+const HEAD_HEIGHT: f32 = 36.0;
+const HEAD_GAP: f32 = 12.0;
+/// One field's row and the gaps between fields, in the left column's grid.
+const FIELD_HEIGHT: f32 = 26.0;
+const FIELD_GAP_Y: f32 = 4.0;
+const FIELD_GAP_X: f32 = 16.0;
+/// The grid always holds at least this many rows, so cards with few fields stay in step.
+const MIN_FIELD_ROWS: usize = 4;
+/// Where a field's value starts: the icon, its label, and the gap.
+const FIELD_LABEL_WIDTH: f32 = 84.0;
 
 pub type RunAction = Rc<dyn Fn(&str, &mut Window, &mut App)>;
 
@@ -200,28 +219,63 @@ pub fn group_header(
         .into_any_element()
 }
 
-/// One run as a card under a group header: the live bot, the run's title, Cancel while it
-/// runs and the status chip on top; a hairline; then each fact (agent and model, repository,
-/// tier, changes, tokens, cost, when it started) as a small label over its value.
+/// How many fields the card's grid holds for `row`: Agent, Repository, Changes, Started, and
+/// Status always; Tier, Tokens, and Cost when known; Cancel while the run is active.
+fn field_count(row: &RunRow) -> usize {
+    5 + usize::from(!row.tier.trim().is_empty())
+        + usize::from(row.tokens_label.is_some())
+        + usize::from(row.cost_label.is_some())
+        + usize::from(row.active)
+}
+
+/// How many rows the card's two-column grid takes, at least [`MIN_FIELD_ROWS`].
+pub fn card_row_count(row: &RunRow) -> usize {
+    field_count(row).div_ceil(2).max(MIN_FIELD_ROWS)
+}
+
+/// The height of the card's content, which is the left column's and so the preview's: the
+/// head, then the rows of the two-column grid.
+pub fn card_content_height(fields: usize) -> f32 {
+    let rows = fields.div_ceil(2).max(MIN_FIELD_ROWS);
+    HEAD_HEIGHT + HEAD_GAP + rows as f32 * FIELD_HEIGHT + (rows - 1) as f32 * FIELD_GAP_Y
+}
+
+/// What a card draws beside its run: whether Cancel is already on its way, and the tail of the
+/// agent's output (`None` until the first read comes back).
+pub struct RunCardState {
+    pub cancelling: bool,
+    pub preview: Option<Rc<RunPreview>>,
+}
+
+/// One run as a card under a group header, in two columns. The left one is the run's prompt
+/// next to its live bot, then the facts in a grid of two columns with each label beside its
+/// value (Agent, Repository, Tier, Changes, Tokens and Cost when known, Started, Status, and
+/// Cancel while the run is active); the long ones end in an ellipsis. The right one, about half
+/// the card and as tall as the left, is a live tail of what the agent printed
+/// ([`tail_preview`]): the newest line at the bottom, fading into the card at both ends while
+/// the run works and at its top once it ended, or a muted "Waiting for output…" while there is
+/// none. Clicking the card opens the run.
 pub fn run_stack_row(
     index: usize,
     row: &RunRow,
-    cancelling: bool,
+    state: RunCardState,
     now_ms: i64,
     on_open: RunAction,
     on_cancel: RunAction,
     cx: &App,
 ) -> AnyElement {
     let theme = Theme::global(cx);
-    let fact = |icon: Icon, label: &'static str, value: AnyElement| {
+    let content_height = card_content_height(field_count(row));
+    let field = |icon: Icon, label: &'static str, value: AnyElement| {
         div()
-            .flex_none()
-            .flex()
-            .flex_col()
-            .gap(px(4.0))
+            .h(px(FIELD_HEIGHT))
             .min_w(px(0.0))
+            .flex()
+            .items_center()
             .child(
                 div()
+                    .flex_none()
+                    .w(px(FIELD_LABEL_WIDTH))
                     .flex()
                     .items_center()
                     .gap(px(5.0))
@@ -231,87 +285,130 @@ pub fn run_stack_row(
                     .child(icon_colored(icon, 12.0, theme.color_text_muted))
                     .child(label),
             )
-            .child(value)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .flex()
+                    .items_center()
+                    .child(value),
+            )
+            .into_any_element()
     };
-    let figure = |id: &'static str, text: &str, title: &str| {
+    // A value on one line that ends in an ellipsis at the width its field gives it.
+    let text = |id: &'static str, text: &str, title: &str, font: gpui::Font, color: gpui::Rgba| {
         let mut cell = div()
             .id((id, index))
-            .whitespace_nowrap()
-            .font(tabular(sans(theme, FontWeight::NORMAL)))
+            .min_w(px(0.0))
+            .flex_1()
+            .font(font)
             .text_size(px(12.0))
-            .text_color(theme.color_text_secondary)
-            .child(SharedString::from(text.to_string()));
+            .text_color(color)
+            .child(ellipsis(SharedString::from(text.to_string())));
         if !title.is_empty() {
             cell = cell.tooltip(tooltip(SharedString::from(title.to_string())));
         }
         cell.into_any_element()
     };
+    let figure = |id: &'static str, value: &str, title: &str| {
+        text(
+            id,
+            value,
+            title,
+            tabular(sans(theme, FontWeight::NORMAL)),
+            theme.color_text_secondary,
+        )
+    };
 
-    // One row, spread apart: when it runs short, Agent and Repository (the long texts) give
-    // way and end in an ellipsis, so Started never drops to a line of its own.
-    let mut facts = div()
-        .flex()
-        .justify_between()
-        .gap_x(px(28.0))
-        .child(fact(Icon::Bot, "Agent", agent_cell(index, row, cx)).flex_shrink())
-        .child(fact(Icon::Folder, "Repository", source_cell(index, row, cx)).flex_shrink());
+    let mut fields = vec![
+        field(
+            Icon::Bot,
+            "Agent",
+            text(
+                "run-agent",
+                &row.agent_label,
+                &row.agent_title,
+                mono(theme, FontWeight::NORMAL),
+                theme.color_text_secondary,
+            ),
+        ),
+        field(
+            Icon::Folder,
+            "Repository",
+            text(
+                "run-source",
+                &row.source,
+                &row.source_title,
+                sans(theme, FontWeight::NORMAL),
+                theme.color_text_secondary,
+            ),
+        ),
+    ];
     if !row.tier.trim().is_empty() {
-        facts = facts.child(fact(
+        fields.push(field(
             Icon::Gauge,
             "Tier",
             figure("runs-tier", &row.tier, ""),
         ));
     }
-    facts = facts.child(fact(Icon::FileDiff, "Changes", changes_cell(row, cx)));
+    fields.push(field(Icon::FileDiff, "Changes", changes_cell(row, cx)));
     if let Some(tokens) = &row.tokens_label {
-        facts = facts.child(fact(
+        fields.push(field(
             Icon::Cpu,
             "Tokens",
             figure("runs-tokens", tokens, &row.tokens_title),
         ));
     }
     if let Some(cost) = &row.cost_label {
-        facts = facts.child(fact(
+        fields.push(field(
             Icon::CreditCard,
             "Cost",
             figure("runs-cost", cost, &row.cost_title),
         ));
     }
-    facts = facts.child(fact(Icon::Clock, "Started", started_cell(row, now_ms, cx)));
-
-    let mut trailing = div().flex_none().flex().items_center().gap(px(8.0));
+    fields.push(field(Icon::Clock, "Started", started_cell(row, now_ms, cx)));
+    fields.push(field(Icon::Activity, "Status", status_cell(row, cx)));
     if row.active {
         let cancel_id = row.id.clone();
-        trailing = trailing.child(
+        fields.push(
             div()
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .h(px(FIELD_HEIGHT))
+                .min_w(px(0.0))
+                .flex()
+                .items_center()
                 .child(
-                    Button::new(
-                        SharedString::from(format!("run-cancel-{}", row.id)),
-                        ButtonKind::Ghost,
-                    )
-                    .size(ButtonSize::Sm)
-                    .icon(Icon::Stop)
-                    .icon_size(CANCEL_ICON)
-                    .label("Cancel")
-                    .disabled(cancelling)
-                    .on_click(move |window, cx| {
-                        cx.stop_propagation();
-                        on_cancel(&cancel_id, window, cx);
-                    }),
-                ),
+                    div()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(
+                            Button::new(
+                                SharedString::from(format!("run-cancel-{}", row.id)),
+                                ButtonKind::Ghost,
+                            )
+                            .size(ButtonSize::Sm)
+                            .icon(Icon::Stop)
+                            .icon_size(CANCEL_ICON)
+                            .label("Cancel")
+                            .disabled(state.cancelling)
+                            .on_click(move |window, cx| {
+                                cx.stop_propagation();
+                                on_cancel(&cancel_id, window, cx);
+                            }),
+                        ),
+                )
+                .into_any_element(),
         );
     }
-    trailing = trailing.child(status_cell(row, cx));
 
     let head = div()
         .flex()
         .items_center()
         .gap(px(12.0))
+        .h(px(HEAD_HEIGHT))
         .child(
             div()
                 .flex_none()
-                .size(px(36.0))
+                .size(px(HEAD_HEIGHT))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -330,8 +427,51 @@ pub fn run_stack_row(
                 .line_height(px(20.0))
                 .text_color(theme.color_text_primary)
                 .child(ellipsis(row.title.clone())),
-        )
-        .child(trailing);
+        );
+    let left = div()
+        .flex_1()
+        .min_w(px(0.0))
+        .h(px(content_height))
+        .flex()
+        .flex_col()
+        .gap(px(HEAD_GAP))
+        .child(head)
+        .child(
+            div()
+                .grid()
+                .grid_cols(2)
+                .gap_x(px(FIELD_GAP_X))
+                .gap_y(px(FIELD_GAP_Y))
+                .children(fields),
+        );
+
+    let lines: Vec<TailLine> = state
+        .preview
+        .as_deref()
+        .map(|preview| {
+            preview
+                .lines
+                .iter()
+                .map(|line| {
+                    TailLine::new(SharedString::from(line.text.clone())).tone(if line.muted {
+                        TailTone::Muted
+                    } else {
+                        TailTone::Normal
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let placeholder = if row.active || state.preview.is_none() {
+        "Waiting for output…"
+    } else {
+        "No output"
+    };
+    let right = div().flex_1().min_w(px(0.0)).h(px(content_height)).child(
+        tail_preview(lines, content_height, theme.color_surface_subtle)
+            .live(row.active)
+            .placeholder(placeholder),
+    );
 
     let open_id = row.id.clone();
     let row_key = row.id.clone();
@@ -340,10 +480,9 @@ pub fn run_stack_row(
         .relative()
         .w_full()
         .flex()
-        .flex_col()
-        .gap(px(14.0))
-        .px(px(18.0))
-        .py(px(16.0))
+        .gap(px(CARD_GAP))
+        .px(px(CARD_PAD_X))
+        .py(px(CARD_PAD_Y))
         .rounded(px(theme.radius_card))
         .bg(theme.color_surface_subtle)
         .border_1()
@@ -351,9 +490,8 @@ pub fn run_stack_row(
         .cursor_pointer()
         .hover(|style| style.border_color(theme.color_border_strong))
         .on_click(move |_, window, cx| on_open(&open_id, window, cx))
-        .child(head)
-        .child(div().h(px(1.0)).w_full().bg(theme.color_border_subtle))
-        .child(facts);
+        .child(left)
+        .child(right);
     div()
         .w_full()
         .debug_selector(move || format!("runs-row-{row_key}"))
@@ -411,4 +549,31 @@ pub fn content_widths(rows: &[RunRow], now_ms: i64, window: &Window, cx: &App) -
         }
     }
     widths
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MIN_FIELD_ROWS, card_content_height, card_row_count};
+    use crate::models::runs::RunRow;
+
+    #[test]
+    fn the_card_holds_at_least_four_rows_and_grows_by_whole_rows() {
+        let four = card_content_height(MIN_FIELD_ROWS * 2);
+        assert_eq!(card_content_height(5), four);
+        assert_eq!(card_content_height(8), four);
+        assert!(card_content_height(9) > four);
+        assert_eq!(card_content_height(9), card_content_height(10));
+    }
+
+    #[test]
+    fn row_count_tracks_optional_fields_and_active_cancel() {
+        let mut row = RunRow::new(&crate::client::DispatchRun::default());
+        assert_eq!(card_row_count(&row), MIN_FIELD_ROWS);
+        row.tier = "normal".into();
+        row.tokens_label = Some("1k tokens".into());
+        row.cost_label = Some("$0.01".into());
+        assert_eq!(card_row_count(&row), 4);
+        row.active = true;
+        assert_eq!(card_row_count(&row), 5);
+    }
 }

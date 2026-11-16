@@ -22,8 +22,9 @@ use syntect::easy::ScopeRegionIterator;
 use syntect::parsing::{ParseState, ScopeStack, SyntaxSet};
 
 use crate::avatar::{BotAvatarState, agent_avatar_playing};
+pub use crate::models::transcript::fold_repeats;
 use crate::models::transcript::{
-    PromptBubble, TranscriptEntry, TranscriptImage, looks_like_diff, looks_like_json,
+    PromptBubble, TranscriptEntry, TranscriptImage, looks_like_diff, looks_like_json, strip_bold,
 };
 use crate::theme::{StatusTone, Theme, status_tone, tw};
 use crate::ui::{
@@ -356,54 +357,6 @@ pub fn flatten_transcript(
         }
     }
     rows
-}
-
-/// The entries to draw, each with how many times its step ran in a row. An agent that polls
-/// (the same step again and again, each with a line about waiting, as Antigravity checks a
-/// background command) shows its last poll once, its step marked `×n`, and its last line.
-pub fn fold_repeats(entries: &[TranscriptEntry]) -> Vec<(usize, Option<usize>)> {
-    let step = |index: usize| match entries.get(index) {
-        Some(TranscriptEntry::Step { text, failed, .. }) if *failed != Some(true) => {
-            Some(text.as_str())
-        }
-        _ => None,
-    };
-    let said = |index: usize| {
-        matches!(
-            entries.get(index),
-            Some(TranscriptEntry::Message { .. } | TranscriptEntry::Thinking { .. })
-        )
-    };
-    let mut shown = Vec::with_capacity(entries.len());
-    let mut index = 0;
-    while index < entries.len() {
-        let Some(text) = step(index) else {
-            shown.push((index, None));
-            index += 1;
-            continue;
-        };
-        // Each poll is the step, then at most one line of its own.
-        let unit = |at: usize| if said(at + 1) { 2 } else { 1 };
-        let mut last = index;
-        let mut count = 1;
-        let mut next = index + unit(index);
-        while step(next) == Some(text) {
-            last = next;
-            count += 1;
-            next += unit(next);
-        }
-        if count == 1 {
-            shown.push((index, None));
-            index += 1;
-            continue;
-        }
-        shown.push((last, Some(count)));
-        if said(last + 1) {
-            shown.push((last + 1, None));
-        }
-        index = next;
-    }
-    shown
 }
 
 /// The row that opens a run's transcript: the prompt's bubble, open or folded.
@@ -786,26 +739,6 @@ fn output_language(text: &str) -> String {
     } else {
         String::new()
     }
-}
-
-fn strip_bold(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(start) = rest.find("**") {
-        out.push_str(&rest[..start]);
-        let after = &rest[start + 2..];
-        if let Some(end) = after.find("**")
-            && end > 0
-        {
-            out.push_str(&after[..end]);
-            rest = &after[end + 2..];
-            continue;
-        }
-        out.push_str("**");
-        rest = after;
-    }
-    out.push_str(rest);
-    out
 }
 
 fn tone_glyph(tone: StatusTone) -> char {

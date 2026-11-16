@@ -7,6 +7,7 @@ pub mod intelligence;
 pub mod new_run;
 pub mod roles;
 pub mod run_page;
+pub mod run_preview;
 pub mod runs;
 pub mod settings;
 pub mod sidebar;
