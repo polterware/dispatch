@@ -108,6 +108,14 @@ struct EarlierRun {
     expanded: HashSet<usize>,
 }
 
+/// One user message in the chat, oldest first: its prompt row in the list when loaded, and
+/// its prompt text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RailMessage {
+    row: Option<usize>,
+    text: String,
+}
+
 /// A wire event as the stream and the page reads hand it on.
 fn paged(event: crate::client::WatchRunResponse) -> PagedEvent {
     PagedEvent {
@@ -132,6 +140,8 @@ pub struct TranscriptView {
     prompt_expanded: bool,
     /// The rows open with the prompt bubble.
     prompt_shown: bool,
+    /// The open run has a prompt bubble for the rail, loaded or not.
+    open_prompt_shown: bool,
     reveal_entry: Option<usize>,
     builder: TranscriptBuilder,
     processed: String,
@@ -220,9 +230,12 @@ pub struct TranscriptView {
     images_asked: bool,
     /// The viewer a thumbnail opens.
     viewer: Entity<super::image_viewer::ImageViewerView>,
-    /// The chat's messages, oldest first: the list row each one's prompt bubble is on, and
-    /// its text. The message rail indexes them.
-    messages: Vec<(usize, String)>,
+    /// The chat's user messages, oldest first: the list row each one's prompt bubble is on
+    /// when loaded, and its text. The message rail indexes them.
+    messages: Vec<RailMessage>,
+    /// A rail bar was clicked while its prompt bubble was not loaded yet; scroll there once
+    /// paging reaches it.
+    pending_reveal: Option<usize>,
 }
 
 impl TranscriptView {
@@ -262,6 +275,7 @@ impl TranscriptView {
             expanded: HashSet::new(),
             prompt_expanded: false,
             prompt_shown: false,
+            open_prompt_shown: false,
             reveal_entry: None,
             builder: TranscriptBuilder::new(),
             processed: String::new(),
@@ -310,6 +324,7 @@ impl TranscriptView {
             images_asked: false,
             viewer,
             messages: Vec::new(),
+            pending_reveal: None,
         };
         view.ensure_stream(cx);
         view.ensure_earlier_runs(cx);
@@ -324,7 +339,7 @@ impl TranscriptView {
         if self.compact || run_id == self.run_id {
             return;
         }
-        let bubble = self.prompt_bubble(cx);
+        let bubble = self.open_prompt_bubble(cx);
         let switches = self
             .state
             .read(cx)
@@ -347,6 +362,7 @@ impl TranscriptView {
         self.earlier_runs_asked = true;
         self.prompt_expanded = false;
         self.reveal_entry = None;
+        self.pending_reveal = None;
         self.builder = TranscriptBuilder::new();
         self.processed.clear();
         self.stored.clear();
@@ -622,8 +638,13 @@ impl TranscriptView {
                                 view.earlier_more = view.streamed.may_have_earlier();
                                 // A run longer than its first page opens where it is now, once
                                 // its rows are in.
-                                view.open_at_end = view.earlier_more && !view.compact;
+                                view.open_at_end = view.earlier_more
+                                    && !view.compact
+                                    && view.pending_reveal.is_none();
                             }
+                            view.apply_log(cx);
+                        } else if ended && !view.opened {
+                            view.opened = true;
                             view.apply_log(cx);
                         }
                         true
@@ -795,27 +816,58 @@ impl TranscriptView {
                 },
             });
         }
-        let bubble = self.prompt_bubble(cx);
+        let open_bubble = self.open_prompt_bubble(cx);
+        self.open_prompt_shown = open_bubble.is_some();
+        let bubble = ((self.opened || self.continued) && !self.earlier_more)
+            .then_some(open_bubble.as_ref())
+            .flatten();
         self.prompt_shown = bubble.is_some();
         if let Some(bubble) = bubble {
-            rows.insert(0, prompt_transcript_row(&bubble, self.prompt_expanded));
+            rows.insert(0, prompt_transcript_row(bubble, self.prompt_expanded));
             // The chat's earlier messages go over this one's, once its start is in.
             let earlier = self.earlier_rows();
             if !earlier.is_empty() {
                 rows.splice(0..0, earlier);
             }
         }
-        self.messages = message_rows(&rows);
+        self.messages = chat_messages(
+            self.earlier_runs
+                .iter()
+                .filter_map(|run| run.bubble.as_ref()),
+            open_bubble.as_ref(),
+            &rows,
+        );
         let rows_now = rows.len();
         self.install_rows(rows);
+        let mut need_more_for_rows = false;
         if let Some(before) = self.rows_before_page.take() {
             if rows_now > before {
                 self.earlier_page = PAGE_BYTES;
-            } else {
-                self.read_on(cx);
+            } else if self.earlier_more {
+                need_more_for_rows = true;
             }
         }
-        if self.open_at_end && !self.entries.is_empty() {
+        if let Some(target) = self.pending_reveal {
+            if let Some(row) = self.messages.get(target).and_then(|message| message.row) {
+                self.pending_reveal = None;
+                self.open_at_end = false;
+                self.scroll_to_message_row(row, cx);
+                need_more_for_rows = false;
+            } else if !self.earlier_more && !self.earlier_inflight && !self.parse_inflight {
+                self.pending_reveal = None;
+            } else if self.earlier_more && !self.earlier_inflight && !self.parse_inflight {
+                if need_more_for_rows {
+                    self.read_on(cx);
+                } else {
+                    self.load_earlier(cx);
+                }
+                need_more_for_rows = false;
+            }
+        }
+        if need_more_for_rows {
+            self.read_on(cx);
+        }
+        if self.open_at_end && self.pending_reveal.is_none() && !self.entries.is_empty() {
             self.open_at_end = false;
             self.follow = Follow::Pending;
         }
@@ -907,9 +959,12 @@ impl TranscriptView {
 
     /// `first` is the first row on show.
     fn on_scroll(&mut self, scrolled: bool, first: usize, cx: &mut Context<Self>) {
-        self.reader_moved = true;
-        if !self.compact && first < EARLIER_ROWS {
-            self.load_earlier(cx);
+        // Ignore the initial top-of-list layout while opening/settling at the log's end.
+        if !self.open_at_end && self.follow == Follow::Idle {
+            self.reader_moved = true;
+            if !self.compact && first < EARLIER_ROWS {
+                self.load_earlier(cx);
+            }
         }
         let pinned = !scrolled;
         if self.pinned && !pinned && self.compact {
@@ -933,18 +988,26 @@ impl TranscriptView {
             return;
         }
         let Some((seq, offset)) = self.streamed.head() else {
+            self.earlier_more = false;
+            self.pending_reveal = None;
             return;
         };
         let Some(client) = self.state.read(cx).client() else {
+            self.pending_reveal = None;
             return;
         };
         self.earlier_inflight = true;
         let generation = self.generation;
+        let max_bytes = if self.pending_reveal.is_some() {
+            MAX_PAGE_BYTES
+        } else {
+            self.earlier_page
+        };
         let request = ReadRunEventsRequest {
             id: self.run_id.clone(),
             before_seq: ProtoI64(seq),
             before_offset: ProtoI64(i64::try_from(offset).unwrap_or(i64::MAX)),
-            max_bytes: ProtoI64(self.earlier_page),
+            max_bytes: ProtoI64(max_bytes),
         };
         cx.spawn(async move |this, cx| {
             let page = cx
@@ -958,20 +1021,28 @@ impl TranscriptView {
                 let Ok(page) = page else {
                     // A core from before pages answers nothing: the text stays as it is.
                     view.earlier_more = false;
+                    view.rows_before_page = None;
+                    view.pending_reveal = None;
+                    view.rebuild_rows(cx);
                     return;
                 };
                 let events: Vec<PagedEvent> = page.events.into_iter().map(paged).collect();
                 view.earlier_more = page.more && !events.is_empty();
                 if events.is_empty() {
+                    view.rows_before_page = None;
+                    view.rebuild_rows(cx);
                     return;
                 }
                 if view.streamed.prepend(&events) {
                     view.prepended = true;
                     view.rows_before_page = Some(view.rows.borrow().len());
                     view.apply_log(cx);
-                } else {
+                } else if view.earlier_more {
                     // Inside one long line: nothing new to show yet.
                     view.read_on(cx);
+                } else {
+                    view.rows_before_page = None;
+                    view.rebuild_rows(cx);
                 }
                 cx.notify();
             });
@@ -1033,10 +1104,9 @@ impl TranscriptView {
         self.rebuild_rows(cx);
     }
 
-    /// The prompt's bubble, which opens the run page's transcript once the text holds the
-    /// run's start: a log read from its end gets it when the earlier pages are in.
-    fn prompt_bubble(&self, cx: &App) -> Option<PromptBubble> {
-        if self.compact || self.earlier_more {
+    /// The open run's own prompt bubble, whether or not the log's start has been paged in.
+    fn open_prompt_bubble(&self, cx: &App) -> Option<PromptBubble> {
+        if self.compact {
             return None;
         }
         let state = self.state.read(cx);
@@ -1044,15 +1114,19 @@ impl TranscriptView {
         prompt_bubble(&run.prompt, &run.caller_agent, &run.created_at)
     }
 
-    /// Whether [`Self::prompt_bubble`] has one, without building it.
-    fn prompt_visible(&self, cx: &App) -> bool {
+    /// Whether [`Self::open_prompt_bubble`] has one, without building it.
+    fn open_prompt_visible(&self, cx: &App) -> bool {
         !self.compact
-            && !self.earlier_more
             && self
                 .state
                 .read(cx)
                 .run(&self.run_id)
                 .is_some_and(|run| !run.prompt.trim().is_empty())
+    }
+
+    /// Whether the open run's prompt bubble shows in the rows, without building it.
+    fn prompt_visible(&self, cx: &App) -> bool {
+        (self.opened || self.continued) && !self.earlier_more && self.open_prompt_visible(cx)
     }
 
     fn set_prompt_expanded(&mut self, open: bool, cx: &mut Context<Self>) {
@@ -1219,34 +1293,55 @@ impl TranscriptView {
     }
 
     /// The message rail's click: scrolls the list so the prompt bubble of message `message`
-    /// (oldest first) is at the top. The reader chose the place, so the log stops following
-    /// its end unless the message is by it.
+    /// (oldest first) is at the top. When the run's start is not paged in yet, loads the
+    /// earlier pages first and scrolls once the bubble appears.
     pub(crate) fn reveal_message(&mut self, message: usize, cx: &mut Context<Self>) {
-        let Some(&(row, _)) = self.messages.get(message) else {
+        let Some(item) = self.messages.get(message) else {
             return;
         };
+        if let Some(row) = item.row {
+            self.pending_reveal = None;
+            self.open_at_end = false;
+            self.scroll_to_message_row(row, cx);
+            return;
+        }
+        if self.compact || (!self.earlier_more && !self.earlier_inflight && !self.parse_inflight) {
+            return;
+        }
+        self.pending_reveal = Some(message);
+        self.open_at_end = false;
         self.glide = false;
         self.follow = Follow::Idle;
+        self.stick = false;
+        self.pinned = false;
+        self.load_earlier(cx);
+        cx.notify();
+    }
+
+    fn scroll_to_message_row(&mut self, row: usize, cx: &mut Context<Self>) {
+        self.glide = false;
+        self.follow = Follow::Idle;
+        self.stick = false;
+        self.pinned = false;
+        self.moved_here = true;
+        self.reader_moved = false;
         self.list.scroll_to(ListOffset {
             item_ix: row,
             offset_in_item: px(0.0),
         });
-        self.on_scroll(true, row, cx);
         cx.notify();
     }
 
     /// The message rail's active bar: the last message whose bubble has begun at the top of
-    /// the list.
+    /// the list (unloaded messages sit above the loaded rows).
     fn message_in_view(&self) -> usize {
         let first = self.list.logical_scroll_top().item_ix;
-        self.messages
-            .iter()
-            .rposition(|&(row, _)| row <= first)
-            .unwrap_or(0)
+        active_message(&self.messages, first)
     }
 
     /// The jump-to-end button: glide down to the end, where the log follows again.
     pub(crate) fn jump_to_end(&mut self, cx: &mut Context<Self>) {
+        self.pending_reveal = None;
         self.glide = true;
         self.stick = true;
         self.frame_dt = 0.0;
@@ -1317,6 +1412,7 @@ impl Render for TranscriptView {
         let switches_len = self.switches_len(cx);
         if live != self.shown_live
             || self.prompt_visible(cx) != self.prompt_shown
+            || self.open_prompt_visible(cx) != self.open_prompt_shown
             || switches_len != self.shown_switches
         {
             self.shown_live = live;
@@ -1552,14 +1648,16 @@ impl Render for TranscriptView {
                     .child(bar),
             );
         }
-        // The message rail: one bar per message of the chat, along the right edge clear of
-        // the scrollbar's gutter and centered under the header. It draws nothing for one.
+        // The message rail: one bar per user message of the chat, along the right edge clear of
+        // the scrollbar's gutter and centered under the header. It draws nothing when empty.
         if message_rail_visible(self.messages.len()) {
             let items = self
                 .messages
                 .iter()
                 .enumerate()
-                .map(|(index, (_, text))| MessageRailItem::new(format!("message-{index}"), text))
+                .map(|(index, message)| {
+                    MessageRailItem::new(format!("message-{index}"), &message.text)
+                })
                 .collect();
             let entity = cx.entity();
             area = area.child(
@@ -1614,6 +1712,46 @@ fn page_scroll(list: &ListState, column_end: f32) -> Option<PageScroll> {
         content: items + tw(LOG_END_GAP) + column_end,
         viewport,
     })
+}
+
+/// The chat's user messages, oldest first: each earlier run's prompt followed by the open
+/// run's prompt, paired with its list row when its prompt bubble is loaded in `rows`.
+fn chat_messages<'a>(
+    earlier: impl IntoIterator<Item = &'a PromptBubble>,
+    open: Option<&'a PromptBubble>,
+    rows: &[TranscriptRow],
+) -> Vec<RailMessage> {
+    let mut items: Vec<RailMessage> = earlier
+        .into_iter()
+        .chain(open)
+        .map(|bubble| RailMessage {
+            row: None,
+            text: bubble.text.clone(),
+        })
+        .collect();
+    let prompt_rows = message_rows(rows);
+    // Prompt bubbles only appear once the open run's start is paged in, with every earlier
+    // bubble sitting over the open one in the same order. Matching from the end pairs each
+    // row even when messages share text, and leaves unloaded bubbles with `row: None`.
+    let mut remaining = prompt_rows.as_slice();
+    for item in items.iter_mut().rev() {
+        if let Some(((row, text), rest)) = remaining.split_last()
+            && *text == item.text
+        {
+            item.row = Some(*row);
+            remaining = rest;
+        }
+    }
+    items
+}
+
+/// The active rail bar at scroll top `first`: the last message whose bubble is at or above
+/// `first`, treating unloaded messages (`row: None`) as above the loaded rows.
+fn active_message(messages: &[RailMessage], first: usize) -> usize {
+    messages
+        .iter()
+        .rposition(|message| message.row.is_none_or(|row| row <= first))
+        .unwrap_or(0)
 }
 
 /// The chat's messages among the list's rows, oldest first: the row of each prompt bubble
@@ -1751,23 +1889,26 @@ async fn next_batch(rx: &mut mpsc::UnboundedReceiver<StreamMsg>) -> Option<Vec<S
 
 #[cfg(test)]
 mod tests {
-    use super::{gap_row, kept_top, message_rows};
+    use super::{RailMessage, active_message, chat_messages, gap_row, kept_top, message_rows};
     use crate::models::transcript::PromptBubble;
-    use crate::ui::parts::transcript::prompt_transcript_row;
+    use crate::ui::parts::transcript::{RowBody, TranscriptRow, prompt_transcript_row};
     use gpui::{ListOffset, px};
 
-    #[test]
-    fn the_rail_indexes_each_prompt_bubble_by_its_row() {
-        let bubble = |text: &str| PromptBubble {
+    fn test_bubble(text: &str) -> PromptBubble {
+        PromptBubble {
             text: text.to_string(),
             meta_label: String::new(),
             time: None,
-        };
+        }
+    }
+
+    #[test]
+    fn the_rail_indexes_each_prompt_bubble_by_its_row() {
         let rows = vec![
-            prompt_transcript_row(&bubble("first"), true),
+            prompt_transcript_row(&test_bubble("first"), true),
             gap_row(),
             gap_row(),
-            prompt_transcript_row(&bubble("second"), true),
+            prompt_transcript_row(&test_bubble("second"), true),
             gap_row(),
         ];
         assert_eq!(
@@ -1775,6 +1916,131 @@ mod tests {
             vec![(0, "first".to_string()), (3, "second".to_string())]
         );
         assert!(message_rows(&rows[1..3]).is_empty());
+    }
+
+    #[test]
+    fn chat_messages_indexes_earlier_and_open_prompts_with_present_or_absent_rows() {
+        let first = test_bubble("first");
+        let second = test_bubble("second");
+        let third = test_bubble("third");
+        let agent_row = TranscriptRow {
+            signature: 1,
+            body: RowBody::Muted("Agent reply".to_string()),
+        };
+
+        // Loaded transcript: every prompt bubble gets its list row; agent output is ignored.
+        let loaded_rows = vec![
+            prompt_transcript_row(&first, true),
+            agent_row.clone(),
+            gap_row(),
+            prompt_transcript_row(&second, true),
+            agent_row.clone(),
+            prompt_transcript_row(&third, false),
+            agent_row.clone(),
+        ];
+        assert_eq!(
+            chat_messages([&first, &second], Some(&third), &loaded_rows),
+            vec![
+                RailMessage {
+                    row: Some(0),
+                    text: "first".to_string(),
+                },
+                RailMessage {
+                    row: Some(3),
+                    text: "second".to_string(),
+                },
+                RailMessage {
+                    row: Some(5),
+                    text: "third".to_string(),
+                },
+            ]
+        );
+
+        // Paged transcript (`earlier_more`): no prompt bubble in `rows`, yet all three user
+        // messages appear oldest-first with `row: None`.
+        let paged_rows = vec![agent_row.clone(), gap_row()];
+        assert_eq!(
+            chat_messages([&first, &second], Some(&third), &paged_rows),
+            vec![
+                RailMessage {
+                    row: None,
+                    text: "first".to_string(),
+                },
+                RailMessage {
+                    row: None,
+                    text: "second".to_string(),
+                },
+                RailMessage {
+                    row: None,
+                    text: "third".to_string(),
+                },
+            ]
+        );
+
+        // Single long run before its start loads.
+        assert_eq!(
+            chat_messages(std::iter::empty(), Some(&first), &paged_rows),
+            vec![RailMessage {
+                row: None,
+                text: "first".to_string(),
+            }]
+        );
+
+        // Repeated prompt text still pairs unambiguously from the end.
+        let repeat = test_bubble("continue");
+        let partial_rows = vec![prompt_transcript_row(&repeat, false), agent_row];
+        assert_eq!(
+            chat_messages([&repeat, &second], Some(&repeat), &partial_rows),
+            vec![
+                RailMessage {
+                    row: None,
+                    text: "continue".to_string(),
+                },
+                RailMessage {
+                    row: None,
+                    text: "second".to_string(),
+                },
+                RailMessage {
+                    row: Some(0),
+                    text: "continue".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn active_message_treats_unloaded_messages_as_above_the_loaded_part() {
+        let unloaded = vec![
+            RailMessage {
+                row: None,
+                text: "first".to_string(),
+            },
+            RailMessage {
+                row: None,
+                text: "second".to_string(),
+            },
+        ];
+        assert_eq!(active_message(&unloaded, 0), 1);
+        assert_eq!(active_message(&unloaded, 42), 1);
+
+        let mixed = vec![
+            RailMessage {
+                row: None,
+                text: "first".to_string(),
+            },
+            RailMessage {
+                row: Some(10),
+                text: "second".to_string(),
+            },
+            RailMessage {
+                row: Some(20),
+                text: "third".to_string(),
+            },
+        ];
+        assert_eq!(active_message(&mixed, 0), 0);
+        assert_eq!(active_message(&mixed, 10), 1);
+        assert_eq!(active_message(&mixed, 25), 2);
+        assert_eq!(active_message(&[], 0), 0);
     }
 
     fn at(item_ix: usize, offset: f32) -> ListOffset {

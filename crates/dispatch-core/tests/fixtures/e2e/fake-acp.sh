@@ -35,6 +35,15 @@ while IFS= read -r line; do
     esac
     case "$line" in *SLOW*) sleep 60 ;; esac
     case "$line" in
+    *LONG*)
+      pad=$(printf '%0850d' 0 | tr '0' 'x')
+      i=0
+      while [ "$i" -lt 400 ]; do
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fake-1","update":{"sessionUpdate":"tool_call","toolCallId":"t%d","kind":"execute","status":"completed","rawInput":{"command":"echo step %03d %s"}}}}\n' "$i" "$i" "$pad"
+        i=$((i + 1))
+      done ;;
+    esac
+    case "$line" in
     *FAIL*)
       echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"error\":{\"code\":-32603,\"message\":\"the fake agent failed\"}}" ;;
     *)

@@ -200,6 +200,22 @@ impl Window<'_> {
         }
     }
 
+    /// Lets the app work until `ids` are all shown, failing with its toasts after 30 seconds.
+    fn wait_shows(&mut self, what: &str, ids: &[&str]) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            self.settle();
+            if ids.iter().all(|id| self.shows(id)) {
+                return;
+            }
+            if std::time::Instant::now() > deadline {
+                let toasts = self.toasts();
+                panic!("timed out waiting until {what}; the app said {toasts:?}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
     /// Waits for the app to see the run's status, refreshing as its poll would.
     fn wait_for_status(&mut self, core: &Core, id: &str, want: &str) {
         self.until(&format!("the core reports {want}"), || {
@@ -456,8 +472,8 @@ fn the_run_page_sends_a_message_to_an_ended_run(cx: &mut TestAppContext) {
 
     assert!(w.shows("run-message"), "an ended run offers no composer");
     assert!(
-        !w.shows("message-rail-0"),
-        "one message has nothing to index"
+        w.shows("message-rail-0") && !w.shows("message-rail-1"),
+        "one message shows one rail bar"
     );
     // A press on the card writes in its field; Enter sends what it holds.
     w.click("run-message");
@@ -501,6 +517,47 @@ fn the_run_page_sends_a_message_to_an_ended_run(cx: &mut TestAppContext) {
     w.click("message-rail-0");
     w.pump();
     assert!(w.shows("transcript-prompt:say hi"));
+
+    // A conversation whose open run is long enough to be paged still indexes every user
+    // message before the start loads, and clicking a bar pages in and reveals its bubble.
+    let paged_first = core.start("paged chat start", true);
+    core.wait_for(&paged_first, "COMPLETED");
+    let paged_second = json(&core.cli(&["send", "--json", &paged_first, "LONG paged tail"]))["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    core.wait_for(&paged_second, "COMPLETED");
+    // Sync the agent log into run_events as an earlier preview/watch would, so opening
+    // the run reads only its tail page (`earlier_more == true`).
+    let tail = core
+        .client
+        .read_run_events(&dispatch_app::client::ReadRunEventsRequest {
+            id: paged_second.clone(),
+            ..Default::default()
+        })
+        .expect("read tail page");
+    assert!(tail.more, "the long run's log did not require paging");
+    w.go(Route::Run(paged_second));
+    w.wait_shows(
+        "both messages appear in the paged run's rail",
+        &["message-rail-0", "message-rail-1"],
+    );
+    assert!(!w.shows("message-rail-2"));
+    assert!(
+        !w.shows("transcript-prompt:paged chat start")
+            && !w.shows("transcript-prompt:LONG paged tail"),
+        "the prompt bubbles loaded before paging"
+    );
+    w.click("message-rail-0");
+    w.wait_shows(
+        "clicking the rail pages in and reveals the first prompt",
+        &["transcript-prompt:paged chat start"],
+    );
+    w.click("message-rail-1");
+    w.wait_shows(
+        "clicking the second rail bar reveals its prompt",
+        &["transcript-prompt:LONG paged tail"],
+    );
     assert!(w.toasts().is_empty(), "{:?}", w.toasts());
 }
 
