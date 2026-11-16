@@ -18,7 +18,7 @@ cargo build -p dispatch-core --bin dispatch && ./target/debug/dispatch serve &
 cargo run -p dispatch-app
 ```
 
-A build run this way has no bundle, so it sets its Dock icon itself (`src/dock_icon.rs`, from `resources/dispatch-icon.png`) and keeps the Sparkle updater off.
+A build run this way has no bundle, so it sets its Dock icon itself via `polterware_ui::window::app_icon::apply` (using `resources/dispatch-icon.png` as the default fallback, or the `dispatch-ice-icon.png` / `dispatch-fire-icon.png` variant chosen in Settings › App) and keeps the Sparkle updater off.
 
 ## Screenshots
 
@@ -49,17 +49,16 @@ What GPUI cannot draw and what is not ported yet, so the pixels differ on purpos
 | File | Owns |
 | --- | --- |
 | `src/main.rs` | The one binary's entry: the CLI and the core (`dispatch_core::cli::main`) for a command, else `dispatch_app::run`. |
-| `src/lib.rs` | `run`: the window (frameless, 1200×800, min 800×560), menus, key bindings, the Dock icon, the updater, opening `AppView`. |
+| `src/lib.rs` | `run`: the window (frameless, 1200×800, min 800×560), menus, key bindings, the app icon, the updater, opening `AppView`. |
 | `src/app.rs` | `AppView`: sidebar, the route, the Commander overlay, the toast stack. One entity per view. |
 | `src/theme.rs` | Dark `Theme` global: colors, radii, spacing, type, row heights. |
 | `src/client.rs` | Loopback `core.json` discovery and the blocking Connect-JSON client, including `WatchRun`. |
 | `src/state.rs` | `AppState`: route, snapshots, 3s poll, toasts, preference files. |
 | `src/format.rs` | Shared display strings (`prompt_first_line`, `non_empty_or`, `agent_display_name`, `is_active_status`). |
 | `src/updater.rs` | Sparkle from the bundle's `Contents/Frameworks`, daily checks and Check for Updates…. |
-| `src/dock_icon.rs` | The Dock icon of a build with no bundle. |
 | `src/shots.rs` | The screenshot tour behind `DISPATCH_GPUI_SHOTS`. |
 | `src/ui/` | Re-exports polterware-ui's controls (`avatar`, `motion`, `vibrancy`, `window_drag` among them); `parts/` holds the pieces only Dispatch's pages draw. |
-| `resources/` | `dispatch.icon` (Icon Composer, the bundle's icon), `dispatch Exports` (its PNG exports), and `dispatch-icon.png` (the Default export on the macOS icon grid, the Dock icon of an unbundled build). |
+| `resources/` | `dispatch.icon` (Icon Composer, the bundle's icon), `dispatch Exports` (its PNG exports), `dispatch-icon.png` (the Default export on the macOS icon grid, fallback Dock icon of an unbundled build), and the Ice/Fire variants (`dispatch-ice.icon`, `dispatch-fire.icon`, `dispatch-ice-icon.png`, `dispatch-fire-icon.png`). |
 | `src/views/<view>.rs` | One screen each: `sidebar`, `run_page`, `transcript`, `roles`, `intelligence`, `spend`, `stats`, `settings`, `commander`, `runs`. `TranscriptView` is not a route: the run page mounts it, and the sidebar's long-hover card mounts it compact. |
 | `src/models/<view>.rs` | The pure logic of that view and its tests. |
 | `src/ui/parts/<view>.rs` | UI helpers only that view uses. |

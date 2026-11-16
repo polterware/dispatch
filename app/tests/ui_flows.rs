@@ -249,6 +249,7 @@ fn every_page_opens_with_data(cx: &mut TestAppContext) {
         Route::Settings(SettingsPage::PickRole),
         Route::Settings(SettingsPage::RoutingPolicy),
         Route::Settings(SettingsPage::Voice),
+        Route::Settings(SettingsPage::App),
     ] {
         w.go(route.clone());
         assert_eq!(w.route(), route);
@@ -781,6 +782,52 @@ fn the_settings_search_opens_a_result_on_its_page(cx: &mut TestAppContext) {
         w.route()
     );
     assert!(w.cx.debug_bounds("settings-priority").is_some());
+}
+
+#[gpui::test]
+fn settings_app_icon_persists_and_switches_variants(cx: &mut TestAppContext) {
+    use dispatch_app::models::settings::{AppIcon, read_app_icon};
+
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let core = Core::new();
+    let mut w = open(&core, cx);
+
+    // Search finds the App icon row under App / Appearance and opens its page.
+    w.go(Route::Settings(SettingsPage::Agents));
+    w.pump();
+    w.click("settings-search");
+    w.cx.simulate_input("app icon");
+    w.pump();
+    w.click("settings-result-0");
+    w.pump();
+    assert_eq!(w.route(), Route::Settings(SettingsPage::App));
+
+    let default =
+        w.cx.debug_bounds("settings-app-icon-default")
+            .expect("Default icon tile");
+    let ice =
+        w.cx.debug_bounds("settings-app-icon-ice")
+            .expect("Ice icon tile");
+    let fire =
+        w.cx.debug_bounds("settings-app-icon-fire")
+            .expect("Fire icon tile");
+    assert!(ice.left() > default.right() && fire.left() > ice.right());
+
+    w.click("settings-app-icon-ice");
+    assert_eq!(w.state.read_with(w.cx, |s, _| s.app_icon()), AppIcon::Ice);
+    assert_eq!(read_app_icon(&core.data), AppIcon::Ice);
+
+    w.click("settings-app-icon-fire");
+    assert_eq!(w.state.read_with(w.cx, |s, _| s.app_icon()), AppIcon::Fire);
+    assert_eq!(read_app_icon(&core.data), AppIcon::Fire);
+
+    w.click("settings-app-icon-default");
+    assert_eq!(
+        w.state.read_with(w.cx, |s, _| s.app_icon()),
+        AppIcon::Default
+    );
+    assert_eq!(read_app_icon(&core.data), AppIcon::Default);
+    assert!(w.toasts().is_empty(), "{:?}", w.toasts());
 }
 
 #[gpui::test]

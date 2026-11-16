@@ -4,12 +4,95 @@
 //! Key material is never copied into a display string.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use serde_json::{Map, Value};
 
 use crate::client::{DispatchAgent, DispatchAgentModels, DispatchModelSetting};
 
 pub const SAMPLE_TASK: &str = "Add pagination to the runs list API and its table, with tests";
+
+/// The preference file holding the chosen app icon variant (`gpui-preferences/app-icon.json`).
+pub const APP_ICON_PREFERENCE: &str = "app-icon";
+
+/// The Icon Composer exports on the macOS icon grid for each app icon variant.
+pub const DEFAULT_ICON_PNG: &[u8] = include_bytes!("../../resources/dispatch-icon.png");
+pub const ICE_ICON_PNG: &[u8] = include_bytes!("../../resources/dispatch-ice-icon.png");
+pub const FIRE_ICON_PNG: &[u8] = include_bytes!("../../resources/dispatch-fire-icon.png");
+
+/// Which variant of Dispatch's icon the Dock and bundle show.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AppIcon {
+    #[default]
+    Default,
+    Ice,
+    Fire,
+}
+
+impl AppIcon {
+    pub const ALL: [Self; 3] = [Self::Default, Self::Ice, Self::Fire];
+
+    pub fn from_key(key: &str) -> Self {
+        match key.trim() {
+            "ice" => Self::Ice,
+            "fire" => Self::Fire,
+            _ => Self::Default,
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Ice => "ice",
+            Self::Fire => "fire",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Default => "Default",
+            Self::Ice => "Ice",
+            Self::Fire => "Fire",
+        }
+    }
+
+    /// The PNG shown in Settings and used as the unbundled Dock fallback.
+    pub fn preview_png(self) -> &'static [u8] {
+        match self {
+            Self::Default => DEFAULT_ICON_PNG,
+            Self::Ice => ICE_ICON_PNG,
+            Self::Fire => FIRE_ICON_PNG,
+        }
+    }
+
+    /// The override PNG for `app_icon::apply`; `None` restores the bundled app's compiled icon.
+    pub fn override_png(self) -> Option<&'static [u8]> {
+        match self {
+            Self::Default => None,
+            Self::Ice => Some(ICE_ICON_PNG),
+            Self::Fire => Some(FIRE_ICON_PNG),
+        }
+    }
+}
+
+/// Reads the persisted app icon choice, falling back to `Default` when missing or unknown.
+pub fn read_app_icon(data_dir: &Path) -> AppIcon {
+    crate::state::read_preference::<String>(data_dir, APP_ICON_PREFERENCE)
+        .ok()
+        .flatten()
+        .map(|key| AppIcon::from_key(&key))
+        .unwrap_or_default()
+}
+
+/// Persists the chosen app icon key (`default`, `ice`, or `fire`).
+pub fn write_app_icon(data_dir: &Path, icon: AppIcon) -> Result<(), String> {
+    crate::state::write_preference(data_dir, APP_ICON_PREFERENCE, &icon.key())
+}
+
+/// Applies the chosen app icon to the Dock and, when bundled, the bundle's Finder icon.
+pub fn apply_app_icon(icon: AppIcon) {
+    crate::ui::window::app_icon::apply(icon.override_png(), DEFAULT_ICON_PNG);
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InstallState {
@@ -848,13 +931,15 @@ fn number_or(value: Option<&Value>, default: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentSetup, ClaudeModState, CliModel, CliState, HookSetup, InstallState, ListedModel,
-        agent_model_groups, classifier_trailing, fixed2, folder_agents_label, hook_note,
-        hook_points_elsewhere, key_chip, model_agent, parse_agent_setup, parse_classify,
-        parse_key_status_value, parse_policy, parse_role_answer, role_answer_line, skill_readers,
-        skills_need_install,
+        AgentSetup, AppIcon, ClaudeModState, CliModel, CliState, DEFAULT_ICON_PNG, FIRE_ICON_PNG,
+        HookSetup, ICE_ICON_PNG, InstallState, ListedModel, agent_model_groups,
+        classifier_trailing, fixed2, folder_agents_label, hook_note, hook_points_elsewhere,
+        key_chip, model_agent, parse_agent_setup, parse_classify, parse_key_status_value,
+        parse_policy, parse_role_answer, read_app_icon, role_answer_line, skill_readers,
+        skills_need_install, write_app_icon,
     };
     use crate::client::{DispatchAgent, DispatchAgentModels, DispatchModelSetting};
+    use crate::state::preference_path;
     use serde_json::json;
 
     #[test]
@@ -1178,5 +1263,44 @@ mod tests {
         assert_eq!(by_agent[0].models.len(), 1);
 
         assert!(agent_model_groups(&agents, &settings, "nothing").is_empty());
+    }
+
+    #[test]
+    fn app_icon_round_trips_and_falls_back_to_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(read_app_icon(dir.path()), AppIcon::Default);
+
+        for variant in AppIcon::ALL {
+            write_app_icon(dir.path(), variant).unwrap();
+            assert_eq!(read_app_icon(dir.path()), variant);
+        }
+
+        let path = preference_path(dir.path(), super::APP_ICON_PREFERENCE);
+        std::fs::write(&path, r#""neon""#).unwrap();
+        assert_eq!(read_app_icon(dir.path()), AppIcon::Default);
+
+        std::fs::write(&path, "not-valid-json").unwrap();
+        assert_eq!(read_app_icon(dir.path()), AppIcon::Default);
+    }
+
+    #[test]
+    fn app_icon_keys_map_to_their_pngs() {
+        assert_eq!(AppIcon::from_key("default"), AppIcon::Default);
+        assert_eq!(AppIcon::from_key("ice"), AppIcon::Ice);
+        assert_eq!(AppIcon::from_key("fire"), AppIcon::Fire);
+        assert_eq!(AppIcon::from_key("unknown"), AppIcon::Default);
+        assert_eq!(AppIcon::from_key(""), AppIcon::Default);
+
+        assert_eq!(AppIcon::Default.preview_png(), DEFAULT_ICON_PNG);
+        assert_eq!(AppIcon::Ice.preview_png(), ICE_ICON_PNG);
+        assert_eq!(AppIcon::Fire.preview_png(), FIRE_ICON_PNG);
+
+        assert_eq!(AppIcon::Default.override_png(), None);
+        assert_eq!(AppIcon::Ice.override_png(), Some(ICE_ICON_PNG));
+        assert_eq!(AppIcon::Fire.override_png(), Some(FIRE_ICON_PNG));
+
+        for png in [DEFAULT_ICON_PNG, ICE_ICON_PNG, FIRE_ICON_PNG] {
+            assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+        }
     }
 }

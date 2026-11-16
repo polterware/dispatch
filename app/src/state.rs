@@ -48,6 +48,7 @@ pub enum SettingsPage {
     RoutingPolicy,
     Worktrees,
     Voice,
+    App,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -547,6 +548,8 @@ pub struct AppState {
     workspace_id: String,
     /// The sidebar's width, between `SIDEBAR_MIN_WIDTH` and `SIDEBAR_MAX_WIDTH`.
     sidebar_width: f32,
+    /// The chosen app icon variant, persisted in `gpui-preferences/app-icon.json`.
+    app_icon: crate::models::settings::AppIcon,
     linked: bool,
     sections: Vec<DispatchSection>,
     conversation_names: HashMap<String, String>,
@@ -583,6 +586,7 @@ impl AppState {
             .filter(|width| width.is_finite())
             .unwrap_or(SIDEBAR_DEFAULT_WIDTH)
             .clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
+        let app_icon = crate::models::settings::read_app_icon(&data_dir);
         let state = Self {
             data_dir,
             // The app opens on a new conversation, ready for its first message.
@@ -592,6 +596,7 @@ impl AppState {
             workspaces: Vec::new(),
             workspace_id,
             sidebar_width,
+            app_icon,
             linked: false,
             sections: Vec::new(),
             conversation_names: HashMap::new(),
@@ -782,6 +787,16 @@ impl AppState {
 
     pub fn sidebar_width(&self) -> f32 {
         self.sidebar_width
+    }
+
+    pub fn app_icon(&self) -> crate::models::settings::AppIcon {
+        self.app_icon
+    }
+
+    pub fn set_app_icon(&mut self, icon: crate::models::settings::AppIcon) -> Result<(), String> {
+        crate::models::settings::write_app_icon(&self.data_dir, icon)?;
+        self.app_icon = icon;
+        Ok(())
     }
 
     /// Sets the sidebar's width, clamped; `persist` stores it (at the end of a drag).

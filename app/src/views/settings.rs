@@ -23,13 +23,14 @@ use crate::client::{
     SetAgentEnabledRequest, SetModelEnabledRequest, WorktreeFolder, at_once, resolve_data_dir,
 };
 use crate::models::settings::{
-    AgentModelGroup, CLASSIFIERS, ClaudeModState, CliState, InstallState, ListedModel, Policy,
-    SAMPLE_TASK, agent_label, agent_model_groups, bool_wire, classifier_trailing, classify_meta,
-    cli_description, draft_ready, env_key_sentence, fixed2, folder_agents_label, hook_note,
-    hook_points_elsewhere, key_chip, key_placeholder, key_test_enabled, key_uses_replace,
-    keyed_classifier, parse_agent_setup, parse_classify, parse_cli_model, parse_key_map,
-    parse_key_status_value, parse_policy, priority_label, priority_value, prob_line, radio_value,
-    role_answer_line, skill_readers, skills_need_install, trimmed_draft,
+    AgentModelGroup, AppIcon, CLASSIFIERS, ClaudeModState, CliState, InstallState, ListedModel,
+    Policy, SAMPLE_TASK, agent_label, agent_model_groups, apply_app_icon, bool_wire,
+    classifier_trailing, classify_meta, cli_description, draft_ready, env_key_sentence, fixed2,
+    folder_agents_label, hook_note, hook_points_elsewhere, key_chip, key_placeholder,
+    key_test_enabled, key_uses_replace, keyed_classifier, parse_agent_setup, parse_classify,
+    parse_cli_model, parse_key_map, parse_key_status_value, parse_policy, priority_label,
+    priority_value, prob_line, radio_value, role_answer_line, skill_readers, skills_need_install,
+    trimmed_draft,
 };
 use crate::motion::{Animator, Spring, SpringTier, SpringValue};
 use crate::state::{AppState, Route, SettingsPage, ToastTone};
@@ -43,8 +44,8 @@ use crate::ui::patterns::{
     scroll_to_settings_section, settings_content_height, settings_dialog, window_anchor,
 };
 use crate::ui::{
-    ButtonKind, FieldSize, Icon, Menu, MenuItem, Popover, STACK_OVERDRAW, Switch, TextInput,
-    TileTone, button, chip, icon, sync_virtual_list, virtual_stack,
+    ButtonKind, FieldSize, Icon, IconChoice, Menu, MenuItem, Popover, STACK_OVERDRAW, Switch,
+    TextInput, TileTone, button, chip, icon, sync_virtual_list, virtual_stack,
 };
 use crate::ui::{SkeletonLayout, page_skeleton};
 use crate::voice;
@@ -57,7 +58,7 @@ const RAIL_GAP: f32 = 2.0;
 /// The editor's height before a frame has measured it: one row of controls.
 const EDITOR_HEIGHT: f32 = 44.0;
 
-const RAIL: [(SettingsPage, &str, Icon); 7] = [
+const RAIL: [(SettingsPage, &str, Icon); 8] = [
     (SettingsPage::Agents, "Agents", Icon::Settings),
     (SettingsPage::Models, "Models", Icon::Cpu),
     (SettingsPage::Classifier, "Classifier", Icon::AiBrain01Icon),
@@ -65,6 +66,7 @@ const RAIL: [(SettingsPage, &str, Icon); 7] = [
     (SettingsPage::RoutingPolicy, "Routing policy", Icon::Sliders),
     (SettingsPage::Worktrees, "Worktrees", Icon::GitBranch),
     (SettingsPage::Voice, "Voice", Icon::Globe),
+    (SettingsPage::App, "App", Icon::Monitor),
 ];
 
 /// One row of Settings › Models' virtual list: the section itself, then each agent's card,
@@ -2186,7 +2188,50 @@ impl SettingsView {
             SettingsPage::RoutingPolicy => self.policy_page(theme, cx),
             SettingsPage::Worktrees => self.worktrees_page(theme, cx),
             SettingsPage::Voice => self.voice_page(theme, cx),
+            SettingsPage::App => self.app_page(cx),
         }
+    }
+
+    /// App preferences kept on this computer: appearance and icon variant.
+    fn app_page(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let current = self.state.read(cx).app_icon();
+        let state = self.state.clone();
+        let mut choice = IconChoice::new("settings-app-icon").selected(current.key());
+        for option in AppIcon::ALL {
+            choice = choice.option(option.key(), option.label(), option.preview_png());
+        }
+        choice = choice.on_change(move |key, _, app| {
+            let next = AppIcon::from_key(key.as_ref());
+            let saved = state.update(app, |state, cx| {
+                let result = state.set_app_icon(next);
+                if let Err(err) = &result {
+                    state.push_toast(
+                        format!("Could not save the app icon: {err}"),
+                        ToastTone::Danger,
+                    );
+                }
+                cx.notify();
+                result.is_ok()
+            });
+            if saved {
+                apply_app_icon(next);
+            }
+        });
+        let body = settings_row(
+            "App icon",
+            Some("Choose the icon shown in the Dock and Finder.".into()),
+            choice,
+            cx,
+        );
+        settings_section(
+            Icon::Image,
+            TileTone::Identity,
+            "Appearance",
+            "How Dispatch looks on your Mac.",
+            None,
+            body,
+            cx,
+        )
     }
 
     /// Voice: what the engine hears and speaks with, the app's own chat choices, and the
@@ -3709,6 +3754,10 @@ fn search_entries() -> Vec<SettingsSearchEntry> {
         entry("Voice", "Models")
             .description("The voice models you can download.")
             .keywords("voice download license whisper tts"),
+        SettingsSearchEntry::new("App", "App icon")
+            .section("Appearance")
+            .description("Choose the icon shown in the Dock and Finder.")
+            .keywords("app icon default ice fire appearance dock finder"),
     ]
 }
 
