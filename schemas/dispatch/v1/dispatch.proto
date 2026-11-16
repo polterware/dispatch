@@ -725,13 +725,14 @@ message SkillResponse {
 message GetAgentSetupRequest {}
 
 message ApplyAgentSetupRequest {
-  // link_cli, install_skill, hook_on, or hook_off.
+  // link_cli, install_skill, remove_skill, install_claude_mod,
+  // remove_claude_mod, hook_on, or hook_off.
   string action = 1;
   // install_skill only: one agent; empty installs for every agent.
   string agent = 2;
 }
 
-// json is the setup report: cli, skills, and hook.
+// json is the setup report: cli, skills, the Claude Code mod, and hooks.
 message GetAgentSetupResponse {
   string json = 1;
 }

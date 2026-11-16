@@ -23,8 +23,8 @@ use crate::client::{
     SetAgentEnabledRequest, SetModelEnabledRequest, WorktreeFolder, at_once, resolve_data_dir,
 };
 use crate::models::settings::{
-    AgentModelGroup, CLASSIFIERS, CliState, InstallState, ListedModel, Policy, SAMPLE_TASK,
-    agent_label, agent_model_groups, bool_wire, classifier_trailing, classify_meta,
+    AgentModelGroup, CLASSIFIERS, ClaudeModState, CliState, InstallState, ListedModel, Policy,
+    SAMPLE_TASK, agent_label, agent_model_groups, bool_wire, classifier_trailing, classify_meta,
     cli_description, draft_ready, env_key_sentence, fixed2, folder_agents_label, hook_note,
     hook_points_elsewhere, key_chip, key_placeholder, key_test_enabled, key_uses_replace,
     keyed_classifier, parse_agent_setup, parse_classify, parse_cli_model, parse_key_map,
@@ -2723,6 +2723,57 @@ impl SettingsView {
             cx,
         ));
 
+        let mut mod_trailing = div()
+            .flex()
+            .items_center()
+            .gap(px(theme.space_2))
+            .child(chip(
+                setup.claude_mod.state.label(),
+                claude_mod_tone(setup.claude_mod.state),
+                cx,
+            ));
+        if let Some(label) = setup.claude_mod.state.action_label() {
+            let (action, done, kind) = if setup.claude_mod.state == ClaudeModState::Current {
+                (
+                    "remove_claude_mod",
+                    "Claude Code mod removed.",
+                    ButtonKind::Ghost,
+                )
+            } else {
+                (
+                    "install_claude_mod",
+                    "Claude Code mod installed.",
+                    ButtonKind::Secondary,
+                )
+            };
+            mod_trailing = mod_trailing.child(dim_button(
+                "settings-claude-mod",
+                label,
+                kind,
+                enabled,
+                gated(enabled, view.clone(), move |this, cx| {
+                    this.apply_setup("claude-mod", action, "", done, cx);
+                }),
+                cx,
+            ));
+        }
+        column = column.child(settings_section(
+            Icon::Plug,
+            TileTone::Integration,
+            "Claude Code mod",
+            "Makes delegation to Dispatch the default or mandatory in Claude Code, with a pane to pick the route.",
+            None,
+            settings_row(
+                div()
+                    .font_family(theme.font_mono)
+                    .child(SharedString::from("dispatch-delegate")),
+                Some(SharedString::from(home_relative(&setup.claude_mod.dir))),
+                mod_trailing,
+                cx,
+            ),
+            cx,
+        ));
+
         let mut hook_body = div().flex().flex_col();
         if setup.hooks.is_empty() {
             hook_body = hook_body.child(settings_row(
@@ -3498,6 +3549,14 @@ fn install_tone(state: InstallState) -> StatusTone {
     }
 }
 
+fn claude_mod_tone(state: ClaudeModState) -> StatusTone {
+    match state {
+        ClaudeModState::Current => StatusTone::Ok,
+        ClaudeModState::Outdated => StatusTone::Warn,
+        ClaudeModState::NotInstalled | ClaudeModState::NoClaude => StatusTone::Muted,
+    }
+}
+
 fn cli_tone(state: CliState) -> StatusTone {
     match state {
         CliState::Linked => StatusTone::Ok,
@@ -3620,6 +3679,9 @@ fn search_entries() -> Vec<SettingsSearchEntry> {
         entry("Agents", "Skill")
             .description("Teaches agents when to delegate with dispatch run.")
             .keywords("skills install remove agents claude codex antigravity gemini cursor"),
+        entry("Agents", "Claude Code mod")
+            .description("Makes delegation to Dispatch the default or mandatory in Claude Code.")
+            .keywords("mod plugin marketplace delegate mandatory claude"),
         entry("Agents", "Session hook")
             .description("The line each agent reads at the start of a session.")
             .keywords("hooks session start codex claude cursor grok copilot"),

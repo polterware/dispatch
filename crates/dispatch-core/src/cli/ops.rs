@@ -46,7 +46,7 @@ pub(crate) const OPS_USAGE: &str = "       dispatch wait <id> [--timeout <dur>] 
        dispatch roles add <name> --from-template <template> [--dir <repo>]
        dispatch roles save <name> [--when <text>] [--tier easy|normal|hard] [--columns easy,normal,hard] [--easy|--normal|--hard agent/model,...] [--readonly] [--instructions <text>] [--manual] [--prefer a,b] [--avoid a,b] [--timeout <dur>] | remove <name>
        dispatch on|off|hook [--agent <name>]
-       dispatch setup [--json] | link | skill [--remove] [<agent> | <folder>] | hook [<agent>] on|off
+       dispatch setup [--json] | link | skill [--remove] [<agent> | <folder>] | mod [--remove] | hook [<agent>] on|off
        dispatch skill install|remove [--agent <name> | --dir <folder>] [--force] | show | refresh
        dispatch update [--check]";
 
@@ -1545,10 +1545,11 @@ pub(super) fn skill(args: &[String]) -> CliResult {
 
 /// Reports how the agent CLIs reach dispatch, or changes one part of it: link
 /// points ~/.local/bin/dispatch at this binary, skill installs the current
-/// skill (into one folder, or the three Dispatch uses) or removes it, and hook
-/// switches an agent's SessionStart hook (Claude Code's when none is named).
-/// The app's Settings › Agents does the same. It also drops the OpenCode
-/// plugin an earlier version installed.
+/// skill (into one folder, or the three Dispatch uses) or removes it, mod
+/// installs the Claude Code mod or removes it, and hook switches an agent's
+/// SessionStart hook (Claude Code's when none is named). The app's Settings ›
+/// Agents does the same. It also drops the OpenCode plugin an earlier version
+/// installed.
 pub(super) fn setup(db_path: &Path, args: &[String]) -> CliResult {
     let home = home()?;
     let binary = crate::runstate::command_binary()?
@@ -1586,6 +1587,18 @@ pub(super) fn setup(db_path: &Path, args: &[String]) -> CliResult {
             }
             r?;
         }
+        "mod" => {
+            let remove = args.get(1).is_some_and(|a| a == "--remove");
+            let (r, verb) = if remove {
+                (setup::remove_claude_mod(&state), "removed")
+            } else {
+                (setup::install_claude_mod(&state), "installed")
+            };
+            if let Ok(path) = &r {
+                println!("{verb} {}", path.display());
+            }
+            r?;
+        }
         "hook" => {
             let usage = || usage_err("usage: dispatch setup hook [<agent>] on|off");
             let (agent, switch) = match (args.get(1), args.get(2)) {
@@ -1603,7 +1616,7 @@ pub(super) fn setup(db_path: &Path, args: &[String]) -> CliResult {
         }
         _ => {
             return Err(usage_err(
-                "usage: dispatch setup [--json] | link | skill [--remove] [<agent> | <folder>] | hook [<agent>] on|off",
+                "usage: dispatch setup [--json] | link | skill [--remove] [<agent> | <folder>] | mod [--remove] | hook [<agent>] on|off",
             ));
         }
     }
@@ -1633,6 +1646,7 @@ fn print_setup(r: &setup::Report) {
             s.agents.join(", ")
         );
     }
+    println!("mod      {:<13} {}", r.claude_mod.state, r.claude_mod.dir);
     for h in &r.hooks {
         let mut state = if h.on {
             "on".to_owned()

@@ -107,10 +107,62 @@ pub struct HookSetup {
     pub current: bool,
 }
 
+/// The Claude Code mod Dispatch installs, which makes delegation the default
+/// or mandatory there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClaudeModState {
+    Current,
+    Outdated,
+    NotInstalled,
+    /// No `claude` command is on this machine, so the mod can be neither
+    /// installed nor removed.
+    NoClaude,
+}
+
+impl ClaudeModState {
+    pub fn from_wire(value: &str) -> Self {
+        match value {
+            "current" => Self::Current,
+            "outdated" => Self::Outdated,
+            "no_claude" => Self::NoClaude,
+            _ => Self::NotInstalled,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Current => "Current",
+            Self::Outdated => "Outdated",
+            Self::NotInstalled => "Not installed",
+            Self::NoClaude => "Claude Code not found",
+        }
+    }
+
+    /// What the row offers: Install, Update, or Remove, and nothing without
+    /// Claude Code.
+    pub fn action_label(self) -> Option<&'static str> {
+        match self {
+            Self::Outdated => Some("Update"),
+            Self::NotInstalled => Some("Install"),
+            Self::Current => Some("Remove"),
+            Self::NoClaude => None,
+        }
+    }
+}
+
+/// The mod's install: its marketplace folder in dispatch's state folder and
+/// how current it is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClaudeMod {
+    pub dir: String,
+    pub state: ClaudeModState,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentSetup {
     pub cli: CliInstall,
     pub skills: Vec<SkillRow>,
+    pub claude_mod: ClaudeMod,
     pub hooks: Vec<HookSetup>,
     /// The agents whose config folder is on this machine.
     pub agents: Vec<String>,
@@ -357,6 +409,7 @@ pub fn hook_note(agent: &str) -> Option<&'static str> {
 pub fn parse_agent_setup(json: &str) -> AgentSetup {
     let root = json_object(json);
     let cli = record(root.get("cli"));
+    let claude_mod = record(root.get("claude_mod"));
     let items = |key: &str| -> Vec<Map<String, Value>> {
         root.get(key)
             .and_then(Value::as_array)
@@ -434,6 +487,10 @@ pub fn parse_agent_setup(json: &str) -> AgentSetup {
             binary: text(&cli, "binary"),
         },
         skills,
+        claude_mod: ClaudeMod {
+            dir: text(&claude_mod, "dir"),
+            state: ClaudeModState::from_wire(&text(&claude_mod, "state")),
+        },
         hooks,
         agents: strings(&root, "agents"),
     }
@@ -791,10 +848,11 @@ fn number_or(value: Option<&Value>, default: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentSetup, CliModel, CliState, HookSetup, InstallState, ListedModel, agent_model_groups,
-        classifier_trailing, fixed2, folder_agents_label, hook_note, hook_points_elsewhere,
-        key_chip, model_agent, parse_agent_setup, parse_classify, parse_key_status_value,
-        parse_policy, parse_role_answer, role_answer_line, skill_readers, skills_need_install,
+        AgentSetup, ClaudeModState, CliModel, CliState, HookSetup, InstallState, ListedModel,
+        agent_model_groups, classifier_trailing, fixed2, folder_agents_label, hook_note,
+        hook_points_elsewhere, key_chip, model_agent, parse_agent_setup, parse_classify,
+        parse_key_status_value, parse_policy, parse_role_answer, role_answer_line, skill_readers,
+        skills_need_install,
     };
     use crate::client::{DispatchAgent, DispatchAgentModels, DispatchModelSetting};
     use serde_json::json;
@@ -901,7 +959,28 @@ mod tests {
         assert!(empty.skills.is_empty());
         assert!(empty.hooks.is_empty());
         assert!(empty.agents.is_empty());
+        assert_eq!(empty.claude_mod.state, ClaudeModState::NotInstalled);
         let _typed: AgentSetup = empty;
+    }
+
+    #[test]
+    fn agent_setup_reads_the_claude_mod() {
+        let view = parse_agent_setup(
+            r#"{"claude_mod":{"dir":"/s/claude-marketplace","state":"no_claude"}}"#,
+        );
+        assert_eq!(view.claude_mod.dir, "/s/claude-marketplace");
+        assert_eq!(view.claude_mod.state, ClaudeModState::NoClaude);
+        assert_eq!(view.claude_mod.state.label(), "Claude Code not found");
+        assert_eq!(view.claude_mod.state.action_label(), None);
+        assert_eq!(
+            ClaudeModState::from_wire("current").action_label(),
+            Some("Remove"),
+            "a current mod is removed, not installed again"
+        );
+        assert_eq!(
+            ClaudeModState::from_wire("outdated").action_label(),
+            Some("Update")
+        );
     }
 
     #[test]
