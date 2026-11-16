@@ -4,28 +4,32 @@
 //! `FilterPopover` (`ActiveFilterBar` under the toolbar), whose Display section groups,
 //! sorts, and narrows what shows: one toolbar button for all of it.
 
-use std::collections::HashMap;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui::{
     AnyElement, AppContext as _, Context, Entity, IntoElement, ListAlignment, ListOffset,
     ListState, Pixels, Render, SharedString, Window, div, prelude::*, px,
 };
 
-use crate::client::{CancelRunRequest, CoreError};
+use crate::client::{CancelRunRequest, CoreError, each_at_once};
 use crate::models::filter::Filters;
+use crate::models::run_preview::{PreviewCache, fetch_preview};
 use crate::models::runs::{
     COLLAPSED_PREFERENCE, DISPLAY_PREFERENCE, REVEALED_PREFERENCE, RunGroup, RunRow, all_rows,
-    filter_specs, group_run_rows, page_run_rows, parse_runs_display, runs_default_display,
-    visible_rows,
+    filter_specs, group_run_rows, is_run_active, page_run_rows, parse_runs_display,
+    runs_default_display, visible_rows,
 };
 use crate::models::sidebar::{
     Direction, GroupBy, SIDEBAR_PAGE_ROWS, Show, SidebarDisplay, SortBy, conversation_ref,
 };
-use crate::state::{AppState, ConnectionState, Route};
+use crate::state::{AppState, ConnectionState, POLL_INTERVAL, Route};
 use crate::theme::Theme;
-use crate::ui::parts::runs::{RunAction, group_header, run_stack_row};
+use crate::ui::parts::runs::{
+    RunAction, RunCardState, card_row_count, group_header, run_stack_row,
+};
 use crate::ui::{
     FilterField, FilterPopover, FiltersChanged, Icon, MascotMood, STACK_OVERDRAW, SidebarItem,
     TextInput, ToastTone, page_empty, page_under, page_under_inset, sync_virtual_list, toolbar,
@@ -92,6 +96,12 @@ pub struct RunsView {
     slot_collapsed: Vec<String>,
     /// The revealed limits the slots were built from.
     slot_revealed: HashMap<String, usize>,
+    /// Tail previews cached per run id; only cards drawn by the virtual list fetch.
+    previews: Rc<RefCell<PreviewCache>>,
+    /// Run ids and active flags rendered on the latest stack pass.
+    rendered: Rc<RefCell<Vec<(String, bool)>>>,
+    /// Ensures at most one deferred preview fetch is queued per draw.
+    fetch_queued: Rc<Cell<bool>>,
 }
 
 /// One item in the runs stack. `after` is the gap under it; the list's own padding is separate.
@@ -221,6 +231,22 @@ impl RunsView {
             }
         })
         .detach();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(POLL_INTERVAL).await;
+                let alive = this
+                    .update(cx, |view, cx| {
+                        if matches!(view.state.read(cx).route(), Route::Runs) {
+                            view.fetch_rendered_previews(cx);
+                        }
+                    })
+                    .is_ok();
+                if !alive {
+                    break;
+                }
+            }
+        })
+        .detach();
         Self {
             state,
             search,
@@ -243,6 +269,9 @@ impl RunsView {
             slots: Rc::default(),
             slots_key: String::new(),
             slot_collapsed: Vec::new(),
+            previews: Rc::new(RefCell::new(PreviewCache::default())),
+            rendered: Rc::new(RefCell::new(Vec::new())),
+            fetch_queued: Rc::new(Cell::new(false)),
         }
     }
 
@@ -261,6 +290,10 @@ impl RunsView {
                 let state = self.state.read(cx);
                 all_rows(state.workspaces(), state.runs())
             };
+            if matches!(self.state.read(cx).connection(), ConnectionState::Online) {
+                let ids: HashSet<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+                self.previews.borrow_mut().retain(&ids);
+            }
             self.sync_fields(&rows, cx);
             self.rows = Rc::new(rows);
             self.rows_key = Some(revision);
@@ -499,6 +532,56 @@ impl RunsView {
         })
         .detach();
     }
+
+    /// Fetches due tail previews for the cards currently rendered by the virtual list, off the
+    /// main thread, updating the view only when a preview changed.
+    fn fetch_rendered_previews(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.state.read(cx).client() else {
+            return;
+        };
+        let now = Instant::now();
+        let due: Vec<(String, bool)> = {
+            let state = self.state.read(cx);
+            let mut cache = self.previews.borrow_mut();
+            let mut due = Vec::new();
+            for (id, was_active) in self.rendered.borrow().iter() {
+                let active = state
+                    .run(id)
+                    .map_or(*was_active, |run| is_run_active(&run.status));
+                if cache.due(id, active, now, POLL_INTERVAL) {
+                    cache.begin(id);
+                    due.push((id.clone(), active));
+                }
+            }
+            due
+        };
+        if due.is_empty() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let results = cx
+                .background_spawn(async move {
+                    each_at_once(&due, |(id, active)| {
+                        (id.clone(), *active, fetch_preview(&client, id, *active))
+                    })
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                let now = Instant::now();
+                let mut changed = false;
+                {
+                    let mut cache = view.previews.borrow_mut();
+                    for (id, active, read) in results {
+                        changed |= cache.finish(&id, read, active, now);
+                    }
+                }
+                if changed {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
 }
 
 impl Render for RunsView {
@@ -604,10 +687,15 @@ impl RunsView {
                 entity.update(cx, |this, cx| this.show_less(id, cx));
             })
         };
+        self.rendered.borrow_mut().clear();
         let slots = self.slots.clone();
         let groups = self.groups.clone();
         let now_ms = self.now_ms;
         let cancelling = self.cancelling.clone();
+        let previews = self.previews.clone();
+        let rendered = self.rendered.clone();
+        let fetch_queued = self.fetch_queued.clone();
+        let fetch_entity = entity.clone();
         virtual_stack(
             "runs-scroll",
             &self.list,
@@ -668,11 +756,31 @@ impl RunsView {
                         else {
                             return div().into_any_element();
                         };
+                        record_rendered(&rendered, &row.id, row.active);
+                        let preview = previews.borrow().get(&row.id);
+                        let now = Instant::now();
+                        if previews
+                            .borrow()
+                            .due(&row.id, row.active, now, POLL_INTERVAL)
+                            && !fetch_queued.get()
+                        {
+                            fetch_queued.set(true);
+                            let entity = fetch_entity.clone();
+                            cx.defer(move |cx| {
+                                entity.update(cx, |view, cx| {
+                                    view.fetch_queued.set(false);
+                                    view.fetch_rendered_previews(cx);
+                                });
+                            });
+                        }
                         let busy = cancelling.as_deref() == Some(row.id.as_str());
                         run_stack_row(
                             row_index,
                             row,
-                            busy,
+                            RunCardState {
+                                cancelling: busy,
+                                preview,
+                            },
                             now_ms,
                             on_open.clone(),
                             on_cancel.clone(),
@@ -758,6 +866,8 @@ fn stack_slots(
             for (row, run) in group.runs.iter().take(page.shown).enumerate() {
                 structure.push('\u{1f}');
                 structure.push_str(&run.id);
+                structure.push(':');
+                structure.push_str(&card_row_count(run).to_string());
                 let after = tail_after(controls == 0 && row + 1 == page.shown);
                 slots.push(StackSlot::Row {
                     group: group_index,
@@ -831,6 +941,15 @@ fn display_rows(display: &SidebarDisplay) -> Vec<DisplayRow> {
             ),
         DisplayRow::new("show", "Show", Icon::ListFilter).group(options(&SHOWS), show),
     ]
+}
+
+fn record_rendered(rendered: &Rc<RefCell<Vec<(String, bool)>>>, id: &str, active: bool) {
+    let mut rendered = rendered.borrow_mut();
+    if let Some(slot) = rendered.iter_mut().find(|(known, _)| known == id) {
+        slot.1 = active;
+    } else {
+        rendered.push((id.to_string(), active));
+    }
 }
 
 fn unix_ms() -> i64 {
